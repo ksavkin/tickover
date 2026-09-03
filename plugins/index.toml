@@ -1,0 +1,55 @@
+# Plugin registry index.
+#
+# This is what "Check updates" in Settings fetches — raw, over HTTPS, from
+# https://raw.githubusercontent.com/ksavkin/tickover/main/plugins/index.toml
+# — and diffs against the manifests already installed. Schema is owned by
+# `src/plugin/registry.rs` (`RegistryIndex`/`RegistryEntry`); this file is
+# just data.
+#
+# `sha256` is over the referenced manifest file's exact bytes (`shasum -a 256
+# plugins/<id>.toml`) and is checked *before* the downloaded manifest is
+# parsed — editing a manifest without bumping the matching entry here (both
+# `version` and `sha256`) breaks the download for everyone, and
+# `tests/registry_index.rs` fails the build to say so.
+
+schema_version = 1
+
+[[plugin]]
+id          = "codex"
+name        = "Codex"
+version     = "2.5.1"
+description = "OpenAI Codex CLI usage: 5h/weekly windows plus a credits balance."
+manifest    = "codex.toml"
+sha256      = "5c1a73cfc3df978684a08a6061a2a1733576159adb1bc5fb9d98ad7d25701de9"
+
+[[plugin]]
+id          = "claude"
+name        = "Claude"
+version     = "1.4.1"
+description = "Claude Code CLI and desktop app usage: 5h/weekly windows, per model."
+manifest    = "claude.toml"
+sha256      = "5fac28643944da153a44ee4b33df76b16ec67b5ddf43f7fd66c4613f90b1f8a8"
+
+[[plugin]]
+id          = "grok"
+name        = "Grok"
+version     = "1.0.0"
+description = "Grok CLI billing: prepaid balance and pay-as-you-go allowance."
+manifest    = "grok.toml"
+sha256      = "ce23cd7fd9164aa691f7a6b61786e471f41b389b52e0b109ab259e5129523a66"
+
+[[plugin]]
+id          = "antigravity"
+name        = "Antigravity"
+version     = "1.1.0"
+description = "Antigravity CLI (Google Gemini Code Assist) quota."
+manifest    = "antigravity.toml"
+sha256      = "b7b23d609f859de7a01e29cec5c733026c20e656bc902c5aa5fddbfe16016832"
+
+[[plugin]]
+id          = "copilot"
+name        = "Copilot"
+version     = "1.0.0"
+description = "GitHub Copilot quota: premium requests, chat and completions."
+manifest    = "copilot.toml"
+sha256      = "094ac70619cc6ec5e204dd3d1aa38a2cd724a2024f3e031b84dee3caf573f1cd"

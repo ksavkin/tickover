@@ -1,0 +1,87 @@
+# Built-in plugin manifest — Grok CLI.
+#
+# Grok's billing figures are read from the same endpoint its own CLI calls,
+# `cli-chat-proxy.grok.com/v1/billing?format=credits`, with the CLI's own
+# bearer token. It is unofficial and undocumented — if its shape changes,
+# update this file, not Rust code.
+#
+# This provider reports no window at all: no percentage, no reset moment,
+# nothing a 5H/WK row could draw. What it states instead is two figures
+# against a monthly billing period — a prepaid balance and a pay-as-you-go
+# allowance — which is exactly the shape [[balances]] exists for (see
+# docs/PLUGIN-ARCHITECTURE.md and `crate::plugin::manifest::BalanceConfig`),
+# and why this manifest declares no [[windows]] section.
+#
+# The response never states a scale for these figures — no minor-unit
+# exponent the way a proper money triplet would carry, and the Grok client's
+# own leading "$" is not something this response confirms. So both figures
+# read as `kind = "number"`, with no `unit_label`: guessing a currency or a
+# word this app cannot verify is exactly what the manifest schema exists to
+# refuse. Grok also states no standing for the account above these two
+# figures (no "blocked"/"allowed" of its own), hence no [status] either.
+
+id           = "grok"
+name         = "Grok"
+menu_label   = "Gr"
+order        = 30
+# `[[balances]]` needs a reader that knows a provider can report a balance
+# instead of a window at all; the credential lives in a JSON object keyed by
+# a per-install string the plain dotted-path auth grammar cannot select. See
+# docs/PLUGIN-ARCHITECTURE.md, "Reader capabilities".
+requires_reader = ["reading-balances", "credentials-map"]
+version      = "1.0.0"
+engine       = "http-api"
+refresh_secs = 60
+
+# Prepaid credit — reported as what remains, not as used-against-a-cap.
+[[balances]]
+id    = "prepaid"
+label = "Prepaid"
+[balances.remaining]
+kind = "number"
+path = "config.prepaidBalance.val"
+[balances.source]
+period_end_path   = "config.billingPeriodEnd"
+period_end_format = "iso8601"
+
+# Pay-as-you-go spend against its own ceiling, the other half of the same
+# response.
+[[balances]]
+id    = "on-demand"
+label = "Pay-as-you-go"
+[balances.used]
+kind = "number"
+path = "config.onDemandUsed.val"
+[balances.cap]
+kind = "number"
+path = "config.onDemandCap.val"
+[balances.source]
+period_end_path   = "config.billingPeriodEnd"
+period_end_format = "iso8601"
+
+[http]
+[[http.request]]
+url = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+[http.request.headers]
+Authorization = "Bearer {token}"
+
+[[surface]]
+id            = "default"
+label         = "Default"
+opt_in        = false
+in_menu_bar   = true
+allowed_hosts = ["cli-chat-proxy.grok.com"]
+
+# `~/.grok/auth.json` keys each account's credentials by
+# "https://auth.x.ai::<uuid>" — a string unique to the install and unknowable
+# in advance, and one the existing dotted-path grammar cannot reach at all: a
+# `.` in `token_json_path` walks object keys, and this key has colons and
+# dots of its own (`json_path_str` / `credentials_file_step` in
+# `src/plugin/auth.rs`). `credentials-map` selects the one entry whose key
+# starts with `key_prefix`, then reads `key` inside it exactly the way
+# `credentials-file` reads `token_json_path` inside the whole file.
+[[surface.auth]]
+type            = "credentials-map"
+path            = "~/.grok/auth.json"
+key_prefix      = "https://auth.x.ai::"
+token_json_path = "key"

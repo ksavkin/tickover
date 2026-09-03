@@ -1,0 +1,217 @@
+# Built-in plugin manifest — GitHub Copilot.
+#
+# Copilot's quota is read from the same endpoint its own editor plugin calls,
+# `api.github.com/copilot_internal/user`, with the credential that plugin
+# already keeps on disk. It is unofficial and undocumented — if its shape
+# changes, update this file, not Rust code. Everything below was read out of
+# the shipped Copilot language server (`copilot-agent/dist/main.js` inside the
+# JetBrains plugin) and then confirmed against a live 200; the measurements are
+# written up in the project's private provider notes, which are deliberately
+# not part of this repository.
+#
+# What this provider needs from the reader is what Grok already needed — no
+# mechanism is new here, which is the point: a fifth provider that is a
+# manifest and nothing else.
+#  * `[[balances]]` (`reading-balances`), because Copilot reports no window at
+#    all: no rolling period, no percentage of one — a monthly allowance
+#    against a calendar reset date.
+#  * `credentials-map`, because the token lives in a JSON object keyed by
+#    `<host>:<app-id>`, a per-editor string the plain dotted-path grammar
+#    cannot select.
+
+id           = "copilot"
+name         = "Copilot"
+menu_label   = "Cp"
+order        = 50
+requires_reader = ["reading-balances", "credentials-map"]
+version      = "1.0.0"
+engine       = "http-api"
+# A monthly counter, not a rolling window, and the number is picked rather than
+# copied from the other manifests — none of which is measuring a month.
+#
+# Nothing here claims a rate the figure is published at: the endpoint answers
+# the current state on every request, and no cache of it was measured. What
+# picks five minutes is the other end. The figure does move within a session —
+# a premium request spends it — so a panel opened after a burst of work should
+# not be showing a reading from half an hour ago; and this is an undocumented
+# endpoint reached with a user's own credential, where a per-minute poll for a
+# figure that changes a few times a day is the app spending someone's API
+# budget to learn nothing. The provider's own client sits far slower still: it
+# re-reads this beside its token refresh, roughly every 25 minutes.
+#
+# The panel's own Refresh is not paced by this at all — that path is held by
+# `min_interval_secs` (default 55).
+refresh_secs = 300
+
+# The response carries three quota buckets — `chat`, `completions` and
+# `premium_interactions` — and only the last one is metered on a paid plan: the
+# other two arrive `unlimited = true` with `entitlement` and `remaining` both
+# zero (measured on the owner's `individual` plan). A row for them would draw a
+# 0-of-0 that means "no ceiling", the one reading `Balance::cap` documents it
+# will never conclude. So one row here, for the bucket that has a number in it —
+# and two more at the bottom of this file for the free plan, which meters those
+# same two buckets through entirely different fields.
+#
+# `unlimited` has no home in the balance grammar and is not being given one
+# here: nothing on this account reads it (see the "no mechanism without a
+# consumer" rule), and the honest alternative — a row that says "unlimited" —
+# is a caption this app would be inventing, not a figure the provider stated.
+#
+# The known weakness that leaves, written down rather than left to be found: an
+# account where *premium* itself arrives unlimited draws `cap 0 / remaining 0`,
+# which reads like an exhausted quota and is not one. Nothing here concludes
+# "exhausted" from a zero (`Balance::cap` is explicit about that), but nothing
+# distinguishes the two either. The flagship test over this manifest in
+# `src/plugin/engine_http.rs` pins that behaviour on purpose, so a later stage
+# that wants to fix it can see exactly what it is changing.
+[[balances]]
+id    = "premium"
+label = "Premium"
+
+# `quota_remaining`, not the `remaining` beside it. Both are stated, and they
+# are not the same number: `remaining` is `floor(quota_remaining)` (measured),
+# while `quota_remaining` is the figure the provider's own `percent_remaining`
+# is computed from — 100·quota_remaining/entitlement matched it exactly, and
+# the integer twin was 0.4 points off. Premium interactions are billed in
+# fractions (a model multiplier of 0.25 spends a quarter of one), so the
+# fraction is the truth and the integer is a rounding of it — one that reads
+# "0 left" while a quarter of a request is still there.
+[balances.remaining]
+kind       = "number"
+path       = "quota_snapshots.premium_interactions.quota_remaining"
+unit_label = "interactions"
+
+# The ceiling, stated as `entitlement`. Same unit on both sides deliberately:
+# a unit on one figure and none on the other stops the pair reading as one row.
+[balances.cap]
+kind       = "number"
+path       = "quota_snapshots.premium_interactions.entitlement"
+unit_label = "interactions"
+
+# The end of the calendar period. `quota_reset_date_utc` (RFC3339 Z, midnight)
+# rather than the `quota_reset_date` beside it, which is a bare `YYYY-MM-DD`
+# with no zone, or the per-bucket `quota_reset_at`, which arrived as 0 on the
+# live response — an epoch this endpoint does not fill.
+#
+# No `percent_path`, and that is the whole reason this comment exists: the
+# response *does* state a percentage, `percent_remaining`, and it is the wrong
+# polarity. The panel prints a stated percent as "N% used" (`src/main.rs`,
+# `balance_data`), so wiring a remaining-percent into it would print 90% used
+# for an account that has spent 10. The two figures above say the same thing
+# without the inversion.
+[balances.source]
+period_end_path   = "quota_reset_date_utc"
+period_end_format = "iso8601"
+
+# ── The free plan ────────────────────────────────────────────────────────
+#
+# A free account is metered somewhere else entirely: `premium_interactions` is
+# empty for it, and its chat and completion allowances arrive at the top level
+# as `limited_user_quotas` (what is left) against `monthly_quotas` (the
+# ceiling), with `limited_user_reset_date` for the period.
+#
+# Where that comes from, and what it is worth: the Copilot language server's own
+# code, which branches on `access_type_sku == "free_limited_copilot"` and
+# computes its percentage as `limited_user_quotas.<bucket> / monthly_quotas.
+# <bucket> * 100` — that division is what fixes which of the two is the
+# remainder. It has **not** been seen on the wire here; nobody on this machine
+# holds a free plan. That is why these two rows carry no unit and no invented
+# field: every figure below is one the provider's own client reads, and nothing
+# else is claimed.
+#
+# The cost of being wrong is nil in one direction and real in the other. A paid
+# response carries none of these paths (measured), so these rows simply do not
+# draw for a paid account — while without them a free user's card says "no usage
+# reported yet" over a quota the provider is reporting perfectly well.
+#
+# No unit label: the row label already names what is counted, and "20 chat /
+# 50 chat" would be worse than "20 / 50". The period end is declared knowing it
+# may not draw — its paid-side sibling `quota_reset_date` is a bare `YYYY-MM-DD`
+# with no zone, which this app's RFC3339 parser refuses; if this one is the
+# same, the figures still draw and the date does not.
+
+[[balances]]
+id    = "free-chat"
+label = "Chat"
+[balances.remaining]
+kind = "number"
+path = "limited_user_quotas.chat"
+[balances.cap]
+kind = "number"
+path = "monthly_quotas.chat"
+[balances.source]
+period_end_path   = "limited_user_reset_date"
+period_end_format = "iso8601"
+
+[[balances]]
+id    = "free-completions"
+label = "Completions"
+[balances.remaining]
+kind = "number"
+path = "limited_user_quotas.completions"
+[balances.cap]
+kind = "number"
+path = "monthly_quotas.completions"
+[balances.source]
+period_end_path   = "limited_user_reset_date"
+period_end_format = "iso8601"
+
+# A plain GET. The Authorization header is the only one the endpoint requires —
+# measured: auth alone, auth + version, and the full editor-identity set the
+# plugin sends all answered 200 with the same body. So no editor identity is
+# claimed here: this app is not an editor, and nothing asked it to pretend.
+#
+# The one extra header is the API-version pin the client itself sends, kept on
+# the same principle that puts the CLI's own User-Agent in `antigravity.toml` —
+# send what the client sends, since what the client sends is what the shape was
+# measured against. (No User-Agent here: this request needs none, and inventing
+# an editor to be would be the opposite of that principle.)
+# Its cost is worth stating plainly, since the measurement above says it buys
+# nothing *today*: GitHub retires an API version eventually, and a request
+# naming a retired one is answered 400. If this provider ever starts failing
+# with a 400 on a request that used to work, this line is the first thing to
+# delete — the endpoint answered identically without it.
+[http]
+[[http.request]]
+url = "https://api.github.com/copilot_internal/user"
+[http.request.headers]
+Authorization             = "Bearer {token}"
+"X-GitHub-Api-Version"    = "2025-05-01"
+
+[[surface]]
+id            = "default"
+label         = "Default"
+opt_in        = false
+in_menu_bar   = true
+allowed_hosts = ["api.github.com"]
+
+# `apps.json` is where every current Copilot editor plugin keeps its OAuth
+# token: the language server migrates the older `hosts.json` into it on
+# startup and deletes the original (read in `main.js`), so this is the one
+# store, not one of two. Its keys are `<host>:<github-app-id>` — the app id
+# differs per editor (JetBrains and VS Code each have their own), which is why
+# the prefix stops at the host.
+#
+# One consequence worth stating, because it is a real machine's configuration
+# and not a hypothetical: a user signed into Copilot from two editors holds two
+# `github.com:` entries, and `credentials-map` refuses that rather than picking
+# one. Most often those two entries are the same person's single GitHub account,
+# and either token would answer identically — the endpoint reports an account,
+# not an editor. But they need not be, nothing in the file says which case this
+# is, and picking by map order would be this app guessing whose quota it is
+# showing. So the row says it cannot tell, and that user gets no figure until
+# the manifest offers a way to choose. Narrowing the prefix to one editor's app
+# id would trade a visible refusal for silently serving only that editor's
+# users, which is the worse of the two.
+#
+# Path: the client resolves `$XDG_CONFIG_HOME/github-copilot` when that is set
+# and absolute, `%USERPROFILE%\AppData\Local\github-copilot` on Windows, and
+# `$HOME/.config/github-copilot` otherwise. The manifest grammar spells the
+# last of those; on the other two the file is simply not found and the surface
+# reports no credential, which is the same "not installed here" this app shows
+# for every provider it cannot see.
+[[surface.auth]]
+type            = "credentials-map"
+path            = "~/.config/github-copilot/apps.json"
+key_prefix      = "github.com:"
+token_json_path = "oauth_token"

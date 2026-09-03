@@ -1,0 +1,5 @@
+# Build with a current stable toolchain. The machine's default may be an older
+# pinned Rust; this file makes `cargo` pick stable for this project so modern
+# Slint / tray-icon compile cleanly.
+[toolchain]
+channel = "stable"

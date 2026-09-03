@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Tickover</string>
+    <key>CFBundleDisplayName</key>
+    <string>Tickover</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.github.ksavkin.tickover</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>tickover</string>
+    <key>CFBundleIconFile</key>
+    <string>app.icns</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <!--
+        Start regular so winit can create the native menu-bar status item.
+        platform::set_accessory_policy() switches to accessory mode just after
+        the event loop starts, so the Dock icon does not remain visible.
+    -->
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+</dict>
+</plist>

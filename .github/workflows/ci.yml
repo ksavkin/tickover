@@ -1,0 +1,124 @@
+# Build and test on both platforms this app ships to, on every push.
+#
+# Until this file existed the project was verified by hand on one macOS laptop,
+# while `src/plugin/auth.rs` carried a `#[cfg(windows)]` branch reading the
+# Windows Credential Manager that had never once been compiled — and neither
+# had the Windows halves of `config.rs`, `seed.rs` or `engine_logfile.rs`. A
+# regression there was invisible: `cargo build` on a Mac never looks at it.
+#
+# Deliberately small. `cargo fmt --check` runs on macOS only, like clippy:
+# formatting is platform-independent, and one job saying so is enough.
+#
+# `clippy -D warnings` was declined on the same terms — "welcome once the commit
+# that makes it green exists" — and that commit now exists: the tree is silent,
+# including the 19 `msg_send!` expansions in `src/platform.rs`, which are
+# answered by naming `feature = "cargo-clippy"` as an expected cfg in
+# `Cargo.toml` rather than by allowing the lint. The gate runs on macOS only,
+# because macOS is the half that can be verified before pushing; turning it on
+# for Windows would mean a red build nobody here can reproduce, which is how a
+# gate stops being read.
+
+name: CI
+
+# Runs on every push to `main` and `dev`, on every pull request, and on
+# demand (`gh workflow run CI --ref <branch>`). `paths-ignore` skips a push
+# that touches only documentation: a checkpoint in `docs/` is not a build,
+# and Windows in particular takes long enough that running it for prose
+# would just be noise between the pushes that changed code.
+on:
+  push:
+    branches: [main, dev]
+    paths-ignore: ["docs/**", "**/*.md"]
+  pull_request:
+    paths-ignore: ["docs/**", "**/*.md"]
+  workflow_dispatch:
+
+# One run per commit, whatever asked for it. A second push to the same branch
+# makes the first run's answer stale before it arrives; and a push to a branch
+# that also has a pull request open fires both triggers for the same code,
+# which — keyed by ref, since a pull request's ref is `refs/pull/N/merge` —
+# would be two full runs of the same commit. Keying by the commit itself
+# collapses them.
+concurrency:
+  group: ci-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: true
+
+# Nothing here writes anything back.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # A cold build of this graph (670 crates, Slint among them) takes minutes,
+    # not tens of them; an hour left unfinished means something is wedged.
+    timeout-minutes: 60
+    strategy:
+      # The whole point of the matrix is to see Windows even when macOS is red,
+      # and the other way round.
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+
+    steps:
+      # Pinned by commit rather than by tag. A tag is whatever it points at
+      # today; this project refuses to install a plugin manifest on that basis
+      # (`src/plugin/registry.rs` checks a sha256), and its own build should
+      # not be looser than that. Comment says which release the commit is.
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Nothing after this reads the repository again, so the checkout
+          # token has no reason to be left behind in `.git/config` where every
+          # later step — and every dependency's build script — could read it.
+          persist-credentials: false
+
+      # No toolchain action: the runners ship rustup, and `rust-toolchain.toml`
+      # already says `channel = "stable"`. Printing it makes the version part
+      # of the log, so a failure that is really a toolchain change reads as one.
+      - name: Show toolchain
+        run: |
+          rustup show active-toolchain
+          cargo --version
+
+      # Default rustfmt style, no rustfmt.toml: the tree was formatted with it
+      # once and this keeps it that way. The component is not part of the
+      # runner's default toolchain, so it is added first.
+      - name: Format (macOS only — see the note at the top)
+        if: matrix.os == 'macos-latest'
+        run: |
+          rustup component add rustfmt
+          cargo fmt --check
+
+      # Only the crate downloads. `target/` is deliberately not cached: the
+      # debug tree for this graph is ~10 GB and the release tree ~2.5 GB, well
+      # past the 10 GB a repository's cache holds in total, so caching it would
+      # evict itself and everything else along with it.
+      - name: Cache crate downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-cargo-
+
+      # `--locked` because `Cargo.lock` is committed: CI must build the graph
+      # that was built here, and a lockfile that has drifted from `Cargo.toml`
+      # should fail loudly instead of being quietly rewritten.
+      # Not a `-D warnings` build, which would also fail on a lint a newer
+      # stable invents; a separate step says which of the two happened.
+      - name: Clippy (macOS only — see the note at the top)
+        if: matrix.os == 'macos-latest'
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --all-targets --locked

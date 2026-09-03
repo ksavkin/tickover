@@ -1,0 +1,198 @@
+# Built-in plugin manifest — Claude Code CLI + Claude desktop app.
+#
+# This is a 1:1 declarative description of the behaviour that used to live in
+# `src/claude.rs` / the `reading_from_claude` adapter in `src/main.rs`. The
+# `/api/oauth/usage` endpoint is unofficial and undocumented — if Anthropic
+# changes its shape, update this file, not Rust code.
+
+id           = "claude"
+name         = "Claude"
+menu_label   = "Cl"
+order        = 20
+# `required` below needs a reader that knows a window can be absent rather than
+# blank — see docs/PLUGIN-ARCHITECTURE.md, "Reader capabilities".
+requires_reader = ["window-presence", "window-identity", "for-each-windows"]
+version      = "1.4.1"
+engine       = "http-api"
+# Claude is re-fetched every 60s (src/main.rs tick_timer, `n % 60`).
+refresh_secs = 60
+
+# Claude reports no window lengths of its own, so the nominal periods (5h =
+# 300 min, weekly = 10080 min) are assumed here — exactly what
+# `reading_from_claude` hardcodes today (`period_minutes: Some(300)` /
+# `Some(10080)`). This is the mirror image of Codex, whose windows carry their
+# own `window_minutes`.
+# Both windows are `required`: Anthropic reports both for every account, so a
+# response missing one has changed shape under us. That is worth saying out
+# loud — the alternative is a panel drawing whichever half still parsed, where
+# a missing row is indistinguishable from a quota nothing has been spent
+# against. It also replaces the reader's old guess, which called a response
+# with *nothing* in it broken and a response with half of it fine.
+[[windows]]
+id       = "claude-5h"
+label    = "5H"
+role     = "primary"
+required = true
+[windows.period]
+mode    = "assumed"
+assumed = 300
+[windows.source]
+used_percent_path = "five_hour.utilization"
+resets_at_path    = "five_hour.resets_at"
+resets_at_format  = "iso8601"
+
+[[windows]]
+id       = "claude-wk"
+label    = "WK"
+role     = "secondary"
+required = true
+[windows.period]
+mode    = "assumed"
+assumed = 10080
+[windows.source]
+used_percent_path = "seven_day.utilization"
+resets_at_path    = "seven_day.resets_at"
+resets_at_format  = "iso8601"
+
+# The third kind of window Anthropic reports, and the one no fixed entry can
+# describe: a weekly allowance scoped to a single model. It does not live in a
+# field of its own — `seven_day_opus` and friends are present in the response
+# and null — but inside the `limits[]` array, as an element whose `kind` says
+# `weekly_scoped` and whose `scope.model.display_name` names the model. On the
+# account this was measured against (2026-08-22) there is one such element,
+# for Fable, and the panel had been silently omitting it while Anthropic's own
+# usage page drew it.
+#
+# So this entry enumerates rather than points (`for_each`, stage C):
+#  * `limits[]` also carries the session and weekly-all windows — the two the
+#    fixed entries above already draw from `five_hour`/`seven_day` — so the
+#    filter is what keeps this from drawing them a second time under a
+#    different caption. Its `kind` is the provider's own word for the
+#    distinction.
+#  * the caption comes from the element, because a per-model row that cannot
+#    say which model is worse than no row (`label`'s own docs carry the
+#    exception; the text is sanitised on the way in like any provider string).
+#  * `role = "extra"` keeps it out of the menu bar and out of the 5H/WK slots,
+#    and makes the panel title it by the manifest's caption instead of by its
+#    length — otherwise a per-model weekly row would sit under the
+#    subscription's weekly row saying the same two words about a different
+#    number (`window_title_of` in src/main.rs).
+#  * the identity is the model's *display name*, and that is a compromise worth
+#    stating: `scope.model.id` exists in the response and is null on the account
+#    this was measured against, so keying on it would resolve to nothing and
+#    draw no row at all. A display name is a caption Anthropic may reword, and
+#    the day it does, the row's registry entry is orphaned and comes back as a
+#    new row. Switch this to `scope.model.id` the moment that field is filled.
+#  * not `required`: an account whose plan scopes nothing reports no such
+#    element, and that is a plan without the limit rather than a response that
+#    changed shape.
+[[windows]]
+id              = "claude-wk-model"
+label           = "{scope.model.display_name} weekly"
+role            = "extra"
+for_each        = "limits"
+for_each_where  = "kind=weekly_scoped"
+element_id_path = "scope.model.display_name"
+[windows.period]
+mode    = "assumed"
+assumed = 10080
+[windows.source]
+used_percent_path = "percent"
+resets_at_path    = "resets_at"
+resets_at_format  = "iso8601"
+
+# claude.rs `fetch_usage`: GET .../oauth/usage with the OAuth bearer token, the
+# `oauth-2025-04-20` beta header, and a `claude-code/<version>` User-Agent
+# (required — Anthropic 429s aggressively without it).
+[http]
+[[http.request]]
+url          = "https://api.anthropic.com/api/oauth/usage"
+timeout_secs = 8
+[http.request.headers]
+Authorization    = "Bearer {token}"
+"anthropic-beta" = "oauth-2025-04-20"
+"User-Agent"     = "claude-code/{version}"
+
+# `{version}` substitution — claude.rs `claude_code_version()`: read the
+# installed CLI's own package.json, falling back to a recent constant.
+#
+# The third is Windows: npm's global prefix is per-user there, under %APPDATA%
+# rather than a system directory. Spelled `~/AppData/Roaming` rather than
+# `{config_dir}` so the path says which platform it is for — `{config_dir}` is
+# ~/Library/Application Support on macOS, where it could never match anything.
+# A winget install has no package.json at all (it ships one self-contained
+# .exe), so that one takes the fallback below — which is what a fallback is
+# for, and costs only a slightly stale version in a User-Agent.
+[http.version]
+files = [
+    "/usr/local/lib/node_modules/@anthropic-ai/claude-code/package.json",
+    "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/package.json",
+    "~/AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/package.json",
+]
+json_path = "version"
+fallback  = "2.1.78"
+
+# Account email — claude.rs `fetch_email`: GET .../oauth/profile with the same
+# headers/auth as [http], then `account.email` in the response body.
+[account]
+type      = "http"
+url       = "https://api.anthropic.com/api/oauth/profile"
+json_path = "account.email"
+
+# CLI surface — always on (claude.rs `read_all` always reads it).
+[[surface]]
+id            = "cli"
+label         = "CLI"
+opt_in        = false
+in_menu_bar   = true
+allowed_hosts = ["api.anthropic.com"]
+
+# claude.rs `cli_token()`: plaintext credentials file first, then the OS
+# secure store per platform. Every step decodes the same JSON shape, hence the
+# same `token_json_path` fallback throughout (claude.rs `extract_access_token`:
+# nested `claudeAiOauth.accessToken`/`claudeAiOauth.access_token`, else flat
+# `accessToken`/`access_token` at the root).
+[[surface.auth]]
+type             = "credentials-file"
+path             = "~/.claude/.credentials.json"
+token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
+
+[[surface.auth]]
+type             = "keychain"
+service          = "Claude Code-credentials"
+token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
+
+[[surface.auth]]
+type             = "win-credential"
+targets          = ["Claude Code-credentials", "Claude Code"]
+token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
+
+# Desktop surface — opt-in (its token needs a one-time Keychain/DPAPI grant),
+# popup-only (claude.rs module docs; `reading_from_claude`:
+# `in_menu_bar: reading.surface == claude::Surface::Cli`).
+[[surface]]
+id            = "desktop"
+label         = "Desktop"
+opt_in        = true
+in_menu_bar   = false
+allowed_hosts = ["api.anthropic.com"]
+
+# claude.rs `desktop_token()`: `{config_dir}/Claude/config.json` →
+# `oauth:tokenCacheV2` (falling back to `oauth:tokenCache`) → an Electron Safe
+# Storage blob, decrypted via the macOS Keychain key "Claude Safe Storage" (or
+# Windows DPAPI, which needs no manifest field). The decrypted payload is the
+# same `claudeAiOauth`-wrapped shape as the CLI's, hence the same
+# `token_json_path` fallback.
+[[surface.auth]]
+type               = "electron-safe-storage"
+config_path        = "{config_dir}/Claude/config.json"
+blob_json_path     = "oauth:tokenCacheV2|oauth:tokenCache"
+token_json_path    = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
+macos_keychain_key = "Claude Safe Storage"
+
+# `claude -p hello` — run while the 5-hour window sits empty, to start a
+# fresh one (src/main.rs `ping_due` / `send_ping`, gated by
+# `config::auto_ping_claude`).
+[ping]
+bin  = "claude"
+args = ["-p", "hello"]

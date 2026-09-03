@@ -1,0 +1,1173 @@
+// Limits — the popover window.
+import { Theme, Icons } from "theme.slint";
+import { LimitBlock, ToggleRow, GhostButton, InfoDot, MiniIconButton, BarTip } from "widgets.slint";
+
+// One quota window (a single console row). A provider now carries a dynamic
+// list of these instead of two fixed slots, so a plugin can declare any number
+// of windows in its manifest. Primary window first, then secondaries.
+export struct WindowData {
+    label: string,        // "5H" / "WK"
+    pct: float,           // used %
+    reset-rel: string,    // "6d 2h" / "2h 4m"
+    reset-at: string,     // "19 Jul 22:18" / "22:10" / ""
+    tooltip: string,
+    // A window the provider has stopped reporting because nothing has been
+    // spent in it yet (Codex does this), drawn as a single faint line instead
+    // of a bar at 0%. False — the default, so a row that forgets to say
+    // anything is drawn as an ordinary one — means every other field is real.
+    not-started: bool,
+}
+
+// One balance row: a figure against a calendar period (a billing month),
+// rather than a percentage against a rolling window — see `Balance` in
+// `src/model.rs` for why it is drawn separately from `WindowData` rather than
+// folded into it. Simpler than a window by design: there is no bar, because a
+// stated percentage is not always there, so every field here is plain text,
+// already formatted by Rust — nothing in this file parses or computes one.
+export struct BalanceData {
+    label: string,        // manifest's row label, e.g. "Spend" / "Credits"
+    // "\n"-joined figures: the used/cap pair on one line when their units
+    // match (`Balance::pair_is_comparable`), the two on separate lines when
+    // they don't, plus `remaining` on its own line — whichever of the three
+    // the provider stated. "" when none were.
+    amount-line: string,
+    // "12% used" — drawn only when the provider stated a percentage
+    // (`Balance.stated_percent`); never computed from the figures above.
+    // "" hides the line.
+    percent-line: string,
+    // "ends in 12d · 3 Sep 2026" / "period ended 3 Sep 2026" — a date (or a
+    // countdown to one), never the period's own length: a calendar month is
+    // 28-31 days. "" when the provider didn't state a period end.
+    period-line: string,
+    // "spending limit reached" — the provider said its spending limit was
+    // hit. Empty when it didn't, or when the quota level already said the
+    // account is blocked (deduplicated in Rust, not here).
+    notice: string,
+}
+
+// One provider's data (Codex or a Claude account).
+export struct ProviderData {
+    name: string,        // "Codex" / "Claude"
+    tag: string,         // plan or surface: "PROLITE" / "CLI" / "Desktop"
+    account: string,     // account email (faint), "" hides it
+    live: bool,          // green status dot
+    status: int,         // 0 = show rows, 1 = show `message`
+    message: string,     // empty / error / not-installed text
+    windows: [WindowData],
+    // Balance rows, drawn under the windows above — see `BalanceData`. Empty
+    // is the ordinary state for a provider that only has windows.
+    balances: [BalanceData],
+    // What the provider says about the quota itself, when it says anything —
+    // "limit reached", and which limit if it named one. Drawn above the rows,
+    // because it can be true while every row looks calm: a quota can be blocked
+    // and report no window at all, and the rows alone would then show an
+    // account with nothing wrong with it. Empty hides the line.
+    notice: string,
+}
+
+// One plugin as shown in the settings sheet's plugin manager.
+export struct SurfaceRow {
+    id: string,          // surface id, e.g. "desktop"
+    label: string,       // display label, e.g. "Desktop"
+    enabled: bool,       // opt-in surface currently on
+}
+
+// One [[option]] the plugin's manifest declares — a plain bool checkbox,
+// resolved to its current value (default, or the user's override).
+export struct OptionRow {
+    key: string,         // manifest option key, e.g. "include_beta"
+    label: string,       // display label from the manifest
+    enabled: bool,       // current resolved value
+}
+
+export struct PluginRow {
+    id: string,          // stable manifest id, e.g. "codex" / "claude"
+    name: string,        // "Codex" / "Claude"
+    menu-label: string,  // short chip: "Cx" / "Cl"
+    engine: string,      // "log-file" / "http-api"
+    enabled: bool,       // plugin active at all (master toggle)
+    has-ping: bool,      // manifest declares a [ping] → show the ping sub-toggle
+    ping-command: string, // the command that toggle actually runs, shown in its label
+    ping-enabled: bool,  // auto-ping "hello" on 5h reset
+    surfaces: [SurfaceRow], // opt-in surfaces (empty for most plugins)
+    options: [OptionRow],  // manifest [[option]] declarations (empty for bundled codex/claude)
+    // ── Registry: update available for an already-installed plugin ──────
+    current-version: string,   // installed version, e.g. "1.0.0"
+    available-version: string, // "" = no update available; else e.g. "1.2.0"
+    has-local-edits: bool,     // installed file's hash has diverged from the origin manifest
+    update-status: int,        // 0 idle (show Update button) / 1 updating / 2 failed
+    update-error: string,      // update-status == 2: error text (e.g. "sha256 mismatch")
+}
+
+// One `[[plugin]]` entry from the registry's index.toml that isn't installed
+// yet. The index only carries id/name/version/description pre-download —
+// no engine chip or manifest detail until Install actually pulls it.
+export struct RegistryPluginRow {
+    id: string,          // stable id; also the target install filename stem
+    name: string,        // display name
+    version: string,     // publisher-declared version, e.g. "0.3.0"
+    description: string, // one-line description shown before install
+    status: int,          // 0 available (show Install) / 1 installing / 2 failed
+    error: string,        // status == 2: error text (e.g. "sha256 mismatch")
+}
+
+// small rounded chip (plan / surface badge / version badge)
+component Chip inherits Rectangle {
+    in property <string> text <=> t.text;
+    // Defaults render the neutral plan/engine badge already used everywhere
+    // (menu-label, plan tag). A version-transition badge ("1.0.0 → 1.2.0" on
+    // an installed plugin's update sub-row, "v0.3.0" on a registry row)
+    // overrides tint/chip-bg/chip-border/tracking to read as amber or plain.
+    in property <color> tint: Theme.text-dim;
+    in property <color> chip-bg: Theme.surface;
+    in property <color> chip-border: Theme.hairline-strong;
+    in property <length> tracking: 1.4px;
+    height: 16px;
+    border-radius: 5px;
+    background: root.chip-bg;
+    border-width: 1px;
+    border-color: root.chip-border;
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        t := Text {
+            font-size: 8.5px;
+            font-weight: 600;
+            letter-spacing: root.tracking;
+            color: root.tint;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Small square icon button for the header (refresh / settings).
+component IconButton inherits Rectangle {
+    // An `Icons` path on a 24×24 grid. The icon is sized from the button, so
+    // both buttons match each other whatever they draw.
+    in property <string> icon;
+    in property <length> icon-size: 17px;
+    in property <color> tint: Theme.text-dim;
+    callback clicked;
+
+    width: 26px;
+    height: 26px;
+    border-radius: 7px;
+    background: ta.has-hover ? Theme.surface : transparent;
+    animate background { duration: 120ms; }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    Path {
+        width: root.icon-size;
+        height: root.icon-size;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: root.icon;
+        fill: transparent;
+        stroke: ta.has-hover ? Theme.text : root.tint;
+        // Matches the weight of the text it sits beside.
+        stroke-width: 1.7px;
+    }
+}
+
+// One balance row, drawn under a provider's quota windows. Simpler than
+// `LimitBlock` by design: a stated percentage is not always there, so there
+// is no bar to draw — this is text only, in the same type scale as a
+// window's caption and reset lines, over figures Rust has already formatted.
+component BalanceRow inherits VerticalLayout {
+    in property <string> bal-label;
+    in property <string> amount-line;
+    in property <string> percent-line;
+    in property <string> period-line;
+    in property <string> notice;
+
+    spacing: 4px;
+
+    HorizontalLayout {
+        spacing: 8px;
+        Text {
+            text: root.bal-label;
+            font-size: 13px;
+            color: Theme.text;
+            vertical-alignment: center;
+        }
+        Rectangle { horizontal-stretch: 1; min-width: 8px; }
+        // The provider's own percentage, exactly as stated — see
+        // `BalanceData.percent-line`'s own doc for why nothing here computes
+        // one.
+        if root.percent-line != "" : Text {
+            text: root.percent-line;
+            font-size: 13px;
+            color: Theme.text-dim;
+            vertical-alignment: center;
+        }
+    }
+    if root.amount-line != "" : Text {
+        text: root.amount-line;
+        font-size: 12px;
+        color: Theme.text-dim;
+        wrap: word-wrap;
+    }
+    if root.period-line != "" : Text {
+        text: root.period-line;
+        font-size: 11px;
+        color: Theme.text-faint;
+    }
+    if root.notice != "" : Text {
+        text: root.notice;
+        font-size: 11px;
+        // Same severity color the quota-level notice uses (Theme.crit): a
+        // stated spending limit is exactly that kind of statement, just
+        // scoped to one balance instead of the whole quota.
+        color: Theme.crit;
+        wrap: word-wrap;
+    }
+}
+
+// One provider section: header row + a stacked block per quota window (or a
+// message). Padded rather than flush, so the last window's reset line does not
+// run straight into the next provider's name.
+component ProviderCard inherits VerticalLayout {
+    in property <ProviderData> data;
+    // This card's position in the panel. Only the tooltip key uses it, and it
+    // has to come from outside: a card cannot tell how many cards precede it,
+    // and its own name does not identify it — two Codex accounts are two cards
+    // both named "Codex", which is why ProviderData also carries `account`.
+    in property <int> card-index;
+    // Passed straight up to the window, which owns the one tooltip bubble the
+    // whole panel shares — see [`BarTip`].
+    callback tip-changed(BarTip);
+    spacing: 2px;
+    padding-top: 6px;
+    padding-bottom: 14px;
+
+    HorizontalLayout {
+        spacing: 8px;
+        height: 24px;
+        Text {
+            text: data.name.to-uppercase();
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 1.6px;
+            color: Theme.text;
+            vertical-alignment: center;
+        }
+        if data.tag != "" : VerticalLayout {
+            alignment: center;
+            Chip { text: data.tag; }
+        }
+        Text {
+            text: data.account;
+            font-size: 9.5px;
+            color: Theme.text-faint;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        Rectangle { horizontal-stretch: 1; min-width: 6px; }
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 6px;
+                height: 6px;
+                border-radius: 3px;
+                background: data.live ? Theme.accent : Theme.text-faint;
+                drop-shadow-color: data.live ? Theme.accent.with-alpha(0.5) : transparent;
+                drop-shadow-blur: 5px;
+            }
+        }
+    }
+
+    if data.notice != "" : HorizontalLayout {
+        padding-top: 8px;
+        Text {
+            text: data.notice;
+            font-size: 10.5px;
+            // The provider refusing the account is the same severity the bars
+            // reserve for ≥ 90%, and it is a stronger statement than any
+            // percentage: this is the provider saying no, not us inferring it.
+            color: Theme.crit;
+            wrap: word-wrap;
+        }
+    }
+    if data.status == 0 : VerticalLayout {
+        padding-top: 10px;
+        padding-bottom: 4px;
+        // Blocks are three lines tall, so they need real air between them or
+        // one window's reset time reads as the next one's caption.
+        spacing: 18px;
+        for w[i] in data.windows : LimitBlock {
+            win-label: w.label; pct: w.pct;
+            reset-rel: w.reset-rel; reset-at: w.reset-at; tooltip: w.tooltip;
+            not-started: w.not-started;
+            // Where the bar is, not what it is called: two windows can be
+            // captioned alike and two cards can be named alike, while no two
+            // bars share a position. The bubble uses this to tell whose
+            // leave-event it is holding.
+            tip-key: "\{root.card-index}#\{i}";
+            tip-changed(t) => { root.tip-changed(t); }
+        }
+        // Balance rows, under the windows above (see `BalanceData`'s doc for
+        // why this is a second, simpler kind of row rather than more window
+        // rows).
+        for b in data.balances : BalanceRow {
+            bal-label: b.label;
+            amount-line: b.amount-line;
+            percent-line: b.percent-line;
+            period-line: b.period-line;
+            notice: b.notice;
+        }
+    }
+    if data.status != 0 : HorizontalLayout {
+        padding-top: 6px;
+        padding-bottom: 8px;
+        Text {
+            text: data.message;
+            font-size: 10.5px;
+            color: Theme.text-faint;
+            wrap: word-wrap;
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Codex + Claude Limits";
+    no-frame: true;
+    background: transparent;
+    // Narrower than the columnar layout needed: each quota window is a stacked
+    // block now, so width no longer has to fit caption, figures, bar, reset
+    // time and pace side by side on one line.
+    width: 420px;
+    // Follow the content: providers arrive asynchronously (Claude lands a
+    // couple of seconds after Codex), and the window must grow with them —
+    // otherwise late sections get clipped at the initial height.
+    height: shell.preferred-height;
+    default-font-family: root.mono-family;
+
+    // ── State pushed from Rust ──────────────────────────────────────────
+    in property <string> mono-family: "monospace";
+    in property <string> ui-family: "sans-serif";
+    in property <[ProviderData]> providers;
+    in property <[PluginRow]> plugins;
+    in property <string> updated: "live";
+    in property <bool> updated-live: false;
+    in-out property <bool> autostart;
+    in-out property <bool> menu-bar-text;
+    in-out property <bool> settings-open: false;
+
+    // The one tooltip bubble the whole panel shares, and which bar raised it.
+    // In-out because Rust clears it when the panel is presented: a bubble put
+    // up by a hover on a panel that was then dismissed has no leave-event
+    // coming for it, and would otherwise be the first thing on screen next
+    // time. See [`BarTip`] for why one bubble serves every bar.
+    in-out property <BarTip> tip;
+
+    // The sheet covering the bars, or uncovering them, takes down whatever
+    // bubble was up. It replaces the bubble's old `!settings-open` guard, which
+    // could not stay once the info dot — which lives inside the sheet — started
+    // using the same bubble: the guard would have hidden the one tooltip the
+    // sheet actually has.
+    changed settings-open => { root.tip = { on: false }; }
+
+    // A bar, or the info dot, reporting that the pointer entered or left it.
+    function take-tip(t: BarTip) {
+        if (t.on) {
+            root.tip = t;
+        } else if (t.key == root.tip.key) {
+            // Only the bar that raised the bubble may take it down. Dragging
+            // quickly across two bars delivers the second one's enter before
+            // the first one's leave, and honouring that leave would blank a
+            // bubble the pointer is currently sitting on.
+            root.tip = { on: false };
+        }
+    }
+
+    // Running from the Dock as an ordinary window rather than as a transient
+    // flyout under a status item.
+    in property <bool> dock-mode: false;
+    // Whether a press on bare card background starts a system window drag.
+    // Rust decides — see `main.rs`'s `set_draggable` call for why this is not
+    // simply `dock-mode`.
+    in property <bool> draggable: false;
+    // Label for the toggle that puts the quota figures next to the clock.
+    // What that place is called, and what actually appears there, differ per
+    // platform — see `menu_bar_text_label` in `main.rs`.
+    in property <string> menu-bar-text-label: "Show stats in menu bar";
+    // Height budget for the provider list, set from the current monitor's
+    // logical size by `sync_providers_cap`. The default only covers the first
+    // frames before Rust has measured a monitor.
+    in property <length> providers-cap: 620px;
+    // Whether the platform draws its own edge and shadow around a frameless
+    // window (macOS does; Windows does not). Gates the card's own chrome.
+    in property <bool> system-window-edge: false;
+
+    // ── Registry (Check updates / Available from registry) ──────────────
+    // Not-yet-installed plugins the last successful index fetch turned up.
+    in property <[RegistryPluginRow]> registry-new;
+    // 0 idle (never checked) / 1 checking / 2 err-network / 3 err-malformed
+    // / 4 up-to-date (checked, nothing new) / 5 results (updates and/or new
+    // plugins found — see registry-summary + the per-row state below).
+    in property <int> registry-status;
+    // registry-status == 2 or 3: the full user-facing sentence (Rust picks
+    // the wording; Slint just renders it verbatim, same idiom as
+    // ProviderData.message).
+    in property <string> registry-error;
+    // registry-status == 5: the short summary, e.g. "1 update, 2 new".
+    in property <string> registry-summary;
+    // registry-status == 4 or 5: just the relative time — "2m ago" / "just
+    // now" — rendered by Slint as "· checked <registry-checked-at>".
+    in property <string> registry-checked-at;
+
+    callback autostart-changed(bool);
+    callback menu-bar-text-changed(bool);
+    // Plugin manager (settings sheet). Rust owns the model and persists each
+    // change, keyed by plugin/surface id.
+    callback plugin-enabled-changed(string, bool);       // (plugin-id, on)
+    callback plugin-ping-changed(string, bool);          // (plugin-id, on)
+    callback surface-opt-in-changed(string, string, bool); // (plugin-id, surface-id, on)
+    callback plugin-option-changed(string, string, bool); // (plugin-id, option-key, on)
+    callback reset-plugins();
+    callback add-plugin();
+    callback edit-plugin(string);          // plugin-id
+    // Deliberately fires with no confirmation from this layer — Slint just
+    // emits the intent. Any "are you sure?" gate belongs to Rust (a native
+    // dialog), not this file.
+    callback remove-plugin(string);        // plugin-id
+    callback open-plugins-folder();
+    callback refresh();
+    callback start-drag();
+    // Registry actions. Trust confirmation (a native dialog) is
+    // Rust's job, not this layer's — Slint only emits the intent.
+    callback check-updates();
+    callback install-plugin(string);       // registry plugin id
+    callback update-plugin(string);        // installed plugin id (from PluginRow.id)
+
+    shell := VerticalLayout {
+        // Where the platform draws the window's own shadow and edge (macOS),
+        // the card is the window: any transparent margin here would show up as
+        // a dark band between the panel and that edge rather than as depth.
+        // Elsewhere a `no-frame` window gets no system edge at all, so the
+        // gutter, border and shadow below are the only thing separating the
+        // flyout from whatever is behind it.
+        padding: root.system-window-edge ? 0px : 16px;
+
+        card := Rectangle {
+            border-radius: 12px;
+            // The dense console can be shorter than the settings sheet needs;
+            // grow while the sheet is open so nothing clips. The plugin manager
+            // (General + Codex/ping + Claude/ping+desktop + the PLUGINS action
+            // row's Add/Open folder/Reset buttons) grows with the plugin list,
+            // so the card follows the sheet's natural height (sheet-body's
+            // preferred-height + the 8px sheet inset on top and bottom) up to a
+            // sane cap. Past the cap the middle section scrolls (a Flickable
+            // inside the sheet) while the header and footer stay pinned — so
+            // any number of plugins fits and the Done row never clips.
+            min-height: root.settings-open
+                ? min(540px, sheet-body.preferred-height + 16px)
+                : 0px;
+            background: @linear-gradient(180deg, Theme.panel-top, Theme.panel);
+            // Flush against a system-drawn edge, a self-drawn border and shadow
+            // would sit directly under it and read as a doubled outline. With
+            // no system edge they are the flyout's only chrome.
+            border-width: root.system-window-edge ? 0px : 1px;
+            border-color: Theme.hairline;
+            drop-shadow-color: #000000b0;
+            drop-shadow-blur: root.system-window-edge ? 0px : 22px;
+            drop-shadow-offset-y: root.system-window-edge ? 0px : 7px;
+
+            // Drag handle. First child, so every control below renders on top
+            // and keeps its own hit-testing; only presses that land on bare
+            // card background reach this and start a system window drag.
+            TouchArea {
+                pointer-event(event) => {
+                    if (root.draggable
+                        && event.button == PointerEventButton.left
+                        && event.kind == PointerEventKind.down) {
+                        root.start-drag();
+                    }
+                }
+            }
+
+            VerticalLayout {
+                padding: 14px;
+                padding-top: 10px;
+                padding-bottom: 12px;
+                spacing: 0px;
+
+                // ── Header: mark · LIVE · refresh · settings ────────────
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 28px;
+                    VerticalLayout {
+                        alignment: center;
+                        Image {
+                            source: @image-url("../assets/tray-icon-color.png");
+                            width: 16px;
+                            height: 16px;
+                        }
+                    }
+                    Text {
+                        text: "Limits";
+                        font-size: 13px;
+                        font-weight: 700;
+                        letter-spacing: 0.4px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 6px;
+                            height: 6px;
+                            border-radius: 3px;
+                            background: root.updated-live ? Theme.accent : Theme.text-faint;
+                            drop-shadow-color: root.updated-live ? Theme.accent.with-alpha(0.6) : transparent;
+                            drop-shadow-blur: 5px;
+                        }
+                    }
+                    Text {
+                        text: root.updated;
+                        font-size: 9.5px;
+                        font-weight: 700;
+                        letter-spacing: 2px;
+                        color: root.updated-live ? Theme.accent : Theme.text-faint;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { width: 6px; }
+                    VerticalLayout {
+                        alignment: center;
+                        IconButton {
+                            icon: Icons.refresh;
+                            tint: Theme.accent;
+                            clicked => { root.refresh(); }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        IconButton {
+                            icon: Icons.gear;
+                            clicked => { root.settings-open = true; }
+                        }
+                    }
+                }
+
+                Rectangle { height: 6px; }
+                Rectangle { height: 1px; background: Theme.hairline; }
+
+                // The column legend that stood here is gone with the columns:
+                // each block now labels its own figures in place.
+
+                // ── Providers (Codex, Claude…) ──────────────────────────
+                if root.providers.length == 0 : HorizontalLayout {
+                    alignment: center;
+                    padding-top: 12px;
+                    padding-bottom: 12px;
+                    Text {
+                        text: "reading…";
+                        font-size: 10.5px;
+                        color: Theme.text-faint;
+                    }
+                }
+                // Stacked blocks are tall: four two-window readings (say two
+                // Codex accounts plus Claude CLI and the opt-in desktop
+                // account) would push the panel past a 768px display, and a
+                // frameless window that sizes itself to content offers no way
+                // to reach what falls off the bottom. So the list grows with
+                // content only up to a cap and scrolls past it — the same
+                // pattern (and for the same reason) as the settings sheet's
+                // plugin region. Under the cap nothing scrolls and the panel
+                // hugs its content exactly as before.
+                //
+                // The cap itself comes from Rust (`sync_providers_cap`), which
+                // reads the current monitor's logical height — a fixed cap
+                // sized for 768px would still overflow a 768px display at
+                // 125% scaling, and the Flickable would consider its whole
+                // viewport visible, leaving the overflow unreachable.
+                providers-region := Rectangle {
+                    preferred-height: providers-column.preferred-height;
+                    height: min(providers-column.preferred-height, root.providers-cap);
+                    clip: true;
+
+                    Flickable {
+                        // Wheel / trackpad scrolling without interactive
+                        // drag-pan, which would fight the drag-to-move area
+                        // and the bar tooltips.
+                        interactive: false;
+                        viewport-width: self.width;
+                        viewport-height: providers-column.preferred-height;
+
+                        providers-column := VerticalLayout {
+                            width: providers-region.width;
+                            spacing: 4px;
+                            for p[i] in root.providers : VerticalLayout {
+                                spacing: 4px;
+                                if i > 0 : Rectangle { height: 1px; background: Theme.hairline; }
+                                ProviderCard {
+                                    data: p;
+                                    card-index: i;
+                                    tip-changed(t) => { root.take-tip(t); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Settings sheet ──────────────────────────────────────────
+            settings-sheet := Rectangle {
+                visible: root.settings-open;
+                x: 8px;
+                y: 8px;
+                width: parent.width - 16px;
+                height: parent.height - 16px;
+                border-radius: 8px;
+                background: #151a22;
+                border-width: 1px;
+                border-color: Theme.hairline-strong;
+                drop-shadow-color: #000000cc;
+                drop-shadow-blur: 20px;
+                drop-shadow-offset-y: 8px;
+
+                // Catch clicks in the sheet's empty space so they cannot reach
+                // the popover controls rendered underneath the modal.
+                TouchArea {
+                    width: parent.width;
+                    height: parent.height;
+                }
+
+                sheet-body := VerticalLayout {
+                    padding: 16px;
+                    padding-top: 12px;
+                    padding-bottom: 12px;
+                    spacing: 7px;
+
+                    // ── Header (pinned, never scrolls) ──────────────────────
+                    HorizontalLayout {
+                        Text {
+                            text: "Settings";
+                            font-size: 14px;
+                            font-weight: 700;
+                            color: Theme.text;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        GhostButton {
+                            label: "Close";
+                            clicked => { root.settings-open = false; }
+                        }
+                    }
+                    Rectangle { height: 1px; background: Theme.hairline; }
+
+                    // ── Scrollable body (GENERAL + PLUGINS) ─────────────────
+                    // Everything between the pinned header and footer lives in a
+                    // Flickable so any number of plugins fits: the region takes
+                    // the slack (vertical-stretch) but is capped by the card's
+                    // max height, so past the cap the content scrolls (wheel /
+                    // trackpad) instead of pushing the footer out of view. With
+                    // the two bundled plugins the content is shorter than the
+                    // region, so nothing scrolls and it looks as before.
+                    scroll-region := Rectangle {
+                        vertical-stretch: 1;
+                        // Drive the sheet's preferred-height (and thus the card's
+                        // cap) from the real content height; min-height 0 lets the
+                        // region compress under the cap so the Flickable scrolls.
+                        preferred-height: sheet-content.preferred-height;
+                        min-height: 0px;
+                        clip: true;
+
+                        flick := Flickable {
+                            // Wheel / trackpad scrolling works without interactive
+                            // drag-pan (which would fight clicks on the toggles).
+                            interactive: false;
+                            viewport-width: self.width;
+                            viewport-height: sheet-content.preferred-height;
+
+                            sheet-content := VerticalLayout {
+                                spacing: 7px;
+
+                                // ── GENERAL: app-wide toggles ───────────────
+                                Text {
+                                    text: "GENERAL";
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                    letter-spacing: 2px;
+                                    color: Theme.text-faint;
+                                }
+                                ToggleRow {
+                                    label: "Launch at login";
+                                    checked <=> root.autostart;
+                                    toggled(v) => { root.autostart-changed(v); }
+                                }
+                                ToggleRow {
+                                    // Named by Rust: the thing being switched
+                                    // on has a different name (and a different
+                                    // shape) on each platform.
+                                    label: root.menu-bar-text-label;
+                                    checked <=> root.menu-bar-text;
+                                    toggled(v) => { root.menu-bar-text-changed(v); }
+                                }
+
+                                Rectangle { height: 1px; background: Theme.hairline; }
+
+                                // ── PLUGINS: action rows + status + master row per plugin ─
+                                // Today's 4 actions (Add plugin, Check updates, Open folder,
+                                // Reset plugins) don't fit on one 420px-wide labeled row, so
+                                // they group by intent: row 1 (accent, next to the label) is
+                                // the two actions that bring in new content; row 2 (faint,
+                                // right-aligned below) is the two occasional maintenance
+                                // actions, unchanged from before, just demoted a row.
+                                VerticalLayout {
+                                    spacing: 3px;
+                                    HorizontalLayout {
+                                        height: 28px;
+                                        VerticalLayout {
+                                            alignment: center;
+                                            Text {
+                                                text: "PLUGINS";
+                                                font-size: 10px;
+                                                font-weight: 700;
+                                                letter-spacing: 2px;
+                                                color: Theme.text-faint;
+                                            }
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        HorizontalLayout {
+                                            spacing: 4px;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                GhostButton {
+                                                    icon: "+";
+                                                    label: "Add plugin";
+                                                    tint: Theme.accent;
+                                                    clicked => { root.add-plugin(); }
+                                                }
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                GhostButton {
+                                                    icon: root.registry-status == 1 ? "⋯" : "⇣";
+                                                    label: root.registry-status == 1 ? "Checking…" : "Check updates";
+                                                    tint: root.registry-status == 1 ? Theme.text-faint : Theme.accent;
+                                                    clicked => {
+                                                        if (root.registry-status != 1) {
+                                                            root.check-updates();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        height: 22px;
+                                        Rectangle { horizontal-stretch: 1; }
+                                        HorizontalLayout {
+                                            spacing: 4px;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                GhostButton {
+                                                    label: "Open folder";
+                                                    tint: Theme.text-faint;
+                                                    button-height: 22px;
+                                                    clicked => { root.open-plugins-folder(); }
+                                                }
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                GhostButton {
+                                                    icon: "↻";
+                                                    label: "Reset plugins";
+                                                    tint: Theme.text-faint;
+                                                    button-height: 22px;
+                                                    clicked => { root.reset-plugins(); }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // ── Check-updates status line ────────────────────
+                                    if root.registry-status == 0 : Text {
+                                        text: "Last checked: never";
+                                        font-size: 10.5px;
+                                        color: Theme.text-faint;
+                                    }
+                                    if root.registry-status == 1 : HorizontalLayout {
+                                        spacing: 6px;
+                                        Text { text: "⋯"; font-size: 10px; color: Theme.text-faint; vertical-alignment: center; }
+                                        Text {
+                                            text: "Fetching index.toml…";
+                                            font-size: 10.5px;
+                                            color: Theme.text-faint;
+                                            vertical-alignment: center;
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                    }
+                                    if root.registry-status == 2 || root.registry-status == 3 : HorizontalLayout {
+                                        spacing: 6px;
+                                        Text { text: "⚠"; font-size: 10px; color: Theme.warn; vertical-alignment: center; }
+                                        Text {
+                                            text: root.registry-error;
+                                            font-size: 10.5px;
+                                            color: Theme.warn;
+                                            wrap: word-wrap;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                    }
+                                    if root.registry-status == 4 : HorizontalLayout {
+                                        spacing: 6px;
+                                        Text { text: "✓"; font-size: 10px; color: Theme.ok; vertical-alignment: center; }
+                                        Text { text: "Up to date"; font-size: 10.5px; color: Theme.ok; vertical-alignment: center; }
+                                        Text {
+                                            text: "· checked \{root.registry-checked-at}";
+                                            font-size: 10.5px;
+                                            color: Theme.text-faint;
+                                            vertical-alignment: center;
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                    }
+                                    if root.registry-status == 5 : HorizontalLayout {
+                                        spacing: 6px;
+                                        Text { text: "⇣"; font-size: 10px; color: Theme.warn; vertical-alignment: center; }
+                                        Text {
+                                            text: root.registry-summary;
+                                            font-size: 10.5px;
+                                            color: Theme.warn;
+                                            vertical-alignment: center;
+                                        }
+                                        Text {
+                                            text: "· checked \{root.registry-checked-at}";
+                                            font-size: 10.5px;
+                                            color: Theme.text-faint;
+                                            vertical-alignment: center;
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    spacing: 2px;
+                                    for p[i] in root.plugins : VerticalLayout {
+                                        spacing: 2px;
+                                        if i > 0 : Rectangle { height: 1px; background: Theme.hairline; }
+
+                                        // master row: enable toggle · name · chip · engine · edit/remove
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            ToggleRow {
+                                                horizontal-stretch: 0;
+                                                // Bounded so a third-party manifest's long name
+                                                // elides instead of pushing the chip, engine and
+                                                // edit/remove controls past the sheet's edge —
+                                                // they neither wrap nor scroll, so anything
+                                                // pushed out is simply unreachable.
+                                                max-width: 170px;
+                                                label: p.name;
+                                                checked: p.enabled;
+                                                toggled(v) => { root.plugin-enabled-changed(p.id, v); }
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Chip { text: p.menu-label; }
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Text {
+                                                    text: p.engine;
+                                                    font-size: 10px;
+                                                    color: Theme.text-faint;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                            Rectangle { horizontal-stretch: 1; }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                MiniIconButton {
+                                                    icon: Icons.pencil;
+                                                    clicked => { root.edit-plugin(p.id); }
+                                                }
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                MiniIconButton {
+                                                    icon: Icons.close;
+                                                    clicked => { root.remove-plugin(p.id); }
+                                                }
+                                            }
+                                        }
+
+                                        // update sub-row (only if the registry found a newer
+                                        // version for this already-installed plugin) — same
+                                        // indented idiom as the ping/surface sub-toggles below.
+                                        if p.available-version != "" : VerticalLayout {
+                                            spacing: 3px;
+                                            if p.update-status != 1 : HorizontalLayout {
+                                                padding-left: 30px;
+                                                spacing: 7px;
+                                                height: 24px;
+                                                Text {
+                                                    text: "⇣";
+                                                    font-size: 11px;
+                                                    color: p.update-status == 2 ? Theme.crit : Theme.warn;
+                                                    vertical-alignment: center;
+                                                }
+                                                Text {
+                                                    text: p.update-status == 2 ? p.update-error : "Update available";
+                                                    font-size: 10.5px;
+                                                    color: p.update-status == 2 ? Theme.crit : Theme.text-dim;
+                                                    vertical-alignment: center;
+                                                }
+                                                if p.update-status != 2 : VerticalLayout {
+                                                    alignment: center;
+                                                    Chip {
+                                                        text: "\{p.current-version} → \{p.available-version}";
+                                                        tint: Theme.warn;
+                                                        chip-bg: Theme.warn.with-alpha(0.10);
+                                                        chip-border: Theme.warn.with-alpha(0.4);
+                                                        tracking: 0.3px;
+                                                    }
+                                                }
+                                                Rectangle { horizontal-stretch: 1; }
+                                                GhostButton {
+                                                    label: p.update-status == 2 ? "Retry" : "Update";
+                                                    tint: p.update-status == 2 ? Theme.crit : Theme.warn;
+                                                    button-height: 22px;
+                                                    clicked => { root.update-plugin(p.id); }
+                                                }
+                                            }
+                                            if p.update-status == 1 : HorizontalLayout {
+                                                padding-left: 30px;
+                                                spacing: 7px;
+                                                height: 24px;
+                                                Text { text: "⇣"; font-size: 11px; color: Theme.text-faint; vertical-alignment: center; }
+                                                Text {
+                                                    text: "Updating…";
+                                                    font-size: 10.5px;
+                                                    color: Theme.text-faint;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                            if p.has-local-edits && p.update-status != 1 : HorizontalLayout {
+                                                padding-left: 30px;
+                                                Text {
+                                                    text: "⚠ locally modified — Update will overwrite your changes";
+                                                    font-size: 9.5px;
+                                                    color: Theme.warn;
+                                                    wrap: word-wrap;
+                                                }
+                                            }
+                                        }
+
+                                        // ping sub-toggle (only if the manifest declares [ping])
+                                        if p.has-ping : HorizontalLayout {
+                                            padding-left: 30px;
+                                            ToggleRow {
+                                                // Names the command rather than describing it:
+                                                // the toggle runs whatever the manifest says, and
+                                                // a third-party plugin's "ping" is not necessarily
+                                                // a ping.
+                                                label: "Run \{p.ping-command} on 5h reset";
+                                                checked: p.ping-enabled;
+                                                enabled-look: p.enabled;
+                                                toggled(v) => { root.plugin-ping-changed(p.id, v); }
+                                            }
+                                        }
+
+                                        // opt-in surface sub-toggles (e.g. Claude desktop)
+                                        for s in p.surfaces : HorizontalLayout {
+                                            padding-left: 30px;
+                                            ToggleRow {
+                                                label: "Include \{s.label} account";
+                                                checked: s.enabled;
+                                                enabled-look: p.enabled;
+                                                toggled(v) => { root.surface-opt-in-changed(p.id, s.id, v); }
+                                            }
+                                        }
+
+                                        // declarative manifest options ([[option]] entries)
+                                        for o in p.options : HorizontalLayout {
+                                            padding-left: 30px;
+                                            ToggleRow {
+                                                label: o.label;
+                                                checked: o.enabled;
+                                                enabled-look: p.enabled;
+                                                toggled(v) => { root.plugin-option-changed(p.id, o.key, v); }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // ── AVAILABLE FROM REGISTRY: not-yet-installed plugins ──
+                                // Only rendered once a check actually turned up something;
+                                // "up to date" / errors are already covered by the status
+                                // line above, so an empty result here just draws nothing.
+                                if root.registry-new.length > 0 : VerticalLayout {
+                                    spacing: 7px;
+                                    Rectangle { height: 1px; background: Theme.hairline; }
+                                    Text {
+                                        text: "AVAILABLE FROM REGISTRY (\{root.registry-new.length})";
+                                        font-size: 10px;
+                                        font-weight: 700;
+                                        letter-spacing: 2px;
+                                        color: Theme.text-faint;
+                                    }
+                                    VerticalLayout {
+                                        spacing: 2px;
+                                        for r[i] in root.registry-new : VerticalLayout {
+                                            spacing: 3px;
+                                            if i > 0 : Rectangle { height: 1px; background: Theme.hairline; }
+
+                                            HorizontalLayout {
+                                                spacing: 8px;
+                                                height: 22px;
+                                                Text {
+                                                    text: r.name;
+                                                    font-size: 13px;
+                                                    font-weight: 600;
+                                                    color: Theme.text;
+                                                    vertical-alignment: center;
+                                                }
+                                                VerticalLayout {
+                                                    alignment: center;
+                                                    Chip { text: "v\{r.version}"; tracking: 0.4px; }
+                                                }
+                                                Rectangle { horizontal-stretch: 1; }
+                                                if r.status == 0 : GhostButton {
+                                                    label: "Install";
+                                                    tint: Theme.accent;
+                                                    button-height: 22px;
+                                                    clicked => { root.install-plugin(r.id); }
+                                                }
+                                                if r.status == 1 : Text {
+                                                    text: "Installing…";
+                                                    font-size: 10.5px;
+                                                    color: Theme.text-faint;
+                                                    vertical-alignment: center;
+                                                }
+                                                if r.status == 2 : GhostButton {
+                                                    label: "Retry";
+                                                    tint: Theme.crit;
+                                                    button-height: 22px;
+                                                    clicked => { root.install-plugin(r.id); }
+                                                }
+                                            }
+                                            Text {
+                                                text: r.description;
+                                                font-size: 10.5px;
+                                                color: Theme.text-dim;
+                                                wrap: word-wrap;
+                                            }
+                                            if r.status == 0 : Text {
+                                                text: "verified against the index's sha256 after download, before install";
+                                                font-size: 9px;
+                                                color: Theme.text-faint;
+                                                wrap: word-wrap;
+                                            }
+                                            if r.status == 1 : Text {
+                                                text: "Downloading manifest, verifying sha256…";
+                                                font-size: 9.5px;
+                                                color: Theme.text-faint;
+                                                wrap: word-wrap;
+                                            }
+                                            if r.status == 2 : Text {
+                                                text: "✕ \{r.error}";
+                                                font-size: 9.5px;
+                                                color: Theme.crit;
+                                                wrap: word-wrap;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Thin, non-interactive scroll indicator — only shown
+                        // when the content overflows the visible region. A plain
+                        // Rectangle takes no pointer events, so it never blocks
+                        // the row actions it floats over.
+                        if sheet-content.preferred-height > flick.height : Rectangle {
+                            width: 3px;
+                            x: parent.width - self.width;
+                            y: (-flick.viewport-y / sheet-content.preferred-height) * parent.height;
+                            height: (flick.height / sheet-content.preferred-height) * parent.height;
+                            border-radius: 1.5px;
+                            background: Theme.hairline-strong;
+                        }
+                    }
+
+                    // ── Footer (pinned, always visible) ─────────────────────
+                    Rectangle { height: 1px; background: Theme.hairline; }
+                    HorizontalLayout {
+                        height: 30px;
+                        VerticalLayout {
+                            alignment: center;
+                            InfoDot {
+                                hint: "Bar = quota used; white tick = elapsed window time; PACE = usage minus elapsed time, in percent points. Codex is read from local session logs, Claude from the usage API. Settings save immediately.";
+                                // Not a position like the bars use: this dot is
+                                // the only one on the panel, and it is not in
+                                // the provider list, so nothing can collide.
+                                tip-key: "info";
+                                tip-changed(t) => { root.take-tip(t); }
+                            }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        VerticalLayout {
+                            alignment: center;
+                            GhostButton {
+                                label: "Done";
+                                tint: Theme.accent;
+                                clicked => { root.settings-open = false; }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── The bar tooltip, drawn for every bar on the panel ────────
+            // Its place in this file is its z-order: Slint has no z-index, so
+            // an element is painted after everything declared before it and
+            // before everything after. Last child of the card means over the
+            // rows, over the settings sheet, and — because it is outside
+            // `providers-region` — not cut off by the scroll clip. Drawn
+            // where the bar said it was, in window coordinates turned back
+            // into card-relative ones.
+            if root.tip.on : tip-bubble := Rectangle {
+                property <length> bar-x: root.tip.x - card.absolute-position.x;
+                property <length> bar-y: root.tip.y - card.absolute-position.y;
+
+                width: 240px;
+                height: tip-text.preferred-height + 16px;
+                // Left-aligned with the bar, but never hanging off the card:
+                // the last bar on a narrow panel would otherwise take half the
+                // bubble with it past the edge.
+                x: min(max(self.bar-x, 8px), card.width - self.width - 8px);
+                // Above the bar, which is where a tooltip belongs — it points
+                // down at what it describes and covers only the caption of the
+                // block it is already explaining. Below it when the bar sits
+                // too close to the top of the panel for the bubble to fit.
+                y: self.bar-y > self.height + 12px
+                    ? self.bar-y - self.height - 8px
+                    : self.bar-y + root.tip.h + 8px;
+                background: #05070a;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: Theme.hairline-strong;
+                drop-shadow-color: #000000aa;
+                drop-shadow-blur: 18px;
+                drop-shadow-offset-y: 6px;
+                tip-text := Text {
+                    x: 11px;
+                    y: 8px;
+                    width: parent.width - 22px;
+                    text: root.tip.text;
+                    font-size: 10.5px;
+                    color: Theme.text-dim;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,288 @@
+# Built-in plugin manifest — OpenAI Codex CLI.
+#
+# Codex usage is read from the same endpoint the Codex CLI itself calls,
+# `chatgpt.com/backend-api/wham/usage`, with the CLI's own credentials. It is
+# unofficial and undocumented — if its shape changes, update this file, not
+# Rust code.
+#
+# Until version 2.0.0 this read `~/.codex/sessions/**/rollout-*.jsonl` instead,
+# via `engine = "log-file"`. Two reasons that had to go:
+#
+#   * A log says what the last session wrote, not what is true now. Leave Codex
+#     unused for a day and the panel quietly shows yesterday.
+#   * A log line carries no identity. It names a plan tier and nothing else, so
+#     an account's address had to be *guessed* from a remembered "tier ->
+#     address" map — a guess that once deleted a live account's row as a
+#     duplicate of itself. The API answers with `email` and `account_id` in the
+#     response, so there is nothing left to guess.
+#
+# A third reason showed up while writing this: rollout logs interleave quota
+# families. A `codex exec` run writes a `rate_limits` container for the
+# GPT-5.3-Codex-Spark limit, which the log reader — newest line wins — showed
+# as *the* Codex quota. The panel read 0% used while the real weekly window sat
+# at 69%. Here, the main quota is `rate_limit` and the side quotas are
+# elsewhere (see `additional_rate_limits` below), so they cannot be confused.
+#
+# The log-file engine itself stays: it is a general mechanism any third-party
+# manifest can use, and `docs/PLUGIN-ARCHITECTURE.md` specifies it.
+
+id           = "codex"
+name         = "Codex"
+menu_label   = "Cx"
+order        = 10
+# `required` below needs a reader that knows a window can be absent rather than
+# blank; `[[windows]] id` needs one that keys a window by identity rather than
+# by position; `[status]` needs one that reads the quota's own standing. See
+# docs/PLUGIN-ARCHITECTURE.md, "Reader capabilities".
+requires_reader = ["window-presence", "window-identity", "reading-status", "reading-balances"]
+version      = "2.5.1"
+engine       = "http-api"
+# One request a minute, matching Claude. The log-file reader polled every 15s
+# because re-reading a local file is free; four requests a minute at somebody
+# else's undocumented endpoint, forever, is not. Nothing here needs to be
+# fresher: the shortest window Codex reports is five hours, so a minute-old
+# figure is at worst 0.3% of a window stale.
+refresh_secs = 60
+
+# What Codex says about the quota itself, above its windows.
+#
+# This is not a nicer way of reading the windows: `allowed` and `limit_reached`
+# are required fields of `rate_limit` in Codex's own schema, while both window
+# slots are optional. So a blocked account with nothing running answers with a
+# status and no windows at all — and presence (correctly) emits no row for a
+# window nobody reported, which would leave the panel showing an account with
+# nothing wrong with it at the one moment something is.
+#
+# `rate_limit_reached_type` sits at the root rather than inside `rate_limit`,
+# and names its kind in a nested `type`.
+[status]
+allowed_path       = "rate_limit.allowed"
+limit_reached_path = "rate_limit.limit_reached"
+reached_type_path  = "rate_limit_reached_type.type"
+
+# The plan chip next to "Codex" ("PRO", …), read from the usage response.
+[tag]
+from      = "field"
+path      = "plan_type"
+transform = "uppercase"
+
+# Account email. The usage response already carries it, so this costs no
+# request at all (unlike Claude, whose usage and profile live at separate
+# endpoints).
+[account]
+type      = "response-field"
+json_path = "email"
+
+# 5-hour window. Codex does not fix slot order: when the 5-hour window has
+# nothing to report it sends the *weekly* window as `primary_window` with
+# `secondary_window` null — observed live, and the reason both windows list
+# both slots as candidates and are told apart by `limit_window_seconds` rather
+# than by position. Windows up to 720 minutes are the short slot, from 721 the
+# weekly one — the same split the log-file manifest used.
+#
+# Deliberately not `required`: this window is legitimately absent. A plan with
+# no 5-hour allowance reports none, and an empty one stops being reported at
+# all until something is spent — the state the auto-ping exists to end. Marking
+# it required would call both of those a broken response.
+[[windows]]
+# Identity, and deliberately not the label: a caption may be reworded, and this
+# string is a segment of a key in the user's config.
+id    = "codex-5h"
+label = "5H"
+role  = "primary"
+[windows.period]
+mode  = "from_field"
+field = "limit_window_seconds"
+unit  = "seconds"
+[windows.source]
+containers         = ["rate_limit.primary_window", "rate_limit.secondary_window"]
+used_percent_path  = "used_percent"
+resets_at_path     = "reset_at"
+resets_at_format   = "unix"
+max_period_minutes = 720
+
+# Weekly window, same pair of candidates, the other side of the split.
+#
+# Also not `required`, for the same reason as the 5-hour window above and one
+# more. A weekly window resets too, and this provider is the one observed to
+# stop reporting a window while it is empty — so an account in the hours after
+# its weekly reset may well send neither. Marking this required would turn that
+# into an error covering the whole provider, hiding the 5-hour figure that did
+# arrive and silencing the auto-ping for as long as it lasted. With neither
+# window `required`, a body with two empty slots and a body whose keys have
+# been renamed read the same here — an account with nothing to show, not an
+# error. That is the deliberate price of not refusing the empty state, and
+# `[status]` (`allowed` / `limit_reached`) is what still speaks for a blocked
+# account in that case.
+[[windows]]
+id    = "codex-wk"
+label = "WK"
+role  = "secondary"
+[windows.period]
+mode  = "from_field"
+field = "limit_window_seconds"
+unit  = "seconds"
+[windows.source]
+containers         = ["rate_limit.primary_window", "rate_limit.secondary_window"]
+used_percent_path  = "used_percent"
+resets_at_path     = "reset_at"
+resets_at_format   = "unix"
+min_period_minutes = 721
+
+# A per-model allowance, from the same response — no extra request. Codex
+# reports these in `additional_rate_limits[]`, an array whose order it does not
+# fix and adds to over time, so this names the one it wants rather than
+# counting: `[limit_name=…]` selects the element that calls itself that. If
+# Codex renames or withdraws the model, nothing matches and this row simply
+# does not appear.
+#
+# `role = "extra"` is what keeps it out of the way. Only `primary` and
+# `secondary` fill the 5H/WK slots and reach the menu-bar pill; an extra quota
+# is a row in the panel and nothing else. That separation is the whole reason
+# this is safe to show: reading a model-specific quota as *the* Codex quota is
+# the bug that had the panel saying 0% while the real weekly window sat at 69%.
+#
+# The response also carries `code_review_rate_limit`, `credits` and
+# `spend_control`. Same mechanism if they are ever worth a row.
+[[windows]]
+id    = "codex-spark"
+label = "GPT-5.3-Codex-Spark"
+role  = "extra"
+[windows.period]
+mode  = "from_field"
+field = "limit_window_seconds"
+unit  = "seconds"
+[windows.source]
+# Both slots, for the same reason the subscription windows list both: Codex
+# does not fix which one a window arrives in, and a model allowance that moved
+# to the other slot would simply stop being reported.
+containers = [
+  "additional_rate_limits[limit_name=GPT-5.3-Codex-Spark].rate_limit.primary_window",
+  "additional_rate_limits[limit_name=GPT-5.3-Codex-Spark].rate_limit.secondary_window",
+]
+used_percent_path = "used_percent"
+resets_at_path    = "reset_at"
+resets_at_format  = "unix"
+
+# Credits — what is left to work with once the subscription quota is spent.
+#
+# This is the state the panel was blind to: when `rate_limit` is exhausted, the
+# question "can I still work" is answered by `credits`, not by a window, and a
+# panel showing a full quota bar said nothing about it. Codex answers the same
+# request that carries the windows, so this costs no extra call.
+#
+# `kind = "text"` is not a shortcut. Codex's own schema types this field as a
+# string (`CreditStatusDetails.balance`, `Option<Option<String>>` in
+# codex-backend-openapi-models), so it is the provider's own wording — read it,
+# sanitise it, print it. Parsing a number back out of it would mean deciding
+# what its currency and scale are, which the response does not say.
+#
+# What is deliberately NOT read here, though the live response carries it:
+# `spend_control.individual_limit` and `rate_limit_reset_credits.*` are absent
+# from the vendored schema, so their meaning would be a reading of their names
+# rather than something a contract states — and a figure this app cannot
+# explain has no business on a panel about limits. Neither is `has_credits`:
+# whether an account is cut off already arrives through `[status]` above
+# (`rate_limit_reached_type` has `workspace_owner_credits_depleted` in its
+# vocabulary), and saying it twice is the repetition the balance level was
+# told not to add.
+#
+# No period end: Codex states none for credits, and a calendar period this app
+# invented would be a date nobody promised.
+[[balances]]
+id    = "codex-credits"
+label = "Credits"
+[balances.remaining]
+kind = "text"
+path = "credits.balance"
+
+[http]
+# Pacing. `refresh_secs` above only paces the timer; the panel opening, the
+# Refresh button, "Refresh now" and app start all fetch too. 55s sits just
+# below the 60s cadence so a scheduled refresh is never the thing that gets
+# throttled, while a user clicking Refresh repeatedly gets the cached reading.
+# See `src/plugin/throttle.rs`.
+min_interval_secs  = 55
+backoff_start_secs = 60
+backoff_max_secs   = 900
+
+[[http.request]]
+url          = "https://chatgpt.com/backend-api/wham/usage"
+# Well above the ~0.6s observed, well below the one-minute cadence.
+timeout_secs = 10
+[http.request.headers]
+Authorization        = "Bearer {token}"
+# Which ChatGPT account the token speaks for. The endpoint needs it as a
+# header, hence [[http.value]] below.
+"chatgpt-account-id" = "{value.account_id}"
+# What the Codex CLI itself sends. The endpoint is the CLI's, and identifying
+# as something else invites being treated as something else.
+originator           = "codex_cli_rs"
+Accept               = "application/json"
+
+# The account id for the header above, read out of the CLI's own credentials
+# file. `tokens.account_id` is written there in plain sight; the same value is
+# also a claim inside `tokens.id_token`, but reading the plain field means one
+# less thing that breaks if the CLI stops storing an id token it does not need.
+[[http.value]]
+name      = "account_id"
+type      = "json-file"
+path      = "~/.codex/auth.json"
+json_path = "tokens.account_id"
+
+# One surface, deliberately named "default": that keeps this provider's reading
+# id "codex" (rather than "codex-cli"), which is what config keys, the menu-bar
+# pill and the auto-ping already refer to, and keeps the chip above showing the
+# plan rather than a surface label.
+[[surface]]
+id            = "default"
+label         = "Default"
+opt_in        = false
+in_menu_bar   = true
+allowed_hosts = ["chatgpt.com"]
+# Shown instead of hiding the provider outright when no credentials are found
+# at all — an installed-but-not-signed-in Codex used to say so, and should
+# still.
+no_credentials_message = "Not signed in — run: codex login"
+
+# Signed in with an API key rather than a ChatGPT account: there is no
+# subscription behind it and therefore no window to report. Say that instead of
+# leaving a blank row. This step is first because a credentials file that
+# exists without a token stops the chain on its own — `unless_json_path` keeps
+# it from firing for an account that does have a token.
+[[surface.auth]]
+type             = "reject-when"
+path             = "~/.codex/auth.json"
+json_path        = "OPENAI_API_KEY"
+unless_json_path = "tokens.access_token"
+message          = "API-key sign-in has no subscription limits"
+
+# The bearer token: the CLI's own OAuth access token, read but never renewed.
+# Refreshing it would hand back a new refresh token and invalidate the copy the
+# Codex CLI is holding — this app would be logging the user's CLI out to draw a
+# progress bar. An expired token stops the polling until the user signs in
+# again (see `src/plugin/throttle.rs`).
+[[surface.auth]]
+type            = "credentials-file"
+path            = "~/.codex/auth.json"
+token_json_path = "tokens.access_token"
+
+# `codex exec hello` — run while the 5-hour window sits empty, to start a
+# fresh one (src/main.rs `ping_due` / `send_ping`, gated by
+# `config::auto_ping_codex`).
+#
+# `--skip-git-repo-check` is not optional here. Without it `codex exec` refuses
+# to start outside a git repository at all: "Not inside a trusted directory and
+# --skip-git-repo-check was not specified." — exit 1, before any request. Its
+# output was discarded, so up to version 2.1.0 this feature failed silently
+# every single time.
+#
+# What that flag gives up is bounded elsewhere rather than here. The app runs
+# the ping in an empty directory it owns (`main.rs::ping_cwd`), not in $HOME,
+# so this unattended model run reads no `AGENTS.md` of the user's as
+# instructions. `--sandbox read-only` is the other half: whatever the user's
+# own `~/.codex/config.toml` sets for their interactive work, a run nobody is
+# watching cannot write to disk.
+[ping]
+bin  = "codex"
+args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "hello"]

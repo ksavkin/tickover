@@ -1,0 +1,21 @@
+# Line endings are content in this repository, not formatting.
+#
+# `src/plugin/seed.rs` embeds `plugins/*.toml` with `include_str!`, and
+# the upgrade path recognises an installed manifest by its sha256 — the same
+# way `src/plugin/registry.rs` recognises a downloaded one. Git converts LF to
+# CRLF on checkout by default on Windows, which changes those bytes: the same
+# source then produces a different hash on a different machine, so a Windows
+# build ships a built-in manifest whose declared hash does not describe it, and
+# the migration that replaces the previous built-in never recognises what it is
+# looking at. CI on windows-latest found exactly that.
+#
+# Checking every text file out with LF everywhere keeps "the manifest" one
+# sequence of bytes, whoever built it.
+* text=auto eol=lf
+
+# Screenshots and icons are bytes already; say so rather than leaving it to
+# content sniffing.
+*.png binary
+*.icns binary
+*.ico binary
+*.ttf binary

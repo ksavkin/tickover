@@ -1,0 +1,208 @@
+# Built-in plugin manifest — Antigravity CLI (Google Gemini Code Assist).
+#
+# Antigravity's quota is read from the same endpoint its own CLI calls,
+# `daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`, with
+# the CLI's own OAuth access token. It is unofficial and undocumented — if its
+# shape changes, update this file, not Rust code. Measured shape and the reason
+# behind every field below:
+# the project's private provider notes, which are deliberately not part of
+# this repository.
+#
+# What sets this provider apart, each a reader capability it declares:
+#  * POST, not GET — the endpoint follows Google's `:verb` HTTP-transcoding
+#    convention, which is POST-only (`http-post`).
+#  * a *remaining* fraction, not a spent percent — the engine complements it
+#    into the consumed-percent a window holds (`remaining-fraction`).
+#  * stable `id`s keying each row across manifest edits (`window-identity`).
+#  * a hybrid auth chain (`keychain-expiry` + `oauth-refresh`): read the fresh
+#    keychain token while Antigravity runs, and refresh from the CLI's own token
+#    file when it has lapsed — so the row keeps working with the IDE closed. See
+#    the `[[surface.auth]]` steps at the bottom.
+#  * that refresh step's own installed-app pair is never typed out here —
+#    `[surface.auth.client]` reads it back out of the client's own installed
+#    binaries at run time instead (`oauth-client-discovery`). See the comment
+#    above that step for the full story.
+
+id           = "antigravity"
+name         = "Antigravity"
+menu_label   = "Ag"
+order        = 40
+requires_reader = ["http-post", "remaining-fraction", "window-identity", "keychain-expiry", "oauth-refresh", "oauth-client-discovery"]
+version      = "1.1.0"
+engine       = "http-api"
+refresh_secs = 60
+
+# The summary reports two model groups, each with a weekly and a five-hour
+# window, as a `remainingFraction` (0..1) against a `resetTime`. The four
+# windows are addressed by their stable `bucketId`, not by array position, so a
+# reordering of the response leaves each row reading the same bucket.
+#
+# None is `required`, and that is deliberate rather than an omission: proto3
+# drops a zero field entirely, so an exhausted bucket arrives with no
+# `remainingFraction` at all — indistinguishable in the JSON from one the
+# response never carried. Marking a window `required` would call that absence a
+# changed endpoint and light up an error; leaving it absent-tolerant reads the
+# same absence as "did not say", so the row simply disappears rather than
+# claiming "spent". That is the owner's call for this provider (silence is not
+# exhaustion), and it is why the honest default here is the opposite of
+# Claude's, whose response always carries both windows.
+#
+# Gemini is the family in the menu bar; the third-party (Claude/GPT) family
+# rides along as its own two rows, out of the 5H/WK slots.
+
+# ── Gemini models ────────────────────────────────────────────────────────
+[[windows]]
+id       = "gemini-5h"
+label    = "5H"
+role     = "primary"
+[windows.period]
+mode    = "assumed"
+assumed = 300
+[windows.source]
+remaining_fraction_path = "groups[0].buckets[bucketId=gemini-5h].remainingFraction"
+resets_at_path          = "groups[0].buckets[bucketId=gemini-5h].resetTime"
+resets_at_format        = "iso8601"
+
+[[windows]]
+id       = "gemini-wk"
+label    = "WK"
+role     = "secondary"
+[windows.period]
+mode    = "assumed"
+assumed = 10080
+[windows.source]
+remaining_fraction_path = "groups[0].buckets[bucketId=gemini-weekly].remainingFraction"
+resets_at_path          = "groups[0].buckets[bucketId=gemini-weekly].resetTime"
+resets_at_format        = "iso8601"
+
+# ── Claude and GPT models ────────────────────────────────────────────────
+[[windows]]
+id       = "3p-5h"
+label    = "3P·5H"
+role     = "extra"
+[windows.period]
+mode    = "assumed"
+assumed = 300
+[windows.source]
+remaining_fraction_path = "groups[1].buckets[bucketId=3p-5h].remainingFraction"
+resets_at_path          = "groups[1].buckets[bucketId=3p-5h].resetTime"
+resets_at_format        = "iso8601"
+
+[[windows]]
+id       = "3p-wk"
+label    = "3P·WK"
+role     = "extra"
+[windows.period]
+mode    = "assumed"
+assumed = 10080
+[windows.source]
+remaining_fraction_path = "groups[1].buckets[bucketId=3p-weekly].remainingFraction"
+resets_at_path          = "groups[1].buckets[bucketId=3p-weekly].resetTime"
+resets_at_format        = "iso8601"
+
+# POST with an empty JSON body `{}` (measured: the endpoint parses the body and
+# accepts `{}`; an unknown field is rejected, so `{}` is what it wants). The
+# User-Agent is the gate — the server answers 403 "no license" to a request
+# without the client's own agent string, and 200 with it (measured); this is
+# the exact string the CLI sends. Content-Type travels as an ordinary header.
+[http]
+[[http.request]]
+url          = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+method       = "post"
+body         = "{}"
+timeout_secs = 8
+[http.request.headers]
+Authorization  = "Bearer {token}"
+"Content-Type" = "application/json"
+"User-Agent"   = "antigravity/cli/1.1.17"
+
+[[surface]]
+id            = "default"
+label         = "Default"
+opt_in        = false
+in_menu_bar   = true
+# Two hosts: the quota endpoint, and Google's OAuth token endpoint the refresh
+# step below is allowed to reach.
+allowed_hosts = ["daily-cloudcode-pa.googleapis.com", "oauth2.googleapis.com"]
+
+# Hybrid auth, two steps. The common case is the first: the Antigravity CLI keeps
+# its OAuth token fresh in the macOS Keychain, generic-password item `gemini` (a
+# single item, so the service name alone finds it), wrapped by the Go
+# `zalando/go-keyring` library in a `go-keyring-base64:` marker the keychain step
+# unwraps before reading `token.access_token`. With `expiry_json_path` set, that
+# step stands aside — resolves Absent — the moment the token has lapsed, rather
+# than handing back a dead one, so the refresh step behind it gets its turn.
+[[surface.auth]]
+type             = "keychain"
+service          = "gemini"
+token_json_path  = "token.access_token"
+expiry_json_path = "token.expiry"
+
+# The fallback, when the keychain token has lapsed (Antigravity not running for a
+# while): read the refresh token from the CLI's own token file and exchange it for
+# a fresh access token at Google's OAuth endpoint. The fresh token is never
+# written back — the file belongs to Antigravity's client. The exchange is paced
+# by an in-memory cache (see `auth::oauth_refresh_step`), so it happens about
+# hourly, not per fetch.
+#
+# The installed-app pair (`client_id`/`client_secret`) is public by OAuth2's own
+# definition — an installed-app secret embedded in a distributed binary cannot be
+# kept from anyone willing to extract it — but "public" is not "safe to publish
+# in this repository": the pair is Antigravity's client's own, this app is not
+# that client, and shipping it as a literal string here is exactly what put it in
+# GitHub's push-protection path in the first place. So it is never typed out —
+# it is read back out of the same installed client every machine running this
+# already has, at run time, via `[surface.auth.client]` below:
+#   * `id_env`/`secret_env` — an operator's own override, checked first;
+#   * failing that, each of `files` (Antigravity's `language_server`, wherever
+#     it landed — the app path or, once in a while, an unsandboxed install
+#     under the home directory) and then `bins` (`agy`, the CLI, resolved on
+#     `PATH`), scanned in order for the first match of `id_pattern` and
+#     `secret_pattern` in the *same* file, each independently — the first
+#     match of one is not required to be anywhere near the first match of
+#     the other, only in the same candidate;
+#   * nothing found — the client isn't installed here, or hasn't been yet —
+#     and this step simply stands aside (Absent), the same as a missing
+#     credentials file. The keychain step above still covers the common case
+#     of Antigravity actually running; only the fallback loses its fallback.
+#
+# `client_id`/`client_secret` (the literal fields, above) and `client` (this
+# table) may not both be set on one step — a manifest naming both would be
+# ambiguous about which it means, so `manifest::validate` refuses the
+# combination outright rather than picking an order silently.
+#
+# Both patterns are exact, not merely bounded — `secret_pattern`'s count
+# (`{28}`) is Google's own fixed length for this secret shape; `id_pattern`'s
+# digit and alnum runs (`{12}`/`{32}`) are the exact counts measured against
+# both installed binaries, not a generous cap above them. Validation still
+# refuses anything that could match more than 256 bytes either way (a client
+# id or secret is never remotely that long), but that ceiling alone is not
+# enough: measured against both binaries, the character class each format
+# allows (`[a-z0-9]`/`[A-Za-z0-9_-]`) keeps matching well past the real
+# value's own end, so a *bounded-but-not-exact* quantifier (e.g. `{1,20}`)
+# still greedily pulls in whatever precedes or follows it — a corrupted id or
+# secret every candidate would match, not a missing one, and by far the
+# harder failure to notice (the exchange 400s with `invalid_client`, which
+# reads the same as any other misconfiguration). An exact count turns that
+# corruption into a loud miss instead — Absent, the same as the client not
+# being installed — which is the trade this makes deliberately: if Google
+# ever issues an id with a different digit count, discovery stops finding it
+# rather than finding a wrong one. That is a narrowing measured against two
+# binaries on one day, not a guarantee about Google's own format; it is
+# revisited the moment discovery goes quiet for a client that used to
+# resolve.
+[[surface.auth]]
+type            = "oauth-refresh"
+path            = "~/.gemini/antigravity-cli/antigravity-oauth-token"
+token_json_path = "token.refresh_token"
+token_url       = "https://oauth2.googleapis.com/token"
+[surface.auth.client]
+id_env         = "TICKOVER_ANTIGRAVITY_CLIENT_ID"
+secret_env     = "TICKOVER_ANTIGRAVITY_CLIENT_SECRET"
+id_pattern     = "[0-9]{12}-[a-z0-9]{32}\\.apps\\.googleusercontent\\.com"
+secret_pattern = "GOCSPX-[A-Za-z0-9_-]{28}"
+files = [
+  "/Applications/Antigravity.app/Contents/Resources/bin/language_server",
+  "~/Applications/Antigravity.app/Contents/Resources/bin/language_server",
+]
+bins  = ["agy"]

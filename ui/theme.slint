@@ -1,0 +1,68 @@
+// ─────────────────────────────────────────────────────────────────────────
+//  Tickover — design system  ("terminal instrument")
+//
+//  Direction: a dark telemetry panel that speaks in the same monospace voice
+//  as the CLI it monitors. Severity-driven accents (mint → amber → red),
+//  tabular figures so the ticking countdown never jitters, pill meters with a
+//  soft accent glow. Restraint over decoration — this is a system utility.
+// ─────────────────────────────────────────────────────────────────────────
+
+export global Theme {
+    // ── Surfaces ────────────────────────────────────────────────────────
+    out property <color> panel: #111419;         // the popover card
+    out property <color> panel-top: #14181f;     // card gradient top
+    out property <color> surface: #171b22;        // inset rows / chips
+    out property <color> track: #20252e;          // meter track
+    out property <color> hairline: #262b34;       // 1px borders
+    out property <color> hairline-strong: #333a45;
+
+    // ── Ink ─────────────────────────────────────────────────────────────
+    out property <color> text: #e7eaf0;
+    out property <color> text-dim: #9aa3b2;
+    out property <color> text-faint: #626b7a;
+
+    // ── Status accents ──────────────────────────────────────────────────
+    out property <color> ok: #3ddc97;            // < 70%   healthy mint
+    out property <color> warn: #f4b740;          // 70–90%  amber
+    out property <color> crit: #f26d6d;          // ≥ 90%   soft red
+    out property <color> accent: #3ddc97;        // brand / live dot
+
+    // ── Type ────────────────────────────────────────────────────────────
+    // The window uses a system UI face; changing metrics opt into monospace.
+    out property <length> fs-body: 13px;
+
+    // Severity → accent color from a used-percent value.
+    pure public function sev(pct: float) -> color {
+        return pct >= 90 ? crit : pct >= 70 ? warn : ok;
+    }
+}
+
+// ── Icons ───────────────────────────────────────────────────────────────
+//
+// Stroked outlines on a 24×24 grid, drawn rather than typed. These were
+// Unicode characters set in the UI font ("↻", "⚙", "✎", "✕"), which is why
+// they read as undersized and out of place: a glyph's drawn size is a
+// fraction of its font size and varies per character, so no single font-size
+// squared them with each other or with the text beside them, and their stroke
+// weight came from whichever face the system resolved. As paths they take the
+// button's size and the interface's stroke weight.
+export global Icons {
+    // Circular arrow: an almost-closed arc, with the head drawn as two sides
+    // of a square at its open end.
+    out property <string> refresh: "M 20 12 A 8 8 0 1 0 17.7 17.7 M 20 6 L 20 12 L 14 12";
+    // Gear: a hub, a rim, and eight teeth standing on the rim. The teeth have
+    // to start at the rim and stay short — set further out, or around a hub
+    // with no rim between them, eight radial strokes read as a sun.
+    out property <string> gear:
+        "M 12 9 A 3 3 0 1 0 12 15 A 3 3 0 1 0 12 9"
+        + " M 12 5 A 7 7 0 1 0 12 19 A 7 7 0 1 0 12 5"
+        + " M 12 5 L 12 2.7 M 12 19 L 12 21.3"
+        + " M 5 12 L 2.7 12 M 19 12 L 21.3 12"
+        + " M 7.05 7.05 L 5.42 5.42 M 16.95 16.95 L 18.58 18.58"
+        + " M 16.95 7.05 L 18.58 5.42 M 7.05 16.95 L 5.42 18.58";
+    // Pencil: nib, body, and the ruled edge under it.
+    out property <string> pencil:
+        "M 4 20 L 4.8 16.4 L 16.2 5 L 19 7.8 L 7.6 19.2 Z M 14.4 6.8 L 17.2 9.6";
+    // Cross.
+    out property <string> close: "M 6.5 6.5 L 17.5 17.5 M 17.5 6.5 L 6.5 17.5";
+}

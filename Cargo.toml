@@ -1,0 +1,138 @@
+[package]
+name = "tickover"
+version = "0.1.0"
+edition = "2021"
+authors = ["Konstantin Savkin <k.e.savkin@gmail.com>"]
+description = "Keeps your AI coding-assistant quota windows rolling — starts each new 5-hour window with a ping and meters Codex, Claude, Grok, Antigravity and GitHub Copilot from the menu bar / system tray. Providers are TOML plugins."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/ksavkin/tickover"
+homepage = "https://github.com/ksavkin/tickover"
+keywords = ["menubar", "tray", "quota", "usage", "slint"]
+categories = ["gui", "command-line-utilities"]
+# No `rust-version`: `rust-toolchain.toml` asks for `stable`, and this project
+# has never held a floor it could test against. Claiming one it does not check
+# would be a promise made to whoever tries an older compiler.
+
+# `msg_send!`, `class!` and `sel!` (the `objc` crate, used in `platform.rs`)
+# expand to a `cfg(feature = "cargo-clippy")` test. This crate has no such
+# feature, so every ObjC call site raised an "unexpected cfg" that is not ours
+# to spell differently — 19 of them, drowning the warnings that are ours.
+# Naming the value as expected silences exactly those and leaves the lint on
+# for every cfg we write ourselves.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+[lib]
+name = "tickover"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tickover"
+path = "src/main.rs"
+
+[dependencies]
+# UI toolkit. `unstable-winit-030` exposes `slint::winit_030` (winit 0.30) so we
+# can set always-on-top and hide the popover on focus loss.
+slint = { version = "~1.13", features = ["unstable-winit-030"] }
+
+# Codex log reading
+serde_json = "1"
+walkdir = "2"
+dirs = "5"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Provider plugin manifests (TOML), read by the provider-plugin layer
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Tray icon + menu (macOS menu bar, Windows notification area).
+# 0.22 uses muda 0.17 + objc2 0.6, matching Slint 1.13's winit backend — a single
+# `muda` avoids the duplicate-ObjC-class ("MudaMenuItem") abort at startup.
+tray-icon = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# "Launch at login"
+auto-launch = "0.5"
+
+# Menu-bar widget: text rasterization for the tray image (system mono font)
+ab_glyph = "0.2"
+
+# Claude usage (GET /api/oauth/usage) — networking + Electron Safe Storage decrypt
+ureq = { version = "2", features = ["json"] }
+base64 = "0.22"
+aes = "0.8"
+cbc = "0.1"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha1 = "0.10"
+
+# Plugin registry: sha256 verification of downloaded manifests.
+sha2 = "0.10"
+# ed25519 verification of the registry index's minisign signature. Already in
+# the binary — rustls reaches it through `ureq` — so naming it here as a direct
+# dependency compiles no new cryptographic code, which is the argument the
+# feature it serves is about.
+ring = "0.17"
+# Blake2b-512, for minisign's prehashed signature form — which is what its
+# signing tool produces by default. Same RustCrypto family as the `sha2`
+# and `pbkdf2` already here.
+blake2 = { version = "0.10", default-features = false }
+
+# `oauth-refresh`'s `[surface.auth.client]` discovery: scanning an installed
+# client's own binary for its OAuth id/secret pair against a manifest-supplied
+# pattern (`plugin::auth::discover_client`), over raw bytes rather than a
+# lossily-decoded string. Already in the tree transitively (a Skia
+# build-dependency, `cargo tree --target all -i regex`), so this names it as a
+# direct one rather than compiling new code.
+regex = "1"
+# The parser `regex` itself builds on — used directly, at manifest-validate
+# time only, to bound how much of a file a `[surface.auth.client]` pattern
+# could ever match (`manifest::validate`'s `pattern_max_match_len`), so a
+# manifest cannot turn "scan a file for a short id" into "read an unbounded
+# slice of it". Already resolved by `regex` at the same version; naming it
+# here compiles no new parser.
+regex-syntax = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+# `scan_candidate`'s `O_NONBLOCK` open (see its own doc comment) — the actual
+# FIFO-hang guard, `std::fs::OpenOptions` has no way to set that flag itself.
+# Already in the tree transitively (a Skia/winit build-dependency on both
+# macOS and Linux — `cargo tree -i libc`), so this names it as a direct one
+# rather than compiling new code. Windows has no FIFOs and no `O_NONBLOCK`;
+# `scan_candidate`'s open there is the plain `std::fs::File::open` it always
+# was.
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Flip the app to accessory (LSUIElement) policy at runtime and focus the popover
+objc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Read the Claude desktop token (Electron Safe Storage → DPAPI) + Credential
+# Manager, and stand in for the `osascript` dialogs macOS gets: a message box
+# (`WindowsAndMessaging`) and the file picker (`Controls_Dialogs`). Both are
+# in the SDK this crate already binds, so neither is a new dependency.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Credentials",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls_Dialogs",
+    # Which theme the taskbar is drawn in, so the tray widget is rendered for
+    # the background it will actually sit on.
+    "Win32_System_Registry",
+] }
+
+[build-dependencies]
+slint-build = "~1.13"
+
+[target.'cfg(windows)'.build-dependencies]
+# Embed assets/app-icon.ico as a Win32 resource — see build.rs. Only the
+# Windows binary needs one; macOS keeps its icon in the .app bundle.
+winresource = "0.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"

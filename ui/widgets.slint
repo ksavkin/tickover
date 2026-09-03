@@ -1,0 +1,358 @@
+// Reusable, hand-styled components for the Limits popover.
+import { Theme, Icons } from "theme.slint";
+
+// A bar asking for its hover tooltip to be drawn — see `LimitBlock`'s
+// `tip-changed`. The bubble cannot be drawn where it is asked for: Slint has no
+// z-index, so painting order is declaration order, and a tooltip that lives
+// inside a bar is painted before every row below it and comes out with the next
+// window's caption and figures written across it. It is also inside the
+// provider list's clipping region, which cuts whatever hangs past the fold. So
+// the bar reports, and one bubble at the top of the window draws.
+export struct BarTip {
+    // False is the pointer leaving. The bubble is only taken down if `key`
+    // matches whoever put it up, because dragging quickly across two bars can
+    // deliver the second bar's enter before the first bar's leave.
+    on: bool,
+    key: string,
+    text: string,
+    // Window coordinates of the bar this belongs to, and its height, so the
+    // bubble can sit above it or drop below when there is no room.
+    x: length,
+    y: length,
+    h: length,
+}
+
+// ── One quota window as a stacked block ───────────────────────────────────
+//   5-hour limit                                                   59% used
+//   ▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+//   resets in 4m 00s · 00:32
+//
+// One quantity, stated once and named: the figure agrees with the bar's fill
+// and with the severity colour, and the label says which quantity it is. What
+// made the old block hard to read at a glance was not the choice of quantity
+// but the company it kept — "41% left" sat beside a bold 59%, and a white
+// tick and a signed pace figure competed with both, so answering "how much is
+// left" meant first sorting out which number was the answer. The tick and the
+// pace live on in the bar's hover tooltip, where they cost nothing to ignore.
+export component LimitBlock inherits VerticalLayout {
+    in property <string> win-label;      // "5H" / "WK"
+    in property <float> pct;             // used %
+    in property <string> reset-rel;      // "6d 2h" / "2h 4m"
+    in property <string> reset-at;       // "19 Jul 22:18" / "22:10" / ""
+    in property <string> tooltip;
+    // Identity of this block among all the blocks on the panel, so the one
+    // bubble that draws for all of them knows whose leave-event it is holding.
+    in property <string> tip-key;
+    // Raised when the pointer enters or leaves the bar. The block does not draw
+    // its own tooltip — see [`BarTip`] for why it cannot.
+    callback tip-changed(BarTip);
+    // A window this provider is not reporting, because nothing has been spent
+    // in it yet. Only the caption line is drawn: there is no figure to bar, and
+    // a bar at 0% beside a countdown to a reset nobody stated would be three
+    // lines of confident detail about a window that has not started. The row
+    // stays so the window itself does not blink out of the panel every time it
+    // empties — see `main.rs`'s seen-window registry.
+    in property <bool> not-started: false;
+
+    // Severity follows the *displayed* value, not the raw one: 89.6 shows as
+    // "90%", and a 90 printed in amber contradicts the palette's own legend.
+    // The 0.4pp this shifts the bar's colour boundary by is invisible.
+    property <color> accent: Theme.sev(root.used-rounded);
+
+    spacing: 7px;
+
+    // Round once and derive the complement, so the pair always sums to 100 —
+    // rounding both sides independently shows "35% / 66% left" for pct 34.5.
+    property <int> used-rounded: round(root.pct);
+
+    // ── Caption line: "5H LIMIT" ......... "41% left"  59% ────────────────
+    // `win-label` stays whatever the manifest declared, so this reads "5H
+    // LIMIT" / "WK LIMIT" without the UI having to know any provider's
+    // well-known window ids.
+    HorizontalLayout {
+        spacing: 8px;
+        Text {
+            text: root.win-label;
+            font-size: 13px;
+            color: root.not-started ? Theme.text-dim : Theme.text;
+            vertical-alignment: center;
+        }
+        Rectangle { horizontal-stretch: 1; min-width: 8px; }
+        // One figure, and it says what it is. The pair that used to stand here
+        // ("41% left" beside a bold 59%) put two answers to the same question
+        // side by side, so reading it meant first working out which one was
+        // being asked for. Severity still speaks through the colour.
+        Text {
+            text: root.not-started ? "not started" : "\{root.used-rounded}% used";
+            font-size: 13px;
+            color: root.not-started ? Theme.text-faint : root.accent;
+            vertical-alignment: center;
+        }
+    }
+
+    // BAR: fill = used, white tick = elapsed window time. Full width now that
+    // it no longer shares a row with the caption and the reset time.
+    if !root.not-started : VerticalLayout {
+        alignment: center;
+        track := Rectangle {
+            height: 8px;
+            border-radius: 4px;
+            background: Theme.track;
+            border-width: 1px;
+            border-color: Theme.hairline;
+
+            Rectangle {
+                x: 0;
+                y: 0;
+                height: parent.height;
+                // A reading below ~1% would otherwise draw a hairline that
+                // reads as an empty track — "barely used" and "not used at
+                // all" must not look the same.
+                width: root.pct <= 0 ? 0px : max(parent.width * root.pct / 100, 3px);
+                border-radius: 3px;
+                background: @linear-gradient(90deg, root.accent.darker(0.28), root.accent);
+                animate width { duration: 700ms; easing: ease-out-quart; }
+            }
+            bar-ta := TouchArea {
+                changed has-hover => {
+                    root.tip-changed({
+                        // A block with nothing to say never raises the bubble,
+                        // but it still has to report leaving: the pointer may
+                        // have arrived here from a bar that did.
+                        on: self.has-hover && root.tooltip != "",
+                        key: root.tip-key,
+                        text: root.tooltip,
+                        x: track.absolute-position.x,
+                        y: track.absolute-position.y,
+                        h: track.height,
+                    });
+                }
+            }
+        }
+    }
+
+    // RESETS, on its own line under the bar: "resets in 6d 2h · 19 Jul 22:18".
+    // The pace figure that used to occupy its own column is now carried by the
+    // white tick, plus the bar's hover tooltip — the same information without a
+    // column that only makes sense once you have read the legend.
+    if !root.not-started : HorizontalLayout {
+        spacing: 4px;
+        Text {
+            // "resets in" only fits an actual countdown. `window_view` also
+            // emits two sentinels: "unknown" (usage reported without a
+            // resets_at) and "due" (reset passed, window period unknown, so
+            // the next boundary can't be projected).
+            text: root.reset-rel == "unknown" ? "next reset unknown"
+                : root.reset-rel == "due" ? "reset due"
+                : "resets in \{root.reset-rel}";
+            font-size: 11px;
+            color: Theme.text-dim;
+            vertical-alignment: center;
+        }
+        if root.reset-at != "" : Text {
+            text: "· \{root.reset-at}";
+            font-size: 11px;
+            color: Theme.text-faint;
+            vertical-alignment: center;
+        }
+        Rectangle { horizontal-stretch: 1; min-width: 4px; }
+    }
+}
+
+// ── Custom checkbox (settings sheet) ──────────────────────────────────────
+export component ToggleRow inherits Rectangle {
+    in property <string> label;
+    in-out property <bool> checked;
+    // Live rows look and behave as before (the default). A plugin sub-toggle
+    // whose parent plugin is disabled sets this false: the row is dimmed and
+    // its click is inert, so the option reads as "present but not applicable".
+    in property <bool> enabled-look: true;
+    callback toggled(bool);
+
+    property <color> accent: Theme.accent;
+    property <bool> hot: root.enabled-look && ta.has-hover;
+    height: 28px;
+    opacity: root.enabled-look ? 1.0 : 0.36;
+
+    ta := TouchArea {
+        mouse-cursor: root.enabled-look ? MouseCursor.pointer : MouseCursor.default;
+        clicked => {
+            if (root.enabled-look) {
+                root.checked = !root.checked;
+                root.toggled(root.checked);
+            }
+        }
+    }
+
+    HorizontalLayout {
+        spacing: 12px;
+        alignment: start;
+
+        VerticalLayout {
+            alignment: center;
+            box := Rectangle {
+                width: 18px;
+                height: 18px;
+                border-radius: 5px;
+                background: root.checked ? root.accent : transparent;
+                border-width: 1.3px;
+                border-color: root.checked
+                    ? root.accent
+                    : (root.hot ? Theme.hairline-strong : Theme.hairline);
+                animate background, border-color { duration: 130ms; }
+
+                Text {
+                    text: "✓";
+                    visible: root.checked;
+                    font-size: 12px;
+                    font-weight: 700;
+                    color: #0b0d10;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        Text {
+            text: root.label;
+            font-size: Theme.fs-body;
+            font-weight: 400;
+            color: root.hot ? Theme.text : #e7eaf0;
+            vertical-alignment: center;
+            // A caller may constrain the row (the plugin manager does, so a
+            // third-party manifest's long name cannot shove the edit/remove
+            // buttons out of the sheet); the label gives way, not the layout.
+            overflow: elide;
+            animate color { duration: 130ms; }
+        }
+    }
+}
+
+// ── Ghost icon/text button (Settings, Refresh, Close…) ────────────────────
+export component GhostButton inherits Rectangle {
+    in property <string> label;
+    /// Optional leading glyph, drawn larger than the label.
+    in property <string> icon: "";
+    in property <length> icon-size: 14px;
+    in property <length> font-size: 11.5px;
+    in property <color> tint: Theme.text-dim;
+    /// Most callers want the standard 28px action-row height; smaller inline
+    /// buttons (an "Update"/"Install"/"Retry" sitting on a sub-row) pass a
+    /// shorter value so they don't dominate the row they're attached to.
+    in property <length> button-height: 28px;
+    callback clicked;
+
+    border-radius: 7px;
+    background: ta.has-hover ? #ffffff0f : transparent;
+    animate background { duration: 120ms; }
+    height: root.button-height;
+    horizontal-stretch: 0;
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 6px;
+        if root.icon != "" : Text {
+            text: root.icon;
+            font-size: root.icon-size;
+            font-weight: 600;
+            color: ta.has-hover ? Theme.text : root.tint;
+            vertical-alignment: center;
+            animate color { duration: 120ms; }
+        }
+        Text {
+            text: root.label;
+            font-size: root.font-size;
+            font-weight: 600;
+            color: ta.has-hover ? Theme.text : root.tint;
+            vertical-alignment: center;
+            animate color { duration: 120ms; }
+        }
+    }
+}
+
+// ── Tiny inline icon button (per-row actions: edit / remove…) ─────────────
+// Same idea as the header's IconButton, but compact enough to sit inline in
+// a plugin's master row without crowding the toggle/chip/engine cluster.
+export component MiniIconButton inherits Rectangle {
+    // An `Icons` path on a 24×24 grid — see the note beside `Icons`.
+    in property <string> icon;
+    in property <length> icon-size: 13px;
+    in property <color> tint: Theme.text-faint;
+    callback clicked;
+
+    width: 20px;
+    height: 20px;
+    border-radius: 6px;
+    background: ta.has-hover ? #ffffff0f : transparent;
+    animate background { duration: 120ms; }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    Path {
+        width: root.icon-size;
+        height: root.icon-size;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: root.icon;
+        fill: transparent;
+        stroke: ta.has-hover ? Theme.text : root.tint;
+        stroke-width: 1.7px;
+        animate stroke { duration: 120ms; }
+    }
+}
+
+// ── Info dot "ⓘ" that reveals a caption on hover ──────────────────────────
+export component InfoDot inherits Rectangle {
+    in property <string> hint;
+    // Same one bubble the bars use, and for the same reason twice over. This
+    // dot's own bubble used to be its child, anchored `parent.width -
+    // self.width` — that is, growing leftwards, which only fits a dot sitting
+    // near the right edge. It sits at the bottom left, so the bubble ran off
+    // the window and was cut down the middle. Reporting instead of drawing
+    // hands the clamping to the one place that can see the whole card.
+    in property <string> tip-key;
+    callback tip-changed(BarTip);
+    width: 20px;
+    height: 20px;
+
+    dot := Rectangle {
+        width: 20px;
+        height: 20px;
+        border-radius: 10px;
+        border-width: 1.2px;
+        border-color: ta.has-hover ? Theme.text-dim : Theme.text-faint;
+        background: ta.has-hover ? #ffffff0d : transparent;
+        animate border-color, background { duration: 120ms; }
+        Text {
+            text: "i";
+            font-size: 11px;
+            font-weight: 700;
+            color: ta.has-hover ? Theme.text-dim : Theme.text-faint;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        changed has-hover => {
+            root.tip-changed({
+                on: self.has-hover && root.hint != "",
+                key: root.tip-key,
+                text: root.hint,
+                x: root.absolute-position.x,
+                y: root.absolute-position.y,
+                h: root.height,
+            });
+        }
+    }
+}

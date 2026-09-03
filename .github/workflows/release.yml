@@ -1,0 +1,204 @@
+# Build the two platform artifacts and stage a release when a version tag is
+# pushed, or rehearse the build by hand without shipping anything.
+#
+# macOS ships a universal `.app`: `macos-latest` runners are arm64, so the
+# x86_64 half is a cross-compile on the same runner, joined with `lipo` before
+# `make-app.sh` bundles the result. Windows ships a bare `.exe` — the tray
+# app's own "launch at login" toggle writes its own registry entry, so an
+# installer would not add anything a zip does not already give a user.
+#
+# Not cargo-dist: the unit this project ships on macOS is an `.app` with
+# `LSUIElement` set, which is what makes it a menu-bar agent instead of a
+# window that steals focus on launch, and cargo-dist packages a bare binary.
+# `packaging/macos/make-app.sh` already builds the right thing.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # For rehearsing a build before cutting a tag. It still runs both platform
+  # builds so a break shows up before it is discovered on a real tag; only the
+  # publish job checks `github.ref_type == 'tag'` and no-ops on a branch ref,
+  # since a dispatch run has no version tag to name a release after. The zips
+  # built on a rehearsal carry the branch name instead of a version — harmless,
+  # since nothing downstream turns them into a release.
+  workflow_dispatch:
+
+# One run per ref. Unlike CI, a release run is not disposable mid-flight: a
+# cancelled build job can leave the publish job downloading whichever
+# artifact finished first and drafting a release short one platform. A second
+# push of the same tag is a mistake to fail loudly on, not a race to resolve
+# by cancelling the first attempt.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Nothing here writes anything back by default; the publish job below opts
+# back in for the one step that needs to.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    # Two targets on macOS plus a Windows build; still minutes, not hours,
+    # so an hour left unfinished means something is wedged rather than slow.
+    timeout-minutes: 60
+    strategy:
+      # See both platforms' outcome even when one fails partway through.
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos
+          - os: windows-latest
+            name: windows
+
+    steps:
+      # Pinned by commit rather than by tag, matching ci.yml: a tag is
+      # whatever it points at today, and this project's own trust model
+      # (`src/plugin/registry.rs` checks a sha256) should not be looser than
+      # that about its own build.
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Nothing after this reads the repository again, so the checkout
+          # token has no reason to be left behind in `.git/config`.
+          persist-credentials: false
+
+      - name: Show toolchain
+        run: |
+          rustup show active-toolchain
+          cargo --version
+
+      # A tag that does not match the version it is meant to release is a
+      # mistake worth failing loudly on, before either platform spends a
+      # build on it. `-qxF` matches the whole line as a literal string, not a
+      # regex — `grep -q "^version = \"1.2.3\""` would also match `1x2y3`
+      # (the dots are wildcards) or a longer version merely prefixed by this
+      # one, and neither is the check this step is for. Skipped on a manual
+      # rehearsal: `workflow_dispatch` has no version tag to check against,
+      # and the task is only to prove the build still works.
+      - name: Tag matches Cargo.toml
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: grep -qxF "version = \"${GITHUB_REF_NAME#v}\"" Cargo.toml
+
+      # Only the crate downloads, as in ci.yml — `target/` is deliberately
+      # not cached there and the same reasoning applies here: two targets on
+      # macOS make the release tree wider still.
+      - name: Cache crate downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-cargo-
+
+      # A tag can land on a commit CI never built: ci.yml's `paths-ignore`
+      # skips a docs-only push, and nothing stops a tag from being cut on
+      # top of one. The release build must not be the first build that skips
+      # the suite — so it runs the suite itself, on both platforms, before
+      # either one is packaged.
+      - name: Test
+        run: cargo test --all-targets --locked
+
+      - name: macOS universal .app
+        if: matrix.name == 'macos'
+        # Matches `LSMinimumSystemVersion` in packaging/macos/Info.plist: the
+        # binary's own minimum should not be older than what the bundle
+        # already promises Launch Services, and without this the toolchain
+        # defaults to whatever the runner's own OS happens to be.
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p target/release
+          lipo -create -output target/release/tickover \
+            target/aarch64-apple-darwin/release/tickover \
+            target/x86_64-apple-darwin/release/tickover
+          ./packaging/macos/make-app.sh target/release/tickover
+          # make-app.sh only warns if ad-hoc signing failed (useful for a
+          # local build without a signing identity available); a release
+          # artifact should not ship an unsigned bundle silently, so verify
+          # it here and fail the job if the signature is missing or broken.
+          codesign --verify --deep --strict "dist/Tickover.app"
+          # A branch name may contain `/` (a rehearsal only, since a tag
+          # never does), which `ditto`'s destination would otherwise read as
+          # a path with a missing directory.
+          LABEL="${GITHUB_REF_NAME//\//-}"
+          ditto -c -k --keepParent "dist/Tickover.app" "Tickover-${LABEL}-macos-universal.zip"
+
+      - name: Windows exe
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          cargo build --release --locked
+          # See the same LABEL note in the macOS step above.
+          $label = $env:GITHUB_REF_NAME -replace '/','-'
+          Compress-Archive target/release/tickover.exe "tickover-$label-windows-x86_64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.name }}
+          path: "*.zip"
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Only this job writes anything, and only for the one step that drafts
+    # the release; everything else in the workflow stays read-only.
+    permissions:
+      contents: write
+    steps:
+      # Downloaded and checksummed even on a rehearsal: that is most of what
+      # this job does, and a `workflow_dispatch` run is supposed to prove the
+      # whole pipeline, not just the two build jobs feeding it.
+      - name: Download artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: out
+          merge-multiple: true
+
+      # Run from inside `out/` so the listing names the zips themselves, not
+      # `out/whatever.zip` — the form `sha256sum -c` expects the file to sit
+      # beside the checksum it is verifying.
+      - name: Checksums
+        working-directory: out
+        run: sha256sum *.zip > SHA256SUMS.txt
+
+      # Draft, not published: a release that is live the moment the workflow
+      # finishes has had no human look at the notes or the two zips it
+      # attaches. `gh` is preinstalled on the runner, so no third-party
+      # action is needed just to call the API it already wraps. This job
+      # never checks the repository out, so `gh` has no local git context to
+      # read the target repository from — `GH_REPO` stands in for that.
+      - name: Draft release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/* \
+            --draft --generate-notes --title "Tickover $GITHUB_REF_NAME"
+
+      # A rehearsal reaches this point with the same two zips and checksum
+      # file a real release would have drafted, and nothing else keeps them:
+      # once the job ends they would otherwise be gone with no way to tell
+      # whether the pipeline actually produced what it claims to.
+      - name: Upload rehearsal artifact
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-rehearsal
+          path: out

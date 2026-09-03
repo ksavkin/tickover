@@ -1,0 +1,2110 @@
+//! The plugin registry: discovering, verifying and comparing manifests
+//! published under `plugins/` of this repository (`index.toml` at its root —
+//! see `docs/PLUGIN-ARCHITECTURE.md`'s "Registry" section, whose schema this
+//! module implements verbatim) and fetched over HTTPS.
+//!
+//! Everything here is pure and hermetic **except** [`fetch_text`] and
+//! [`fetch_bytes`] — the two network calls, isolated so the rest (index
+//! parsing/validation, URL resolution, semver compare, sha256, the lockfile,
+//! the installed-vs-registry diff, and trust disclosure) is unit-testable on
+//! fixtures with zero network access. `src/main.rs`'s registry UI is the only
+//! caller of either: [`fetch_text`] for `index.toml` (parsed as TOML text, so
+//! a UTF-8 decode along the way is harmless), [`fetch_bytes`] for a manifest
+//! file (whose raw transport bytes must survive undecoded — see
+//! [`verify_and_prepare`]'s byte-exact contract). It wires this module's pure
+//! functions together with the actual filesystem writes (this module never
+//! writes a plugin manifest to disk itself — see [`verify_and_prepare`]'s doc
+//! comment for the byte-exact contract that implies).
+//!
+//! ```text
+//! schema_version = 1                       # optional, default 1
+//! [[plugin]]
+//! id          = "some-provider"            # ^[A-Za-z0-9_-]+$
+//! name        = "Some Provider"
+//! version     = "1.0.0"                    # non-empty
+//! description = "Some Provider usage indicator"  # optional
+//! manifest    = "manifests/some-provider.toml"   # relative, no scheme, no ..
+//! sha256      = "…"                        # 64 lowercase hex chars
+//! ```
+//!
+//! Trust model: verifying `sha256` against the index only proves the
+//! downloaded bytes weren't altered in transit — it says nothing about
+//! whether the manifest itself is trustworthy. [`analyze_trust`] surfaces
+//! what a manifest declares (not a verdict) so the installer can show a
+//! meaningful warning before writing it to disk; see
+//! `docs/PLUGIN-ARCHITECTURE.md`'s "Trust model" section for the full
+//! picture this only summarizes.
+
+use std::cmp::Ordering;
+use std::collections::HashSet;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::plugin::auth::url_host;
+use crate::plugin::manifest::{AuthType, EngineKind, PluginManifest};
+
+// ── index.toml schema ────────────────────────────────────────────────────
+
+/// A parsed, validated `index.toml`. Unknown top-level/entry fields are
+/// ignored, not rejected (`deny_unknown_fields` deliberately unset, mirroring
+/// [`PluginManifest`] — a future registry publisher may add fields this
+/// build doesn't know about yet).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RegistryIndex {
+    /// Index format version. Not currently branched on — reserved for a
+    /// future incompatible schema change.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: i64,
+    /// `[[plugin]]` — every plugin the registry publishes.
+    #[serde(default, rename = "plugin")]
+    pub plugins: Vec<RegistryEntry>,
+}
+
+fn default_schema_version() -> i64 {
+    1
+}
+
+/// One `[[plugin]]` entry in `index.toml`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RegistryEntry {
+    /// Stable identifier — same charset as [`PluginManifest::id`]
+    /// (`^[A-Za-z0-9_-]+$`), since it becomes the installed manifest's
+    /// filename stem too.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Publisher-declared version (compared with [`version_cmp`]).
+    pub version: String,
+    /// Optional one-line description shown before install.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Path to the manifest file, **relative to the index's own directory**
+    /// (see [`resolve_manifest_url`]) — never a full URL. Validated to rule
+    /// out a scheme, a leading path separator, or a `..` component (a
+    /// compromised index pointing at a manifest hosted on a different host,
+    /// or outside the registry's own tree).
+    pub manifest: String,
+    /// Expected sha256 of the manifest file's raw bytes, lowercase hex.
+    pub sha256: String,
+}
+
+impl RegistryIndex {
+    /// Parse and validate `index.toml` source. Rejects malformed TOML and
+    /// every invariant [`RegistryIndex::validate`] checks; a corrupted or
+    /// dishonest index is rejected wholesale rather than partially trusted.
+    // Deliberately inherent rather than `FromStr`, for the reason
+    // `PluginManifest::from_str` is: a `FromStr` delegating here would be
+    // sound, but `.parse()` reads as a conversion, and this validates as well
+    // — a named constructor says which is happening at the call site.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(input: &str) -> Result<Self, String> {
+        let index: RegistryIndex =
+            toml::from_str(input).map_err(|e| format!("invalid index TOML: {e}"))?;
+        index.validate()?;
+        Ok(index)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let mut seen_ids: HashSet<&str> = HashSet::new();
+        for p in &self.plugins {
+            validate_registry_id(&p.id)?;
+            if p.name.trim().is_empty() {
+                return Err(format!("plugin \"{}\": `name` must not be empty", p.id));
+            }
+            if p.version.trim().is_empty() {
+                return Err(format!("plugin \"{}\": `version` must not be empty", p.id));
+            }
+            validate_sha256_hex(&p.id, &p.sha256)?;
+            validate_relative_manifest_path(&p.manifest)
+                .map_err(|e| format!("plugin \"{}\": {e}", p.id))?;
+            if !seen_ids.insert(p.id.as_str()) {
+                return Err(format!(
+                    "duplicate plugin id \"{}\" in index — a corrupted or dishonest index is \
+                     rejected wholesale",
+                    p.id
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Same charset rule as [`PluginManifest::validate`]'s `id` check — the
+/// registry entry's id becomes `<id>.toml` on disk once installed.
+fn validate_registry_id(id: &str) -> Result<(), String> {
+    if id.trim().is_empty() {
+        return Err("`id` must not be empty".to_string());
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!(
+            "`id = \"{id}\"` must contain only ASCII letters, digits, underscores and hyphens"
+        ));
+    }
+    Ok(())
+}
+
+/// A sha256 hex string must be exactly 64 characters, every one of them a
+/// *lowercase* hex digit — rejecting uppercase keeps every stored/compared
+/// hash in one canonical form (see [`sha256_hex`], which only ever emits
+/// lowercase).
+fn validate_sha256_hex(id: &str, sha: &str) -> Result<(), String> {
+    let ok = sha.len() == 64
+        && sha
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !ok {
+        return Err(format!(
+            "plugin \"{id}\": `sha256` must be exactly 64 lowercase hex characters, got \"{sha}\""
+        ));
+    }
+    Ok(())
+}
+
+/// Reject anything that isn't a plain relative path under the index's own
+/// tree: a URL scheme (`://`), a leading path separator (absolute path), or
+/// any `..` component (directory traversal). This is what closes "a
+/// compromised index tricks the installer into fetching a manifest from a
+/// different host, or a file outside the registry's own tree" — see the
+/// module docs' Trust model note. Checked on the *raw* string before any
+/// joining happens; [`resolve_manifest_url`] re-checks the joined URL's host
+/// as a second, independent guard.
+fn validate_relative_manifest_path(path: &str) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("`manifest` must not be empty".to_string());
+    }
+    if path.contains("://") {
+        return Err(format!(
+            "`manifest = \"{path}\"` must not contain a URL scheme"
+        ));
+    }
+    if path.starts_with('/') || path.starts_with('\\') {
+        return Err(format!(
+            "`manifest = \"{path}\"` must be relative (no leading path separator)"
+        ));
+    }
+    if path.split(['/', '\\']).any(|seg| seg == "..") {
+        return Err(format!(
+            "`manifest = \"{path}\"` must not contain a `..` component"
+        ));
+    }
+    Ok(())
+}
+
+// ── Manifest URL resolution ──────────────────────────────────────────────
+
+/// Resolve a `[[plugin]].manifest` path (already validated relative, see
+/// [`validate_relative_manifest_path`]) against the index's own URL.
+/// `base_index_url` is the URL `index.toml` itself was fetched from; its
+/// trailing `index.toml` (if present) is stripped, and `relative_manifest`
+/// is appended. As a second, independent guard against a hostile relative
+/// path smuggling a host change past the string checks above, the resolved
+/// URL's host is re-checked against the base URL's host — belt-and-braces,
+/// since a purely relative path (no scheme, no leading `/`) can't actually
+/// change host through string concatenation alone, but this function is the
+/// one place that would notice if it somehow did.
+pub fn resolve_manifest_url(
+    base_index_url: &str,
+    relative_manifest: &str,
+) -> Result<String, String> {
+    validate_relative_manifest_path(relative_manifest)?;
+
+    // A query string or fragment on the index URL is not part of the path a
+    // manifest hangs off. Left on, `strip_suffix("index.toml")` misses, and
+    // the manifest name gets appended to the query instead of the directory —
+    // a URL that resolves to the wrong thing, or to nothing.
+    let base = base_index_url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(base_index_url);
+    let base = base.strip_suffix("index.toml").unwrap_or(base);
+    let base = base.trim_end_matches('/');
+    let joined = format!("{base}/{relative_manifest}");
+
+    let base_host = url_host(base_index_url)
+        .ok_or_else(|| format!("cannot determine host of index URL \"{base_index_url}\""))?;
+    let joined_host = url_host(&joined)
+        .ok_or_else(|| format!("cannot determine host of resolved manifest URL \"{joined}\""))?;
+    if !base_host.eq_ignore_ascii_case(joined_host) {
+        return Err(format!(
+            "resolved manifest URL \"{joined}\" left the index's host \"{base_host}\""
+        ));
+    }
+    Ok(joined)
+}
+
+// ── Version comparison (hand-rolled semver, no crate) ────────────────────
+
+/// A version's numeric `major.minor.patch` base plus an optional prerelease
+/// identifier string (the part after `-`, build metadata already stripped)
+/// — [`parse_semver`]'s return shape, named so its callers don't repeat the
+/// nested tuple type.
+type SemverParts<'a> = ((u64, u64, u64), Option<&'a str>);
+
+/// Compare two version strings as `major.minor.patch` integers when both
+/// parse that way (so `"1.2.0" < "1.10.0"`, unlike a naive string compare),
+/// with basic semver prerelease semantics on top: a `-<prerelease>` suffix
+/// (e.g. `"1.0.0-alpha"`) is split off the numeric base by [`parse_semver`]
+/// and compared per semver's own rules — a release outranks any prerelease
+/// of the same base (`"1.0.0" > "1.0.0-alpha"`), and two prereleases of the
+/// same base compare dot-segment by dot-segment via [`compare_prerelease`].
+/// Build metadata (a trailing `+...`) is stripped and never affects the
+/// comparison (`"1.0.0+build" == "1.0.0"`), per semver. Falls back to plain
+/// string comparison when either side isn't shaped like `x.y.z` (optionally
+/// followed by `-<prerelease>` and/or `+<build>`) at all — a missing
+/// segment, a non-numeric major/minor/patch, empty string, … — a fallback
+/// comparison is still a total order (never panics, never treats the two as
+/// equal unless the strings are identical), just not a semver-aware one.
+pub fn version_cmp(a: &str, b: &str) -> Ordering {
+    match (parse_semver(a), parse_semver(b)) {
+        (Some((base_a, pre_a)), Some((base_b, pre_b))) => match base_a.cmp(&base_b) {
+            Ordering::Equal => match (pre_a, pre_b) {
+                (None, None) => Ordering::Equal,
+                // A plain release outranks a prerelease of the same base —
+                // "1.0.0" is newer than "1.0.0-alpha".
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(pa), Some(pb)) => compare_prerelease(pa, pb),
+            },
+            other => other,
+        },
+        _ => a.cmp(b),
+    }
+}
+
+/// Parse `v` into its numeric `major.minor.patch` base plus an optional
+/// prerelease identifier string — `None` when `v` isn't shaped like `x.y.z`
+/// (optionally followed by `-<prerelease>`), matching [`version_cmp`]'s own
+/// documented fallback condition. Build metadata (everything from the first
+/// `+` onward, if any) is stripped before anything else is parsed and simply
+/// discarded — per semver, it never affects precedence.
+fn parse_semver(v: &str) -> Option<SemverParts<'_>> {
+    let v = v.split('+').next().unwrap_or(v); // strip build metadata, if any
+    let (base, prerelease) = match v.split_once('-') {
+        Some((b, p)) => (b, Some(p)),
+        None => (v, None),
+    };
+    let mut parts = base.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None; // more than three segments -> not a plain x.y.z
+    }
+    Some(((major, minor, patch), prerelease))
+}
+
+/// Compare two prerelease identifier strings (already split off the base
+/// version's `major.minor.patch` by [`parse_semver`], e.g. `"alpha"` or
+/// `"beta.2"`) dot-segment by dot-segment: a segment that parses as a
+/// non-negative integer compares numerically, otherwise both segments
+/// compare as plain ASCII strings. A prerelease with fewer segments than the
+/// other, once every shared segment compares equal, sorts before the longer
+/// one (`"1.0.0-alpha" < "1.0.0-alpha.1"`) — per semver, a larger set of
+/// fields has higher precedence than a smaller set when all preceding
+/// identifiers are equal. This is deliberately the *basic* semver semantics
+/// [`version_cmp`]'s own doc comment scopes itself to — full semver also
+/// ranks any numeric identifier below any alphanumeric one at the same
+/// position and forbids leading zeros in numeric identifiers; neither nuance
+/// is enforced here.
+fn compare_prerelease(a: &str, b: &str) -> Ordering {
+    let mut ai = a.split('.');
+    let mut bi = b.split('.');
+    loop {
+        match (ai.next(), bi.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                let cmp = match (x.parse::<u64>(), y.parse::<u64>()) {
+                    (Ok(nx), Ok(ny)) => nx.cmp(&ny),
+                    (Ok(_), Err(_)) => Ordering::Less,
+                    (Err(_), Ok(_)) => Ordering::Greater,
+                    (Err(_), Err(_)) => x.cmp(y),
+                };
+                if cmp != Ordering::Equal {
+                    return cmp;
+                }
+            }
+        }
+    }
+}
+
+/// Whether `registry` is a newer version than `installed` — `false` for
+/// equal or older ([`Ordering::Equal`]/[`Ordering::Less`]), never an
+/// "unknown" third state; an unparsable pair still resolves via
+/// [`version_cmp`]'s string fallback.
+fn update_available(installed: &str, registry: &str) -> bool {
+    version_cmp(registry, installed) == Ordering::Greater
+}
+
+// ── sha256 ────────────────────────────────────────────────────────────────
+
+/// Lowercase hex sha256 of `bytes`.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Whether `bytes` hashes to `expected_hex` (case-insensitive on the
+/// expected string — an index is required to publish lowercase via
+/// [`validate_sha256_hex`], but this comparison doesn't rely on that having
+/// been checked, e.g. when verifying an already-installed file's hash
+/// against a hand-typed value in a test).
+pub fn verify_sha256(bytes: &[u8], expected_hex: &str) -> bool {
+    sha256_hex(bytes).eq_ignore_ascii_case(expected_hex)
+}
+
+// ── Byte-exact download verification ─────────────────────────────────────
+
+/// Verify a downloaded manifest's raw bytes against the index's expected
+/// sha256, and parse it as a gate ("does this even parse as a
+/// [`PluginManifest`]") — **not** as the source of what gets written to
+/// disk. The contract with the caller (`src/main.rs`'s registry UI):
+///
+/// 1. Download the manifest's raw bytes (via [`fetch_bytes`] — never
+///    [`fetch_text`], whose `into_string` UTF-8-decodes the response body
+///    before this function ever sees it; sha256 must be computed over the
+///    exact bytes the server sent, not a decoded/re-encoded copy of them).
+/// 2. Call this function with those exact bytes and the index's `sha256`.
+/// 3. On `Ok`, write the **original, unmodified `raw_bytes`** to disk (never
+///    a re-serialization of the returned [`PluginManifest`] — TOML
+///    re-serialization is not guaranteed byte-identical, and the whole point
+///    of the sha256 check is that the bytes on disk are the exact bytes that
+///    were verified).
+/// 4. Store the returned hash (already lowercase — see [`sha256_hex`]) as
+///    that plugin's [`RegistryLockEntry::origin_sha256`].
+///
+/// Returns `Err` on a sha256 mismatch (before ever attempting to parse —
+/// verify first, parse second) or on a hash match that still doesn't parse
+/// as a valid [`PluginManifest`].
+pub fn verify_and_prepare(
+    raw_bytes: &[u8],
+    expected_sha_hex: &str,
+) -> Result<(PluginManifest, String), String> {
+    let actual = sha256_hex(raw_bytes);
+    if !actual.eq_ignore_ascii_case(expected_sha_hex) {
+        return Err(format!(
+            "sha256 mismatch: expected {expected_sha_hex}, downloaded bytes hash to {actual}"
+        ));
+    }
+    let text = std::str::from_utf8(raw_bytes)
+        .map_err(|e| format!("downloaded manifest is not valid UTF-8: {e}"))?;
+    let manifest = PluginManifest::from_str(text)?;
+    Ok((manifest, actual))
+}
+
+// ── Lockfile (registry-state.json) — provenance for the diff/state machine ─
+
+/// One plugin's install provenance: what it was installed *from*, so a later
+/// "check updates" run can tell a pristine install (safe to overwrite) apart
+/// from one the user has since hand-edited (overwrite would destroy their
+/// edits) — see [`diff_installed`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegistryLockEntry {
+    /// The index URL this plugin was installed/updated from.
+    pub origin_registry_url: String,
+    /// The registry `version` at the time of install/update.
+    pub origin_version: String,
+    /// The sha256 (lowercase hex) of the exact bytes written to disk at
+    /// install/update time — compared against the *current* file's hash
+    /// (computed by the caller — this module never reads plugin files off
+    /// disk) to detect local edits.
+    pub origin_sha256: String,
+    /// Unix seconds at install/update time. Set by the caller
+    /// (`src/main.rs`); this module never reads the clock.
+    pub installed_at: u64,
+}
+
+/// `registry-state.json`'s top-level shape: `{ "plugins": { "<id>": {...} } }`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RegistryLockState {
+    #[serde(default)]
+    pub plugins: std::collections::BTreeMap<String, RegistryLockEntry>,
+}
+
+impl RegistryLockState {
+    /// This plugin's provenance record, if any (`None` for a plugin that was
+    /// never installed via the registry — e.g. the bundled codex/claude
+    /// manifests, or a hand-dropped third-party one).
+    pub fn get(&self, id: &str) -> Option<&RegistryLockEntry> {
+        self.plugins.get(id)
+    }
+
+    /// Record (or overwrite) a plugin's provenance after an install/update.
+    pub fn set(&mut self, id: &str, entry: RegistryLockEntry) {
+        self.plugins.insert(id.to_string(), entry);
+    }
+
+    /// Drop a plugin's provenance record (e.g. on removal), mirroring
+    /// `crate::config::remove_plugin_keys`'s cleanup-on-delete role for the
+    /// registry's own state.
+    pub fn remove(&mut self, id: &str) {
+        self.plugins.remove(id);
+    }
+}
+
+/// Where the real lockfile lives: `<config dir>/tickover/registry-state.json`
+/// — the same `tickover` base directory `crate::config` and
+/// `crate::plugin::seed::plugins_dir` use. Never called by a test (every test
+/// exercises [`load_lockfile`]/[`save_lockfile`] with an explicit tempdir
+/// path instead — see their own docs); only `src/main.rs` calls this to get
+/// the production path.
+pub fn lockfile_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("tickover")
+        .join("registry-state.json")
+}
+
+/// Load the lockfile at `path`. Best-effort, like `crate::config`'s own
+/// `load`: a missing file, unreadable file, or corrupt JSON all quietly
+/// resolve to [`RegistryLockState::default`] (an empty `plugins` map) rather
+/// than an error — a missing/corrupt lockfile must never block reading or
+/// installing plugins, only degrade the "was this locally modified"
+/// provenance check in [`diff_installed`] to the no-record branch.
+pub fn load_lockfile(path: &Path) -> RegistryLockState {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persist `state` to `path`, creating its parent directory if needed
+/// (mirrors `crate::plugin::seed::write_templates`'s `create_dir_all` before
+/// `write`).
+pub fn save_lockfile(path: &Path, state: &RegistryLockState) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let text =
+        serde_json::to_string_pretty(state).map_err(|e| std::io::Error::other(e.to_string()))?;
+    // Temp file then rename, for the same reason `config.rs` does it: a
+    // truncated lockfile reads as "nothing was ever installed from a
+    // registry", which quietly turns every installed plugin's update check
+    // into a version-only guess.
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    // Created rather than written through: a symlink left on the temp path
+    // would otherwise be followed out of this directory (same reasoning as
+    // `config::write_atomically` and `main::update_write`).
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+// ── State machine: installed vs. registry ────────────────────────────────
+
+/// One plugin's state relative to the registry, as decided by
+/// [`diff_installed`]. Three states, not a richer taxonomy, matching the
+/// registry's own "check updates" UI (`docs/PLUGIN-ARCHITECTURE.md`): offer
+/// install, nothing to do, or offer an update (annotated with whether that
+/// update would be a safe overwrite).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RegistryPluginState {
+    /// Not installed locally at all — the index lists an id with no matching
+    /// local file. Offer install.
+    New,
+    /// Nothing to do: either the installed file provably matches its
+    /// recorded origin and the registry hasn't moved (`locally_modified =
+    /// false`), or the installed file has provably diverged from its
+    /// recorded origin but the registry version is unchanged too — no update
+    /// to offer either way, but `locally_modified = true` flags the
+    /// divergence for display. `locally_modified` is a *positive* signal
+    /// only (comes from a lockfile hash mismatch); its `false` value means
+    /// "no evidence of local edits found", not "provably pristine" — see the
+    /// no-lockfile-record branch of [`diff_installed`], where the file's
+    /// origin is simply unknown and this is the best that can be said.
+    UpToDate { locally_modified: bool },
+    /// The registry has something newer (or, with no lockfile record at all,
+    /// a version that simply differs — see [`diff_installed`]) to offer.
+    UpdateAvailable {
+        /// `true` only when a lockfile record proves the installed file
+        /// still matches what was last installed — overwriting it destroys
+        /// nothing. `false` means overwriting *may* destroy local edits (or
+        /// there's no provenance to know either way); `warning` explains why.
+        overwrite_safe: bool,
+        /// Human-readable warning to show before an unsafe overwrite; `None`
+        /// only when `overwrite_safe` is `true`.
+        warning: Option<String>,
+    },
+}
+
+/// Decide each registry-listed plugin's state relative to what's installed
+/// locally. **Returned in the same order as `index.plugins`, one state per
+/// entry** — this function does not repeat each entry's `id` in the result,
+/// so the caller must zip the two: `index.plugins.iter().zip(diff_installed(...))`.
+///
+/// `installed` is `(id, current_file_sha256, installed_version)` for every
+/// plugin manifest currently on disk (both file's sha256 and the manifest's
+/// own declared `version`, computed by the caller — this module never reads
+/// the plugins directory itself); a plugin manifest on disk whose id isn't
+/// in the index is simply never visited (the index, not the disk, drives
+/// iteration — "check updates" only concerns itself with plugins the
+/// registry actually knows about).
+///
+/// **`current_file_sha256` must be [`sha256_hex`] of the manifest file's raw
+/// on-disk bytes** ([`std::fs::read`], not [`std::fs::read_to_string`] + a
+/// round-trip through [`PluginManifest`]/`toml::to_string`) — the same
+/// byte-exactness [`verify_and_prepare`] requires on the write side. Hashing
+/// a re-serialized manifest instead would almost never match
+/// `origin_sha256` (TOML re-serialization isn't guaranteed byte-identical to
+/// the original file), making every installed plugin spuriously look
+/// locally-modified/unsafe-to-overwrite.
+///
+/// Decision table (`lockfile` is this plugin's [`RegistryLockEntry`], when
+/// one exists):
+///
+/// | local file | lockfile | local == origin | index == origin | state |
+/// |---|---|---|---|---|
+/// | absent | — | — | — | `New` |
+/// | present | yes | yes | yes | `UpToDate { locally_modified: false }` |
+/// | present | yes | yes | no  | `UpdateAvailable { overwrite_safe: true, .. }` |
+/// | present | yes | no  | yes | `UpToDate { locally_modified: true }` |
+/// | present | yes | no  | no  | `UpdateAvailable { overwrite_safe: false, .. }` |
+/// | present | no  | — | (best-effort `installed_version` vs `index.version`) | `UpdateAvailable{overwrite_safe:false,..}` if newer, else `UpToDate{locally_modified:false}` |
+pub fn diff_installed(
+    index: &RegistryIndex,
+    installed: &[(String, String, String)],
+    lockfile: &RegistryLockState,
+) -> Vec<RegistryPluginState> {
+    index
+        .plugins
+        .iter()
+        .map(|entry| diff_one(entry, installed, lockfile))
+        .collect()
+}
+
+fn diff_one(
+    entry: &RegistryEntry,
+    installed: &[(String, String, String)],
+    lockfile: &RegistryLockState,
+) -> RegistryPluginState {
+    let Some((_, local_sha, local_version)) = installed.iter().find(|(id, _, _)| id == &entry.id)
+    else {
+        return RegistryPluginState::New;
+    };
+
+    match lockfile.get(&entry.id) {
+        Some(lock) => {
+            let local_matches_origin = local_sha.eq_ignore_ascii_case(&lock.origin_sha256);
+            let index_matches_origin = entry.sha256.eq_ignore_ascii_case(&lock.origin_sha256);
+            match (local_matches_origin, index_matches_origin) {
+                (true, true) => RegistryPluginState::UpToDate {
+                    locally_modified: false,
+                },
+                (true, false) => RegistryPluginState::UpdateAvailable {
+                    overwrite_safe: true,
+                    warning: None,
+                },
+                (false, true) => RegistryPluginState::UpToDate {
+                    locally_modified: true,
+                },
+                (false, false) => RegistryPluginState::UpdateAvailable {
+                    overwrite_safe: false,
+                    warning: Some(
+                        "the installed file has local edits (it no longer matches what was \
+                         last installed) and the registry has a different version too — \
+                         updating will overwrite those edits"
+                            .to_string(),
+                    ),
+                },
+            }
+        }
+        None => {
+            if update_available(local_version, &entry.version) {
+                RegistryPluginState::UpdateAvailable {
+                    overwrite_safe: false,
+                    warning: Some(
+                        "no install record for this plugin (installed before the registry, or \
+                         dropped in by hand) — updating will overwrite the installed file; \
+                         whether it has local edits can't be determined"
+                            .to_string(),
+                    ),
+                }
+            } else {
+                RegistryPluginState::UpToDate {
+                    locally_modified: false,
+                }
+            }
+        }
+    }
+}
+
+// ── Trust disclosure (not a verdict) ─────────────────────────────────────
+
+/// Hosts trusted by default — the bundled Claude manifest's own endpoint.
+/// Callers pass their own trusted set; this is just the sensible default a
+/// caller with no opinion can start from.
+pub const TRUSTED_HOSTS: &[&str] = &["api.anthropic.com", "chatgpt.com"];
+
+/// What a manifest declares about how it reads credentials and where it
+/// sends them — a disclosure for the installer UI to show before writing a
+/// manifest to disk, **not** a trust verdict (a hostile manifest can lie
+/// about none of this — it's the manifest's own declared shape, same trust
+/// boundary as everywhere else in this app; see the module docs).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrustDisclosure {
+    /// Local files this manifest reads besides its credential stores:
+    /// `[[http.value]] path`, `[http.version] files`, and an `oauth-refresh`
+    /// step's `[surface.auth.client] files`/`bins`/`id_env`/`secret_env`/
+    /// `id_pattern`/`secret_pattern` — `bins` entries are the *program
+    /// names* `bin_candidates` resolves on `PATH`, labelled `"<name>
+    /// (resolved on PATH or the usual CLI install directories)"` rather than
+    /// a path, since which file that resolves to isn't known until the
+    /// client is actually installed; `id_env`/`secret_env` are not a file at
+    /// all, labelled `"$NAME (environment variable)"` so a registry manifest
+    /// cannot name, say, `AWS_SECRET_ACCESS_KEY` and install unseen just
+    /// because nothing here is technically a path; `id_pattern`/
+    /// `secret_pattern` are not a place read from at all, labelled
+    /// `"id_pattern: <pattern>"`/`"secret_pattern: <pattern>"` — without them
+    /// the dialog would show only *where* a `client` table looks, never
+    /// *what shape* it pulls out of there. What makes rendering the pattern
+    /// *text* safe is `manifest::validate`'s `CLIENT_PATTERN_MAX_TEXT_BYTES`
+    /// cap on the pattern's own source (512 bytes) — a **different** bound
+    /// from `CLIENT_PATTERN_MAX_MATCH_BYTES`, which limits only what the
+    /// pattern can *match* and says nothing about how long the pattern
+    /// itself is (thousands of fixed-length alternatives could match a
+    /// short string while running to kilobytes of source). Even so, this
+    /// truncates each rendered pattern to 120 bytes plus `…` — a dialog line
+    /// is meant to be read, not merely not-unbounded. `files`/
+    /// `http.version.files` end up in a request
+    /// header, so a manifest can turn any readable JSON file on the machine
+    /// into something it sends; `client.files`/`bins`/env vars/patterns are
+    /// read for a different reason (resolving an OAuth id/secret pair — see
+    /// `auth::resolve_client`) but are exactly as much "this manifest reads
+    /// a credential from somewhere of its own choosing" as the other two,
+    /// and the installer has to be told before, not after, either way.
+    pub local_files: Vec<String>,
+    /// The command this manifest runs after a window resets (`[ping]`), if it
+    /// declares one. It is the only field in a manifest that executes
+    /// anything, so it is the last one that should be invisible here.
+    pub ping: Option<String>,
+    pub engine: EngineKind,
+    /// Every distinct [`AuthType`] used by any `[[surface.auth]]` step
+    /// across every surface, in first-seen order.
+    pub auth_types: Vec<AuthType>,
+    /// Every distinct host a request could reach: `[[http.request]].url`
+    /// hosts plus `[account].url`'s host (when `type = "http"`), in
+    /// first-seen order, case-insensitively de-duplicated.
+    pub dest_hosts: Vec<String>,
+    /// The subset of `dest_hosts` that is **not** in the `trusted_hosts` set
+    /// [`analyze_trust`] was called with, same order/case-insensitive
+    /// dedup as `dest_hosts` — a UI can use this to highlight which
+    /// destinations are unfamiliar without having to re-derive the trusted
+    /// set itself. Purely informational: unlike the pre-widening rule, this
+    /// list no longer feeds into `requires_approval` (see that field's doc).
+    pub untrusted_hosts: Vec<String>,
+    /// `true` when this manifest combines a credential-*store*-backed auth
+    /// step (`credentials-file`/`keychain`/`electron-safe-storage`/
+    /// `win-credential` — i.e. reads a secret out of some OS/app-managed
+    /// store, as opposed to a plain `env` var the user set themselves) with
+    /// `engine = "http-api"` — the combination `docs/PLUGIN-ARCHITECTURE.md`'s
+    /// Trust model section flags as the actual exfiltration risk. Widened
+    /// (2026-07): this used to also require a destination host outside
+    /// `trusted_hosts`, but every path that calls [`analyze_trust`] is the
+    /// *install* flow, where the manifest is by definition a third party —
+    /// bundled codex/claude are seeded straight onto disk and never go
+    /// through this gate — so gating on host as well as store-backed auth
+    /// just gave a false sense of safety for a manifest that happens to
+    /// (today) point at a trusted host but could point anywhere after an
+    /// update. `dest_hosts`/`untrusted_hosts` are still disclosed so the UI
+    /// can call out unfamiliar destinations, they just no longer decide
+    /// whether approval is *required*. `env`-only auth is disclosed in
+    /// `auth_types` like everything else, but deliberately never gates this
+    /// flag on its own (see that doc's rationale: an env var is something
+    /// the user put there themselves, not a store this manifest goes
+    /// digging in).
+    pub requires_approval: bool,
+}
+
+/// Push `url`'s host onto `dest_hosts` if it has one and isn't already
+/// present (case-insensitive) — the de-duplication helper behind
+/// [`analyze_trust`]'s `dest_hosts` list.
+fn push_dest_host(url: &str, dest_hosts: &mut Vec<String>) {
+    if let Some(h) = url_host(url) {
+        if !dest_hosts
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(h))
+        {
+            dest_hosts.push(h.to_string());
+        }
+    }
+}
+
+/// The most bytes of a `client.id_pattern`/`secret_pattern` [`analyze_trust`]
+/// renders before cutting it short with `…` — smaller than
+/// `manifest::CLIENT_PATTERN_MAX_TEXT_BYTES` (512, the *load-time* cap on
+/// the pattern's own text) on purpose: a dialog line is meant to be read at
+/// a glance, not merely bounded enough not to be a denial-of-service.
+const PATTERN_DISPLAY_MAX_BYTES: usize = 120;
+
+/// `s`, cut to at most [`PATTERN_DISPLAY_MAX_BYTES`] and marked with `…` if
+/// it was — backed off to the nearest char boundary at or before the cap, so
+/// a multi-byte character straddling the cut point is never split into
+/// invalid UTF-8.
+fn truncate_for_display(s: &str) -> String {
+    if s.len() <= PATTERN_DISPLAY_MAX_BYTES {
+        return s.to_string();
+    }
+    let mut cut = PATTERN_DISPLAY_MAX_BYTES;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &s[..cut])
+}
+
+/// Build a [`TrustDisclosure`] for `m` against `trusted_hosts` (pass
+/// [`TRUSTED_HOSTS`] for the built-in default).
+pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclosure {
+    let mut auth_types: Vec<AuthType> = Vec::new();
+    for surface in &m.surface {
+        for step in &surface.auth {
+            if !auth_types.contains(&step.kind) {
+                auth_types.push(step.kind);
+            }
+        }
+    }
+
+    let mut dest_hosts: Vec<String> = Vec::new();
+    if let Some(http) = &m.http {
+        for req in &http.request {
+            push_dest_host(&req.url, &mut dest_hosts);
+        }
+    }
+    if let Some(url) = &m.account.url {
+        push_dest_host(url, &mut dest_hosts);
+    }
+
+    let mut local_files: Vec<String> = Vec::new();
+    if let Some(http) = &m.http {
+        for v in &http.value {
+            if let Some(path) = &v.path {
+                if !local_files.contains(path) {
+                    local_files.push(path.clone());
+                }
+            }
+        }
+        if let Some(version) = &http.version {
+            for file in &version.files {
+                if !local_files.contains(file) {
+                    local_files.push(file.clone());
+                }
+            }
+        }
+    }
+    for surface in &m.surface {
+        for step in &surface.auth {
+            let Some(client) = &step.client else { continue };
+            for file in &client.files {
+                if !local_files.contains(file) {
+                    local_files.push(file.clone());
+                }
+            }
+            for name in &client.bins {
+                let label =
+                    format!("{name} (resolved on PATH or the usual CLI install directories)");
+                if !local_files.contains(&label) {
+                    local_files.push(label);
+                }
+            }
+            // Not a file read, but the same "this manifest can turn into a
+            // credential from somewhere the installer hasn't seen" shape:
+            // `id_env`/`secret_env` name environment variables this step
+            // reads outright, ahead of ever touching `files`/`bins`. Folded
+            // into `local_files` rather than a list of its own — the field
+            // this struct exposes is a flat disclosure of "things read off
+            // this machine", and a `$NAME` reads unambiguously as not a path.
+            for env_name in [&client.id_env, &client.secret_env].into_iter().flatten() {
+                let label = format!("${env_name} (environment variable)");
+                if !local_files.contains(&label) {
+                    local_files.push(label);
+                }
+            }
+            // Not a place read from either, but the shape a `files`/`bins`
+            // candidate is searched for — without it the dialog would show
+            // only *where* this step looks, never *what* it pulls out of
+            // there. `manifest::validate` bounds the pattern's own text to
+            // `CLIENT_PATTERN_MAX_TEXT_BYTES` (512) — a load-time ceiling,
+            // not a rendering one; `truncate_for_display` is the rendering
+            // one, shorter still, so a dialog line stays a dialog line.
+            for (kind, pattern) in [
+                ("id_pattern", &client.id_pattern),
+                ("secret_pattern", &client.secret_pattern),
+            ] {
+                let Some(pattern) = pattern else { continue };
+                let label = format!("{kind}: {}", truncate_for_display(pattern));
+                if !local_files.contains(&label) {
+                    local_files.push(label);
+                }
+            }
+        }
+    }
+
+    let ping = m.ping.as_ref().map(|p| {
+        if p.args.is_empty() {
+            p.bin.clone()
+        } else {
+            format!("{} {}", p.bin, p.args.join(" "))
+        }
+    });
+
+    let untrusted_hosts: Vec<String> = dest_hosts
+        .iter()
+        .filter(|h| {
+            !trusted_hosts
+                .iter()
+                .any(|trusted| trusted.eq_ignore_ascii_case(h))
+        })
+        .cloned()
+        .collect();
+
+    let store_backed = auth_types.iter().any(|t| {
+        matches!(
+            t,
+            AuthType::CredentialsFile
+                | AuthType::Keychain
+                | AuthType::ElectronSafeStorage
+                | AuthType::WinCredential
+                // Added with the step itself, and nearly not: a `credentials-map`
+                // step reads somebody's credential file exactly like
+                // `credentials-file` does — it only picks the record out of a map
+                // rather than out of a single object — so a manifest whose one
+                // auth step is this used to install with no dialog at all,
+                // because nothing else here would have flagged it. The rule this
+                // list encodes is "does the manifest read a credential", not
+                // "which spelling of reading one", and every future variant has
+                // to be added here in the change that adds it.
+                | AuthType::CredentialsMap
+                // `oauth-refresh` does more than read a credential — it *sends*
+                // one (a refresh token) to the network. If anything here needs
+                // the trust dialog, it does; leaving it out would let a manifest
+                // whose only step is this install with no dialog, reading a local
+                // file and mailing a refresh token to a host. Added with the step
+                // in the same change, exactly as `credentials-map` was.
+                | AuthType::OauthRefresh
+        )
+    });
+    // Widened (2026-07): no longer conditioned on `dest_hosts` reaching
+    // outside `trusted_hosts` — see `requires_approval`'s doc comment.
+    //
+    // Widened again: reading a credential is not the only thing worth
+    // stopping for. A manifest that names a command to run needs approval
+    // whatever its engine — that command is arbitrary, and the toggle that
+    // later fires it cannot describe itself. So does one that reads local
+    // files of its own choosing into a request header: that is the same
+    // "somebody's file leaves this machine" shape as a credential, minus the
+    // word credential.
+    let requires_approval = (store_backed && m.engine == EngineKind::HttpApi)
+        || ping.is_some()
+        || !local_files.is_empty();
+
+    TrustDisclosure {
+        engine: m.engine,
+        auth_types,
+        dest_hosts,
+        untrusted_hosts,
+        local_files,
+        ping,
+        requires_approval,
+    }
+}
+
+// ── Network (the only part that isn't unit-tested) ───────────────────────
+
+/// Whether `url` uses `https://` — split out of [`fetch_text`]/[`fetch_bytes`]
+/// so the gate itself is testable without ever calling either networked
+/// function.
+fn is_https(url: &str) -> bool {
+    url.starts_with("https://")
+}
+
+/// GET `url` (`index.toml`) and return the raw response body as text.
+/// HTTPS-only (a plain-`http://` URL is refused before any connection is
+/// attempted — the registry's whole trust story rests on verified sha256
+/// *and* a non-tampered transport). Built like
+/// `crate::plugin::engine_http::perform`: `redirects(0)` (so a compromised/
+/// misconfigured CDN can't silently hand back content from a different
+/// host — the caller's own URL is all that was ever vetted) and an ~8s
+/// timeout.
+///
+/// Only ever used for `index.toml` — see [`fetch_bytes`] for why a manifest
+/// file must go through that function instead. Not exercised by any test in
+/// this module — see the module docs.
+pub fn fetch_text(url: &str) -> Result<String, String> {
+    if !is_https(url) {
+        return Err(format!("refusing non-https URL: {url}"));
+    }
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let req = agent.get(url).timeout(Duration::from_secs(8));
+    match req.call() {
+        Ok(r) if (300..400).contains(&r.status()) => {
+            Err(format!("HTTP {} (redirect blocked)", r.status()))
+        }
+        Ok(r) => r.into_string().map_err(|e| format!("bad response: {e}")),
+        Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
+        Err(e) => Err(format!("network error: {e}")),
+    }
+}
+
+/// GET `url` (a manifest file) and return the raw response body as bytes,
+/// **undecoded** — unlike [`fetch_text`]'s `into_string`, which UTF-8-decodes
+/// the body first. That decode is harmless for `index.toml` (parsed as TOML
+/// text anyway), but wrong for a manifest: [`verify_and_prepare`]'s sha256
+/// check is only meaningful against the exact bytes the server sent — a
+/// manifest that isn't UTF-8-clean, or that round-trips through decode/
+/// re-encode with different line endings or a BOM, would then hash to
+/// something other than what `index.toml` actually published, producing a
+/// false mismatch (or, worse, a false match against bytes that were never
+/// actually served). Same HTTPS-only gate, `redirects(0)`, ~8s timeout, and
+/// response-size cap as [`fetch_text`] — see its own docs for the rationale,
+/// which applies here unchanged. The cap matters here specifically because
+/// `Response::into_reader()` (unlike `into_string()`, which applies ureq's
+/// own 10MB `INTO_STRING_LIMIT` internally before ever returning) is
+/// otherwise fully unbounded — without re-imposing the same ceiling here, a
+/// hostile or misbehaving registry could make this function buffer an
+/// unbounded response into memory, and it would do so *before*
+/// [`verify_and_prepare`]'s sha256 check (which only runs once this function
+/// has already returned) ever gets a chance to reject it.
+///
+/// Not exercised by any test in this module — see the module docs.
+pub fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+    if !is_https(url) {
+        return Err(format!("refusing non-https URL: {url}"));
+    }
+    // Mirrors ureq's own private `Response::INTO_STRING_LIMIT` — see this
+    // function's own doc comment for why `into_reader()` needs the same cap
+    // re-imposed by hand.
+    const MAX_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let req = agent.get(url).timeout(Duration::from_secs(8));
+    match req.call() {
+        Ok(r) if (300..400).contains(&r.status()) => {
+            Err(format!("HTTP {} (redirect blocked)", r.status()))
+        }
+        Ok(r) => {
+            let mut buf = Vec::new();
+            r.into_reader()
+                .take(MAX_RESPONSE_BYTES + 1)
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("bad response: {e}"))?;
+            if buf.len() as u64 > MAX_RESPONSE_BYTES {
+                return Err("response too big for fetch_bytes".to_string());
+            }
+            Ok(buf)
+        }
+        Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
+        Err(e) => Err(format!("network error: {e}")),
+    }
+}
+
+// ── Tests (hermetic: no network — fetch_text/fetch_bytes never called) ───
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── RegistryIndex::from_str ──────────────────────────────────────────
+
+    const VALID_INDEX: &str = r#"
+        schema_version = 1
+
+        [[plugin]]
+        id          = "some-provider"
+        name        = "Some Provider"
+        version     = "1.0.0"
+        description = "Some Provider usage indicator"
+        manifest    = "manifests/some-provider.toml"
+        sha256      = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+        [[plugin]]
+        id       = "another"
+        name     = "Another"
+        version  = "2.3.4"
+        manifest = "manifests/another.toml"
+        sha256   = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    "#;
+
+    #[test]
+    fn parses_a_valid_index() {
+        let idx = RegistryIndex::from_str(VALID_INDEX).expect("valid index");
+        assert_eq!(idx.schema_version, 1);
+        assert_eq!(idx.plugins.len(), 2);
+        let first = &idx.plugins[0];
+        assert_eq!(first.id, "some-provider");
+        assert_eq!(first.name, "Some Provider");
+        assert_eq!(first.version, "1.0.0");
+        assert_eq!(
+            first.description.as_deref(),
+            Some("Some Provider usage indicator")
+        );
+        assert_eq!(first.manifest, "manifests/some-provider.toml");
+        assert_eq!(first.sha256.len(), 64);
+        assert!(
+            idx.plugins[1].description.is_none(),
+            "description is optional"
+        );
+    }
+
+    #[test]
+    fn schema_version_defaults_to_1_when_omitted() {
+        let idx = RegistryIndex::from_str(
+            r#"
+            [[plugin]]
+            id       = "x"
+            name     = "X"
+            version  = "1.0.0"
+            manifest = "manifests/x.toml"
+            sha256   = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        "#,
+        )
+        .expect("valid index");
+        assert_eq!(idx.schema_version, 1);
+    }
+
+    #[test]
+    fn empty_index_with_no_plugins_is_valid() {
+        let idx = RegistryIndex::from_str("schema_version = 1").expect("valid empty index");
+        assert!(idx.plugins.is_empty());
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored_not_rejected() {
+        let idx = RegistryIndex::from_str(
+            r#"
+            schema_version = 1
+            future_top_level_field = "ignored"
+
+            [[plugin]]
+            id                 = "x"
+            name               = "X"
+            version            = "1.0.0"
+            manifest           = "manifests/x.toml"
+            sha256             = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            future_entry_field = 123
+        "#,
+        )
+        .expect("unknown fields must not break parsing");
+        assert_eq!(idx.plugins[0].id, "x");
+    }
+
+    #[test]
+    fn rejects_malformed_toml() {
+        assert!(RegistryIndex::from_str("this is not [valid toml").is_err());
+    }
+
+    fn entry_with(field: &str, value: &str) -> String {
+        let mut base = std::collections::BTreeMap::from([
+            ("id", "x".to_string()),
+            ("name", "X".to_string()),
+            ("version", "1.0.0".to_string()),
+            ("manifest", "manifests/x.toml".to_string()),
+            (
+                "sha256",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            ),
+        ]);
+        base.insert(field, value.to_string());
+        let body: String = base
+            .iter()
+            .map(|(k, v)| format!("{k} = \"{v}\"\n"))
+            .collect();
+        format!("[[plugin]]\n{body}")
+    }
+
+    #[test]
+    fn rejects_sha256_wrong_length() {
+        let idx = entry_with("sha256", "abc123");
+        let err = RegistryIndex::from_str(&idx).expect_err("short sha256 must be rejected");
+        assert!(err.contains("sha256"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_sha256_non_hex() {
+        let idx = entry_with(
+            "sha256",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        );
+        assert!(RegistryIndex::from_str(&idx).is_err());
+    }
+
+    #[test]
+    fn rejects_sha256_uppercase() {
+        let idx = entry_with(
+            "sha256",
+            "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+        );
+        let err = RegistryIndex::from_str(&idx).expect_err("uppercase sha256 must be rejected");
+        assert!(err.contains("sha256"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_manifest_path_with_a_url_scheme() {
+        let idx = entry_with("manifest", "https://evil.example.com/x.toml");
+        let err =
+            RegistryIndex::from_str(&idx).expect_err("scheme in manifest path must be rejected");
+        assert!(err.contains("manifest"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_manifest_path_with_a_leading_slash() {
+        let idx = entry_with("manifest", "/etc/passwd");
+        assert!(RegistryIndex::from_str(&idx).is_err());
+    }
+
+    #[test]
+    fn rejects_manifest_path_with_a_dotdot_component() {
+        let idx = entry_with("manifest", "../../etc/passwd");
+        assert!(RegistryIndex::from_str(&idx).is_err());
+        let idx2 = entry_with("manifest", "manifests/../../secret.toml");
+        assert!(RegistryIndex::from_str(&idx2).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_version() {
+        let idx = entry_with("version", "");
+        let err = RegistryIndex::from_str(&idx).expect_err("empty version must be rejected");
+        assert!(err.contains("version"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_ids() {
+        let idx = format!("{VALID_INDEX}\n[[plugin]]\nid = \"some-provider\"\nname = \"Dup\"\nversion = \"1.0.0\"\nmanifest = \"manifests/dup.toml\"\nsha256 = \"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\"\n");
+        let err = RegistryIndex::from_str(&idx).expect_err("duplicate id must be rejected");
+        assert!(err.contains("duplicate"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_bad_id_charset() {
+        let idx = entry_with("id", "../evil");
+        assert!(RegistryIndex::from_str(&idx).is_err());
+    }
+
+    // ── resolve_manifest_url ─────────────────────────────────────────────
+
+    #[test]
+    fn resolves_manifest_path_against_index_url_with_index_toml_suffix() {
+        let url = resolve_manifest_url(
+            "https://example.com/registry/index.toml",
+            "manifests/some-provider.toml",
+        )
+        .expect("resolves");
+        assert_eq!(
+            url,
+            "https://example.com/registry/manifests/some-provider.toml"
+        );
+    }
+
+    #[test]
+    fn resolves_manifest_path_against_index_url_without_index_toml_suffix() {
+        let url = resolve_manifest_url("https://example.com/registry/", "manifests/x.toml")
+            .expect("resolves");
+        assert_eq!(url, "https://example.com/registry/manifests/x.toml");
+    }
+
+    #[test]
+    fn resolve_manifest_url_rejects_a_traversal_path() {
+        assert!(resolve_manifest_url(
+            "https://example.com/registry/index.toml",
+            "../../etc/passwd"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn resolve_manifest_url_rejects_a_scheme_in_the_relative_path() {
+        assert!(resolve_manifest_url(
+            "https://example.com/registry/index.toml",
+            "https://evil.example.com/x.toml"
+        )
+        .is_err());
+    }
+
+    // ── version_cmp / update_available ───────────────────────────────────
+
+    #[test]
+    fn version_cmp_compares_numerically_not_lexicographically() {
+        assert_eq!(version_cmp("1.2.0", "1.10.0"), Ordering::Less);
+        assert_eq!(version_cmp("1.10.0", "1.2.0"), Ordering::Greater);
+    }
+
+    #[test]
+    fn version_cmp_equal_versions() {
+        assert_eq!(version_cmp("1.2.3", "1.2.3"), Ordering::Equal);
+    }
+
+    #[test]
+    fn version_cmp_unparsable_falls_back_to_string_comparison() {
+        assert_eq!(version_cmp("abc", "abd"), Ordering::Less);
+        assert_eq!(version_cmp("1.2.3-beta", "1.2.3-beta"), Ordering::Equal);
+        assert_ne!(
+            version_cmp("1.2", "1.2.0"),
+            Ordering::Equal,
+            "\"1.2\" isn't a plain x.y.z"
+        );
+    }
+
+    // ── version_cmp: semver prerelease/build semantics ───────────────────
+
+    #[test]
+    fn version_cmp_a_release_outranks_its_own_prerelease() {
+        assert_eq!(version_cmp("1.0.0-alpha", "1.0.0"), Ordering::Less);
+        assert_eq!(version_cmp("1.0.0", "1.0.0-alpha"), Ordering::Greater);
+    }
+
+    #[test]
+    fn version_cmp_numeric_base_still_wins_over_prerelease_status() {
+        assert_eq!(version_cmp("1.0.0", "1.0.1"), Ordering::Less);
+        // A prerelease of a newer base still outranks an older release.
+        assert_eq!(version_cmp("1.0.1-alpha", "1.0.0"), Ordering::Greater);
+    }
+
+    #[test]
+    fn version_cmp_prereleases_of_the_same_base_compare_lexically_by_identifier() {
+        assert_eq!(version_cmp("1.0.0-alpha", "1.0.0-beta"), Ordering::Less);
+        assert_eq!(version_cmp("1.0.0-beta", "1.0.0-alpha"), Ordering::Greater);
+    }
+
+    #[test]
+    fn version_cmp_prereleases_compare_numeric_identifiers_numerically() {
+        // "9" < "10" numerically, unlike a naive lexical compare of the
+        // dot-segment strings.
+        assert_eq!(
+            version_cmp("1.0.0-alpha.9", "1.0.0-alpha.10"),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn version_cmp_a_shorter_prerelease_sorts_before_a_longer_one_with_the_same_prefix() {
+        assert_eq!(version_cmp("1.0.0-alpha", "1.0.0-alpha.1"), Ordering::Less);
+    }
+
+    #[test]
+    fn version_cmp_build_metadata_never_affects_precedence() {
+        assert_eq!(version_cmp("1.0.0+build", "1.0.0"), Ordering::Equal);
+        assert_eq!(version_cmp("1.0.0+build1", "1.0.0+build2"), Ordering::Equal);
+        assert_eq!(
+            version_cmp("1.0.0-alpha+build", "1.0.0-alpha"),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn update_available_true_when_registry_is_newer() {
+        assert!(update_available("1.2.0", "1.10.0"));
+    }
+
+    #[test]
+    fn update_available_false_when_versions_are_equal() {
+        assert!(!update_available("1.2.3", "1.2.3"));
+    }
+
+    #[test]
+    fn update_available_false_on_downgrade() {
+        assert!(!update_available("2.0.0", "1.9.9"));
+    }
+
+    #[test]
+    fn update_available_unparsable_versions_compare_as_unequal_strings() {
+        assert!(
+            update_available("aaa", "bbb"),
+            "\"bbb\" > \"aaa\" lexicographically"
+        );
+        assert!(!update_available("bbb", "aaa"));
+    }
+
+    // ── sha256 ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sha256_hex_matches_known_test_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn verify_sha256_matches_case_insensitively() {
+        assert!(verify_sha256(
+            b"abc",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        ));
+        assert!(verify_sha256(
+            b"abc",
+            "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"
+        ));
+    }
+
+    #[test]
+    fn verify_sha256_rejects_a_mismatch() {
+        assert!(!verify_sha256(
+            b"not abc",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        ));
+    }
+
+    // ── verify_and_prepare ────────────────────────────────────────────────
+
+    const MINIMAL_MANIFEST: &str = r#"
+        id         = "x"
+        name       = "X"
+        menu_label = "X"
+        order      = 1
+        engine     = "log-file"
+        [[windows]]
+        label = "5H"
+        role  = "primary"
+        [windows.period]
+        mode = "assumed"
+        assumed = 300
+        [windows.source]
+        used_percent_path = "p"
+        resets_at_path = "r"
+        [logfile]
+        root = "~/.x"
+        glob = "*.jsonl"
+        container_key = "rate_limits"
+    "#;
+
+    #[test]
+    fn verify_and_prepare_succeeds_on_matching_hash_and_valid_manifest() {
+        let bytes = MINIMAL_MANIFEST.as_bytes();
+        let expected = sha256_hex(bytes);
+        let (manifest, hash) = verify_and_prepare(bytes, &expected).expect("verifies and parses");
+        assert_eq!(manifest.id, "x");
+        assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn verify_and_prepare_rejects_a_hash_mismatch_before_parsing() {
+        let bytes = MINIMAL_MANIFEST.as_bytes();
+        let wrong = "0".repeat(64);
+        let err = verify_and_prepare(bytes, &wrong).expect_err("hash mismatch must be rejected");
+        assert!(err.contains("mismatch"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn verify_and_prepare_rejects_bytes_that_hash_correctly_but_dont_parse() {
+        let bytes = b"this is not valid toml at all";
+        let expected = sha256_hex(bytes);
+        assert!(verify_and_prepare(bytes, &expected).is_err());
+    }
+
+    // ── lockfile round-trip (tempdir only — never the real config dir) ───
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-registry-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn lockfile_round_trips_through_a_tempdir() {
+        let dir = temp_dir("lockfile-roundtrip");
+        let path = dir.join("registry-state.json");
+
+        let loaded_before = load_lockfile(&path);
+        assert!(
+            loaded_before.plugins.is_empty(),
+            "missing file loads as empty state"
+        );
+
+        let mut state = RegistryLockState::default();
+        state.set(
+            "some-provider",
+            RegistryLockEntry {
+                origin_registry_url: "https://example.com/registry/index.toml".to_string(),
+                origin_version: "1.0.0".to_string(),
+                origin_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+                installed_at: 1_800_000_000,
+            },
+        );
+        save_lockfile(&path, &state).expect("save");
+
+        let loaded = load_lockfile(&path);
+        std::fs::remove_dir_all(&dir).ok();
+
+        let entry = loaded
+            .get("some-provider")
+            .expect("entry present after round-trip");
+        assert_eq!(entry.origin_version, "1.0.0");
+        assert_eq!(entry.installed_at, 1_800_000_000);
+    }
+
+    #[test]
+    fn lockfile_load_of_corrupt_json_yields_empty_state() {
+        let dir = temp_dir("lockfile-corrupt");
+        let path = dir.join("registry-state.json");
+        std::fs::write(&path, "not json at all").unwrap();
+        let state = load_lockfile(&path);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(state.plugins.is_empty());
+    }
+
+    #[test]
+    fn lockfile_set_and_remove() {
+        let mut state = RegistryLockState::default();
+        state.set(
+            "x",
+            RegistryLockEntry {
+                origin_registry_url: "https://example.com/index.toml".to_string(),
+                origin_version: "1.0.0".to_string(),
+                origin_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+                installed_at: 0,
+            },
+        );
+        assert!(state.get("x").is_some());
+        state.remove("x");
+        assert!(state.get("x").is_none());
+    }
+
+    // ── diff_installed: state machine ────────────────────────────────────
+
+    const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const HASH_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    fn one_entry_index(sha256: &str, version: &str) -> RegistryIndex {
+        RegistryIndex {
+            schema_version: 1,
+            plugins: vec![RegistryEntry {
+                id: "prov".to_string(),
+                name: "Prov".to_string(),
+                version: version.to_string(),
+                description: None,
+                manifest: "manifests/prov.toml".to_string(),
+                sha256: sha256.to_string(),
+            }],
+        }
+    }
+
+    fn lock_with(sha256: &str, version: &str) -> RegistryLockState {
+        let mut state = RegistryLockState::default();
+        state.set(
+            "prov",
+            RegistryLockEntry {
+                origin_registry_url: "https://example.com/index.toml".to_string(),
+                origin_version: version.to_string(),
+                origin_sha256: sha256.to_string(),
+                installed_at: 0,
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn diff_new_when_no_local_file() {
+        let idx = one_entry_index(HASH_A, "1.0.0");
+        let states = diff_installed(&idx, &[], &RegistryLockState::default());
+        assert_eq!(states, vec![RegistryPluginState::New]);
+    }
+
+    #[test]
+    fn diff_up_to_date_when_local_and_index_both_match_origin() {
+        let idx = one_entry_index(HASH_A, "1.0.0");
+        let lockfile = lock_with(HASH_A, "1.0.0");
+        let installed = vec![("prov".to_string(), HASH_A.to_string(), "1.0.0".to_string())];
+        let states = diff_installed(&idx, &installed, &lockfile);
+        assert_eq!(
+            states,
+            vec![RegistryPluginState::UpToDate {
+                locally_modified: false
+            }]
+        );
+    }
+
+    #[test]
+    fn diff_update_available_safe_when_local_matches_origin_but_index_moved() {
+        let idx = one_entry_index(HASH_B, "1.1.0"); // index != origin (HASH_A)
+        let lockfile = lock_with(HASH_A, "1.0.0");
+        let installed = vec![("prov".to_string(), HASH_A.to_string(), "1.0.0".to_string())];
+        let states = diff_installed(&idx, &installed, &lockfile);
+        assert_eq!(
+            states,
+            vec![RegistryPluginState::UpdateAvailable {
+                overwrite_safe: true,
+                warning: None
+            }]
+        );
+    }
+
+    #[test]
+    fn diff_up_to_date_but_locally_modified_when_local_diverges_and_index_matches_origin() {
+        let idx = one_entry_index(HASH_A, "1.0.0"); // index == origin
+        let lockfile = lock_with(HASH_A, "1.0.0");
+        let installed = vec![("prov".to_string(), HASH_C.to_string(), "1.0.0".to_string())]; // local != origin
+        let states = diff_installed(&idx, &installed, &lockfile);
+        assert_eq!(
+            states,
+            vec![RegistryPluginState::UpToDate {
+                locally_modified: true
+            }]
+        );
+    }
+
+    #[test]
+    fn diff_update_available_unsafe_when_both_local_and_index_diverge_from_origin() {
+        let idx = one_entry_index(HASH_B, "1.1.0"); // index != origin
+        let lockfile = lock_with(HASH_A, "1.0.0");
+        let installed = vec![("prov".to_string(), HASH_C.to_string(), "1.0.0".to_string())]; // local != origin
+        let states = diff_installed(&idx, &installed, &lockfile);
+        match &states[0] {
+            RegistryPluginState::UpdateAvailable {
+                overwrite_safe,
+                warning,
+            } => {
+                assert!(!overwrite_safe);
+                assert!(warning.is_some());
+            }
+            other => panic!("expected UpdateAvailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_no_lockfile_record_falls_back_to_version_compare() {
+        let idx = one_entry_index(HASH_B, "2.0.0");
+        let installed = vec![("prov".to_string(), HASH_A.to_string(), "1.0.0".to_string())];
+        let states = diff_installed(&idx, &installed, &RegistryLockState::default());
+        match &states[0] {
+            RegistryPluginState::UpdateAvailable {
+                overwrite_safe,
+                warning,
+            } => {
+                assert!(!overwrite_safe, "no provenance -> never a safe overwrite");
+                assert!(warning.is_some());
+            }
+            other => panic!("expected UpdateAvailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_no_lockfile_record_and_same_version_is_up_to_date() {
+        let idx = one_entry_index(HASH_B, "1.0.0"); // same version, different hash
+        let installed = vec![("prov".to_string(), HASH_A.to_string(), "1.0.0".to_string())];
+        let states = diff_installed(&idx, &installed, &RegistryLockState::default());
+        assert_eq!(
+            states,
+            vec![RegistryPluginState::UpToDate {
+                locally_modified: false
+            }]
+        );
+    }
+
+    // ── analyze_trust ─────────────────────────────────────────────────────
+    //
+    // Widened rule (2026-07): `requires_approval` is now store-backed auth
+    // (credentials-file/keychain/electron-safe-storage/win-credential) AND
+    // `engine = "http-api"` — full stop, no longer conditioned on the
+    // destination host. `dest_hosts`/`untrusted_hosts` are still disclosed
+    // (and still worth asserting on), they just don't gate approval anymore.
+
+    fn http_api_manifest(url: &str, auth_type: &str) -> PluginManifest {
+        let toml = format!(
+            r#"
+            id         = "x"
+            name       = "X"
+            menu_label = "X"
+            order      = 1
+            engine     = "http-api"
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [http]
+            [[http.request]]
+            url = "{url}"
+            [[surface]]
+            id = "cli"
+            label = "CLI"
+            allowed_hosts = ["example.com"]
+            [[surface.auth]]
+            type = "{auth_type}"
+            path = "~/.x/creds.json"
+            token_json_path = "access_token"
+            service = "svc"
+            var = "SOME_VAR"
+            config_path = "~/.x/config.json"
+            blob_json_path = "blob"
+            macos_keychain_key = "key"
+            "#
+        );
+        PluginManifest::from_str(&toml).expect("valid manifest")
+    }
+
+    #[test]
+    fn http_api_with_credentials_file_and_untrusted_host_requires_approval() {
+        let m = http_api_manifest("https://evil.example.com/usage", "credentials-file");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert!(disclosure.requires_approval);
+        assert_eq!(disclosure.dest_hosts, vec!["evil.example.com".to_string()]);
+        assert_eq!(
+            disclosure.untrusted_hosts,
+            vec!["evil.example.com".to_string()]
+        );
+        assert_eq!(disclosure.auth_types, vec![AuthType::CredentialsFile]);
+    }
+
+    #[test]
+    fn http_api_with_credentials_file_and_trusted_host_still_requires_approval() {
+        // Widened rule: store-backed auth + http-api gates on its own now —
+        // the destination happening to be a trusted host no longer excuses
+        // it (a later manifest update could point the same store-backed
+        // auth at an untrusted host, and the install flow only asks once).
+        let m = http_api_manifest("https://api.anthropic.com/usage", "credentials-file");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert!(disclosure.requires_approval);
+        assert!(
+            disclosure.untrusted_hosts.is_empty(),
+            "the host is still disclosed as trusted even though approval is required regardless"
+        );
+    }
+
+    #[test]
+    fn a_manifest_whose_only_auth_step_reads_a_credential_map_still_needs_approval() {
+        // The gap this closes: nothing else in `analyze_trust` would have
+        // flagged such a manifest. It declares no `[ping]`, and `local_files`
+        // is fed only from `[[http.value]]` and `http.version.files` — never
+        // from an auth step's own `path` — so a third-party plugin reading
+        // somebody's `auth.json` and posting the token to its own host would
+        // have installed in silence.
+        let toml = r#"
+            id         = "x"
+            name       = "X"
+            menu_label = "X"
+            order      = 1
+            engine     = "http-api"
+            requires_reader = ["credentials-map"]
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [http]
+            [[http.request]]
+            url = "https://evil.example.com/usage"
+            [[surface]]
+            id = "cli"
+            label = "CLI"
+            allowed_hosts = ["example.com"]
+            [[surface.auth]]
+            type = "credentials-map"
+            path = "~/.x/auth.json"
+            key_prefix = "https://issuer::"
+            token_json_path = "key"
+        "#;
+        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert!(
+            disclosure.requires_approval,
+            "reading a credential out of a map is reading a credential"
+        );
+        assert_eq!(disclosure.auth_types, vec![AuthType::CredentialsMap]);
+    }
+
+    #[test]
+    fn http_api_with_keychain_and_untrusted_host_requires_approval() {
+        let m = http_api_manifest("https://evil.example.com/usage", "keychain");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert!(disclosure.requires_approval);
+        assert_eq!(
+            disclosure.untrusted_hosts,
+            vec!["evil.example.com".to_string()]
+        );
+        assert_eq!(disclosure.auth_types, vec![AuthType::Keychain]);
+    }
+
+    #[test]
+    fn an_oauth_refresh_step_is_credential_bearing_and_needs_approval() {
+        // The most security-significant line in the hybrid: a manifest whose
+        // step *sends* a refresh token to the network must not install without
+        // the trust dialog. Asserted directly, on a trusted host so nothing but
+        // the auth step could be what trips the approval.
+        let toml = r#"
+            id = "sample"
+            name = "Sample"
+            menu_label = "Sa"
+            order = 1
+            engine = "http-api"
+            requires_reader = ["oauth-refresh"]
+            [[windows]]
+            label = "5H"
+            role = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [http]
+            [[http.request]]
+            url = "https://example.com/usage"
+            [[surface]]
+            id = "cli"
+            label = "CLI"
+            allowed_hosts = ["example.com", "oauth2.googleapis.com"]
+            [[surface.auth]]
+            type = "oauth-refresh"
+            path = "~/.gemini/oauth_creds.json"
+            token_json_path = "refresh_token"
+            token_url = "https://oauth2.googleapis.com/token"
+            client_id = "cid.apps.googleusercontent.com"
+            client_secret = "secret"
+        "#;
+        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert!(
+            disclosure.requires_approval,
+            "a step that mails a refresh token to the network must be gated by the trust dialog"
+        );
+        assert_eq!(disclosure.auth_types, vec![AuthType::OauthRefresh]);
+    }
+
+    #[test]
+    fn a_client_discovery_tables_files_and_bins_are_disclosed_as_local_files() {
+        // The gap this closes: an `oauth-refresh` step's `client` table reads
+        // local files exactly like `[[http.value]] path` does — a `files`
+        // entry directly, a `bins` name after resolving it on `PATH` — and
+        // nothing else in `analyze_trust` would have noticed either.
+        let toml = r#"
+            id = "sample"
+            name = "Sample"
+            menu_label = "Sa"
+            order = 1
+            engine = "http-api"
+            requires_reader = ["oauth-refresh", "oauth-client-discovery"]
+            [[windows]]
+            label = "5H"
+            role = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [http]
+            [[http.request]]
+            url = "https://example.com/usage"
+            [[surface]]
+            id = "cli"
+            label = "CLI"
+            allowed_hosts = ["example.com", "oauth2.googleapis.com"]
+            [[surface.auth]]
+            type = "oauth-refresh"
+            path = "~/.gemini/oauth_creds.json"
+            token_json_path = "refresh_token"
+            token_url = "https://oauth2.googleapis.com/token"
+            [surface.auth.client]
+            id_env         = "SAMPLE_CLIENT_ID"
+            secret_env     = "SAMPLE_CLIENT_SECRET"
+            id_pattern     = "[0-9]{1,10}-[a-z]{1,10}\\.apps\\.googleusercontent\\.com"
+            secret_pattern = "GOCSPX-[A-Za-z0-9]{1,20}"
+            files = ["/Applications/Sample.app/Contents/MacOS/sample"]
+            bins  = ["sample-cli"]
+        "#;
+        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert!(
+            disclosure
+                .local_files
+                .contains(&"/Applications/Sample.app/Contents/MacOS/sample".to_string()),
+            "{:?}",
+            disclosure.local_files
+        );
+        assert!(
+            disclosure.local_files.contains(
+                &"sample-cli (resolved on PATH or the usual CLI install directories)".to_string()
+            ),
+            "a `bins` name is disclosed labelled, not as a bare path nobody can act on — {:?}",
+            disclosure.local_files
+        );
+        // The env override is a way to hand this app a credential without
+        // any file ever being read — a registry manifest naming, say,
+        // `AWS_SECRET_ACCESS_KEY` must not install unseen just because
+        // nothing here is technically a *file*.
+        assert!(
+            disclosure
+                .local_files
+                .contains(&"$SAMPLE_CLIENT_ID (environment variable)".to_string()),
+            "{:?}",
+            disclosure.local_files
+        );
+        assert!(
+            disclosure
+                .local_files
+                .contains(&"$SAMPLE_CLIENT_SECRET (environment variable)".to_string()),
+            "{:?}",
+            disclosure.local_files
+        );
+        // The patterns themselves — not a place read from, but what a
+        // `files`/`bins` candidate is searched for. Without these the
+        // dialog would show only where this step looks, never what shape
+        // it pulls out of there.
+        assert!(
+            disclosure.local_files.contains(
+                &"id_pattern: [0-9]{1,10}-[a-z]{1,10}\\.apps\\.googleusercontent\\.com".to_string()
+            ),
+            "{:?}",
+            disclosure.local_files
+        );
+        assert!(
+            disclosure
+                .local_files
+                .contains(&"secret_pattern: GOCSPX-[A-Za-z0-9]{1,20}".to_string()),
+            "{:?}",
+            disclosure.local_files
+        );
+        assert!(
+            disclosure.requires_approval,
+            "reading a local file, however it's named, needs approval"
+        );
+    }
+
+    #[test]
+    fn a_client_pattern_longer_than_the_display_limit_is_truncated_with_an_ellipsis() {
+        // `manifest::validate`'s own cap on a pattern's source text is 512
+        // bytes — a load-time ceiling, not a rendering one. This pattern is
+        // 150 bytes: valid, bounded, non-empty-match (a run of literal `1`s
+        // matches only itself), so it loads fine — but is still well over
+        // `PATTERN_DISPLAY_MAX_BYTES` (120), and the dialog line must not
+        // grow to match it.
+        let long_pattern = "1".repeat(150);
+        let toml = r#"
+            id = "sample"
+            name = "Sample"
+            menu_label = "Sa"
+            order = 1
+            engine = "http-api"
+            requires_reader = ["oauth-refresh", "oauth-client-discovery"]
+            [[windows]]
+            label = "5H"
+            role = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [http]
+            [[http.request]]
+            url = "https://example.com/usage"
+            [[surface]]
+            id = "cli"
+            label = "CLI"
+            allowed_hosts = ["example.com", "oauth2.googleapis.com"]
+            [[surface.auth]]
+            type = "oauth-refresh"
+            path = "~/.gemini/oauth_creds.json"
+            token_json_path = "refresh_token"
+            token_url = "https://oauth2.googleapis.com/token"
+            [surface.auth.client]
+            id_pattern     = "{long_pattern}"
+            secret_pattern = "GOCSPX-[A-Za-z0-9]{1,20}"
+            files = ["/Applications/Sample.app/Contents/MacOS/sample"]
+        "#
+        .replace("{long_pattern}", &long_pattern);
+        let m = PluginManifest::from_str(&toml)
+            .expect("valid manifest — 150 bytes is under the 512 limit");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+
+        let expected = format!(
+            "id_pattern: {}…",
+            &long_pattern[..PATTERN_DISPLAY_MAX_BYTES]
+        );
+        assert!(
+            disclosure.local_files.contains(&expected),
+            "{:?}",
+            disclosure.local_files
+        );
+        assert!(
+            !disclosure
+                .local_files
+                .iter()
+                .any(|f| f.starts_with("id_pattern:") && f.len() > 140),
+            "the rendered pattern must be cut short, not grown to match the source — {:?}",
+            disclosure.local_files
+        );
+    }
+
+    #[test]
+    fn log_file_manifest_with_no_auth_does_not_require_approval() {
+        let toml = r#"
+            id         = "x"
+            name       = "X"
+            menu_label = "X"
+            order      = 1
+            engine     = "log-file"
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [logfile]
+            root = "~/.x"
+            glob = "*.jsonl"
+            container_key = "rate_limits"
+        "#;
+        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert!(!disclosure.requires_approval);
+        assert!(disclosure.auth_types.is_empty());
+        assert!(disclosure.dest_hosts.is_empty());
+        assert_eq!(disclosure.engine, EngineKind::LogFile);
+    }
+
+    #[test]
+    fn env_only_auth_is_disclosed_but_never_gates_approval() {
+        let m = http_api_manifest("https://evil.example.com/usage", "env");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert_eq!(
+            disclosure.auth_types,
+            vec![AuthType::Env],
+            "env is still disclosed"
+        );
+        assert!(
+            !disclosure.requires_approval,
+            "env-only auth (a var the user set themselves) never mandates approval on its own"
+        );
+    }
+
+    #[test]
+    fn dest_hosts_includes_account_url_host_alongside_the_request_host() {
+        let toml = r#"
+            id         = "x"
+            name       = "X"
+            menu_label = "X"
+            order      = 1
+            engine     = "http-api"
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [http]
+            [[http.request]]
+            url = "https://api.example.com/usage"
+            [account]
+            type      = "http"
+            url       = "https://profile.example.com/me"
+            json_path = "email"
+            [[surface]]
+            id = "cli"
+            label = "CLI"
+        "#;
+        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        let mut hosts = disclosure.dest_hosts.clone();
+        hosts.sort();
+        assert_eq!(
+            hosts,
+            vec![
+                "api.example.com".to_string(),
+                "profile.example.com".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn untrusted_hosts_flags_only_the_dest_hosts_outside_trusted_hosts() {
+        let toml = r#"
+            id         = "x"
+            name       = "X"
+            menu_label = "X"
+            order      = 1
+            engine     = "http-api"
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [http]
+            [[http.request]]
+            url = "https://api.anthropic.com/usage"
+            [account]
+            type      = "http"
+            url       = "https://profile.example.com/me"
+            json_path = "email"
+            [[surface]]
+            id = "cli"
+            label = "CLI"
+        "#;
+        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert_eq!(
+            disclosure.dest_hosts,
+            vec![
+                "api.anthropic.com".to_string(),
+                "profile.example.com".to_string()
+            ]
+        );
+        assert_eq!(
+            disclosure.untrusted_hosts,
+            vec!["profile.example.com".to_string()],
+            "only the host outside TRUSTED_HOSTS is flagged, the trusted one is not"
+        );
+    }
+
+    // ── is_https gate (fetch_text/fetch_bytes themselves are never called —
+    //    see module docs) ─────────────────────────────────────────────────
+
+    #[test]
+    fn is_https_accepts_only_the_https_scheme() {
+        assert!(is_https("https://example.com/index.toml"));
+        assert!(!is_https("http://example.com/index.toml"));
+        assert!(!is_https("ftp://example.com/index.toml"));
+        assert!(!is_https("example.com/index.toml"));
+    }
+}
