@@ -249,7 +249,7 @@ Where the account email shown next to the tag comes from.
 | `path` | string | — | `jwt-file`: path to the file holding the token |
 | `token_path` | string | — | `jwt-file`: dotted JSON path to the JWT string inside that file |
 | `claim` | string | — | `jwt-file`: claim name read out of the decoded JWT (e.g. `"email"`) |
-| `url` | string | — | `http`: URL to fetch the account profile from |
+| `url` | string | — | `http`: URL to fetch the account profile from; must be `https` |
 | `json_path` | string | — | `http`: dotted JSON path to the email in the response body; `response-field`: the same path, read out of the **usage** response |
 
 `type = "response-field"` costs no request at all: the address is taken from
@@ -502,8 +502,8 @@ No escaping is offered rather than invented. No wildcards.
 | `remaining_fraction_path` | string | — (the other) | dotted JSON path to a **remaining** fraction, 0..1, for a provider that states what is left rather than what is spent (Antigravity's `remainingFraction`). Mutually exclusive with `used_percent_path`; needs `requires_reader = ["remaining-fraction"]` |
 | `resets_at_path` | string | — (required) | dotted JSON path to the absolute reset timestamp |
 | `resets_at_format` | `"unix"` \| `"iso8601"` | `"unix"` | format of the value at `resets_at_path` |
-| `max_period_minutes` | integer | — (optional) | classification bound: this slot only if the period is ≤ this many minutes |
-| `min_period_minutes` | integer | — (optional) | classification bound: this slot only if the period is ≥ this many minutes |
+| `max_period_minutes` | integer | — (optional) | classification bound: this slot only if the period is ≤ this many minutes. On `http-api`, needs `period.mode = "from_field"` — refused alongside `mode = "assumed"`, which already states the length and leaves the bound nothing to classify; [`log-file`'s own classification](#engine--log-file) applies it either way |
+| `min_period_minutes` | integer | — (optional) | classification bound: this slot only if the period is ≥ this many minutes. Same `http-api`-only `period.mode = "from_field"` requirement as `max_period_minutes` |
 
 An `http-api` window states its figure through **exactly one** of
 `used_percent_path` and `remaining_fraction_path`; naming both, or neither, is
@@ -522,10 +522,20 @@ Declare `containers` when a provider does **not** fix which slot a given
 window arrives in. Codex sends its weekly window as `primary_window` with
 `secondary_window` null whenever the 5-hour window has nothing to report, so
 reading "primary" as "the 5-hour window" would print a weekly figure on the 5H
-row. With candidates declared, each window takes the first candidate whose own
+row. With bounds declared, each window takes the first candidate whose own
 length (`period.field`, converted by `period.unit`) falls inside its
-`min_period_minutes`/`max_period_minutes` bounds — the same first-match rule
-`log-file` uses for its `primary`/`secondary` pair.
+`min_period_minutes`/`max_period_minutes` — the same first-match rule
+`log-file` uses for its `primary`/`secondary` pair. Declaring neither bound is
+also legal with several candidates: the first one that resolves to a value at
+all (skipping `null`) wins, in the order `containers` names them. On this
+engine, either bound only means something once `period.mode = "from_field"`
+gives a length to measure it against — `mode = "assumed"` states the
+window's length outright, so a bound declared beside it would never be read
+here, and `validate` refuses that combination on `http-api`. The same
+manifest is legal on `log-file`: its own [classification](#engine--log-file)
+applies a bound to a candidate's length regardless of `period.mode`, and a
+`role = "extra"` log-file window needs one — with neither bound set, it
+classifies to nothing and never draws.
 
 #### `role = "extra"`
 
@@ -645,8 +655,8 @@ What the provider says about the quota **as a whole**, above its windows.
 Optional; needs `requires_reader = ["reading-status"]`. Read only by
 `engine = "http-api"` — a `log-file` manifest carrying it is refused, since a
 log line records what one session saw, not the standing of the account. The
-table must name at least one of its three paths; an empty `[status]` is
-refused at load.
+table must name at least one of its three paths — an empty `[status]` is
+refused at load, and so is any of the three that is present but blank.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -709,8 +719,8 @@ Required when `engine = "http-api"`.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `url` | string | — (required) | request URL |
-| `timeout_secs` | integer | `8` | request timeout, seconds |
+| `url` | string | — (required) | request URL; must be `https` |
+| `timeout_secs` | integer | `8` | request timeout, seconds; must be greater than 0 |
 | `method` | `"get"` \| `"post"` | `"get"` | HTTP verb. Needs `requires_reader = ["http-post"]` |
 | `body` | string | — (optional) | request body for `method = "post"`, substituted exactly like a header value. A GET carrying one fails validation. Needs `requires_reader = ["http-post"]` |
 | `headers` | map<string,string> | empty | header map; values may contain `{token}` / `{version}` / `{option.<key>}` / `{value.<name>}` placeholders |
@@ -833,10 +843,13 @@ it fires only when the fast path has actually lapsed.
 
 Because that step sends a credential of its own — before the engine's own
 `allowed_hosts` check on the main request ever runs — it enforces the rules
-itself: `token_url` must be `https`, and an **empty** `allowed_hosts` is
-refused outright rather than read as "no restriction" the way it is everywhere
-else. Successful exchanges are cached in memory by expiry, and a failed one
-backs off, so a one-minute poll does not become a one-minute token exchange.
+itself: `token_url` must be `https` (refused at load by `validate`, the same
+as `[[http.request]].url` and `[account].url` above, and refused again where
+the exchange is actually sent — defence in depth, not the only depth), and an
+**empty** `allowed_hosts` is refused outright rather than read as "no
+restriction" the way it is everywhere else. Successful exchanges are cached
+in memory by expiry, and a failed one backs off, so a one-minute poll does
+not become a one-minute token exchange.
 
 The cache is read by `(token_url, refresh_token)` **before** the installed-app
 pair (`client_id`/`client_secret`, literal or discovered) is ever resolved —
@@ -949,12 +962,12 @@ has never signed in to this surface at all:
    candidate set that is *always* truncated (an oversized `bins` match, say)
    still must not be re-read in full on every single tick.
 
-(The literal `client_id`/`client_secret` fields are still read as a fallback
-inside `resolve_client` between steps 1 and 2 above, but a manifest that
-passed validation can never reach that branch — `client` and the literal
-pair together are refused at load, per the mutual-exclusion rule above. What
-still exercises it is a hand-built `AuthStep` bypassing validation, in this
-reader's own tests.)
+(The literal `client_id`/`client_secret` fields are not part of this
+resolution order at all — `resolve_client` never reads them.
+`auth::oauth_refresh_step` reads them directly, before ever calling
+`resolve_client`, and only when the step carries no `client` table; the two
+are mutually exclusive by the rule above, so a manifest that passed
+validation is always in exactly one of the two shapes.)
 
 A found pair is cached in memory for the life of the process, keyed by
 *(the discovery config, the file it was found in)* — so the *same* installed
@@ -1488,8 +1501,12 @@ trusted as whoever wrote it.
 mistakes, not a sandbox against a hostile author — the manifest supplies both
 the request URL and the list it's checked against, so an author who wants to
 exfiltrate a credential simply writes a consistent `url` /
-`allowed_hosts` pair naming their own host, and the check passes. What it
-does buy you, for a manifest you already trust:
+`allowed_hosts` pair naming their own host, and the check passes. A host is
+read out of a URL by `url::Url` — the same parser `ureq` builds the request
+through, not a hand-rolled split on the URL's punctuation, so what is checked
+here is what the request actually dials — and every URL this app attaches a
+credential to must be `https`, refused at load if it isn't. What it does buy
+you, for a manifest you already trust:
 
 - **Defense against a typo or a stale copy-paste.** If a future edit to
   `[[http.request]].url` (by you, or a well-meaning upstream manifest update)

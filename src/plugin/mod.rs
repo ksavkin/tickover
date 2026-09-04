@@ -25,6 +25,10 @@
 //!   state and trust disclosure. Everything in it is pure and hermetic
 //!   except its two network calls (`fetch_text`, `fetch_bytes`) — see its
 //!   own module docs.
+//! * [`signature`] — who published the registry index, as opposed to whether
+//!   it arrived intact: ed25519 (minisign) verification of `index.toml`,
+//!   checked ahead of [`registry`]'s own sha256/parsing once a key is pinned
+//!   — see its own module docs for what a signature does and does not prove.
 
 pub mod auth;
 pub mod capability;
@@ -43,10 +47,13 @@ use std::path::PathBuf;
 use crate::model::Window;
 use manifest::{PluginManifest, WindowConfig};
 
-/// The UI slot a manifest's declared role names. One definition: both engines
-/// and the binary's own registry ask, and a role mapped differently in one of
-/// them would be a window in the wrong slot — the failure `crate::model::Role`
-/// exists to prevent.
+/// The UI slot a manifest's declared role names. One definition, so every
+/// caller agrees: both engines convert a window's declared role into this UI
+/// slot while building a `Window` (`engine_http`/`engine_logfile`), and
+/// `src/main.rs` converts it the same way to look up a declared window's
+/// remembered seen-state by role. A role mapped differently by any of them
+/// would file the same window under the wrong slot — the failure
+/// `crate::model::Role` exists to prevent.
 pub fn map_role(r: manifest::Role) -> crate::model::Role {
     match r {
         manifest::Role::Primary => crate::model::Role::Primary,
@@ -148,6 +155,37 @@ pub fn strip_bom(text: &str) -> &str {
     text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
+/// The host `url` will actually be sent to — `None` for anything that is not
+/// `https`, including a string that does not parse as a URL at all. Every
+/// caller of this function is deciding whether a credential may leave the
+/// machine, and no answer is safer than a wrong one.
+///
+/// Parsed with the `url` crate — the same WHATWG parser `ureq` builds a
+/// request through — rather than by splitting the string on `/`, `?`, `#`
+/// and `@` by hand. The two do not agree on where a URL's authority ends:
+/// `https` is a WHATWG *special* scheme, and a special scheme's authority
+/// ends at a `\` exactly as it does at a `/` — a byte a hand-rolled split
+/// never looked for. `https://evil.example\@api.anthropic.com/x` reads, to
+/// a human and to a naive parser, as userinfo `evil.example` at host
+/// `api.anthropic.com`; `url` — and therefore `ureq`, which sends the
+/// request — reads it as host `evil.example`, path
+/// `/@api.anthropic.com/x`. An `allowed_hosts` check that used the naive
+/// reading would wave through a URL whose request goes somewhere else
+/// entirely, which is the whole point of the check failing quietly.
+///
+/// `Url::host_str` already returns the host normalised — lowercase, an
+/// IPv6 literal bracketed with its hex digits lowered, a Unicode label
+/// turned to its punycode form — so nothing further is done to what it
+/// returns here; callers still compare case-insensitively regardless, as a
+/// second, cheaper safeguard rather than a substitute for this one.
+pub fn https_host(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    parsed.host_str().map(str::to_string)
+}
+
 /// Expand a manifest path spec.
 ///
 /// Two prefixes are recognised, checked only at the very start of the
@@ -187,29 +225,79 @@ fn join_rest(base: PathBuf, rest: &str) -> PathBuf {
     }
 }
 
-/// Read a file that must be a *regular* file, bounded in size.
+/// Read a file that must resolve to a *regular* file, bounded in size.
 ///
 /// Every path this app reads is either configured in a manifest or sits in a
 /// directory the user's other programs can write to, so "open the path and
 /// read to the end" is not a safe instruction: a FIFO blocks until somebody
-/// writes to it, which for a startup read is forever; a character device
-/// never ends at all; and a symlink to either is indistinguishable from a
-/// file by name. `symlink_metadata` refuses both without following the link,
-/// and the cap keeps an unexpectedly enormous file from being pulled into
-/// memory whole.
+/// writes to it, which for a startup read is forever, and a character device
+/// never ends at all. A symlink *to a regular file* is read exactly as if it
+/// had been written directly — refusing it (as `symlink_metadata` used to,
+/// here) reads as "this manifest/credentials file is absent" for no better
+/// reason than the extra hop, which is not what somebody who symlinked a
+/// shared dotfile into place would expect. What still has to be refused is a
+/// path — direct or through a symlink — that resolves to anything other than
+/// a plain file, a FIFO or device most of all, and the path can change kind
+/// between a check and an open (a classic TOCTOU), so the `is_file()`
+/// criterion below is applied twice: once by path, once more against the
+/// open handle — the same two-stat technique `auth::scan_candidate` uses for
+/// the identical race. The cap keeps an unexpectedly enormous file from being
+/// pulled into memory whole.
 pub fn read_regular_file(path: &std::path::Path, max_bytes: u64) -> Option<String> {
     use std::io::Read;
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_file() || meta.len() > max_bytes {
-        return None;
+    // Follows a symlink (unlike `symlink_metadata`) — a cheap early exit for
+    // the common case (missing, a directory, a FIFO) that never opens a
+    // handle at all.
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => {
+            if meta.len() > max_bytes {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // This stat and the open below are two different syscalls: the path
+        // can change kind between them, so a symlink swapped in for a FIFO
+        // right after the check above would otherwise block an open with no
+        // reason to expect anyone to ever write to it. `O_NONBLOCK` makes the
+        // open itself return at once no matter what is there now (POSIX: a
+        // FIFO opened this way still succeeds); the handle-level `is_file()`
+        // check just below is what turns that success into a refusal instead
+        // of a read — the same technique `auth::scan_candidate` uses for the
+        // identical race.
+        open_options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = open_options.open(path).ok()?;
+    match file.metadata() {
+        Ok(meta) if meta.file_type().is_file() => {}
+        _ => return None,
     }
     let mut text = String::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(max_bytes)
-        .read_to_string(&mut text)
-        .ok()?;
+    file.take(max_bytes).read_to_string(&mut text).ok()?;
     Some(text)
+}
+
+/// This app's own directory under the OS config dir
+/// (`<OS config dir>/tickover`) — the library side's one definition.
+/// `seed::plugins_dir` and `registry::lockfile_path` used to each redo
+/// `dirs::config_dir()...join("tickover")` by hand, with their own text and
+/// their own fallback, which is exactly the two-places-to-look
+/// `config::dir()`'s own doc comment (in the binary crate) already warns
+/// against — for its two callers there, not these. The binary and this
+/// library are two separate compilation units (`src/lib.rs` does not declare
+/// a `config` module), so `config::dir()` cannot reuse this function and
+/// this cannot reuse it either; this is the one definition available to
+/// callers that live in the library.
+///
+/// `None` when the OS config dir itself can't be resolved — callers decide
+/// their own fallback, the same way `config::dir()`'s callers do.
+pub fn app_config_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("tickover"))
 }
 
 /// The directories a provider CLI is looked for in, and the ones it is
@@ -267,10 +355,12 @@ pub fn cli_install_dirs() -> Vec<PathBuf> {
 /// one of them would file the same window under two registry entries — the
 /// failure `map_role` exists to prevent, one field over.
 ///
-/// The `<element>` half is empty here and stays empty until an entry can
-/// enumerate an array. The separator is written anyway rather than added later:
-/// a key whose shape changes between releases is a key every install has to
-/// migrate, and the empty tail costs one byte.
+/// The `<element>` half is empty here on purpose: this is the *entry's* own
+/// key, and an enumerating entry (`windows.for_each`) has no single element
+/// to name at this point — [`window_element_key`] is the one that fills that
+/// half, once per element. The separator is written anyway rather than added
+/// later: a key whose shape changes between releases is a key every install
+/// has to migrate, and the empty tail costs one byte.
 ///
 /// Separators are outside the byte set a part may contain (`[A-Za-z0-9_-]`), so
 /// a value carrying one cannot be mistaken for a boundary. That is not
@@ -344,12 +434,11 @@ pub const PROVIDER_TEXT_MAX_CHARS: usize = 64;
 /// arrives over the network, it changes without notice, and an enumerating
 /// entry (`windows.for_each`) supplies row captions straight from it.
 ///
-/// Called on `reached_type`, on the currency and text an amount can carry, and
-/// on an enumerating entry's row caption (`fill_label`). It is *not* yet
-/// called on the other two strings a response can supply — the plan chip
-/// (`[tag]`) and the account address — which reach the screen unfiltered.
-/// Saying so rather than claiming the wider guarantee: those two reach the
-/// screen unfiltered today.
+/// Called at every sink a response-fed string reaches the screen through:
+/// `reached_type`, the currency and text an amount can carry, an enumerating
+/// entry's row caption (`fill_label`), the plan chip (`[tag] from =
+/// "field"`), and the account address (`sanitized_account` in each engine) —
+/// nothing a provider's response supplies reaches the panel unfiltered.
 ///
 /// Not covered, deliberately: combining marks. A run of them stacks glyphs
 /// vertically, and the cap below bounds how far that can go, but stripping
@@ -359,11 +448,18 @@ pub const PROVIDER_TEXT_MAX_CHARS: usize = 64;
 /// a `\r` rewrites the log line before it), the bidi overrides
 /// (U+202A–U+202E, U+2066–U+2069) that can visually reorder the text around
 /// them, and the zero-width characters (U+200B–U+200D, U+FEFF) that hide
-/// differences between two strings that look identical. Then capped, because a
-/// provider deciding to answer with a megabyte is a provider deciding how tall
-/// the panel is.
+/// differences between two strings that look identical. Trimmed before the
+/// length cap is applied, not after: capping first would let leading padding
+/// spend the budget that should go to content, then trim away only what's
+/// left exposed at the far edge — a caption padded with ten leading spaces
+/// would lose ten characters of its own text to them instead of losing
+/// nothing. Trimmed once more at the end for whatever the cut itself exposes
+/// (a run of internal whitespace landing right at the cap). Then capped,
+/// because a provider deciding to answer with a megabyte is a provider
+/// deciding how tall the panel is.
 pub fn sanitize_provider_text(text: &str) -> String {
-    text.chars()
+    text.trim()
+        .chars()
         .filter(|c| !c.is_control() && !is_invisible_or_directional(*c))
         .take(PROVIDER_TEXT_MAX_CHARS)
         .collect::<String>()
@@ -470,6 +566,57 @@ mod tests {
         assert_eq!(strip_bom(""), "");
     }
 
+    // ── https_host ───────────────────────────────────────────────────────
+
+    #[test]
+    fn https_host_reads_the_host_the_way_the_request_will_reach_it() {
+        assert_eq!(
+            https_host("https://api.anthropic.com/api/oauth/usage").as_deref(),
+            Some("api.anthropic.com")
+        );
+        // Userinfo and port are not the host.
+        assert_eq!(
+            https_host("https://user:pass@api.anthropic.com/x").as_deref(),
+            Some("api.anthropic.com")
+        );
+        assert_eq!(
+            https_host("https://api.anthropic.com:443/x").as_deref(),
+            Some("api.anthropic.com")
+        );
+        // `Url::host_str` already lowercases.
+        assert_eq!(
+            https_host("https://API.ANTHROPIC.COM/x").as_deref(),
+            Some("api.anthropic.com")
+        );
+    }
+
+    #[test]
+    fn https_host_sees_the_backslash_authority_terminator_ureq_sees() {
+        // `https` is a WHATWG "special" scheme, so its authority ends at a
+        // `\` exactly as it does at a `/` — the byte a hand-rolled split on
+        // `/`, `?`, `#` and `@` never looked for, and the reason this
+        // function exists rather than one written by hand. The host here is
+        // `evil.example`, not `api.anthropic.com`: `ureq` would send the
+        // request there, so an `allowed_hosts` check must see it there too.
+        assert_eq!(
+            https_host("https://evil.example\\@api.anthropic.com/api/oauth/usage").as_deref(),
+            Some("evil.example")
+        );
+    }
+
+    #[test]
+    fn https_host_rejects_non_https_and_unparsable_urls() {
+        assert_eq!(https_host("http://api.anthropic.com/x"), None);
+        assert_eq!(https_host("ftp://api.anthropic.com/x"), None);
+        assert_eq!(https_host("not a url at all"), None);
+        assert_eq!(https_host(""), None);
+    }
+
+    #[test]
+    fn https_host_handles_a_bracketed_ipv6_literal_without_panicking() {
+        assert_eq!(https_host("https://[::1]/x").as_deref(), Some("[::1]"));
+    }
+
     #[test]
     fn expands_tilde_to_home_dir() {
         let home = dirs::home_dir().expect("home dir resolvable in test env");
@@ -560,8 +707,8 @@ mod tests {
         );
 
         // A FIFO: reading one blocks until somebody writes, which for a
-        // startup read means forever. `symlink_metadata` sees it for what it
-        // is without opening it.
+        // startup read means forever. `metadata` sees it for what it is
+        // without opening it — there is no symlink here for it to follow.
         let fifo = dir.join("blocks.json");
         let made = std::process::Command::new("mkfifo").arg(&fifo).status();
         if matches!(made, Ok(s) if s.success()) {
@@ -569,5 +716,43 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_regular_file_follows_a_symlink_to_a_regular_file() {
+        // The gap this closes: a symlinked credentials file or manifest used
+        // to read as absent for no reason but the extra hop — "not signed
+        // in" for an account that plainly is.
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-read-regular-symlink-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let real = dir.join("real.json");
+        std::fs::write(&real, "{\"token\":\"abc\"}").unwrap();
+        let link = dir.join("via-symlink.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            read_regular_file(&link, SMALL_FILE_MAX_BYTES).as_deref(),
+            Some("{\"token\":\"abc\"}"),
+            "a symlinked credentials file/manifest must read exactly like one written directly"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sanitize_provider_text_trims_before_capping_so_leading_padding_never_eats_the_budget() {
+        let padded = format!("{}{}", " ".repeat(10), "x".repeat(PROVIDER_TEXT_MAX_CHARS));
+        let sanitized = sanitize_provider_text(&padded);
+        assert_eq!(
+            sanitized.chars().count(),
+            PROVIDER_TEXT_MAX_CHARS,
+            "capping before trimming would have spent ten characters of the budget on the \
+             leading padding instead of on content: {sanitized:?}"
+        );
     }
 }

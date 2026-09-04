@@ -66,6 +66,15 @@ cbc = "0.1"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 sha1 = "0.10"
 
+# A request URL's host, read by the parser that will actually send the
+# request (`plugin::https_host`) rather than by hand — a hand-rolled split
+# on `/`, `?`, `#` and `@` does not see `\` the way a WHATWG "special"
+# scheme like `https` does, so it can be made to agree with `allowed_hosts`
+# while `ureq` goes somewhere else entirely. Already in the tree at this
+# version (`ureq` depends on it transitively — `cargo tree -i url`), so
+# naming it here as a direct dependency compiles no new parser.
+url = "2"
+
 # Plugin registry: sha256 verification of downloaded manifests.
 sha2 = "0.10"
 # ed25519 verification of the registry index's minisign signature. Already in
@@ -87,20 +96,22 @@ blake2 = { version = "0.10", default-features = false }
 regex = "1"
 # The parser `regex` itself builds on — used directly, at manifest-validate
 # time only, to bound how much of a file a `[surface.auth.client]` pattern
-# could ever match (`manifest::validate`'s `pattern_max_match_len`), so a
+# could ever match (`manifest::validate`'s `regex_max_match_len`), so a
 # manifest cannot turn "scan a file for a short id" into "read an unbounded
 # slice of it". Already resolved by `regex` at the same version; naming it
 # here compiles no new parser.
 regex-syntax = "0.8"
 
 [target.'cfg(unix)'.dependencies]
-# `scan_candidate`'s `O_NONBLOCK` open (see its own doc comment) — the actual
-# FIFO-hang guard, `std::fs::OpenOptions` has no way to set that flag itself.
-# Already in the tree transitively (a Skia/winit build-dependency on both
-# macOS and Linux — `cargo tree -i libc`), so this names it as a direct one
-# rather than compiling new code. Windows has no FIFOs and no `O_NONBLOCK`;
-# `scan_candidate`'s open there is the plain `std::fs::File::open` it always
-# was.
+# The `O_NONBLOCK` open that `plugin::read_regular_file` and `auth::scan_candidate`
+# use as the actual FIFO-hang guard (`std::fs::OpenOptions` has no way to set
+# that flag itself), and the `flock` behind the single-instance lock in
+# `platform.rs`. Already in the tree transitively (a Skia/winit
+# build-dependency on both macOS and Linux — `cargo tree -i libc`), so this
+# names it as a direct one rather than compiling new code. Windows has no
+# FIFOs and no `O_NONBLOCK`; the opens there are the plain
+# `std::fs::File::open` they always were, and the instance lock is a Win32
+# file handle.
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -5,9 +5,10 @@
 //! ([`crate::plugin::engine_logfile`], [`crate::plugin::engine_http`]) and the
 //! credential chain ([`crate::plugin::auth`]) are built against the types
 //! here, and it grows only by adding new optional fields.
-//! `#[serde(deny_unknown_fields)]` is deliberately **not** used: a manifest
-//! field a future version of this reader doesn't know about yet must be
-//! ignored, not rejected.
+//! `#[serde(deny_unknown_fields)]` is deliberately **not** used, with one
+//! exception ([`AuthClientDiscovery`], `[surface.auth.client]` — see its own
+//! doc for why): a manifest field a future version of this reader doesn't
+//! know about yet must be ignored, not rejected.
 //!
 //! ```text
 //! id            = "codex"
@@ -23,14 +24,14 @@
 //! path  = "plan_type"
 //!
 //! [account]
-//! type       = "jwt-file"           # "none" (default) | "jwt-file" | "http"
+//! type       = "jwt-file"           # "none" (default) | "jwt-file" | "http" | "response-field"
 //! path       = "~/.codex/auth.json"
 //! token_path = "tokens.id_token"
 //! claim      = "email"
 //!
 //! [[windows]]
 //! label = "5H"
-//! role  = "primary"                 # | "secondary"
+//! role  = "primary"                 # | "secondary" | "extra"
 //! [windows.period]
 //! mode  = "from_field"              # "assumed" | "from_field"
 //! field = "window_minutes"
@@ -324,8 +325,7 @@ impl PluginManifest {
         // request that cannot be sent, and `allowed_hosts` has no host to
         // check it against either.
         if let Some(http) = &self.http {
-            if let Some(req) = http.request.iter().find(|r| r.url.trim().is_empty()) {
-                let _ = req;
+            if http.request.iter().any(|r| r.url.trim().is_empty()) {
                 return Err("`[[http.request]] url` must not be empty".to_string());
             }
         }
@@ -598,6 +598,24 @@ impl PluginManifest {
                         .to_string(),
                 );
             }
+            // A path present but blank passes `is_empty()` above (it only
+            // asks whether every path is absent) and then resolves to
+            // nothing at fetch time — the same gap the `[[balances]]` blank
+            // check below closes for its own paths.
+            let blank_paths = [
+                ("allowed_path", &status.allowed_path),
+                ("limit_reached_path", &status.limit_reached_path),
+                ("reached_type_path", &status.reached_type_path),
+            ];
+            if let Some((field, _)) = blank_paths
+                .iter()
+                .find(|(_, p)| p.as_deref().is_some_and(|s| s.trim().is_empty()))
+            {
+                return Err(format!(
+                    "`[status] {field}` is present but blank — a path that reads nothing is not \
+                     a path"
+                ));
+            }
         }
 
         // Only the HTTP engine reads balances, for the reason `[status]` is
@@ -789,6 +807,39 @@ impl PluginManifest {
             }
         }
 
+        // A classification bound only means something once there is a
+        // length, read from the response, to measure it against — and on
+        // `engine = "http-api"`, `period.mode = "assumed"` states the
+        // window's own length outright (`period.assumed`), leaving nothing
+        // for a bound to classify. `engine_http::select_container` treats a
+        // bound exactly this way: it only ever consults
+        // `min_period_minutes`/`max_period_minutes` when
+        // `mode = "from_field"`, so on this engine a bound declared beside
+        // `assumed` is not a stricter rule, it is dead weight — a number
+        // nothing ever reads, which a manifest author would have every
+        // reason to believe does something. The log-file engine is not the
+        // same: `engine_logfile::classify_slot`/`effective_bounds` apply a
+        // bound to a log record regardless of `period.mode`, and a
+        // `role = "extra"` log-file window *needs* one (with neither bound
+        // set it classifies to nothing and never draws — see
+        // `classify_slot`'s own early return). So this refusal is scoped to
+        // `http-api` only; the same manifest is legal for `log-file`.
+        if self.engine == EngineKind::HttpApi {
+            for w in &self.windows {
+                if w.period.mode == PeriodMode::Assumed
+                    && (w.source.min_period_minutes.is_some()
+                        || w.source.max_period_minutes.is_some())
+                {
+                    return Err(format!(
+                        "windows[label = \"{}\"]: min_period_minutes/max_period_minutes classify \
+                         a candidate by length on engine = \"http-api\" — meaningless when \
+                         period.mode = \"assumed\" already states the length outright",
+                        w.label
+                    ));
+                }
+            }
+        }
+
         if let Some(http) = &self.http {
             // `{token}`, `{version}` and `{value.<name>}` are header-only, by
             // design: a URL is where a credential is most easily logged by
@@ -809,6 +860,34 @@ impl PluginManifest {
                     return Err(format!(
                         "`[account] url` may not contain {bad} — {{token}}, {{version}} and \
                          {{value.<name>}} are substituted into headers only"
+                    ));
+                }
+            }
+            // Every URL this engine ever sends a credential to must be
+            // `https` — read by `super::https_host`, the same WHATWG parser
+            // `ureq` builds the request through, so what is checked here is
+            // what `perform` would actually dial. Caught at load rather than
+            // left for `perform`'s own refusal (defence in depth, not the
+            // only depth): a manifest that cannot be sent safely should
+            // never reach a fetch to find that out. `token_url` carries the
+            // same rule too — checked below, in the per-step loop over
+            // `[[surface.auth]]`, since it lives on the step rather than on
+            // `[http]` — and enforced again where it is spent
+            // (`auth::oauth_refresh_step`), since a refresh token's exchange
+            // has its own allow-list check to sit next to.
+            for req in &http.request {
+                if super::https_host(&req.url).is_none() {
+                    return Err(format!(
+                        "`[[http.request]] url` must be https — refusing to send a request over \
+                         {}",
+                        req.url
+                    ));
+                }
+            }
+            if let Some(url) = &self.account.url {
+                if super::https_host(url).is_none() {
+                    return Err(format!(
+                        "`[account] url` must be https — refusing to send a request over {url}"
                     ));
                 }
             }
@@ -840,6 +919,16 @@ impl PluginManifest {
                     "`[http] backoff_max_secs` ({}) must be at least backoff_start_secs ({})",
                     http.backoff_max_secs, http.backoff_start_secs
                 ));
+            }
+            // A timeout of 0 is not "no timeout" (`ureq` has no such
+            // setting to ask for) — it is a request that fails before it
+            // could ever succeed, same as the two siblings above.
+            for req in &http.request {
+                if req.timeout_secs == 0 {
+                    return Err(
+                        "`[[http.request]] timeout_secs` must be greater than 0".to_string()
+                    );
+                }
             }
             let mut seen_value_names: std::collections::HashSet<&str> =
                 std::collections::HashSet::new();
@@ -1040,6 +1129,31 @@ impl PluginManifest {
                         ));
                     }
                 }
+                // A `token_url` that is not `https` would send the refresh
+                // token — and the installed-app secret paired with it — to
+                // whatever sits in front of that endpoint, in the clear.
+                // Read the same way as `[[http.request]] url` and `[account]
+                // url` above (`super::https_host`, the WHATWG parser `ureq`
+                // builds the request through), so what is checked here is
+                // what `auth::oauth_refresh_step` would actually dial.
+                // `oauth_refresh_step` refuses the same thing again at run
+                // time — its own `starts_with("https://")`, defence in
+                // depth — but a manifest that can never refresh safely
+                // should never reach a fetch to find that out. By this point
+                // in the loop `token_url` is `Some` and non-blank (the
+                // `missing`/`blank` checks above already returned otherwise),
+                // so this only ever runs against text a manifest actually
+                // wrote.
+                if step.kind == AuthType::OauthRefresh {
+                    let token_url = step.token_url.as_deref().unwrap_or_default();
+                    if super::https_host(token_url).is_none() {
+                        return Err(format!(
+                            "surface \"{}\": an `oauth-refresh` auth step's `token_url` must be \
+                             https — refusing to send a refresh token over {token_url}",
+                            surface.id
+                        ));
+                    }
+                }
                 // The rest of `client`: patterns compilable, no blank entry
                 // in `files`/`bins`, and something for `auth::discover_client`
                 // to actually search — checked only once the block above has
@@ -1125,10 +1239,31 @@ impl PluginManifest {
                             // `!m.is_empty()` check at scan time, which
                             // exists only as the last line of defense for a
                             // pattern that got past this some other way.
-                            if !matches!(regex_min_match_len(pattern), Some(len) if len >= 1) {
+                            // `Some(len)` failing this can only be
+                            // `Some(0)` (`len` is a `usize`, so the only way
+                            // `>= 1` fails on a value is for it to be zero);
+                            // the other failing case is `None`, which is not
+                            // the same claim, let alone a softer one —
+                            // `regex_min_match_len` returns it exactly when
+                            // the pattern can never match anything at all
+                            // (an empty intersection like `[a&&b]`), so it
+                            // is named separately rather than folded into a
+                            // message that would call a pattern matching
+                            // nothing "the empty string" too.
+                            let min_len = regex_min_match_len(pattern);
+                            if !matches!(min_len, Some(len) if len >= 1) {
+                                let why = match min_len {
+                                    None => {
+                                        "can never match anything, so it can never find a \
+                                         client id or secret"
+                                    }
+                                    Some(_) => {
+                                        "can match the empty string — every client id or secret \
+                                         is at least one byte"
+                                    }
+                                };
                                 return Err(format!(
-                                    "surface \"{}\": a `{}` auth step's `{field}` can match the \
-                                     empty string — every client id or secret is at least one byte",
+                                    "surface \"{}\": a `{}` auth step's `{field}` {why}",
                                     surface.id,
                                     auth_type_name(step.kind)
                                 ));
@@ -1384,8 +1519,10 @@ impl PluginManifest {
             // Outside the request loop, where it belongs: a `[[http.value]]`
             // is declared once for the section, not once per request. Nested,
             // it was checked as many times as there were requests — which is
-            // once for the one request an `http-api` manifest may declare, and
-            // *never* for a manifest that has an `[http]` section without one.
+            // once for the one request an `http-api` manifest must declare
+            // (`validate` refuses anything else), and only ever zero for a
+            // manifest whose own engine never reads `[http]` at all and still
+            // carries the section.
             for value in &http.value {
                 templates.push((
                     format!("`[[http.value]] name = \"{}\"` path", value.name),
@@ -1861,13 +1998,16 @@ fn template_complaint(label: &str) -> Option<&'static str> {
     }
 }
 
-/// Cap on `[[windows]] id`.
+/// Cap on `[[windows]] id`, and, sharing the same constant, `[[balances]]
+/// id` (see [`BalanceConfig::entry_key`]).
 ///
-/// It bounds a string that becomes part of a window's identity, and would
-/// become a segment of a key inside the user's `config.json` the day that
-/// identity is used to persist state there. Capped now rather than then,
-/// because a manifest that already shipped with a 4 KB id would have to keep
-/// working.
+/// Both bound a string that is part of that entry's identity, and both
+/// identities already persist: a window's `id` becomes a segment of the key
+/// `config::seen_key` writes into the user's `config.json` once that window
+/// has been seen, and a balance's `id` becomes part of
+/// [`crate::model::Balance::key`] the same way. Capped here rather than left
+/// open, because a manifest that already shipped with a 4 KB id would have
+/// to keep working.
 pub const WINDOW_ID_MAX_BYTES: usize = 64;
 
 impl WindowConfig {
@@ -2003,11 +2143,16 @@ pub struct SourceConfig {
     /// Format of the value at `resets_at_path`.
     #[serde(default)]
     pub resets_at_format: ResetsAtFormat,
-    /// Optional classification bound (log-file engine): a window is this
-    /// slot only if its period is at most this many minutes.
+    /// Optional classification bound, read by both engines
+    /// (`engine_logfile::classify_slot`, and `engine_http::select_container`
+    /// for the `containers` case above): a window is this slot only if its
+    /// period is at most this many minutes. Meaningless — and refused by
+    /// `validate` — on a window whose `period.mode = "assumed"` already
+    /// states the length outright.
     pub max_period_minutes: Option<u64>,
-    /// Optional classification bound (log-file engine): a window is this
-    /// slot only if its period is at least this many minutes.
+    /// Same as [`max_period_minutes`](Self::max_period_minutes), the other
+    /// direction: a window is this slot only if its period is at least this
+    /// many minutes.
     pub min_period_minutes: Option<u64>,
 }
 
@@ -2033,7 +2178,6 @@ pub enum ResetsAtFormat {
 /// Needs `requires_reader = ["reading-balances"]`: an older build has no notion
 /// of a balance, and would show such a provider as one that reported nothing.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BalanceConfig {
     /// Stable identity of this entry, used to build
     /// [`crate::model::Balance::key`] — same rules and same reasoning as
@@ -2060,7 +2204,6 @@ pub struct BalanceConfig {
 
 /// One figure inside a `[[balances]]` entry, and where to read it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AmountConfig {
     /// Which form the provider states this figure in.
     pub kind: AmountKind,
@@ -2097,7 +2240,6 @@ pub enum AmountKind {
 
 /// `[balances.source]` — everything in a balance that is not an amount.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BalanceSourceConfig {
     /// JSON path to a percentage **the provider states**. There is
     /// deliberately no way to ask for a computed one: a percentage this app
@@ -2174,7 +2316,6 @@ impl BalanceConfig {
 /// blocked" without saying which kind of limit it hit is answered with what it
 /// said, not with a guess.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StatusConfig {
     /// JSON path to a boolean: may this account currently spend at all.
     pub allowed_path: Option<String>,
@@ -2296,9 +2437,10 @@ fn default_classify_threshold_minutes() -> u64 {
 // ── [http] ────────────────────────────────────────────────────────────────
 
 /// `[http]` — configuration for the `engine = "http-api"` reader.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct HttpConfig {
-    /// `[[http.request]]` — one or more requests to issue (usually one).
+    /// `[[http.request]]` — the one request this surface issues. `validate`
+    /// refuses an `[http]` section with none or with more than one.
     #[serde(default)]
     pub request: Vec<HttpRequestConfig>,
     /// `[http.version]` — optional source for the `{version}` substitution.
@@ -2472,8 +2614,8 @@ pub struct SurfaceConfig {
     pub no_credentials_message: Option<String>,
     /// `[[surface.auth]]` — ordered credential lookup chain. Tried in order;
     /// each step is Present-ok (token found, use it), Present-err (the
-    /// credential store exists but the token couldn't be read — surface much
-    /// stop with an error), or Absent (store doesn't exist — try the next
+    /// credential store exists but the token couldn't be read — the surface
+    /// must stop with an error), or Absent (store doesn't exist — try the next
     /// step, or conclude the surface isn't present if none are left).
     #[serde(default)]
     pub auth: Vec<AuthStep>,
@@ -2661,8 +2803,7 @@ pub enum AuthType {
     CredentialsMap,
     /// Not a credential store: a diagnostic step that turns a *known* dead
     /// end into a sentence the user can act on. When the field at `json_path`
-    /// is present (and equal to `equals`, if given), the chain stops with
-    /// `message`.
+    /// is present, the chain stops with `message`.
     ///
     /// Codex's case: signing in with an API key instead of a ChatGPT account
     /// leaves `OPENAI_API_KEY` set in `~/.codex/auth.json` and no OAuth
@@ -2705,18 +2846,24 @@ fn is_bare_program_name(name: &str) -> bool {
 /// `/Applications/Antigravity.app/…` — an entirely ordinary POSIX absolute
 /// path, and exactly what the shipped Antigravity manifest's `client.files`
 /// names — is *not* absolute, because Windows requires a drive letter or a
-/// UNC prefix. A plugin manifest is cross-platform data (the same
-/// `antigravity.toml` ships to macOS and Windows installs alike); a
-/// macOS-only candidate on a Windows machine is simply a file that will
-/// never exist at discovery time, the same as any other candidate nothing
-/// installed there — not a reason to refuse the *manifest* at load, on
-/// every platform, for a path some other platform wrote. `starts_with('/')`
-/// on the lossy string is the POSIX half this platform's own
-/// `is_absolute()` may disagree with; `Path::is_absolute()` itself still
-/// covers this platform's own notion (POSIX `/…` when validating on POSIX,
-/// a drive letter or UNC prefix when validating on Windows).
+/// UNC prefix; on macOS/Linux the reverse holds for `C:\Program Files\…` or
+/// `\\server\share\…`, a client's own path on a Windows install. A plugin
+/// manifest is cross-platform data (the same `antigravity.toml` ships to
+/// macOS and Windows installs alike); a candidate written for one platform
+/// is simply a file that will never exist at discovery time on another — not
+/// a reason to refuse the *manifest* at load, on every platform, for a path
+/// some other platform wrote. `Path::is_absolute()` still covers this
+/// platform's own notion; the three prefix checks beside it — a leading
+/// `/`, a drive letter (`C:\` or `C:/`), a UNC `\\` — cover every other
+/// platform's, read off the lossy string rather than through whatever this
+/// binary's own `Path` would parse them as.
 fn is_absolute_on_any_platform(p: &Path) -> bool {
-    p.is_absolute() || p.to_string_lossy().starts_with('/')
+    let s = p.to_string_lossy();
+    let has_drive_prefix = s.len() >= 3
+        && s.as_bytes()[0].is_ascii_alphabetic()
+        && s.as_bytes()[1] == b':'
+        && matches!(s.as_bytes()[2], b'/' | b'\\');
+    p.is_absolute() || s.starts_with('/') || has_drive_prefix || s.starts_with("\\\\")
 }
 
 /// [`AuthClientDiscovery::id_env`]/`secret_env`: the POSIX/Windows
@@ -2753,12 +2900,20 @@ pub(crate) fn regex_max_match_len(pattern: &str) -> Option<usize> {
 }
 
 /// The fewest bytes any match of `pattern` could ever return — `0` for a
-/// pattern that can match the empty string (e.g. `a*` or `(foo)?`). Paired
-/// with [`regex_max_match_len`] against the same parse: an `id_pattern`/
-/// `secret_pattern` that can match nothing is not "bounded", it is a
-/// manifest bug that `discover_client` would otherwise turn into a client
-/// id of `""` — a credential the OAuth exchange would then fail on with a
-/// message naming no field a user wrote.
+/// pattern that can match the empty string (e.g. `a*` or `(foo)?`), `None`
+/// when the parse fails (unreachable at the one call site, which only ever
+/// runs on a pattern `regex::bytes::Regex::new` already compiled) or when
+/// `regex_syntax` says the pattern can never match anything at all — an
+/// empty intersection like `[a&&b]`, not merely an unmeasured minimum.
+/// `PluginManifest::validate`'s own call site treats both `Some(0)` and
+/// `None` as "not safely at least one byte", but names them separately in
+/// the message it returns: only `Some(0)` is actually "matches the empty
+/// string", and calling "matches nothing" by that name would be wrong, not
+/// just imprecise. Paired with [`regex_max_match_len`] against the same
+/// parse: an `id_pattern`/`secret_pattern` that can match nothing is not
+/// "bounded", it is a manifest bug that `discover_client` would otherwise
+/// turn into a client id of `""` — a credential the OAuth exchange would
+/// then fail on with a message naming no field a user wrote.
 fn regex_min_match_len(pattern: &str) -> Option<usize> {
     regex_syntax::Parser::new()
         .parse(pattern)
@@ -2821,15 +2976,15 @@ pub struct PingConfig {
 /// One `[[option]]` — a declarative bool option a plugin exposes, resolved by
 /// `crate::config::plugin_option` and made available to the engines as the
 /// `{option.<key>}` substitution (see [`crate::plugin::substitute_options`]).
-/// A settings-sheet checkbox for these is a later phase (3b UI) — this
-/// schema layer is UI-agnostic.
+/// Settings draws no checkbox for these yet; this schema layer is
+/// UI-agnostic.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct OptionConfig {
     /// Stable identifier, unique within the plugin. Restricted to ASCII
     /// letters/digits/underscore (see [`PluginManifest::validate`]) so the
     /// `{option.<key>}` placeholder it drives is always unambiguous.
     pub key: String,
-    /// Display label for the (future) checkbox.
+    /// Display label for the checkbox Settings does not yet draw.
     pub label: String,
     /// Value used until the user overrides it via config.
     #[serde(default)]
@@ -2841,8 +2996,11 @@ pub struct OptionConfig {
 /// Read every `*.toml` file directly inside `dir` as a [`PluginManifest`],
 /// sorted by declared `order` (ties broken by `id`). Manifests that fail to
 /// parse or validate are returned as `Err((path, message))` and sort after
-/// every successfully-loaded manifest, keeping their directory-listing
-/// relative order among themselves.
+/// every successfully-loaded manifest, keeping their lexicographic
+/// (path-sorted) relative order among themselves — the paths are sorted
+/// before `load_one` ever runs, and the final sort is stable, so a
+/// directory-listing order this platform happened to hand back never leaks
+/// through.
 ///
 /// Returns an empty vec if `dir` doesn't exist or isn't readable — loading
 /// plugin manifests is always best-effort at the call site.
@@ -2883,7 +3041,9 @@ mod tests {
     use super::*;
 
     /// A Codex-like manifest: `engine = "log-file"`, one primary window
-    /// classified `from_field`, one secondary window classified `assumed`.
+    /// classified `from_field`, one secondary window classified `assumed`
+    /// (a bound beside `assumed` is legal on this engine — see `validate`,
+    /// which refuses that combination only on `engine = "http-api"`).
     const CODEX_LIKE: &str = r#"
         id           = "codex"
         name         = "Codex"
@@ -3257,6 +3417,58 @@ mod tests {
         let m = PluginManifest::from_str(with_extra_fields)
             .expect("unknown fields must not break parsing");
         assert_eq!(m.id, "x");
+
+        // The same forward-compatibility rule holds for `[status]`
+        // (`StatusConfig`) and every table inside `[[balances]]`
+        // (`BalanceConfig`, `AmountConfig`, `BalanceSourceConfig`) — all four
+        // `deny_unknown_fields` was mistakenly applied to and then removed
+        // from (see the module doc and `AuthClientDiscovery`'s own doc for
+        // the one table that keeps it). No windows here: `[[balances]]` is
+        // legal without any (Grok ships exactly that shape), which also
+        // keeps this manifest away from the http-api "exactly one window
+        // figure" rules that windows would pull in for no reason this test
+        // cares about.
+        let with_extra_status_and_balance_fields = r#"
+            id              = "y"
+            name            = "Y"
+            menu_label      = "Y"
+            order           = 1
+            engine          = "http-api"
+            requires_reader = ["reading-status", "reading-balances"]
+
+            [status]
+            allowed_path       = "allowed"
+            future_status_field = "some value from a newer schema version"
+
+            [[balances]]
+            label = "Credits"
+            future_balance_field = "some value from a newer schema version"
+            [balances.remaining]
+            kind = "text"
+            path = "credits.balance"
+            future_amount_field = "some value from a newer schema version"
+            [balances.source]
+            percent_path = "credits.percent"
+            future_source_field = "some value from a newer schema version"
+
+            [http]
+            [[http.request]]
+            url = "https://example.com/usage"
+            [http.request.headers]
+            Authorization = "Bearer {token}"
+
+            [[surface]]
+            id            = "default"
+            label         = "Default"
+            allowed_hosts = ["example.com"]
+            [[surface.auth]]
+            type            = "credentials-file"
+            path            = "~/.y/auth.json"
+            token_json_path = "token"
+        "#;
+        let m = PluginManifest::from_str(with_extra_status_and_balance_fields)
+            .expect("unknown fields in [status]/[[balances]] must not break parsing either");
+        assert_eq!(m.id, "y");
     }
 
     #[test]
@@ -3385,7 +3597,14 @@ mod tests {
             used_percent_path = "p"
             resets_at_path = "r"
         "#;
-        assert!(PluginManifest::from_str(no_engine).is_err());
+        // Bare `is_err()` would pass just as well for a manifest refused for
+        // an entirely different reason — this one also carries no `[logfile]`
+        // and no `[http]`, either of which `validate` would refuse on its
+        // own. Naming the field pins the refusal to the one this row is
+        // actually about: `engine` itself, missing from the TOML, is what
+        // `toml::from_str` reports before `validate` ever runs.
+        let err = PluginManifest::from_str(no_engine).expect_err("must be rejected");
+        assert!(err.contains("engine"), "unexpected error: {err}");
 
         // Missing `[[windows]]` entirely.
         let no_windows = r#"
@@ -3859,13 +4078,13 @@ mod tests {
 
         let duplicate = http_manifest_with(
             "",
-            "[[http.value]]\nname = \"a\"\ntype = \"json-file\"\npath = \"p\"\njson_path = \"j\"\n\
-             [[http.value]]\nname = \"a\"\ntype = \"json-file\"\npath = \"p\"\njson_path = \"j\"",
+            "[[http.value]]\nname = \"dupval\"\ntype = \"json-file\"\npath = \"p\"\njson_path = \"j\"\n\
+             [[http.value]]\nname = \"dupval\"\ntype = \"json-file\"\npath = \"p\"\njson_path = \"j\"",
             "",
         );
         let err = PluginManifest::from_str(&duplicate).expect_err("must be rejected");
         assert!(
-            err.contains('a'),
+            err.contains("dupval"),
             "error should name the duplicated value: {err}"
         );
     }
@@ -4813,9 +5032,14 @@ mod tests {
     }
 
     #[test]
-    fn is_absolute_on_any_platform_accepts_posix_and_refuses_relative_regardless_of_the_running_platform(
+    fn is_absolute_on_any_platform_accepts_posix_and_windows_forms_and_refuses_relative_regardless_of_the_running_platform(
     ) {
         assert!(is_absolute_on_any_platform(Path::new("/Applications/x")));
+        assert!(is_absolute_on_any_platform(Path::new(
+            r"C:\Program Files\x"
+        )));
+        assert!(is_absolute_on_any_platform(Path::new("C:/Program Files/x")));
+        assert!(is_absolute_on_any_platform(Path::new(r"\\server\share\x")));
         assert!(!is_absolute_on_any_platform(Path::new("relative/x")));
         assert!(!is_absolute_on_any_platform(Path::new("x")));
     }

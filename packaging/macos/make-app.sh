@@ -4,7 +4,9 @@
 #   cargo build --release
 #   ./packaging/macos/make-app.sh
 #
-# Produces ./dist/Tickover.app  (a menu-bar accessory — LSUIElement).
+# Produces ./dist/Tickover.app  (a menu-bar accessory — the binary switches
+# itself to the accessory activation policy at launch, the runtime
+# equivalent of LSUIElement; Info.plist carries no such key).
 #
 # Takes the binary to bundle as an optional first argument, defaulting to the
 # release build's own path — a caller assembling a cross-compiled or

@@ -81,7 +81,7 @@ fn parses_last_reading_matching_oracle() {
     assert_eq!(
         readings.len(),
         1,
-        "the log-file engine always returns exactly one reading"
+        "one reading for this single-surface manifest"
     );
     let reading = &readings[0];
     assert!(

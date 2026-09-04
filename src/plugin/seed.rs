@@ -21,16 +21,15 @@ pub const DEFAULT_TEMPLATES: &[(&str, &str)] = &[
     ("copilot.toml", include_str!("../../plugins/copilot.toml")),
 ];
 
-/// Where user-editable plugin manifests live: `<config dir>/tickover/plugins`
-/// — the same `tickover` base `crate::config` uses for its own JSON file
-/// (`<config dir>/tickover/config.json`). Falls back to the current
-/// directory on the rare platform where the OS config dir can't be resolved,
-/// mirroring the `dirs::home_dir()` fallback used elsewhere (`src/main.rs`
-/// `spawn_hello`) — best-effort, never a panic.
+/// Where user-editable plugin manifests live:
+/// `crate::plugin::app_config_dir()/plugins` — the same `tickover` base
+/// `config::dir()` (in the binary crate) uses for its own JSON file. Falls
+/// back to the current directory on the rare platform where the OS config
+/// dir can't be resolved, mirroring the `dirs::home_dir()` fallback used
+/// elsewhere (`src/main.rs` `spawn_hello`) — best-effort, never a panic.
 pub fn plugins_dir() -> PathBuf {
-    dirs::config_dir()
+    crate::plugin::app_config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("tickover")
         .join("plugins")
 }
 
@@ -56,18 +55,50 @@ fn write_templates(dir: &Path, templates: &[(&str, &str)]) -> std::io::Result<Ve
 }
 
 /// Write `contents` to `path`, replacing whatever is there — but never
-/// *through* it. The plugins directory is writable by anything running as
+/// *through* it, and never something its caller hasn't already decided is
+/// safe to delete. The plugins directory is writable by anything running as
 /// this user, and `fs::write` follows a symlink: a link left at
 /// `plugins/codex.toml` would send a manifest into whatever it points at,
-/// truncating that file. Removing the path first removes the link itself; the
-/// create then has to be the thing that makes the file.
+/// truncating that file.
+///
+/// `symlink_metadata` — the directory entry itself, never following — is
+/// what decides, not `classify_builtin`'s own (symlink-following) read of
+/// the *content* behind it: a plain file is unlinked and then created fresh
+/// in its place, so nothing here ever writes *through* whatever was there;
+/// anything else found at `path` — a symlink (live or dangling), a
+/// directory, a FIFO — is left exactly as it is and this returns `Err`
+/// instead. That refusal is deliberate even when the symlink's target is a
+/// byte-identical earlier build a caller has every right to call `Replace`:
+/// `classify_builtin` answers "is the content behind this path safe to
+/// overwrite", not "is this path itself safe to delete", and only the
+/// latter question is this function's to answer — a user who symlinked a
+/// manifest into place put it there on purpose, and an automatic upgrade is
+/// not the moment to silently turn their symlink into a plain file.
 fn write_new(path: &Path, contents: &str) -> std::io::Result<()> {
-    let _ = std::fs::remove_file(path);
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => {
+            std::fs::remove_file(path)?;
+        }
+        Ok(_) => {
+            return Err(std::io::Error::other(format!(
+                "{}: not a plain file — refusing to delete and replace it",
+                path.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)?;
-    std::io::Write::write_all(&mut file, contents.as_bytes())
+    std::io::Write::write_all(&mut file, contents.as_bytes()).inspect_err(|_| {
+        // A write that fails partway through leaves a manifest on disk that
+        // is neither the built-in nor nothing — and `has_any_toml`/
+        // `classify_builtin` would then read it as present, so it never gets
+        // a second chance to be written correctly.
+        let _ = std::fs::remove_file(path);
+    })
 }
 
 /// Whether `dir` (already known to exist) contains at least one `*.toml` file.
@@ -89,10 +120,18 @@ pub fn seed_if_empty(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     write_templates(dir, DEFAULT_TEMPLATES)
 }
 
-/// "Reset plugins": overwrite `codex.toml` and `claude.toml` with their
-/// built-in defaults, unconditionally — restoring them even if the user
-/// edited or deleted one. Any other file in `dir` (a third-party manifest, a
-/// stray `.toml`) is left untouched. Returns the paths written.
+/// "Reset plugins": overwrite every built-in manifest in
+/// [`DEFAULT_TEMPLATES`] (`codex.toml`, `claude.toml`, `grok.toml`,
+/// `antigravity.toml`, `copilot.toml`) with its shipped default — restoring
+/// each even if the user edited or deleted it, as long as what's at that
+/// name is a plain file or nothing at all. A symlink at one of those names is
+/// left exactly as it is instead: [`write_new`] refuses to delete a
+/// directory entry it can't confirm is a plain file, so this call returns
+/// `Err` rather than silently replacing somebody's deliberate link with a
+/// fresh regular file — and nothing in the batch is written, per
+/// [`write_templates`]'s own all-or-nothing rollback. Any other file in
+/// `dir` (a third-party manifest, a stray `.toml`) is left untouched either
+/// way. Returns the paths written on success.
 pub fn reseed_defaults(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     write_templates(dir, DEFAULT_TEMPLATES)
 }
@@ -332,18 +371,52 @@ pub enum UpgradeAction {
     /// line a user reads should say a provider arrived, not that one was
     /// updated.
     Delivered,
+    /// A directory entry exists at this path, but it wasn't a plain,
+    /// size-bounded file [`crate::plugin::read_regular_file`] could read
+    /// back — a directory, a FIFO, a symlink (dangling, or pointing at any
+    /// of those), one over the size cap, bytes that failed to decode as
+    /// UTF-8. Not the same fact as [`Self::Absent`]: something *is* there,
+    /// on purpose or not, and `deliver_if_absent` is not a licence to guess
+    /// what it was meant to be and overwrite it — see
+    /// [`upgrade_builtin`]'s own doc for how this and `Absent` are told
+    /// apart. Worth its own log line at the call site, the same as
+    /// [`Self::Delivered`]: unlike an ordinary `Absent`, this usually means
+    /// something unexpected is sitting where a manifest should be.
+    Unreadable,
+    /// `upgrade.file` names nothing in [`DEFAULT_TEMPLATES`] at all — a
+    /// defect in [`BUILTIN_UPGRADES`] itself, not a fact about the user's
+    /// disk. `builtin_upgrade_table_agrees_with_the_templates_it_migrates_to`
+    /// exists so this should never happen; if it ever does, the caller
+    /// should log it as what it is rather than let it read as an ordinary
+    /// first install.
+    NoSuchTemplate,
 }
 
-/// Classify one built-in, purely. `on_disk` is `None` when the file isn't
-/// there. Hashes are compared case-insensitively, mirroring
+/// What's at a built-in's path on disk, from
+/// [`crate::plugin::read_regular_file`]'s point of view — enough for
+/// [`classify_builtin`] to tell "nothing here" apart from "something here
+/// that resisted reading", which `Option<&[u8]>` alone could not: both used
+/// to read as the same `None`, which is what let a symlinked-but-otherwise-
+/// fine manifest be classified `Absent` and then delivered over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnDisk<'a> {
+    /// No directory entry at this path at all.
+    Absent,
+    /// A directory entry exists, but not one `read_regular_file` could read
+    /// back as a plain, size-bounded file.
+    Unreadable,
+    /// Read back as a plain file's bytes.
+    Present(&'a [u8]),
+}
+
+/// Classify one built-in, purely, from what [`OnDisk`] says is at its path.
+/// Hashes are compared case-insensitively, mirroring
 /// [`crate::plugin::registry::verify_sha256`].
-fn classify_builtin(
-    current: &str,
-    on_disk: Option<&[u8]>,
-    previous_sha256: &[&str],
-) -> UpgradeAction {
-    let Some(bytes) = on_disk else {
-        return UpgradeAction::Absent;
+fn classify_builtin(current: &str, on_disk: OnDisk, previous_sha256: &[&str]) -> UpgradeAction {
+    let bytes = match on_disk {
+        OnDisk::Absent => return UpgradeAction::Absent,
+        OnDisk::Unreadable => return UpgradeAction::Unreadable,
+        OnDisk::Present(bytes) => bytes,
     };
     if bytes == current.as_bytes() {
         return UpgradeAction::AlreadyCurrent;
@@ -374,23 +447,34 @@ pub fn builtin_contents(file: &str) -> Option<&'static str> {
 /// per shipped version, not once per launch.
 pub fn upgrade_builtin(dir: &Path, upgrade: &BuiltinUpgrade) -> std::io::Result<UpgradeAction> {
     let Some(current) = builtin_contents(upgrade.file) else {
-        return Ok(UpgradeAction::Absent);
+        // Not a fact about the user's disk at all — see
+        // `UpgradeAction::NoSuchTemplate`'s own doc.
+        return Ok(UpgradeAction::NoSuchTemplate);
     };
     let path = dir.join(upgrade.file);
     // A regular file only: this runs at startup, before there is any UI, and
     // `fs::read` on a FIFO left at this path would block there forever.
-    let on_disk = crate::plugin::read_regular_file(&path, crate::plugin::SMALL_FILE_MAX_BYTES);
-    let mut action = classify_builtin(
-        current,
-        on_disk.as_deref().map(str::as_bytes),
-        upgrade.previous_sha256,
-    );
+    let on_disk_text = crate::plugin::read_regular_file(&path, crate::plugin::SMALL_FILE_MAX_BYTES);
+    let on_disk = match &on_disk_text {
+        Some(text) => OnDisk::Present(text.as_bytes()),
+        // `read_regular_file` says nothing about *why* there was nothing to
+        // read — a missing path and a directory/FIFO/oversized/undecodable
+        // one both come back `None`. `symlink_metadata` (never following)
+        // tells the two apart without opening anything: no entry at all is
+        // `Absent`; any entry, whatever it is, is `Unreadable`.
+        None => match std::fs::symlink_metadata(&path) {
+            Ok(_) => OnDisk::Unreadable,
+            Err(_) => OnDisk::Absent,
+        },
+    };
+    let mut action = classify_builtin(current, on_disk, upgrade.previous_sha256);
     // A built-in shipping for the first time has nothing on disk to compare
-    // against, so `classify_builtin` — which only ever answers about a file
-    // that is there — says `Absent`. Whether that means "deliver it" or "the
-    // user deleted it" is not something the bytes can settle; the manifest's
-    // own entry says which, and the caller's marker makes it a decision taken
-    // once.
+    // against, so `classify_builtin` says `Absent` — never `Unreadable`,
+    // which means something *is* there and is excluded from this branch on
+    // purpose (see `UpgradeAction::Unreadable`'s own doc). Whether an
+    // `Absent` here means "deliver it" or "the user deleted it" is not
+    // something the bytes can settle; the manifest's own entry says which,
+    // and the caller's marker makes it a decision taken once.
     if action == UpgradeAction::Absent && upgrade.deliver_if_absent {
         action = UpgradeAction::Delivered;
     }
@@ -408,29 +492,45 @@ mod tests {
         ResetsAtFormat,
     };
 
-    /// Every entry in the upgrade table actually reaches disk. The table grew
-    /// a second entry for the first time here, and "the loop only ever looked
-    /// at the first one" is the way that would fail — silently, and for good,
-    /// since the migration marker records the decision as made.
+    /// Every entry in the upgrade table actually reaches disk, not just the
+    /// first one — the table grew a second entry for the first time here,
+    /// and "the loop only ever looked at the first one" is the way that
+    /// would fail silently, since the migration marker records the decision
+    /// as made either way.
+    ///
+    /// Renamed from
+    /// `every_entry_in_the_table_migrates_an_untouched_copy_of_its_own_previous_version`:
+    /// that name, and the comment that used to sit on the fixture below,
+    /// claimed this exercises `Replace` against "the most recent previous
+    /// version". It never did and structurally cannot: the fixture is a
+    /// stand-in string, not the real historical bytes (which are gone — see
+    /// `BUILTIN_UPGRADES`'s own doc), so its hash is never in
+    /// `previous_sha256` and the outcome is always `KeepModified`. It also
+    /// used `.last()` as "the most recent", which is false for claude.toml —
+    /// its list is not in chronological order. `Replace` has its own test,
+    /// `an_untouched_previous_builtin_is_replaced`, against a fabricated
+    /// pair this module can actually reproduce the bytes of.
     #[test]
-    fn every_entry_in_the_table_migrates_an_untouched_copy_of_its_own_previous_version() {
+    fn every_entry_in_the_table_correctly_classifies_an_unrecognised_file_and_its_own_current_template(
+    ) {
         for upgrade in BUILTIN_UPGRADES {
             // A built-in shipping for the first time has no previous version
-            // to migrate from — that path is `deliver_if_absent`, and it has
-            // its own test below. Skipping it here rather than weakening the
-            // assertions keeps this test about what it is about.
-            let Some(sha) = upgrade.previous_sha256.last() else {
+            // to migrate from at all — that path is `deliver_if_absent`, and
+            // it has its own test below.
+            if upgrade.previous_sha256.is_empty() {
                 continue;
-            };
+            }
             let dir = temp_dir(&format!("table-{}", upgrade.id));
-            // The most recent previous version, which is what an install of
-            // the last release actually has on disk. Its bytes are not in the
-            // tree any more, so they are reconstructed from the one thing that
-            // is: this test asserts the *plumbing*, and the hashes themselves
-            // are historical constants nothing in the tree can recompute — see
-            // the comment on `BUILTIN_UPGRADES` above.
-            std::fs::write(dir.join(upgrade.file), format!("# stand-in for {sha}\n"))
-                .expect("write fixture");
+            // Not real previous-version bytes — see this test's own doc for
+            // why there are none left to write here. Its hash will not be in
+            // `previous_sha256` (nothing not already listed there could be,
+            // short of a sha256 collision), so the only outcome this fixture
+            // can honestly stand for is "not one of the recognised ones".
+            std::fs::write(
+                dir.join(upgrade.file),
+                "# not a previous build of this file\n",
+            )
+            .expect("write fixture");
 
             // A file whose hash is not in the table is the user's own work.
             assert_eq!(
@@ -454,9 +554,9 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
         }
 
-        // Both built-ins are covered. claude.toml went the whole project
-        // without an entry, so an edit to it would not have reached a single
-        // installed copy.
+        // Every built-in ships with an entry in this table. claude.toml went
+        // the whole project without one, so an edit to it would not have
+        // reached a single installed copy.
         let files: Vec<&str> = BUILTIN_UPGRADES.iter().map(|u| u.file).collect();
         for (name, _) in DEFAULT_TEMPLATES {
             assert!(files.contains(name), "{name} ships but has no upgrade rule");
@@ -884,7 +984,7 @@ mod tests {
         assert_eq!(
             classify_builtin(
                 builtin_contents("codex.toml").unwrap(),
-                Some(previous.as_bytes()),
+                OnDisk::Present(previous.as_bytes()),
                 upgrade.previous_sha256
             ),
             UpgradeAction::Replace,
@@ -903,6 +1003,115 @@ mod tests {
         assert!(
             !dir.join("codex.toml").exists(),
             "upgrading never creates a manifest"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn classify_builtin_distinguishes_absent_from_something_unreadable_here() {
+        assert_eq!(
+            classify_builtin("current", OnDisk::Absent, &["deadbeef"]),
+            UpgradeAction::Absent
+        );
+        assert_eq!(
+            classify_builtin("current", OnDisk::Unreadable, &["deadbeef"]),
+            UpgradeAction::Unreadable,
+            "something being there, unreadable, is not the same fact as nothing being there"
+        );
+    }
+
+    #[test]
+    fn upgrade_builtin_leaves_an_unreadable_entry_alone_even_with_deliver_if_absent() {
+        // A directory at this name isn't "nothing installed yet" — it is
+        // something the user or another program put there, and
+        // `deliver_if_absent` exists for the first case, not the second.
+        let dir = temp_dir("upgrade-unreadable-dir");
+        let path = dir.join("grok.toml");
+        std::fs::create_dir_all(&path).unwrap();
+        let upgrade = BuiltinUpgrade {
+            file: "grok.toml",
+            id: "grok",
+            to_version: "1.0.0",
+            previous_sha256: &[],
+            deliver_if_absent: true,
+        };
+        assert_eq!(
+            upgrade_builtin(&dir, &upgrade).expect("upgrade runs"),
+            UpgradeAction::Unreadable
+        );
+        assert!(path.is_dir(), "left exactly as it was");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn upgrade_builtin_reports_a_table_entry_naming_no_shipped_template_distinctly() {
+        // A defect in `BUILTIN_UPGRADES` itself (a typo'd `file`, an entry
+        // left behind after its template was removed from
+        // `DEFAULT_TEMPLATES`) is not the same fact as the user simply not
+        // having the file yet — conflating the two would have this exact bug
+        // read as an ordinary first install.
+        let dir = temp_dir("upgrade-no-such-template");
+        let bogus = BuiltinUpgrade {
+            file: "does-not-exist.toml",
+            id: "nonexistent",
+            to_version: "1.0.0",
+            previous_sha256: &[],
+            deliver_if_absent: true,
+        };
+        assert_eq!(
+            upgrade_builtin(&dir, &bogus).expect("upgrade runs"),
+            UpgradeAction::NoSuchTemplate
+        );
+        assert!(
+            !dir.join(bogus.file).exists(),
+            "nothing is written for a template this app doesn't actually ship"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_new_refuses_to_delete_a_symlink_and_writes_nothing() {
+        let dir = temp_dir("write-new-symlink");
+        let real_target = dir.join("real-target.toml");
+        std::fs::write(&real_target, "# elsewhere\n").unwrap();
+        let link = dir.join("codex.toml");
+        std::os::unix::fs::symlink(&real_target, &link).unwrap();
+
+        write_new(&link, "# built-in\n").expect_err("a symlink must not be unlinked here");
+        assert!(link.is_symlink(), "the symlink itself must survive");
+        assert_eq!(
+            std::fs::read_to_string(&real_target).unwrap(),
+            "# elsewhere\n",
+            "and never written through, either"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn upgrade_builtin_does_not_delete_a_symlinked_previous_build() {
+        // The residual gap `read_regular_file` following symlinks opens on
+        // its own: once a symlinked earlier build reads back as
+        // `Replace`-worthy content, `write_new` — not `classify_builtin` — is
+        // what has to refuse to unlink the user's own symlink to make room
+        // for a plain file.
+        let dir = temp_dir("upgrade-symlinked-previous");
+        let upgrade = &fabricated_upgrade();
+        let target = dir.join("elsewhere.toml");
+        std::fs::write(&target, EARLIER_BUILD).unwrap();
+        let link = dir.join(upgrade.file);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            upgrade_builtin(&dir, upgrade).is_err(),
+            "a symlink is left exactly as it is, not replaced"
+        );
+        assert!(link.is_symlink(), "the symlink itself must survive");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            EARLIER_BUILD,
+            "and never written through"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1048,15 +1257,18 @@ mod tests {
     }
 
     #[test]
-    fn seed_if_empty_writes_both_templates_into_a_fresh_dir() {
+    fn seed_if_empty_writes_every_built_in_template_into_a_fresh_dir() {
         let dir = temp_dir("fresh");
         let written = seed_if_empty(&dir).expect("seed");
         std::fs::remove_dir_all(&dir).ok();
 
         assert_eq!(written.len(), DEFAULT_TEMPLATES.len());
-        assert!(written.iter().any(|p| p.ends_with("codex.toml")));
-        assert!(written.iter().any(|p| p.ends_with("claude.toml")));
-        assert!(written.iter().any(|p| p.ends_with("grok.toml")));
+        for (name, _) in DEFAULT_TEMPLATES {
+            assert!(
+                written.iter().any(|p| p.ends_with(name)),
+                "{name} missing from what seed_if_empty wrote: {written:?}"
+            );
+        }
     }
 
     #[test]

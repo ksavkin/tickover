@@ -69,9 +69,13 @@ for good. `docs/DEVELOPMENT.md` has the whole story.
   exists because a clippy suggestion would otherwise have passed the suite
   while breaking every non-string selector.
 
-There is no `cargo fmt` gate: rustfmt is not run on this tree, and a formatting
-pass would bury the history of files whose comments carry most of the reasoning.
-Match the surrounding style instead.
+**`cargo fmt --check` is a CI gate**, run on the macOS job only — formatting
+is platform-independent, so one job saying so is enough. Run
+`cargo fmt` before you push; a formatting pass on a tree that was already
+formatted with it does not bury the history of files whose comments carry
+most of the reasoning, but running it on your own diff up front is cheaper
+than a red build. Match the surrounding style for everything the tool
+itself does not decide (naming, comment density, doc-comment shape).
 
 ## CI
 

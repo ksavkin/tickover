@@ -5,13 +5,13 @@
 //! 2× for retina and let AppKit scale it down):
 //!
 //! ```text
-//! ( ⌾  Cx ▮▮▮▯▯▯|▯▯  9/32 )
-//! (    Cl ▮▮▮▮▮▮▮▮| 94/23 )
+//! ⌾ Cx ▂▂ 91/68 · Cl ▂▂ 6/77
 //! ```
 //!
-//! Per provider row: label, a mini bar of the 5-hour window (fill = used,
-//! tick = elapsed window time), then used-% for the 5-hour and weekly windows,
-//! both severity-coloured. Light and dark palettes follow the menu bar theme.
+//! One line, at most two providers, joined by a middle dot. Per provider:
+//! label, two stacked mini bars (5-hour on top, weekly below; fill = used,
+//! tick = elapsed window time), then the `%used-5h/%used-week` pair, both
+//! severity-coloured. Light and dark palettes follow the menu bar theme.
 //!
 //! Pure image code — no UI toolkit deps — so it lives in the library and is
 //! unit-testable. Text is rasterized with the system monospace font; when no
@@ -351,9 +351,11 @@ fn draw_text_bold(
 }
 
 /// Render the widget: a single-line pill
-/// `⌾ Cx ▂▂ 91/68 · Cl ▂▂ 06/77` — per provider: label, two stacked mini
+/// `⌾ Cx ▂▂ 91/68 · Cl ▂▂ 6/77` — per provider: label, two stacked mini
 /// bars (5-hour on top, weekly below; fill = used, tick = elapsed time) and
-/// the `%used-5h / %used-week` pair, each severity-coloured.
+/// the `%used-5h / %used-week` pair, each severity-coloured. `rows` beyond
+/// the first two are dropped — the pill shows only the first two providers,
+/// by order, and has no room for more.
 /// `scale` is the pixel density (2.0 for retina). Returns `None` when there
 /// is nothing to draw or no font is available.
 pub fn render(rows: &[ProviderRow], dark: bool, scale: f32) -> Option<RgbaImage> {
@@ -503,7 +505,8 @@ pub fn render(rows: &[ProviderRow], dark: bool, scale: f32) -> Option<RgbaImage>
 /// `px` is the icon's edge in real pixels; the layout is proportional to it,
 /// so 16, 24 and 32 all come out as the same picture. `None` when there is
 /// nothing to draw, matching [`render`] so the caller's fallback is one
-/// branch for both.
+/// branch for both. Same cap as [`render`]: only the first two of `rows` are
+/// drawn, the rest dropped.
 pub fn render_badge(rows: &[ProviderRow], dark: bool, px: u32) -> Option<RgbaImage> {
     let rows: Vec<&ProviderRow> = rows.iter().take(2).collect();
     if rows.is_empty() {

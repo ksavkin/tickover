@@ -129,11 +129,18 @@ fn path() -> Option<PathBuf> {
     dir().map(|d| d.join("config.json"))
 }
 
-/// This app's own directory under the OS config dir — where `config.json`, the
-/// plugins folder and the single-instance lock all live. One definition, so
-/// nothing ends up looking for them in two different places.
+/// This app's own directory under the OS config dir — where `config.json`,
+/// the plugins folder and the single-instance lock all live.
+///
+/// Delegates to [`tickover::plugin::app_config_dir`] rather than re-deriving
+/// `dirs::config_dir().join("tickover")` here too: that library function is
+/// the one true definition callable from every crate this binary links
+/// (`plugin::seed::plugins_dir` already uses it). `registry::lockfile_path`
+/// still spells the same join out for itself rather than calling it — a
+/// duplicate this file can name but not remove, since fixing it means editing
+/// `src/plugin/registry.rs`, not this one.
 pub fn dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("tickover"))
+    tickover::plugin::app_config_dir()
 }
 
 /// One-time move of an install made before the rename to Tickover:
@@ -191,15 +198,82 @@ fn migrate_legacy_dir_at(old: &Path, new: &Path) -> Result<bool, std::io::Error>
     Ok(true)
 }
 
+/// Save whatever is at `path` right now aside as `<name>.corrupt-<unix
+/// secs>`, if — and only if — it doesn't parse as JSON. [`load`] treats
+/// unparsable the same as "nothing here": every setter builds its new value
+/// from an empty object and then overwrites the file, so a corrupt
+/// `config.json` was one preference change away from being gone for good,
+/// with nothing left on disk to even show what it had contained. A copy
+/// (never a rename) — the normal write below still has to land at `path`
+/// either way, and leaving the original in place is one less way for a
+/// failed backup to turn a corrupt file into a missing one.
+///
+/// Best-effort like the rest of this module: a backup that can't be written
+/// is logged and given up on, not allowed to block the write it was meant to
+/// precede.
+fn backup_if_corrupt(path: &std::path::Path) {
+    let Ok(existing) = std::fs::read_to_string(path) else {
+        return; // absent, or unreadable for some other reason: nothing to save
+    };
+    if serde_json::from_str::<Value>(tickover::plugin::strip_bom(&existing)).is_ok() {
+        return; // parses fine — an ordinary overwrite, nothing at risk
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut backup_name = path.file_name().unwrap_or_default().to_os_string();
+    backup_name.push(format!(".corrupt-{secs}"));
+    let backup = path.with_file_name(backup_name);
+    match std::fs::copy(path, &backup) {
+        Ok(_) => crate::diag::line(format!(
+            "{} did not parse — the unreadable copy was saved as {} before it was overwritten",
+            path.display(),
+            backup.display()
+        )),
+        Err(e) => crate::diag::line(format!(
+            "{} did not parse, and the unreadable copy could not be backed up to {}: {e}",
+            path.display(),
+            backup.display()
+        )),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`write_atomically`] has actually landed a write on
+    /// this thread, since the last [`take_write_count`]. Test-only
+    /// instrumentation: a "does not rewrite the file for an unchanged value"
+    /// test used to check this through the file's mtime, which is
+    /// indistinguishable from "wrote nothing" on any filesystem with
+    /// one-second resolution even when the file actually was rewritten twice
+    /// inside that second — exactly the case a fast, in-memory temp directory
+    /// produces on every run. Counting the write itself makes the claim
+    /// direct instead of hoping the clock ticked in between.
+    static WRITE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Take (and reset) the number [`WRITE_COUNT`] has reached on this thread.
+#[cfg(test)]
+fn take_write_count() -> u64 {
+    WRITE_COUNT.with(|c| c.replace(0))
+}
+
 /// Write `text` to `path` without ever leaving a half-written file behind:
 /// into a temporary neighbour first, then a rename over the target, which is
 /// atomic on every filesystem this app runs on. A plain write truncates first,
 /// so an app quit (or a crash, or a full disk) in the middle of one leaves
 /// settings that no longer parse — and this file's reader treats unparsable
 /// as empty, which is every preference in it, silently gone.
+///
+/// Backs up a corrupt `path` (see [`backup_if_corrupt`]) before ever touching
+/// it — every setter routes through here, so this is the one place that can
+/// catch a corrupt file the moment before it would be overwritten with a
+/// fresh, mostly-empty one.
 fn write_atomically(path: &std::path::Path, text: &str) {
     let Some(dir) = path.parent() else { return };
     let _ = std::fs::create_dir_all(dir);
+    backup_if_corrupt(path);
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     // Created, not written into whatever is already there: the temp path is
     // predictable, and a symlink left on it by anything running as this user
@@ -217,6 +291,9 @@ fn write_atomically(path: &std::path::Path, text: &str) {
     }
     if std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
+    } else {
+        #[cfg(test)]
+        WRITE_COUNT.with(|c| c.set(c.get() + 1));
     }
 }
 
@@ -287,7 +364,7 @@ pub fn set_monitor_desktop(v: bool) {
 
 /// Auto-send `codex exec hello` while the Codex 5-hour window sits empty (to
 /// start a fresh one). Consumes a little quota, so it's a toggle. One ping per
-/// window — see `main.rs::ping_target` and the two keys below.
+/// window — see `main.rs::ping_due`/`window_start` and the two keys below.
 pub fn auto_ping_codex() -> bool {
     get_bool("auto_ping_codex")
 }
@@ -571,17 +648,32 @@ pub fn set_builtin_migrated(id: &str, version: &str) {
     write_atomically(&p, &cfg.to_string());
 }
 
-/// briefly deleted).
+/// Drop every stored override for a removed plugin — enabled/disabled state,
+/// surface toggles, options, seen-window bookkeeping — everything nested under
+/// `plugin.<id>.`, so a later reinstall starts from the manifest's defaults
+/// rather than whatever this install session had accumulated. The codex/claude
+/// bridge keys (`auto_ping_codex`, `monitor_desktop`, …) survive by
+/// construction rather than by any carve-out here: they are top-level keys,
+/// never nested under `plugin.<id>.` at all, so this never sees them.
+///
+/// `builtin_migrated` is the one key that *is* under that prefix and this
+/// deliberately leaves alone anyway: it is not user state, it is the record
+/// that a built-in's on-disk manifest has already been carried forward to a
+/// given version. If Remove wiped it, the very next launch's
+/// `seed::upgrade_builtin` would find the plugin `Absent` and rewrite the
+/// shipped file the user just chose to delete — the seed step then treats
+/// "gone" the same as "never migrated".
 pub fn remove_plugin_keys(id: &str) {
     let Some(p) = path() else { return };
     let prefix = format!("plugin.{id}.");
+    let keep = format!("plugin.{id}.builtin_migrated");
     let mut cfg = load();
     let Some(obj) = cfg.as_object_mut() else {
         return;
     };
     let stale: Vec<String> = obj
         .keys()
-        .filter(|k| k.starts_with(&prefix))
+        .filter(|k| k.starts_with(&prefix) && k.as_str() != keep)
         .cloned()
         .collect();
     if stale.is_empty() {
@@ -679,6 +771,60 @@ mod tests {
         assert_eq!(path(), path());
     }
 
+    /// A corrupt `config.json` used to be one preference change away from
+    /// vanishing outright: `load` reads unparsable as empty, every setter
+    /// builds its new value from that empty object, and `write_atomically`
+    /// then overwrote the only copy with it — the corrupt bytes gone, and
+    /// nothing on disk to even show what had been lost. `backup_if_corrupt`
+    /// runs first now, so a copy survives under `config.json.corrupt-<unix
+    /// secs>` and the log says so, before the setter's own change lands as
+    /// usual.
+    #[test]
+    fn a_corrupt_config_is_backed_up_before_the_next_write_overwrites_it() {
+        with_test_config_path(|| {
+            let p = path().expect("test config path resolves");
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            let corrupt = "{not valid json";
+            std::fs::write(&p, corrupt).expect("seed a corrupt file");
+            let _ = crate::diag::take_recorded(); // drain anything left on this thread
+
+            set_plugin_enabled("acme", true);
+
+            let backups: Vec<_> = std::fs::read_dir(p.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("config.json.corrupt-")
+                })
+                .collect();
+            assert_eq!(
+                backups.len(),
+                1,
+                "exactly one backup, named after the file it came from"
+            );
+            assert_eq!(
+                std::fs::read_to_string(backups[0].path()).unwrap(),
+                corrupt,
+                "the corrupt bytes are preserved verbatim, not re-serialized"
+            );
+
+            assert!(
+                plugin_enabled("acme", false),
+                "the write that triggered the backup still landed"
+            );
+
+            let lines = crate::diag::take_recorded();
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("did not parse") && l.contains("corrupt-")),
+                "expected a diagnostic naming the backup: {lines:?}"
+            );
+        });
+    }
+
     /// `plugin_option` follows the same config > manifest-default precedence
     /// as `plugin_enabled`/`plugin_ping`, with no well-known-id bridge to
     /// worry about. Runs against a disposable temp file (`with_test_config_path`)
@@ -756,6 +902,38 @@ mod tests {
                 monitor_desktop(),
                 "the claude-desktop bridge key is never touched by remove_plugin_keys"
             );
+        });
+    }
+
+    #[test]
+    fn remove_plugin_keys_leaves_the_builtin_migrated_marker_in_place() {
+        // A removed built-in must not look "never migrated" to the next
+        // launch: seed::upgrade_builtin treats a plugin with no marker as
+        // Absent and re-delivers the shipped manifest, undoing the very
+        // Remove the user asked for. Everything else under `plugin.<id>.`
+        // still goes, same as the generic-keys test above.
+        // "antigravity", not "codex": `plugin_ping`/`set_plugin_ping` bridge
+        // codex (and claude) straight to the legacy `auto_ping_codex` key,
+        // which `remove_plugin_keys` never touches either — by design, same
+        // as the bridge keys in the test above. A removable built-in with no
+        // bridge is what actually exercises the generic-key sweep here.
+        with_test_config_path(|| {
+            set_builtin_migrated("antigravity", "1.2.0");
+            set_plugin_enabled("antigravity", false);
+            set_plugin_ping("antigravity", true);
+
+            remove_plugin_keys("antigravity");
+
+            assert_eq!(
+                builtin_migrated("antigravity").as_deref(),
+                Some("1.2.0"),
+                "builtin_migrated must survive remove_plugin_keys"
+            );
+            assert!(
+                plugin_enabled("antigravity", true),
+                "every other override for the plugin is still cleared"
+            );
+            assert!(!plugin_ping("antigravity"), "ping override cleared");
         });
     }
 
@@ -875,17 +1053,13 @@ mod tests {
                 period_minutes: Some(300),
             };
             set_plugin_seen_window_for("acme", "acme", "primary", seen);
-            let p = path().expect("test path");
-            let first = std::fs::metadata(&p)
-                .expect("written")
-                .modified()
-                .expect("mtime");
+            take_write_count(); // drop the write above; only the second call is under test
             set_plugin_seen_window_for("acme", "acme", "primary", seen);
-            let second = std::fs::metadata(&p)
-                .expect("still there")
-                .modified()
-                .expect("mtime");
-            assert_eq!(first, second, "an unchanged entry must not touch the file");
+            assert_eq!(
+                take_write_count(),
+                0,
+                "an unchanged entry must not touch the file"
+            );
         });
     }
 
@@ -923,17 +1097,13 @@ mod tests {
     fn set_u64_does_not_rewrite_the_file_for_an_unchanged_value() {
         with_test_config_path(|| {
             set_plugin_pinged_at("acme", 1_700_000_005);
-            let p = path().expect("test path");
-            let first = std::fs::metadata(&p)
-                .expect("written")
-                .modified()
-                .expect("mtime");
+            take_write_count(); // drop the write above; only the second call is under test
             set_plugin_pinged_at("acme", 1_700_000_005);
-            let second = std::fs::metadata(&p)
-                .expect("still there")
-                .modified()
-                .expect("mtime");
-            assert_eq!(first, second, "an unchanged value must not touch the file");
+            assert_eq!(
+                take_write_count(),
+                0,
+                "an unchanged value must not touch the file"
+            );
         });
     }
 

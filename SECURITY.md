@@ -15,10 +15,10 @@ what it does with them — and what it refuses to do.
   diagnostics and has never carried one. Most tokens live only for the request
   they are used in. The exception is the one this app obtains itself: an
   `oauth-refresh` result is kept in a process-global in-memory cache
-  (`src/plugin/auth.rs`, a `Mutex` over a map) until the moment the provider
-  said it expires, after which it is not used again — an expired entry reads
-  as a miss and the next exchange overwrites it. (It is not scrubbed at the
-  moment it expires; if that distinction matters to you, the map is
+  (`src/plugin/auth.rs`, a `Mutex` over a map) until 60 seconds before the
+  moment the provider said it expires, after which it is not used again — an
+  expired entry reads as a miss and the next exchange overwrites it. (It is
+  not scrubbed at that moment; if that distinction matters to you, the map is
   `REFRESH_CACHE` and it dies with the process.) Without the cache a
   one-minute poll would mean a token exchange a minute, which is both rude to
   the provider and a way to get an account rate-limited.
@@ -41,7 +41,14 @@ what it does with them — and what it refuses to do.
 ### Requests this app makes
 
 Four call sites, all of them `ureq` with redirects disabled — `grep -n ureq -r src`
-finds every one:
+finds every one — carrying five kinds of request between them, since the
+registry's own fetch function is reused for both the index and its signature
+file. All four are `https`-only, each enforced where it is sent: the usage
+endpoint's URL is refused at load (`PluginManifest::validate`) and refused
+again by the generic HTTP engine right before it would open a connection; the
+`oauth-refresh` token exchange refuses a non-`https` `token_url` of its own
+accord before dialing it; and the registry's `index.toml`/signature/manifest
+fetches carry the same gate at their own call site.
 
 1. **The provider's own usage endpoint**, per manifest, to a host that
    manifest pins in `allowed_hosts`. This is the one on a timer.
@@ -50,14 +57,18 @@ finds every one:
    its own: it happens inside a scheduled fetch, and only when the token that
    fetch needs has lapsed — which the in-memory cache above makes rare.
 3. **One `index.toml`**, and only when you press "Check updates" in Settings.
-4. **A manifest file named by that index**, and only when you then choose to
+4. **That index's signature file**, `index.toml.minisig`, fetched right after
+   and only on the same trigger — minisign's own convention keeps it at a
+   fixed name beside the index, and it is what the trust check in the gap
+   list below verifies (or, until a key is pinned, fails to).
+5. **A manifest file named by that index**, and only when you then choose to
    install or update one of the plugins it lists. Its bytes are checked
    against the sha256 the index stated before anything is parsed or written —
    see the gap about provenance below.
 
 ### A request this app makes something *else* make
 
-`[ping]` is the fifth way traffic leaves because of this app, and it is not an
+`[ping]` is the sixth way traffic leaves because of this app, and it is not an
 HTTP call of its own: it runs a local command the manifest names, shortly after
 that provider's window resets, and that command talks to its own provider. The
 shipped example is `codex exec … hello` — a real prompt, spending a little real

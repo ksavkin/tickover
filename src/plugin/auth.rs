@@ -2,7 +2,9 @@
 //! way to find a provider's token, without a per-provider Rust module.
 //!
 //! Each [`AuthStep`] is evaluated in order and classified as one of three
-//! outcomes (mirrors the doc comment on [`AuthStep`] in `manifest.rs`):
+//! outcomes (mirrors the doc comment on `SurfaceConfig::auth` in
+//! `manifest.rs` — the classification lives there, not on [`AuthStep`]
+//! itself):
 //!   * **Present-ok**   — the credential store exists and yielded a token.
 //!     [`resolve_token`] returns it immediately.
 //!   * **Present-err**  — the credential store exists but the token couldn't
@@ -117,40 +119,24 @@ fn json_path_present(root: &Value, path: &str) -> bool {
 /// Is `url` allowed for a surface with this `allowed_hosts` list? An empty
 /// list allows every host (no restriction configured); a non-empty list
 /// requires an exact match on `url`'s host (case-insensitive, no wildcards —
-/// a subdomain of an allowed host does **not** match). Used by the http
-/// engine so a surface's token can never leak to a host the manifest didn't
-/// name.
+/// a subdomain of an allowed host does **not** match).
+///
+/// The host is read by [`super::https_host`] — the same WHATWG parser
+/// `ureq` builds the request through — rather than by a hand-rolled split
+/// on the URL's punctuation, and a `url` that isn't `https` at all is never
+/// allowed: this function exists so a surface's token can never leak to a
+/// host the manifest didn't name, and a request the http engine would have
+/// refused to send in the clear is not a host worth comparing against.
 pub fn host_allowed(allowed_hosts: &[String], url: &str) -> bool {
     if allowed_hosts.is_empty() {
         return true;
     }
-    match url_host(url) {
+    match super::https_host(url) {
         Some(host) => allowed_hosts
             .iter()
-            .any(|allowed| allowed.eq_ignore_ascii_case(host)),
+            .any(|allowed| allowed.eq_ignore_ascii_case(&host)),
         None => false,
     }
-}
-
-/// Pull the host out of a URL by hand (no `url` crate dependency here):
-/// strip the scheme, take the authority up to the next `/`, `?` or `#`, drop
-/// any userinfo (`user:pass@`) and port, and unwrap a bracketed IPv6 literal.
-///
-/// `pub(crate)` (rather than private) so `crate::plugin::registry` can share
-/// this exact implementation instead of keeping its own copy — see that
-/// module's `resolve_manifest_url`/`analyze_trust`.
-pub(crate) fn url_host(url: &str) -> Option<&str> {
-    let rest = match url.find("://") {
-        Some(i) => &url[i + 3..],
-        None => url,
-    };
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..end];
-    let authority = authority.rsplit('@').next().unwrap_or(authority);
-    if let Some(bracketed) = authority.strip_prefix('[') {
-        return bracketed.split(']').next();
-    }
-    Some(authority.split(':').next().unwrap_or(authority))
 }
 
 // ── Step: credentials-file ────────────────────────────────────────────────
@@ -173,7 +159,12 @@ fn credentials_file_step(step: &AuthStep) -> Result<Option<String>, String> {
         .ok_or_else(|| format!("{} is not a readable regular file", file.display()))?;
     extract_token(&text, token_json_path)
         .map(Some)
-        .ok_or_else(|| format!("no token at `{token_json_path}` in {}", file.display()))
+        .ok_or_else(|| {
+            format!(
+                "not JSON, or no token at `{token_json_path}` in {}",
+                file.display()
+            )
+        })
 }
 
 // ── Step: credentials-map ─────────────────────────────────────────────────
@@ -213,9 +204,9 @@ fn credentials_map_step(step: &AuthStep) -> Result<Option<String>, String> {
         .as_object()
         .ok_or_else(|| format!("{} is not a JSON object", file.display()))?;
 
-    // Collected rather than short-circuited on the first hit: a second match
-    // has to be noticed, not silently shadowed by whichever entry the map
-    // happens to iterate first.
+    // The filtered iterator is advanced a second time rather than stopping
+    // at the first hit: a second match has to be noticed, not silently
+    // shadowed by whichever entry the map happens to iterate first.
     let mut matches = object.iter().filter(|(key, _)| key.starts_with(key_prefix));
     let Some((_, entry)) = matches.next() else {
         return Err(format!(
@@ -280,9 +271,10 @@ fn keychain_step(step: &AuthStep) -> Result<Option<String>, String> {
 /// untouched: a JSON object opens with `{`, so it can never collide with this
 /// prefix, which makes recognising the wrapper safe to do unconditionally
 /// rather than behind a manifest key. Split out of `keychain_step` so the
-/// decode is unit-tested without a real Keychain — hence the same
-/// `cfg(any(macos, test))` its only caller carries, so a non-macOS build (where
-/// `keychain_step` never calls it) does not warn it as dead code.
+/// decode is unit-tested without a real Keychain — hence the extra `test` arm
+/// on this function's own `cfg`, so a non-macOS build (where `keychain_step`'s
+/// `cfg(target_os = "macos")` block, its only caller, never runs) does not
+/// warn it as dead code outside of `cargo test`.
 ///
 /// `zalando/go-keyring` writes one of two markers, and reads both: the current
 /// `go-keyring-base64:` (standard base64, what Antigravity's item carries and
@@ -344,7 +336,9 @@ fn keychain_token_from_blob(
     }
     extract_token(json, token_json_path)
         .map(Some)
-        .ok_or_else(|| format!("no token at `{token_json_path}` in Keychain item '{service}'"))
+        .ok_or_else(|| {
+            format!("not JSON, or no token at `{token_json_path}` in Keychain item '{service}'")
+        })
 }
 
 /// Current wall-clock time as Unix seconds. Split out so `token_is_stale` and
@@ -409,7 +403,11 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 fn env_step(step: &AuthStep) -> Result<Option<String>, String> {
     let var = require_str("env", "var", step.var.as_deref())?;
-    Ok(std::env::var(var).ok())
+    // A set-but-blank variable is Absent, not a present empty token — the
+    // same rule every other step's token lookup applies (see
+    // `client_env_pair`'s identical filter), so unsetting a shell export by
+    // exporting it empty behaves the same as not exporting it at all.
+    Ok(std::env::var(var).ok().filter(|v| !v.trim().is_empty()))
 }
 
 // ── Step: electron-safe-storage ───────────────────────────────────────────
@@ -441,8 +439,13 @@ fn electron_safe_storage_step(step: &AuthStep) -> Result<Option<String>, String>
     if !file.is_file() {
         return Ok(None); // desktop app not installed
     }
-    let text = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
-    let value: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    // Regular and bounded, same as `credentials_file_step`: this path also
+    // comes from a manifest, and a fetch thread blocked reading a FIFO never
+    // reports back at all.
+    let text = super::read_regular_file(&file, super::SMALL_FILE_MAX_BYTES)
+        .ok_or_else(|| format!("{} is not a readable regular file", file.display()))?;
+    let value: Value =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", file.display()))?;
     let enc = match extract_token_at(&value, blob_json_path) {
         Some(enc) => enc,
         None => return Ok(None), // config present but never logged in
@@ -464,7 +467,7 @@ fn electron_safe_storage_step(step: &AuthStep) -> Result<Option<String>, String>
     };
     token_from_decrypted(&plain, token_json_path)
         .map(Some)
-        .ok_or_else(|| format!("no token at `{token_json_path}` in decrypted payload"))
+        .ok_or_else(|| format!("not JSON, or no token at `{token_json_path}` in decrypted payload"))
 }
 
 /// Extract the token from a decrypted Safe Storage payload, which may carry
@@ -478,10 +481,13 @@ fn token_from_decrypted(plain: &[u8], token_json_path: &str) -> Option<String> {
     extract_token(json, token_json_path)
 }
 
-/// `Ok(Some(bytes))` — decrypted; `Ok(None)` — the Keychain item that holds
-/// the Safe Storage key doesn't exist on this machine (Absent, the caller
-/// must treat this the same as "config not present"); `Err` — the item
-/// exists but couldn't be read (access denied) or decryption itself failed.
+/// `Ok(Some(bytes))` — decrypted; `Ok(None)` — either the Keychain item that
+/// holds the Safe Storage key doesn't exist on this machine, or this OS has
+/// no Safe Storage backend at all (Absent either way, the caller must treat
+/// both the same as "config not present" — the same convention every other
+/// step's off-platform arm follows, e.g. `keychain_step`'s); `Err` — the
+/// item exists but couldn't be read (access denied) or decryption itself
+/// failed.
 fn electron_decrypt(
     blob: &[u8],
     macos_keychain_key: Option<&str>,
@@ -505,8 +511,12 @@ fn electron_decrypt(
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
+        // No Safe Storage backend on this OS at all — Absent, not an error,
+        // the same as a `keychain`/`win-credential` step's own off-platform
+        // arm: the chain moves on to whatever step follows rather than
+        // reporting a store that was never going to exist here as broken.
         let _ = (blob, macos_keychain_key);
-        Err("desktop token unsupported on this OS".to_string())
+        Ok(None)
     }
 }
 
@@ -520,18 +530,31 @@ fn win_credential_step(step: &AuthStep) -> Result<Option<String>, String> {
         "token_json_path",
         step.token_json_path.as_deref(),
     )?;
-    // Tolerant of any per-target failure (not found, or an unreadable
-    // credential): try the next target name; only if every target comes up
-    // empty is the whole step Absent — any error on one target moves on to
-    // the next rather than stopping there.
+    // Tolerant of any per-target failure (not found, or a blob present but
+    // without the token at `token_json_path`): try the next target name;
+    // only if every target comes up empty is the whole step Absent. A target
+    // that *is* found but doesn't yield a token moves on rather than
+    // stopping there — Claude's manifest ships two Credential Manager
+    // targets, and the first one existing with the wrong shape must not hide
+    // a token sitting in the second. The last such error is only returned if
+    // no later target produces a token either.
+    let mut last_err = None;
     for target in targets {
         if let Some(raw) = win_credential(target) {
-            return extract_token(&raw, token_json_path)
-                .map(Some)
-                .ok_or_else(|| format!("no token at `{token_json_path}` in credential"));
+            match extract_token(&raw, token_json_path) {
+                Some(token) => return Ok(Some(token)),
+                None => {
+                    last_err = Some(format!(
+                        "not JSON, or no token at `{token_json_path}` in credential"
+                    ));
+                }
+            }
         }
     }
-    Ok(None)
+    match last_err {
+        Some(err) => Err(err),
+        None => Ok(None),
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -547,19 +570,26 @@ fn win_credential_step(_step: &AuthStep) -> Result<Option<String>, String> {
 /// tick, or the step floods the token endpoint with a valid client id and
 /// earns a 429 for the whole client.
 ///
-/// Only `Failed` carries the `client_id` it was produced with — not part of
-/// the *key* (see [`refresh_cache_key`]), but readable at lookup time so a
-/// `Backoff` hit can tell a still-relevant failure apart from one that
-/// belongs to a pair this config no longer uses. `Fresh` deliberately does
-/// **not** carry it, even though an earlier version of this change did: a
-/// still-valid access token is served purely by expiry, exactly the fix this
-/// whole change makes (see [`REFRESH_CACHE`]'s own doc) — comparing it
-/// against a freshly-*resolved* `client_id` on every `Fresh` hit would mean
-/// resolving the client on every hit, reopening the very hole ("a transient
-/// discovery miss must not discard a still-valid cached access token") this
-/// closes. `Backoff` has no such risk: there is no valid token to discard by
-/// resolving there, only a decision between "still backed off" and "try
-/// again now".
+/// Only `Failed` carries the `client_id` (and a hash of the `client_secret`
+/// — never the secret itself, same discipline as [`REFRESH_CACHE`]'s own
+/// key) it was produced with — not part of the *key* (see
+/// [`refresh_cache_key`]), but readable at lookup time so a `Backoff` hit
+/// can tell a still-relevant failure apart from one that belongs to a pair
+/// this config no longer uses, rotated secret included: a client id an
+/// operator keeps while only replacing its secret must still be retried
+/// right away, not punished for the old secret's failure. `Fresh`
+/// deliberately does **not** carry either, even though an earlier version of
+/// this change did: a still-valid access token is served purely by expiry,
+/// exactly the fix this whole change makes (see [`REFRESH_CACHE`]'s own
+/// doc) — comparing it against a freshly-*resolved* pair on every `Fresh`
+/// hit would mean resolving the client on every hit, reopening the very
+/// hole ("a transient discovery miss must not discard a still-valid cached
+/// access token") this closes. `Backoff` has no such risk: there is no
+/// valid token to discard by resolving there, only a decision between
+/// "still backed off" and "try again now". `Failed` also carries the
+/// message the failed attempt produced, so a `Backoff` hit that is not
+/// retried can report exactly why the last attempt failed instead of a
+/// message that says only that one happened.
 enum CacheEntry {
     Fresh {
         access_token: String,
@@ -568,6 +598,8 @@ enum CacheEntry {
     Failed {
         retry_after_unix: i64,
         client_id: String,
+        secret_hash: u64,
+        message: String,
     },
 }
 
@@ -577,11 +609,15 @@ enum CacheLookup {
     /// whole point of *not* keying on `client_id` — no need to resolve the
     /// client pair at all to serve it.
     Hit(String),
-    /// A recent failure still in its backoff, and the `client_id` it failed
-    /// with — do not exchange again yet *unless* the pair currently
-    /// resolves to a different id, in which case the failure was some other
-    /// pair's, not this one's.
-    Backoff { client_id: String },
+    /// A recent failure still in its backoff — the `client_id`/`secret_hash`
+    /// it failed with, so this can tell "still that pair, do not exchange
+    /// again yet" from "the pair has since changed, retry immediately" —
+    /// and the message it failed with, for when it is still that pair.
+    Backoff {
+        client_id: String,
+        secret_hash: u64,
+        message: String,
+    },
     /// Nothing usable cached — go exchange.
     Miss,
 }
@@ -615,6 +651,12 @@ enum CacheLookup {
 /// it to a host of its own choosing, so the collision buys nothing that was
 /// not already available. The map is process-local and dies with the
 /// process.
+///
+/// Every `Mutex` this module keeps recovers from poison the same way
+/// (`.lock().unwrap_or_else(|e| e.into_inner())`, `throttle::with_state`'s
+/// own convention): a panic in some other thread while holding one of these
+/// must not be what stops this module's caching and diagnostics from ever
+/// working again for the rest of the process.
 static REFRESH_CACHE: std::sync::Mutex<Option<std::collections::HashMap<u64, CacheEntry>>> =
     std::sync::Mutex::new(None);
 
@@ -633,11 +675,24 @@ fn refresh_cache_key(token_url: &str, refresh_token: &str) -> u64 {
     hasher.finish()
 }
 
+/// A non-reversible fingerprint of a `client_secret`, stored in
+/// [`CacheEntry::Failed`] instead of the secret itself — the same "never
+/// either in the clear" discipline [`REFRESH_CACHE`]'s own key follows.
+/// Distinctness, not proof, exactly as that key's own doc says of itself: a
+/// hash collision would mean a different secret is read back as
+/// unchanged, but engineering one buys an attacker nothing they could not
+/// already do with the secret in hand.
+fn secret_hash(secret: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    secret.len().hash(&mut hasher);
+    secret.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// What the cache holds for `key` as of `now`.
 fn refresh_cache_lookup(key: u64, now: i64) -> CacheLookup {
-    let Ok(guard) = REFRESH_CACHE.lock() else {
-        return CacheLookup::Miss;
-    };
+    let guard = REFRESH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     match guard.as_ref().and_then(|m| m.get(&key)) {
         Some(CacheEntry::Fresh {
             access_token,
@@ -646,8 +701,12 @@ fn refresh_cache_lookup(key: u64, now: i64) -> CacheLookup {
         Some(CacheEntry::Failed {
             retry_after_unix,
             client_id,
+            secret_hash,
+            message,
         }) if *retry_after_unix > now => CacheLookup::Backoff {
             client_id: client_id.clone(),
+            secret_hash: *secret_hash,
+            message: message.clone(),
         },
         _ => CacheLookup::Miss,
     }
@@ -655,11 +714,10 @@ fn refresh_cache_lookup(key: u64, now: i64) -> CacheLookup {
 
 /// Store an entry (fresh token or a failure to back off from) under `key`.
 fn refresh_cache_store(key: u64, entry: CacheEntry) {
-    if let Ok(mut guard) = REFRESH_CACHE.lock() {
-        guard
-            .get_or_insert_with(std::collections::HashMap::new)
-            .insert(key, entry);
-    }
+    let mut guard = REFRESH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(key, entry);
 }
 
 /// How long a failed exchange is not retried, in seconds. Must be well over one
@@ -769,10 +827,10 @@ fn oauth_refresh_step(step: &AuthStep, allowed_hosts: &[String]) -> Result<Optio
     // *unless* the pair has since changed (see `REFRESH_CACHE`'s own doc). A
     // broken clock (`now == 0`) skips the cache read entirely rather than
     // trust a stored expiry against it, and always resolves the pair. A
-    // `Backoff` hit that cannot resolve *any* pair right now resolves the
-    // step Absent, the same as `Miss`'s own `None` arm below, not the
-    // backoff error — there is no pair to compare against the one that
-    // failed, so there is no basis to claim it is still that one.
+    // `Backoff` hit that cannot resolve *any* pair right now reports the
+    // same backoff error a still-current pair would (see that arm below for
+    // why) rather than falling to Absent — unlike `Miss`'s own `None` arm,
+    // which has no cached failure to report and stays Absent.
     let now = now_unix();
     let key = refresh_cache_key(token_url, &refresh_token);
     let (client_id, client_secret) = if now != 0 {
@@ -780,21 +838,34 @@ fn oauth_refresh_step(step: &AuthStep, allowed_hosts: &[String]) -> Result<Optio
             CacheLookup::Hit(token) => return Ok(Some(token)),
             CacheLookup::Backoff {
                 client_id: cached_id,
+                secret_hash: cached_secret_hash,
+                message,
             } => match resolve_pair()? {
-                Some(pair) if pair.0 != cached_id => pair,
-                Some(_) => {
-                    return Err(
-                        "token refresh failed recently — will retry after a short backoff"
-                            .to_string(),
-                    );
+                Some(pair) if pair.0 != cached_id || secret_hash(&pair.1) != cached_secret_hash => {
+                    pair
                 }
-                // Nothing resolves right now — same as `Miss`'s own `None`
-                // arm below, this is Absent, not the backoff error: a
-                // client that cannot currently be resolved (uninstalled
-                // mid-session, say) is "not here" regardless of what an
-                // earlier, different attempt failed with, and there is no
-                // proof either way that the pair has or hasn't changed.
-                None => return Ok(None),
+                Some(_) => {
+                    return Err(message);
+                }
+                // Nothing resolves right now: unlike `Some(_)` just above
+                // (proven to be the exact same pair that failed), there is
+                // no pair here at all to compare against the one that
+                // failed — no proof either way that it has changed. This
+                // used to resolve Absent anyway, the same as `Miss`'s own
+                // `None` arm below, but a client that cannot currently be
+                // resolved is very often exactly *why* the exchange failed
+                // in the first place — a binary mid-reinstall, or
+                // `on_exchange_error`'s own `client_discovery_evict` having
+                // just armed a fresh discovery-miss backoff over it (see
+                // that function's own doc) — and Absent silently hides the
+                // row instead of explaining it, for as long as this cache
+                // entry's own backoff says the failure is still current.
+                // Reporting the same `message` the proven-unchanged case
+                // above reports keeps the row, and the reason, visible
+                // until this backoff lapses; only then does an
+                // unresolvable client fall back to Absent, same as
+                // `Miss`'s own arm.
+                None => return Err(message),
             },
             CacheLookup::Miss => match resolve_pair()? {
                 Some(pair) => pair,
@@ -810,14 +881,19 @@ fn oauth_refresh_step(step: &AuthStep, allowed_hosts: &[String]) -> Result<Optio
 
     // A failed exchange, and a 200 that carried no usable token, both back off:
     // `store_backoff` is a no-op when the clock is broken (`now == 0`), so a
-    // bogus `retry_after` is never written to outlast the bad clock.
-    let store_backoff = |now: i64| {
+    // bogus `retry_after` is never written to outlast the bad clock. The
+    // message is stored alongside it, so a later `Backoff` hit that is not
+    // retried can report exactly this failure rather than a placeholder that
+    // only says one happened.
+    let store_backoff = |now: i64, message: String| {
         if now != 0 {
             refresh_cache_store(
                 key,
                 CacheEntry::Failed {
                     retry_after_unix: now.saturating_add(REFRESH_BACKOFF_SECS),
                     client_id: client_id.clone(),
+                    secret_hash: secret_hash(&client_secret),
+                    message,
                 },
             );
         }
@@ -826,7 +902,7 @@ fn oauth_refresh_step(step: &AuthStep, allowed_hosts: &[String]) -> Result<Optio
         match oauth_refresh_request(token_url, &client_id, &client_secret, &refresh_token) {
             Ok(r) => r,
             Err(e) => {
-                store_backoff(now);
+                store_backoff(now, e.clone());
                 on_exchange_error(step, &e);
                 return Err(e);
             }
@@ -837,8 +913,9 @@ fn oauth_refresh_step(step: &AuthStep, allowed_hosts: &[String]) -> Result<Optio
             // A 200 with no token (or one too short-lived to cache usefully) is
             // still a reason to back off — otherwise a stuck endpoint is hit
             // every tick with no exchange ever succeeding.
-            store_backoff(now);
-            return Err("token refresh response carried no usable access_token".to_string());
+            let message = "token refresh response carried no usable access_token".to_string();
+            store_backoff(now, message.clone());
+            return Err(message);
         }
     };
     // A 60s margin, same as the keychain step's, so the cached token is retired
@@ -893,24 +970,19 @@ fn on_exchange_error(step: &AuthStep, err: &str) {
 /// when every source comes up empty — [`oauth_refresh_step`] then resolves
 /// the step Absent, exactly like any other missing credential store.
 ///
-/// The literal `client_id`/`client_secret` fallback this used to try between
-/// those two is still here, defensively, but a manifest that passed
-/// `manifest::validate` can no longer reach it: `client` and the literal
-/// pair together are refused at load (a step may not set both — see the
-/// manifest comment on `oauth-refresh`). What still exercises this branch is
-/// a hand-built `AuthStep` — this module's own tests construct a few that
-/// set `client` and the literal fields together — not a real manifest.
+/// A step's literal `client_id`/`client_secret` are never consulted here —
+/// `client` and the literal pair together are refused at load
+/// (`manifest::validate`; a step may not set both, see the manifest comment
+/// on `oauth-refresh`), and the caller only reaches this function once it
+/// has already confirmed `step.client.is_some()`, taking the literal fields
+/// itself otherwise. There is nothing left for a literal-pair fallback here
+/// to ever run against.
 ///
 /// Only ever called with `step.client.is_some()` — see the caller.
 fn resolve_client(step: &AuthStep) -> Option<(String, String)> {
     let client = step.client.as_ref()?;
     if let Some(pair) = client_env_pair(client) {
         return Some(pair);
-    }
-    if let (Some(id), Some(secret)) = (step.client_id.as_deref(), step.client_secret.as_deref()) {
-        if !id.trim().is_empty() && !secret.trim().is_empty() {
-            return Some((id.to_string(), secret.to_string()));
-        }
     }
     discover_client(client)
 }
@@ -975,7 +1047,9 @@ static CLIENT_DISCOVERY_FOUND: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 fn client_discovery_found_lookup(config_key: u64, path: &Path) -> Option<(String, String)> {
-    let guard = CLIENT_DISCOVERY_FOUND.lock().ok()?;
+    let guard = CLIENT_DISCOVERY_FOUND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let entry = guard.as_ref()?.get(&(config_key, path.to_path_buf()))?;
     // The file's current identity, not the cached one — a changed length or
     // modification time means whatever is at this path now is not what was
@@ -989,24 +1063,34 @@ fn client_discovery_found_lookup(config_key: u64, path: &Path) -> Option<(String
     Some((entry.id.clone(), entry.secret.clone()))
 }
 
-fn client_discovery_found_store(config_key: u64, path: PathBuf, id: String, secret: String) {
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return;
-    };
-    let Ok(mtime) = meta.modified() else { return };
-    if let Ok(mut guard) = CLIENT_DISCOVERY_FOUND.lock() {
-        guard
-            .get_or_insert_with(std::collections::HashMap::new)
-            .insert(
-                (config_key, path),
-                ClientFound {
-                    id,
-                    secret,
-                    len: meta.len(),
-                    mtime,
-                },
-            );
-    }
+/// `len`/`mtime` come from [`scan_candidate`]'s own handle-level `stat` —
+/// see [`ScanOutcome::Found`]'s own doc for why this does not take a fresh
+/// one of its own against `path`: by the time this runs, the file at `path`
+/// may already be something else, and a re-`stat` here would tag the pair
+/// actually found with whatever identity that something-else has, not the
+/// one it was actually read out of.
+fn client_discovery_found_store(
+    config_key: u64,
+    path: PathBuf,
+    id: String,
+    secret: String,
+    len: u64,
+    mtime: std::time::SystemTime,
+) {
+    let mut guard = CLIENT_DISCOVERY_FOUND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(
+            (config_key, path),
+            ClientFound {
+                id,
+                secret,
+                len,
+                mtime,
+            },
+        );
 }
 
 /// The other half of the discovery cache: "nothing in `client.files`/
@@ -1085,45 +1169,56 @@ const CLIENT_DISCOVERY_LIMITS: ScanLimits = ScanLimits {
 };
 
 fn client_discovery_miss_lookup(key: u64, now: i64) -> bool {
-    let Ok(guard) = CLIENT_DISCOVERY_MISS.lock() else {
-        return false;
-    };
+    let guard = CLIENT_DISCOVERY_MISS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     matches!(guard.as_ref().and_then(|m| m.get(&key)), Some(retry_after) if *retry_after > now)
 }
 
 fn client_discovery_miss_store(key: u64, retry_after_unix: i64) {
-    if let Ok(mut guard) = CLIENT_DISCOVERY_MISS.lock() {
-        guard
-            .get_or_insert_with(std::collections::HashMap::new)
-            .insert(key, retry_after_unix);
-    }
+    let mut guard = CLIENT_DISCOVERY_MISS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(key, retry_after_unix);
 }
 
-/// Drop everything a discovery config has cached about a *credential* — the
-/// positive match and the negative-result backoff — so the very next attempt
-/// starts over rather than replaying a pair the OAuth endpoint has just said
-/// is wrong. Called from `oauth_refresh_step` on an `invalid_client`
-/// response (see there); nothing else ever learns that a cached pair has
-/// gone stale.
+/// Drop what a discovery config has cached as a *found* credential — so the
+/// next attempt rescans rather than replaying a pair the OAuth endpoint has
+/// just said is wrong — and replace whatever it had cached as a miss with a
+/// fresh [`CLIENT_DISCOVERY_RETRY_SECS`] backoff, the same window a genuine
+/// miss or read error already gets. Called from `oauth_refresh_step` on an
+/// `invalid_client` response (see there); nothing else ever learns that a
+/// cached pair has gone stale.
+///
+/// The backoff matters as much as the found-cache clear: a pair the OAuth
+/// endpoint keeps rejecting — a revoked grant, say, with the client binary
+/// on disk unchanged — calls this function again on every single refresh
+/// attempt, and an outright-cleared miss cache would let each of those
+/// immediately rescan from scratch, for as long as the rejection persists.
+/// For Antigravity's ~180 MB `agy` binary, scanned on every tick forever
+/// rather than once per ten minutes, that is the exact cost this cache
+/// exists to avoid.
 ///
 /// Deliberately does **not** clear [`CLIENT_DISCOVERY_LOGGED`]: the
 /// once-per-process "not found"/"half-set env" notifications are about a
 /// *config*, not about the credential this evicts, and an operator who has
 /// already read one has no reason to see it a second time just because a
 /// pair it found earlier turned out to be stale. Eviction is "forget the
-/// credential and let discovery run again", not "reset what has already
-/// been told".
+/// credential and let discovery run again, no sooner than the usual backoff
+/// allows", not "reset what has already been told".
 fn client_discovery_evict(client: &AuthClientDiscovery) {
     let key = client_config_key(client);
-    if let Ok(mut guard) = CLIENT_DISCOVERY_FOUND.lock() {
-        if let Some(map) = guard.as_mut() {
-            map.retain(|(config_key, _path), _| *config_key != key);
-        }
+    let mut guard = CLIENT_DISCOVERY_FOUND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.retain(|(config_key, _path), _| *config_key != key);
     }
-    if let Ok(mut guard) = CLIENT_DISCOVERY_MISS.lock() {
-        if let Some(map) = guard.as_mut() {
-            map.remove(&key);
-        }
+    let now = now_unix();
+    if now != 0 {
+        client_discovery_miss_store(key, now.saturating_add(CLIENT_DISCOVERY_RETRY_SECS));
     }
 }
 
@@ -1150,26 +1245,26 @@ static PENDING_DIAGNOSTICS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::ne
 /// often (a queue not drained this tick is drained the next one, and an
 /// empty queue costs a lock).
 pub fn take_pending_diagnostics() -> Vec<String> {
-    match PENDING_DIAGNOSTICS.lock() {
-        Ok(mut guard) => std::mem::take(&mut *guard),
-        Err(_) => Vec::new(),
-    }
+    let mut guard = PENDING_DIAGNOSTICS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *guard)
 }
 
 /// Queue `message` under `key`, the first time only — every diagnostic this
 /// module writes goes through here so "once per process" is one mechanism,
 /// not three copies of it.
 fn queue_diag_once(key: u64, message: String) {
-    let should_log = match CLIENT_DISCOVERY_LOGGED.lock() {
-        Ok(mut guard) => guard
-            .get_or_insert_with(std::collections::HashSet::new)
-            .insert(key),
-        Err(_) => false,
-    };
+    let should_log = CLIENT_DISCOVERY_LOGGED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(key);
     if should_log {
-        if let Ok(mut guard) = PENDING_DIAGNOSTICS.lock() {
-            guard.push(message);
-        }
+        PENDING_DIAGNOSTICS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(message);
     }
 }
 
@@ -1205,7 +1300,7 @@ fn half_set_env_diag(client: &AuthClientDiscovery) -> String {
 
 /// Hash `s` into `hasher`, length-prefixed so `("ab","c")` and `("a","bc")`
 /// cannot collide by concatenation — the discipline every key function in
-/// this module (and [`refresh_cache_key`], for its own unrelated triple)
+/// this module (and [`refresh_cache_key`], for its own unrelated pair)
 /// hashes its parts with.
 fn hash_part(hasher: &mut std::collections::hash_map::DefaultHasher, s: &str) {
     use std::hash::Hash;
@@ -1309,7 +1404,17 @@ fn client_truncated_diag() -> String {
 ///
 /// Precedence matches a plain, cache-free scan exactly: candidates are
 /// tried in the order they are named, and the first one that actually
-/// carries both patterns wins — cache or no cache. The found-cache lookup
+/// carries both patterns wins — cache or no cache. That guarantee only
+/// covers candidates the pass actually settles, though: `NotFound` and
+/// `Found` are the two verdicts that answer "does this one carry both
+/// patterns", but `Truncated` and `Error` both leave that question open and
+/// move straight on to the next candidate (see the loop below) rather than
+/// stopping the pass to insist on an answer first. A candidate that never
+/// gets read past a budget cutoff or an I/O error might well have matched
+/// too — this precedence is silent on it, not a claim that it did not — and
+/// a later candidate that *does* get fully read and matches is served
+/// instead, exactly as it would be if the truncated/errored one had simply
+/// come back `NotFound`. The found-cache lookup
 /// is the first thing each iteration below does, the same as it always was
 /// before there was a cache at all; it is never consulted for every
 /// candidate up front, because that would let a pair cached under a later
@@ -1417,8 +1522,15 @@ fn discover_client_within(
             &mut budget,
             limits.per_file_cap,
         ) {
-            ScanOutcome::Found(id, secret) => {
-                client_discovery_found_store(key, path.clone(), id.clone(), secret.clone());
+            ScanOutcome::Found(id, secret, len, mtime) => {
+                client_discovery_found_store(
+                    key,
+                    path.clone(),
+                    id.clone(),
+                    secret.clone(),
+                    len,
+                    mtime,
+                );
                 return Some((id, secret));
             }
             ScanOutcome::NotFound => continue,
@@ -1456,16 +1568,18 @@ fn discover_client_within(
 }
 
 /// Resolve each of `names` to a file on this machine, in the order given —
-/// mirroring `main.rs`'s `find_bin` (bare program names, PATH first). Checked
-/// against the inherited `PATH`, then the same install directories that
-/// binary's own auto-ping already appends
-/// ([`super::cli_install_dirs`] — the canonical list; see its own doc for
-/// why it lives here and not beside `find_bin`). A name not found anywhere
-/// contributes nothing, exactly like a `files` candidate that doesn't exist —
-/// discovery treats "not installed here" the same way regardless of which
-/// list named the candidate.
+/// mirroring `main.rs`'s `find_bin` (the same install directories that
+/// binary's own auto-ping already appends first, then the inherited `PATH`
+/// — [`super::cli_install_dirs`] is the canonical list; see its own doc for
+/// why it lives here and not beside `find_bin`). Same order both resolvers
+/// search in, so a machine with two installs of the same client on `PATH`
+/// at once cannot have this step discover a different pair from the one
+/// `find_bin` would have pinged. A name not found anywhere contributes
+/// nothing, exactly like a `files` candidate that doesn't exist — discovery
+/// treats "not installed here" the same way regardless of which list named
+/// the candidate.
 fn bin_candidates(names: &[String]) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut dirs: Vec<PathBuf> = super::cli_install_dirs();
     if let Some(p) = std::env::var_os("PATH") {
         // An empty `PATH` entry (a leading, trailing or doubled `:`) means
         // "the current directory" — POSIX's own convention, and never a
@@ -1475,7 +1589,6 @@ fn bin_candidates(names: &[String]) -> Vec<PathBuf> {
         // `is_absolute()` refuses that and any other relative entry.
         dirs.extend(std::env::split_paths(&p).filter(|d| d.is_absolute()));
     }
-    dirs.extend(super::cli_install_dirs());
     let mut found = Vec::new();
     for name in names {
         // Windows resolves a bare command name through `PATHEXT`, which a
@@ -1515,7 +1628,18 @@ fn bin_candidates(names: &[String]) -> Vec<PathBuf> {
 /// installed, read to the end and neither pattern matched" does.
 #[derive(Debug, PartialEq)]
 enum ScanOutcome {
-    Found(String, String),
+    /// The id, the secret, and the length/modification time of the file
+    /// they were actually read out of — taken from the very same
+    /// handle-level `stat` [`scan_candidate`] already does for `file_len`,
+    /// not a fresh one after the fact. [`client_discovery_found_store`]
+    /// caches by this identity rather than re-`stat`ing the path itself
+    /// once scanning is done: between "the scan finished" and "the cache
+    /// was updated" the file could have been rewritten, and a re-`stat` at
+    /// that point would tag the pair actually found with a *different*
+    /// file's identity, breaking the promise the found-cache's own doc
+    /// makes — that a cache hit's identity check reflects what was
+    /// actually scanned.
+    Found(String, String, u64, std::time::SystemTime),
     /// Read to EOF (or the candidate wasn't a regular file, or didn't
     /// exist) without a match — a genuine "not this candidate".
     NotFound,
@@ -1639,7 +1763,6 @@ fn accept_settled_match(
     pattern: &ScanPattern,
     eof: bool,
     found: &mut Option<String>,
-    label: &str,
 ) {
     if found.is_some() {
         return;
@@ -1670,11 +1793,6 @@ fn accept_settled_match(
     if m.len() <= super::CLIENT_PATTERN_MAX_MATCH_BYTES && !m.is_empty() {
         *found = Some(String::from_utf8_lossy(m.as_bytes()).into_owned());
     }
-    debug_assert!(
-        m.len() <= super::CLIENT_PATTERN_MAX_MATCH_BYTES,
-        "{label} match ({} bytes) exceeded the validated bound",
-        m.len()
-    );
 }
 
 /// Read `path` in bounded chunks, carrying a small overlap across each
@@ -1720,7 +1838,7 @@ fn accept_settled_match(
 /// (though a genuine mid-candidate cutoff can come from those too — either
 /// this cap, or the shared 1 GiB pass budget spread thin over several large
 /// candidates at once, and the largest known client binary, Antigravity's
-/// `agy`, is measured at well under a fifth of
+/// `agy`, is measured at about a third of
 /// [`CLIENT_DISCOVERY_MAX_SCAN_BYTES`] alone): every shipped pattern is
 /// exact-length (72 bytes for the id, 35 for the secret — see
 /// [`ScanPattern::max_len`]'s own doc for what that means for
@@ -1746,9 +1864,10 @@ fn accept_settled_match(
 /// `is_file()`, applied twice: once against the path here, and once more
 /// against the *open handle* afterward — closing the race between the two,
 /// since a symlink swapped in between would otherwise have its new target
-/// read on the strength of a check that never actually looked at it.
-/// Symlinks are followed on purpose, unlike `read_regular_file`: a `bins`
-/// candidate is routinely one.
+/// read on the strength of a check that never actually looked at it —
+/// `read_regular_file` follows the same technique for the identical race.
+/// Symlinks are followed on purpose here, same as there: a `bins` candidate
+/// is routinely one.
 fn scan_candidate(
     path: &Path,
     id_pattern: &ScanPattern,
@@ -1801,8 +1920,17 @@ fn scan_candidate(
     // `files`/`bins` candidate is always a regular file by the time this
     // line runs (the match above just confirmed it), so there is no
     // `/proc`-style entry with an unreliable stat in the shapes this scans.
-    let file_len = match file.metadata() {
-        Ok(meta) if meta.file_type().is_file() => meta.len(),
+    // `mtime` travels alongside `file_len` for the same reason: both come
+    // from this one handle-level `stat`, taken before any of the reads
+    // below, so a `Found` result can report the exact identity of what was
+    // actually scanned — see `ScanOutcome::Found`'s own doc — rather than
+    // `client_discovery_found_store` re-`stat`ing the path afterward and
+    // risking a *different* file's identity if it changed in between.
+    let (file_len, mtime) = match file.metadata() {
+        Ok(meta) if meta.file_type().is_file() => match meta.modified() {
+            Ok(mtime) => (meta.len(), mtime),
+            Err(e) => return ScanOutcome::Error(e.to_string()),
+        },
         Ok(_) => return ScanOutcome::NotFound,
         Err(e) => return ScanOutcome::Error(e.to_string()),
     };
@@ -1846,16 +1974,10 @@ fn scan_candidate(
             // anything. Settle directly instead — the same acceptance the
             // real EOF branch below gives a match once nothing more can
             // ever follow it.
-            accept_settled_match(&carry, id_pattern, true, &mut found_id, "id_pattern");
-            accept_settled_match(
-                &carry,
-                secret_pattern,
-                true,
-                &mut found_secret,
-                "secret_pattern",
-            );
+            accept_settled_match(&carry, id_pattern, true, &mut found_id);
+            accept_settled_match(&carry, secret_pattern, true, &mut found_secret);
             if let (Some(id), Some(secret)) = (&found_id, &found_secret) {
-                return ScanOutcome::Found(id.clone(), secret.clone());
+                return ScanOutcome::Found(id.clone(), secret.clone(), file_len, mtime);
             }
             break;
         }
@@ -1891,32 +2013,20 @@ fn scan_candidate(
             // settles there directly, the same acceptance this branch
             // gives, without ever waiting on a further read to report `0`:
             // neither site relies on this branch to get here.
-            accept_settled_match(&carry, id_pattern, true, &mut found_id, "id_pattern");
-            accept_settled_match(
-                &carry,
-                secret_pattern,
-                true,
-                &mut found_secret,
-                "secret_pattern",
-            );
+            accept_settled_match(&carry, id_pattern, true, &mut found_id);
+            accept_settled_match(&carry, secret_pattern, true, &mut found_secret);
             if let (Some(id), Some(secret)) = (&found_id, &found_secret) {
-                return ScanOutcome::Found(id.clone(), secret.clone());
+                return ScanOutcome::Found(id.clone(), secret.clone(), file_len, mtime);
             }
             break;
         }
         *budget = budget.saturating_sub(n as u64);
         carry.extend_from_slice(&chunk[..n]);
         scanned = scanned.saturating_add(n as u64);
-        accept_settled_match(&carry, id_pattern, false, &mut found_id, "id_pattern");
-        accept_settled_match(
-            &carry,
-            secret_pattern,
-            false,
-            &mut found_secret,
-            "secret_pattern",
-        );
+        accept_settled_match(&carry, id_pattern, false, &mut found_id);
+        accept_settled_match(&carry, secret_pattern, false, &mut found_secret);
         if let (Some(id), Some(secret)) = (&found_id, &found_secret) {
-            return ScanOutcome::Found(id.clone(), secret.clone());
+            return ScanOutcome::Found(id.clone(), secret.clone(), file_len, mtime);
         }
         if carry.len() > CLIENT_DISCOVERY_OVERLAP_BYTES {
             let drop = carry.len() - CLIENT_DISCOVERY_OVERLAP_BYTES;
@@ -1951,16 +2061,10 @@ fn scan_candidate(
             // directly, the same acceptance the real EOF branch below
             // gives a match once nothing more will ever be read from this
             // candidate.
-            accept_settled_match(&carry, id_pattern, true, &mut found_id, "id_pattern");
-            accept_settled_match(
-                &carry,
-                secret_pattern,
-                true,
-                &mut found_secret,
-                "secret_pattern",
-            );
+            accept_settled_match(&carry, id_pattern, true, &mut found_id);
+            accept_settled_match(&carry, secret_pattern, true, &mut found_secret);
             if let (Some(id), Some(secret)) = (&found_id, &found_secret) {
-                return ScanOutcome::Found(id.clone(), secret.clone());
+                return ScanOutcome::Found(id.clone(), secret.clone(), file_len, mtime);
             }
             break;
         }
@@ -2151,10 +2255,11 @@ fn keychain_password(service: &str) -> Result<Option<String>, String> {
 
 /// Classify the raw result of `security find-generic-password …` into the
 /// three-way Present-ok / Present-err / Absent outcome the auth chain uses:
-/// success with a non-empty password is Present-ok (`Ok(Some(_))`); a failure
-/// whose stderr says the item doesn't exist is Absent (`Ok(None)`) — the
-/// chain moves on / the surface hides, exactly like a missing file; any other
-/// failure (almost always a denied access prompt) is Present-err (`Err`).
+/// success with a non-empty password is Present-ok (`Ok(Some(_))`); success
+/// with an empty password, and a failure whose stderr says the item doesn't
+/// exist, are both Absent (`Ok(None)`) — the chain moves on / the surface
+/// hides, exactly like a missing file; any other failure (almost always a
+/// denied access prompt) is Present-err (`Err`).
 /// Split out of `keychain_password` so this stderr-sniffing logic can be
 /// unit-tested without a real Keychain (see `tests::classify_keychain_*`).
 #[cfg(any(target_os = "macos", test))]
@@ -2198,8 +2303,9 @@ fn safe_storage_decrypt(blob: &[u8], pw: &str) -> Result<Vec<u8>, String> {
     Ok(pt.to_vec())
 }
 
-// ── Windows credential helpers (written against the Win32 APIs; not compiled
-//    on this machine — expect one build pass on Windows) ───────────────────
+// ── Windows credential helpers (written against the Win32 APIs; built and
+//    run on Windows 11 x86_64 MSVC — reached, but not yet against a real
+//    stored credential, per SECURITY.md's own note) ────────────────────────
 
 /// Read a Windows Credential Manager "generic" credential. `None` on *any*
 /// failure (no such target, or an unreadable/non-UTF8 blob) — the caller
@@ -2216,10 +2322,21 @@ fn win_credential(target: &str) -> Option<String> {
         let mut cred: *mut CREDENTIALW = std::ptr::null_mut();
         CredReadW(PCWSTR(wide.as_ptr()), CRED_TYPE_GENERIC, 0, &mut cred).ok()?;
         let c = &*cred;
-        let bytes =
-            std::slice::from_raw_parts(c.CredentialBlob, c.CredentialBlobSize as usize).to_vec();
+        // An empty stored credential (deliberately blanked out, or never
+        // written a value) leaves `CredentialBlob` null with size 0;
+        // `slice::from_raw_parts` requires a non-null pointer even for a
+        // zero-length slice, so that combination is checked for before the
+        // slice is built rather than after — a null blob just yields no
+        // token, the same as any other credential that doesn't carry one.
+        let token = if c.CredentialBlob.is_null() || c.CredentialBlobSize == 0 {
+            None
+        } else {
+            let bytes = std::slice::from_raw_parts(c.CredentialBlob, c.CredentialBlobSize as usize)
+                .to_vec();
+            String::from_utf8(bytes).ok()
+        };
         CredFree(cred as *const _ as *const core::ffi::c_void);
-        String::from_utf8(bytes).ok()
+        token
     }
 }
 
@@ -2236,16 +2353,22 @@ fn windows_dpapi_decrypt(blob: &[u8]) -> Result<Vec<u8>, String> {
         blob
     };
     unsafe {
-        let mut in_blob = CRYPT_INTEGER_BLOB {
+        let in_blob = CRYPT_INTEGER_BLOB {
             cbData: data.len() as u32,
             pbData: data.as_ptr() as *mut u8,
         };
         let mut out_blob = CRYPT_INTEGER_BLOB::default();
         CryptUnprotectData(&in_blob, None, None, None, None, 0, &mut out_blob)
             .map_err(|e| format!("DPAPI: {e}"))?;
-        let slice = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
+        // Same guard as `win_credential`'s blob: a zero-length decrypted
+        // result can come back with `pbData` null, and `from_raw_parts`
+        // requires a non-null pointer even then.
+        let slice = if out_blob.pbData.is_null() || out_blob.cbData == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec()
+        };
         let _ = LocalFree(windows::Win32::Foundation::HLOCAL(out_blob.pbData as _));
-        let _ = &mut in_blob;
         Ok(slice)
     }
 }
@@ -2568,6 +2691,22 @@ mod tests {
         compile_scan_pattern(pattern).expect("test pattern must compile")
     }
 
+    /// The `Found` a real `scan_candidate` call against `file` would build —
+    /// same length/mtime read straight off the file, for a test asserting
+    /// equality against `scan_candidate`'s own return value. Only correct
+    /// when nothing touches `file` between it being written and scanned,
+    /// true of every test that uses this: each writes its fixture once and
+    /// scans it immediately after, with no further write in between.
+    fn found(file: &Path, id: &str, secret: &str) -> ScanOutcome {
+        let meta = std::fs::metadata(file).expect("fixture file must exist");
+        ScanOutcome::Found(
+            id.to_string(),
+            secret.to_string(),
+            meta.len(),
+            meta.modified().expect("this platform must report mtime"),
+        )
+    }
+
     #[test]
     fn discover_client_finds_both_in_one_file() {
         let dir = temp_dir("discover-basic");
@@ -2630,7 +2769,7 @@ mod tests {
                 &mut budget,
                 CLIENT_DISCOVERY_MAX_SCAN_BYTES
             ),
-            ScanOutcome::Found(real_id.clone(), real_secret.clone()),
+            found(&file, &real_id, &real_secret),
             "the leading digit must not be swallowed into the match"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -2665,7 +2804,7 @@ mod tests {
                 &mut budget,
                 CLIENT_DISCOVERY_MAX_SCAN_BYTES
             ),
-            ScanOutcome::Found(id_text.clone(), secret_text.clone())
+            found(&file, &id_text, &secret_text)
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2729,7 +2868,7 @@ mod tests {
                 &mut budget,
                 CLIENT_DISCOVERY_MAX_SCAN_BYTES
             ),
-            ScanOutcome::Found(id_text.clone(), secret_text.clone())
+            found(&file, &id_text, &secret_text)
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2772,7 +2911,7 @@ mod tests {
                     &mut budget,
                     CLIENT_DISCOVERY_MAX_SCAN_BYTES
                 ),
-                ScanOutcome::Found(id_text, secret_text)
+                found(&file, &id_text, &secret_text)
             );
             std::fs::remove_dir_all(&dir).ok();
         }
@@ -2809,7 +2948,7 @@ mod tests {
                     &mut budget,
                     CLIENT_DISCOVERY_MAX_SCAN_BYTES
                 ),
-                ScanOutcome::Found(id_text, secret_text)
+                found(&file, &id_text, &secret_text)
             );
             std::fs::remove_dir_all(&dir).ok();
         }
@@ -2852,7 +2991,7 @@ mod tests {
                 &mut budget,
                 CLIENT_DISCOVERY_MAX_SCAN_BYTES
             ),
-            ScanOutcome::Found(id_text, secret_text)
+            found(&file, &id_text, &secret_text)
         );
         assert_eq!(
             budget, 0,
@@ -2889,29 +3028,31 @@ mod tests {
         let mut budget = CLIENT_DISCOVERY_PASS_BUDGET_BYTES;
         assert_eq!(
             scan_candidate(&file, &id_pattern, &secret_pattern, &mut budget, 3000),
-            ScanOutcome::Found(id_text, secret_text)
+            found(&file, &id_text, &secret_text)
         );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn scan_candidate_never_reads_past_the_cap_even_when_the_file_is_longer_than_its_stat_said() {
-        // A wrong `file_len` is hard to fake honestly with a real file — it
-        // is read from the very same `stat` this test would also have to
-        // fake being wrong — so this instead pins the *observable* bound
-        // the bottom-of-loop cap site must never violate: reading past
-        // `per_file_cap` at all, whatever `file_len` says. Measured
-        // directly against the actual defect this guards: a `stat` of `0`
-        // bytes against a real 8 MiB file, a 1 MiB cap and a 6 MiB shared
-        // budget read the full 6 MiB instead of stopping at the cap's own
-        // 1 MiB, because a cap site that read on past its limit — trusting
-        // `scanned >= file_len` (`0 >= 0`, immediately) to mean "the next
-        // `read` will report EOF" — would be exactly backwards when the
-        // file is *larger* than the stat said, not smaller.
+    fn scan_candidate_never_reads_past_the_cap_regardless_of_what_file_len_says() {
+        // A wrong `file_len` (a real `stat` that is stale by the time the
+        // reads happen) is hard to fake honestly with a real file — it is
+        // read from the very same `stat` this test would also have to fake
+        // being wrong — so a genuinely stale stat is not what this
+        // exercises. What it pins instead is the *observable* bound the
+        // bottom-of-loop cap site must never violate regardless: reading
+        // past `per_file_cap` at all, whatever `file_len` happens to say.
+        // Measured against the actual defect this guards: a stale `stat` of
+        // `0` bytes against a real 8 MiB file, a 1 MiB cap and a 6 MiB
+        // shared budget read the full 6 MiB instead of stopping at the
+        // cap's own 1 MiB, because a cap site that read on past its limit —
+        // trusting `scanned >= file_len` (`0 >= 0`, immediately) to mean
+        // "the next `read` will report EOF" — would be exactly backwards
+        // when the file is *larger* than the stat said, not smaller.
         let id_pattern = scan_pattern(&synthetic_id_pattern());
         let secret_pattern = scan_pattern(&synthetic_secret_pattern());
 
-        let dir = temp_dir("scan-cap-bound-vs-stale-stat");
+        let dir = temp_dir("scan-cap-bound-regardless-of-file-len");
         let file = dir.join("no-pair");
         std::fs::write(&file, vec![b'x'; CLIENT_DISCOVERY_CHUNK_BYTES * 2 + 100]).unwrap();
 
@@ -2995,7 +3136,7 @@ mod tests {
                 &mut budget,
                 CLIENT_DISCOVERY_MAX_SCAN_BYTES
             ),
-            ScanOutcome::Found(id_text, secret_text)
+            found(&file, &id_text, &secret_text)
         );
         assert_eq!(
             budget, 0,
@@ -3057,7 +3198,7 @@ mod tests {
                 &mut budget,
                 CLIENT_DISCOVERY_CHUNK_BYTES as u64
             ),
-            ScanOutcome::Found(id_text, secret_text)
+            found(&file, &id_text, &secret_text)
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3294,11 +3435,12 @@ mod tests {
         let _diag_guard = DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // No credentials file at all: the step must resolve Absent without
         // ever reaching `resolve_client` — proven here by a `client` table
-        // that would panic/loop forever if it were actually scanned (a
-        // `files` entry naming a directory a regex could never finish
-        // matching against is besides the point; what matters is that no
-        // diagnostic — the one thing only a real discovery attempt queues —
-        // shows up at all).
+        // naming a `files` entry that does not exist. `scan_candidate`
+        // treats a missing path as a harmless miss, not something that could
+        // panic or hang, so this fixture is not itself dangerous to scan;
+        // what it actually shows is that a discovery attempt against it
+        // never happens at all — no diagnostic, the one thing only a real
+        // attempt queues, shows up here.
         let dir = temp_dir("no-refresh-file-yet");
         let mut step = oauth_refresh_step_for(&dir, r#"{"refresh_token":"r-1"}"#);
         step.path = Some(
@@ -3381,21 +3523,55 @@ mod tests {
     fn oauth_refresh_step_honors_backoff_when_the_client_id_is_unchanged() {
         let dir = temp_dir("oauth-backoff-unchanged-client");
         let step = oauth_refresh_step_for(&dir, r#"{"refresh_token":"r-backoff-same"}"#);
-        // `oauth_refresh_step_for` sets the literal `client_id` to
-        // "test-client-id" — the same one this entry says it failed with.
+        // `oauth_refresh_step_for` sets the literal `client_id`/`client_secret`
+        // to "test-client-id"/"test-client-secret" — the same pair this
+        // entry says it failed with.
         let key = refresh_cache_key(step.token_url.as_deref().unwrap(), "r-backoff-same");
         refresh_cache_store(
             key,
             CacheEntry::Failed {
                 retry_after_unix: now_unix() + 300,
                 client_id: "test-client-id".to_string(),
+                secret_hash: secret_hash("test-client-secret"),
+                message: "stale mock failure message".to_string(),
             },
         );
 
         assert_eq!(
             oauth_refresh_step(&step, &["oauth2.googleapis.com".to_string()]),
-            Err("token refresh failed recently — will retry after a short backoff".to_string()),
-            "the same pair that just failed must not be retried before its backoff passes"
+            Err("stale mock failure message".to_string()),
+            "the same pair that just failed must not be retried before its backoff passes, and \
+             must report exactly what that failure said"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn oauth_refresh_step_bypasses_backoff_when_only_the_secret_has_changed() {
+        // The other half of "the pair has changed": the same `client_id` as
+        // the cached failure, but a different `client_secret` — an operator
+        // rotating just the secret (the client id, an installed app's, does
+        // not change) must not be judged by the old secret's failure either.
+        let dir = temp_dir("oauth-backoff-changed-secret");
+        let mut step = oauth_refresh_step_for(&dir, r#"{"refresh_token":"r-backoff-newsecret"}"#);
+        step.token_url = Some("https://127.0.0.1:1/token".to_string());
+        step.client_secret = Some("rotated-client-secret".to_string());
+        let key = refresh_cache_key(step.token_url.as_deref().unwrap(), "r-backoff-newsecret");
+        refresh_cache_store(
+            key,
+            CacheEntry::Failed {
+                retry_after_unix: now_unix() + 300,
+                client_id: "test-client-id".to_string(),
+                secret_hash: secret_hash("test-client-secret"),
+                message: "stale mock failure message".to_string(),
+            },
+        );
+
+        let err = oauth_refresh_step(&step, &["127.0.0.1".to_string()])
+            .expect_err("nothing listens on 127.0.0.1:1 — some connection error is expected");
+        assert!(
+            !err.contains("stale mock failure message"),
+            "a changed secret must bypass the old backoff and attempt a fresh exchange: {err}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3418,26 +3594,28 @@ mod tests {
             CacheEntry::Failed {
                 retry_after_unix: now_unix() + 300,
                 client_id: "an-old-superseded-client-id".to_string(),
+                secret_hash: secret_hash("an-old-superseded-client-secret"),
+                message: "stale mock failure message".to_string(),
             },
         );
 
         let err = oauth_refresh_step(&step, &["127.0.0.1".to_string()])
             .expect_err("nothing listens on 127.0.0.1:1 — some connection error is expected");
         assert!(
-            !err.contains("will retry after a short backoff"),
+            !err.contains("stale mock failure message"),
             "a changed client_id must bypass the old backoff and attempt a fresh exchange: {err}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn oauth_refresh_step_resolves_absent_not_the_backoff_error_when_the_client_cannot_resolve() {
-        // Deliberately aligned with `CacheLookup::Miss`'s own `None` arm:
-        // a client that cannot currently be resolved is Absent — "not here"
-        // — the same fact either way, whether or not a *different* attempt
-        // recently failed with a *different* pair. There is no proof either
-        // way that the pair has changed, so the honest answer is "don't
-        // know", not "assume it's the same one and keep backing off".
+    fn oauth_refresh_step_reports_the_backoff_message_not_absent_when_the_client_cannot_resolve() {
+        // The interaction this closes (see the `None` arm's own doc in
+        // `oauth_refresh_step`): a client that cannot currently be resolved
+        // during an active refresh backoff is very often exactly *why* the
+        // backoff exists in the first place, not an unrelated fact — so
+        // this reports the same message a proven-unchanged pair would,
+        // instead of falling to Absent and hiding the row and its reason.
         let dir = temp_dir("oauth-backoff-unresolvable-client");
         let mut step =
             oauth_refresh_step_for(&dir, r#"{"refresh_token":"r-backoff-unresolvable"}"#);
@@ -3457,14 +3635,150 @@ mod tests {
             CacheEntry::Failed {
                 retry_after_unix: now_unix() + 300,
                 client_id: "some-old-client-id".to_string(),
+                secret_hash: secret_hash("some-old-client-secret"),
+                message: "stale mock failure message".to_string(),
+            },
+        );
+
+        assert_eq!(
+            oauth_refresh_step(&step, &["oauth2.googleapis.com".to_string()]),
+            Err("stale mock failure message".to_string()),
+            "an unresolvable client during an active backoff must report the backoff's own \
+             message, not Absent"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn oauth_refresh_step_resolves_absent_once_the_backoff_has_lapsed_and_the_client_still_cannot_resolve(
+    ) {
+        // The other side of the sibling test above: once the refresh
+        // backoff itself is over, `refresh_cache_lookup` reports `Miss`,
+        // not `Backoff` — there is no message left in the cache to report,
+        // and an unresolvable client really is "not here", the same as it
+        // always was and the same as `Miss`'s own `None` arm still is.
+        let dir = temp_dir("oauth-backoff-lapsed-unresolvable-client");
+        let mut step =
+            oauth_refresh_step_for(&dir, r#"{"refresh_token":"r-backoff-lapsed-unresolvable"}"#);
+        step.client_id = None;
+        step.client_secret = None;
+        step.client = Some(AuthClientDiscovery {
+            id_env: None,
+            secret_env: None,
+            id_pattern: Some(synthetic_id_pattern()),
+            secret_pattern: Some(synthetic_secret_pattern()),
+            files: vec![dir.join("does-not-exist").to_string_lossy().into_owned()],
+            bins: Vec::new(),
+        });
+        let key = refresh_cache_key(
+            step.token_url.as_deref().unwrap(),
+            "r-backoff-lapsed-unresolvable",
+        );
+        refresh_cache_store(
+            key,
+            CacheEntry::Failed {
+                retry_after_unix: now_unix() - 1,
+                client_id: "some-old-client-id".to_string(),
+                secret_hash: secret_hash("some-old-client-secret"),
+                message: "stale mock failure message".to_string(),
             },
         );
 
         assert_eq!(
             oauth_refresh_step(&step, &["oauth2.googleapis.com".to_string()]),
             Ok(None),
-            "an unresolvable client during an active backoff must be Absent, not the backoff error"
+            "once the backoff has lapsed, an unresolvable client is Absent again — there is no \
+             message left to report"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn oauth_refresh_step_reports_the_stale_pair_message_while_a_discovery_miss_backoff_evict_armed_hides_it(
+    ) {
+        // The exact interaction `on_exchange_error`'s and
+        // `client_discovery_evict`'s own docs name: an `invalid_client`
+        // response evicts the found-cache entry and arms a fresh
+        // discovery-miss backoff over it — so the very next call's
+        // `resolve_pair()` finds nothing, not because the client vanished,
+        // but because discovery itself is now in its own backoff. Before
+        // the `None` arm fix, resolving nothing here fell straight to
+        // Absent regardless of why, hiding the row and its reason for as
+        // long as either backoff stayed active — for the one real
+        // `client`-table provider this ships (Antigravity), on every
+        // `invalid_client` response.
+        let dir = temp_dir("oauth-evict-armed-miss-reports-message");
+        let file = dir.join("client-binary");
+        let id = fake_client_id("600006", "backoffmessage");
+        let secret = fake_secret("backoffmessagesecret0123456789ABCD");
+        std::fs::write(&file, format!("{id} {secret}")).unwrap();
+        let client = AuthClientDiscovery {
+            id_env: None,
+            secret_env: None,
+            id_pattern: Some(synthetic_id_pattern()),
+            secret_pattern: Some(synthetic_secret_pattern()),
+            files: vec![file.to_string_lossy().into_owned()],
+            bins: Vec::new(),
+        };
+        assert!(
+            discover_client(&client).is_some(),
+            "sanity: the pair must resolve and be cached before eviction is asserted"
+        );
+
+        let mut step = oauth_refresh_step_for(&dir, r#"{"refresh_token":"r-evict-armed-miss"}"#);
+        step.client_id = None;
+        step.client_secret = None;
+        step.client = Some(client.clone());
+        // Refused immediately, not a real endpoint — this must never
+        // actually reach `oauth_refresh_request` in the first assertion
+        // below; the second assertion needs exactly this same refusal once
+        // the step does proceed to a fresh exchange.
+        step.token_url = Some("https://127.0.0.1:1/token".to_string());
+        let key = refresh_cache_key(step.token_url.as_deref().unwrap(), "r-evict-armed-miss");
+        let message = "token refresh failed: invalid_client (HTTP 400)".to_string();
+        refresh_cache_store(
+            key,
+            CacheEntry::Failed {
+                retry_after_unix: now_unix() + 300,
+                client_id: id.clone(),
+                secret_hash: secret_hash(&secret),
+                message: message.clone(),
+            },
+        );
+        // The reaction a real `invalid_client` response drives.
+        client_discovery_evict(&client);
+
+        assert_eq!(
+            oauth_refresh_step(&step, &["127.0.0.1".to_string()]),
+            Err(message.clone()),
+            "an undiscoverable client during an active refresh backoff must report the \
+             backoff's own message, not Absent — the row must stay, with the reason, instead \
+             of vanishing"
+        );
+
+        // Both backoffs cleared: the pair really is still there (the file
+        // was never touched), so discovery finds it again and the step
+        // proceeds — past the Absent/backoff-error gate and into an actual
+        // exchange attempt, proven the same way the sibling backoff tests
+        // do, against a connection nothing answers.
+        client_discovery_miss_store(client_config_key(&client), 0);
+        refresh_cache_store(
+            key,
+            CacheEntry::Failed {
+                retry_after_unix: 0,
+                client_id: id.clone(),
+                secret_hash: secret_hash(&secret),
+                message: message.clone(),
+            },
+        );
+        let err = oauth_refresh_step(&step, &["127.0.0.1".to_string()])
+            .expect_err("nothing listens on 127.0.0.1:1 — some connection error is expected");
+        assert!(
+            !err.contains("invalid_client"),
+            "once both backoffs lapse, the step must attempt a fresh exchange rather than \
+             replay the stale backoff message: {err}"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3649,6 +3963,46 @@ mod tests {
             "eviction must not clear the once-only logged set — a second \
              `client_discovery_log_once` with the same key must queue nothing more, got {second:?}"
         );
+    }
+
+    #[test]
+    fn client_discovery_evict_arms_a_miss_backoff_rather_than_clearing_it() {
+        // The bug this closes: an outright clear left a persistently invalid
+        // pair (the endpoint rejects it every time; the binary on disk never
+        // changes) rescanning from scratch on the very next call — for as
+        // long as the rejection kept coming, on every single refresh
+        // attempt, forever. Evicting must instead leave the same
+        // `CLIENT_DISCOVERY_RETRY_SECS` backoff a genuine miss gets.
+        let dir = temp_dir("discover-evict-arms-backoff");
+        let file = dir.join("client-binary");
+        std::fs::write(
+            &file,
+            format!(
+                "{} {}",
+                fake_client_id("777888", "evictbackoff"),
+                fake_secret("evictbackoffsecret0123456789AB")
+            ),
+        )
+        .unwrap();
+        let client = AuthClientDiscovery {
+            id_env: None,
+            secret_env: None,
+            id_pattern: Some(synthetic_id_pattern()),
+            secret_pattern: Some(synthetic_secret_pattern()),
+            files: vec![file.to_string_lossy().into_owned()],
+            bins: Vec::new(),
+        };
+        assert!(discover_client(&client).is_some());
+        let key = client_config_key(&client);
+
+        client_discovery_evict(&client);
+
+        assert!(
+            client_discovery_miss_lookup(key, now_unix()),
+            "eviction must arm a miss backoff, not merely clear one — a persistently invalid \
+             pair must not be rescanned on the very next call"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3857,11 +4211,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn scan_candidate_never_reads_a_fifo() {
-        // Mirrors `super::super::tests::read_regular_file_refuses_anything_that_is_not_one`'s
-        // own FIFO case: reading one blocks until somebody writes, which for
-        // this scan means for as long as the process runs. The test itself
-        // is the proof — if `scan_candidate` opened the FIFO directly, this
-        // test would hang rather than fail.
+        // A writerless FIFO's own end-of-file behaviour — a read on a FIFO
+        // nobody has open for writing returns `0` immediately, no different
+        // from an empty regular file — would make this test pass even with
+        // the metadata-before-open guard deleted: `scan_candidate` opening
+        // and reading it would just find nothing either way. Keeping a
+        // writer attached, with a matching id/secret pair already sitting in
+        // the pipe, closes that gap: if `scan_candidate` ever actually
+        // opened and read this path, it would find both patterns waiting
+        // and report `Found`, not `NotFound` — so `NotFound` here proves the
+        // path is never opened at all, not merely that nothing was there to
+        // read.
         //
         // `mkfifo` failing to spawn or exit clean is not "this environment
         // has no FIFO support" — every Unix this crate targets does — so it
@@ -3880,6 +4240,29 @@ mod tests {
             fifo.display()
         );
 
+        let id_text = fake_client_id("444555", "fifotest");
+        let secret_text = fake_secret("fifotestsecret0123456789ABCDEFGHIJ");
+        let mut content = id_text.as_bytes().to_vec();
+        content.push(b' ');
+        content.extend_from_slice(secret_text.as_bytes());
+        // A plain write-only open of a FIFO blocks until a reader connects —
+        // one this test must never provide, since providing one is exactly
+        // what this test is checking `scan_candidate` does not do. POSIX
+        // leaves `O_RDWR` (read *and* write) on a FIFO unspecified, but it
+        // does not have that wait on macOS — the only platform this
+        // `#[cfg(unix)]` test actually runs on in this crate's matrix — so
+        // it is what gets a writer attached, and kept attached for the
+        // FIFO's whole lifetime, without a reader ever being involved. If a
+        // future platform in that matrix *did* block on it, this `open`
+        // hangs rather than fails; nothing here retries or times it out.
+        use std::io::Write;
+        let mut writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .expect("O_RDWR open of a FIFO must not block");
+        writer.write_all(&content).unwrap();
+
         let id_pattern = scan_pattern(&synthetic_id_pattern());
         let secret_pattern = scan_pattern(&synthetic_secret_pattern());
         let mut budget = CLIENT_DISCOVERY_PASS_BUDGET_BYTES;
@@ -3891,8 +4274,10 @@ mod tests {
                 &mut budget,
                 CLIENT_DISCOVERY_MAX_SCAN_BYTES
             ),
-            ScanOutcome::NotFound
+            ScanOutcome::NotFound,
+            "a FIFO must never be read, even one already holding a matching pair"
         );
+        drop(writer);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3930,7 +4315,12 @@ mod tests {
         );
 
         let mut ample_budget: u64 = content.len() as u64;
-        assert!(matches!(
+        // The fixture carries only an id, no secret, so a budget large
+        // enough to read the whole file can never come back `Found` —
+        // `secret_pattern` has nothing to match. Asserting the specific
+        // outcome, not just "not `Truncated`", is what actually proves the
+        // budget stopped mattering once it covers the whole file.
+        assert_eq!(
             scan_candidate(
                 &file,
                 &id_pattern,
@@ -3938,8 +4328,8 @@ mod tests {
                 &mut ample_budget,
                 CLIENT_DISCOVERY_MAX_SCAN_BYTES
             ),
-            ScanOutcome::NotFound | ScanOutcome::Found(_, _)
-        ));
+            ScanOutcome::NotFound
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4057,15 +4447,17 @@ mod tests {
     // gigabyte fixtures. `discover_client_within` exists so these three can
     // run against a `ScanLimits` of a few kilobytes instead.
     //
-    // None of the three sets or removes an environment variable, so there
-    // is no race for `ENV_TEST_LOCK` to guard here — but `discover_client_within`
+    // Five tests exercise this aggregation (the three behaviours above, plus
+    // two more about how a cache hit interacts with the shared budget). None
+    // of the five sets or removes an environment variable, so there is no
+    // race for `ENV_TEST_LOCK` to guard here — but `discover_client_within`
     // does read `PATH` through `bin_candidates` on every call. With `bins`
     // empty on every config below, that result is discarded before it can
     // affect anything, so a concurrent `PATH` rewrite by
     // `bin_candidates_ignores_relative_path_entries` cannot change an
     // outcome here — the same footing every older `discover_client_*` test
     // in this module already stands on. `DIAG_TEST_LOCK` is still held for
-    // the whole body of each, since all three drain
+    // the whole body of each, since all five drain
     // `take_pending_diagnostics`.
 
     #[test]
@@ -4162,15 +4554,19 @@ mod tests {
         // the miss-backoff gate at the very top of `discover_client_within`
         // — before ever reaching the queueing point — which would prove
         // only the backoff above again, not the once-per-process dedup on
-        // `queue_diag_once`. Eviction clears that gate (and the found
-        // cache, unused here) without touching `CLIENT_DISCOVERY_LOGGED` —
-        // the same distinction
+        // `queue_diag_once`. `client_discovery_evict` no longer merely
+        // clears that gate — it arms a fresh backoff of its own (see its
+        // own doc) — so what actually needs clearing here, and what this
+        // does directly, is the stored retry-after itself: zeroing it (any
+        // real `now_unix()` is `> 0`) is "not in backoff" without touching
+        // `CLIENT_DISCOVERY_LOGGED`, unlike eviction. The call below
+        // genuinely re-runs the scan to the same truncation, reaches
+        // `queue_diag_once` a second time with the same key, and it is
+        // that call which must decline to queue a second "stopped
+        // scanning" line — the same distinction
         // `client_discovery_evict_does_not_clear_the_once_only_logged_set`
-        // exercises directly — so the call below genuinely re-runs the
-        // scan to the same truncation, reaches `queue_diag_once` a second
-        // time with the same key, and it is that call which must decline
-        // to queue a second "stopped scanning" line.
-        client_discovery_evict(&client);
+        // exercises directly.
+        client_discovery_miss_store(key, 0);
         assert_eq!(discover_client_within(&client, tiny), None);
         let drained_again = take_pending_diagnostics();
         assert!(
@@ -4180,10 +4576,10 @@ mod tests {
              {drained_again:?}"
         );
 
-        // Evicted once more, and now with production's own limits: the
+        // Cleared once more, and now with production's own limits: the
         // pair really was reachable all along — a truncated pass poisoned
         // neither the found cache nor the result.
-        client_discovery_evict(&client);
+        client_discovery_miss_store(key, 0);
         assert_eq!(
             discover_client_within(&client, CLIENT_DISCOVERY_LIMITS),
             Some((id, secret))
@@ -4295,10 +4691,12 @@ mod tests {
         );
 
         // Sanity: the pair really was only missed because `second` was
-        // skipped, not because the fixture is wrong — eviction (standing
-        // in for the backoff elapsing) plus production's own limits finds
-        // it.
-        client_discovery_evict(&client);
+        // skipped, not because the fixture is wrong — clearing the stored
+        // retry-after (standing in for the backoff elapsing; not
+        // `client_discovery_evict`, which now arms a fresh one of its own
+        // rather than clearing this one — see its own doc) plus
+        // production's own limits finds it.
+        client_discovery_miss_store(key, 0);
         assert_eq!(
             discover_client_within(&client, CLIENT_DISCOVERY_LIMITS),
             Some((id, secret))
@@ -4625,11 +5023,17 @@ mod tests {
             CacheEntry::Failed {
                 retry_after_unix: 1000,
                 client_id: "c".to_string(),
+                secret_hash: secret_hash("s"),
+                message: "exchange failed".to_string(),
             },
         );
         assert!(
-            matches!(refresh_cache_lookup(key, 999), CacheLookup::Backoff { client_id } if client_id == "c"),
-            "inside backoff, carrying the client_id it failed with"
+            matches!(
+                refresh_cache_lookup(key, 999),
+                CacheLookup::Backoff { client_id, secret_hash: sh, message }
+                    if client_id == "c" && sh == secret_hash("s") && message == "exchange failed"
+            ),
+            "inside backoff, carrying the client_id/secret_hash/message it failed with"
         );
         assert!(
             matches!(refresh_cache_lookup(key, 1000), CacheLookup::Miss),
@@ -5147,6 +5551,21 @@ mod tests {
         assert_eq!(env_step(&step), Ok(None));
     }
 
+    #[test]
+    fn env_step_absent_when_var_set_but_blank() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Set, not unset — exported as whitespace, the shell-script
+        // equivalent of "export FOO=" — and must still resolve Absent, the
+        // same way an unset var does, rather than a present token of "".
+        std::env::set_var("TICKOVER_AUTH_TEST_ENV_BLANK", "   ");
+        let step = AuthStep {
+            var: Some("TICKOVER_AUTH_TEST_ENV_BLANK".to_string()),
+            ..auth_step(AuthType::Env)
+        };
+        assert_eq!(env_step(&step), Ok(None));
+        std::env::remove_var("TICKOVER_AUTH_TEST_ENV_BLANK");
+    }
+
     // ── chain semantics ───────────────────────────────────────────────────
 
     #[test]
@@ -5268,5 +5687,39 @@ mod tests {
             !host_allowed(&allowed, "https://evil.anthropic.com/x"),
             "a subdomain must not match its parent domain"
         );
+    }
+
+    #[test]
+    fn host_allowed_accepts_userinfo_ahead_of_the_real_host() {
+        let allowed = vec!["api.anthropic.com".to_string()];
+        assert!(host_allowed(
+            &allowed,
+            "https://user:pass@api.anthropic.com/x"
+        ));
+    }
+
+    #[test]
+    fn host_allowed_rejects_the_backslash_authority_terminator_attack() {
+        // `\` ends an authority in a WHATWG special scheme (`https` is one)
+        // exactly as `/` does — a hand-rolled split on `/`, `?`, `#` and `@`
+        // never looked for it, and would read this URL's host as
+        // `api.anthropic.com` instead of the `evil.example` it actually is.
+        let allowed = vec!["api.anthropic.com".to_string()];
+        assert!(!host_allowed(
+            &allowed,
+            "https://evil.example\\@api.anthropic.com/api/oauth/usage"
+        ));
+    }
+
+    #[test]
+    fn host_allowed_rejects_a_plaintext_url() {
+        let allowed = vec!["api.anthropic.com".to_string()];
+        assert!(!host_allowed(&allowed, "http://api.anthropic.com/x"));
+    }
+
+    #[test]
+    fn host_allowed_handles_a_bracketed_ipv6_literal_without_panicking() {
+        let allowed = vec!["[::1]".to_string()];
+        assert!(host_allowed(&allowed, "https://[::1]/x"));
     }
 }

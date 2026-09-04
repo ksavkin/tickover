@@ -9,11 +9,15 @@ notes ([`DEVELOPMENT.md`](DEVELOPMENT.md)) carry the detail.
 
 ```
 plugins/*.toml         five provider manifests + the registry index      (data)
+src/lib.rs             the library crate root: `plugin`, `model`, `menubar`
 src/plugin/            the library: manifest → capability gate → engine  (no UI)
 src/model.rs           one provider-neutral reading every consumer draws from
 src/main.rs            the binary: tray, panel, timers, dialogs, auto-ping (Slint)
 src/menubar.rs         rasterises the tray reading (pill on macOS, badge on Windows)
 src/platform.rs        accessory policy, single instance, dock mode
+src/config.rs          persisted settings (JSON under the OS config dir)
+src/autostart.rs       the launch-at-login toggle
+src/diag.rs            the trimmed local diagnostics log (`tickover.log`)
 ui/*.slint             the panel, declared
 ```
 

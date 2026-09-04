@@ -23,10 +23,13 @@
 //!   *trusted* manifest against its own mistakes (a typo'd URL, an open
 //!   redirect on the declared host) — it is **not** a sandbox against a hostile
 //!   author, who supplies both the URL and the allow-list. A blocked host is a
-//!   normal `reading.error`, and the request is never attempted. The check only
-//!   ever looks at the request's own URL, so [`perform`] also disables HTTP
-//!   redirects (`redirects(0)`) — otherwise a 3xx on a permitted host could
-//!   hand the token to an unlisted host the allowlist check never saw. See
+//!   normal `reading.error`, and the request is never attempted. The host is
+//!   read by [`crate::plugin::https_host`] — the same parser `ureq` sends the
+//!   request through — and [`perform`] refuses anything that isn't `https`
+//!   outright, before either check runs. The allow-list check only ever looks
+//!   at the request's own URL, so [`perform`] also disables HTTP redirects
+//!   (`redirects(0)`) — otherwise a 3xx on a permitted host could hand the
+//!   token to an unlisted host the allowlist check never saw. See
 //!   `docs/PLUGIN-ARCHITECTURE.md` (Trust model) for the full picture.
 //!
 //! [`fetch`] is the engine's public entry point. Everything else here is
@@ -50,10 +53,10 @@ use crate::plugin::manifest::{
 use crate::plugin::throttle;
 
 /// The reading error for HTTP 401 — a token this engine may not renew (see
-/// the module docs on why no provider's refresh token is ever spent here), so
-/// the only way out is the user signing in again. Named because
-/// [`crate::plugin::throttle`] recognises it as the one failure retrying
-/// cannot fix.
+/// the comment on [`perform`]'s 401 match arm for why no provider's refresh
+/// token is ever spent here), so the only way out is the user signing in
+/// again. Named because [`crate::plugin::throttle`] recognises it as the one
+/// failure retrying cannot fix.
 pub const UNAUTHORIZED: &str = "session expired — sign in again";
 
 // ── Public entry point ───────────────────────────────────────────────────
@@ -292,9 +295,15 @@ fn resolve_tag(
     }
     let raw = match m.tag.from {
         TagFrom::Static => m.tag.value.clone(),
+        // The manifest names the field, but the *value* in it is the
+        // provider's own answer (Codex's `plan_type`, live) — sanitised like
+        // any other response-supplied text before it reaches the tag chip.
         TagFrom::Field => {
             let path = m.tag.path.as_deref()?;
-            json_path_get(value?, path)?.as_str().map(str::to_owned)
+            json_path_get(value?, path)?
+                .as_str()
+                .map(crate::plugin::sanitize_provider_text)
+                .filter(|s| !s.is_empty())
         }
         TagFrom::None => None,
     }?;
@@ -328,9 +337,7 @@ fn resolve_account(
     let headers = substitute_headers(&req.headers, token, version, options, values);
     let timeout = Duration::from_secs(req.timeout_secs);
     let value = perform(&url, HttpMethod::Get, None, &headers, timeout).ok()?;
-    json_path_get(&value, json_path)?
-        .as_str()
-        .map(str::to_owned)
+    sanitized_account(json_path_get(&value, json_path)?.as_str()?)
 }
 
 /// `[account]` resolution for `type = "response-field"` — the email is
@@ -343,8 +350,19 @@ fn resolve_account_from_response(m: &PluginManifest, value: &Value) -> Option<St
         return None;
     }
     let json_path = m.account.json_path.as_deref()?;
-    let email = json_path_get(value, json_path)?.as_str()?.trim();
-    (!email.is_empty()).then(|| email.to_string())
+    sanitized_account(json_path_get(value, json_path)?.as_str()?)
+}
+
+/// An `[account]` field, whichever of the two routes above produced it,
+/// reduced to what the panel is allowed to show: sanitised the way any other
+/// provider-supplied string is ([`crate::plugin::sanitize_provider_text`]) and
+/// rejected outright if that leaves nothing — an address is either a real
+/// address or it is no account at all, never a blank row in the picker. One
+/// helper so the http-type and response-field-type paths can't quietly grow
+/// two different ideas of what counts as blank.
+fn sanitized_account(raw: &str) -> Option<String> {
+    let s = crate::plugin::sanitize_provider_text(raw);
+    (!s.is_empty()).then_some(s)
 }
 
 // ── `{value.<name>}` header values (local files, no network) ─────────────
@@ -362,8 +380,10 @@ fn resolve_values(values: &[HttpValueConfig]) -> Result<BTreeMap<String, String>
         }
         .ok_or_else(|| {
             format!(
-                "could not read `{}` for the {{value.{}}} header",
-                v.name, v.name
+                "could not read `{}` from `{}` for the {{value.{}}} header",
+                v.name,
+                v.path.as_deref().unwrap_or("(no path declared)"),
+                v.name
             )
         })?;
         out.insert(v.name.clone(), resolved);
@@ -622,11 +642,14 @@ fn element_matches(element: &Value, filter: Option<&str>) -> bool {
 ///
 /// The comparison is against the field's text — a number or a boolean compares
 /// as it prints — because a manifest is TOML and everything in a path or a
-/// filter is a string by the time it gets here. One function for both callers
-/// on purpose: a path selector (`limits[kind=weekly_scoped]`, one element) and
-/// an enumeration filter (`for_each_where`, every element) differ in how many
-/// elements they keep and in nothing else, and two copies of this would be two
-/// chances for that to stop being true.
+/// filter is a string by the time it gets here. Both `field` and `wanted` are
+/// taken as given: trimming, if the caller's manifest syntax needs it, is the
+/// caller's job ([`pick`] and [`element_matches`] both do it before calling
+/// in). One function for both callers on purpose: a path selector
+/// (`limits[kind=weekly_scoped]`, one element) and an enumeration filter
+/// (`for_each_where`, every element) differ in how many elements they keep
+/// and in nothing else, and two copies of this would be two chances for that
+/// to stop being true.
 // `cmp_owned` says to compare the `Value` directly, and that is wrong here:
 // `Value == &str` is true only for a `Value::String`, so every number and every
 // boolean would stop matching — the case the line below exists for.
@@ -777,17 +800,28 @@ fn parse_quota(value: &Value, m: &PluginManifest) -> Option<crate::model::QuotaS
 /// `primary_window` and `secondary_window` null whenever the 5-hour window has
 /// nothing to report, so slot position says nothing about window length.
 ///
-/// Candidates are therefore classified the way
-/// `engine_logfile::classify_slot` classifies a log line's `primary`/
-/// `secondary` pair: scan them in declared order and take the first whose own
-/// length falls inside this window's `[min_period_minutes,
-/// max_period_minutes]` bounds. First-match is the rule the log-file engine
-/// has always used, so both engines resolve an ambiguous provider the same
-/// way. A candidate that is absent, null, or carries no readable length can't
-/// be classified and is skipped; when nothing matches, the window has no
-/// source at all and every field of it reads `None` — the same shape a
-/// missing window has always produced (`src/main.rs` renders a reading whose
-/// windows are all blank as "no usage reported yet", see commit ff8f67d).
+/// When the window's length comes `from_field` *and* the manifest declares
+/// at least one of `[min_period_minutes, max_period_minutes]`, candidates
+/// are classified the way `engine_logfile::classify_slot` classifies a log
+/// line's `primary`/`secondary` pair: scan them in declared order and take
+/// the first whose own length falls inside those bounds. First-match is the
+/// rule the log-file engine has always used, so both engines resolve an
+/// ambiguous provider the same way. A candidate that is absent, null, or
+/// carries no readable length can't be classified and is skipped; when
+/// nothing matches, the window has no source at all and every field of it
+/// reads `None` — the same shape a missing window has always produced
+/// (`src/main.rs` renders a reading whose windows are all blank as "no usage
+/// reported yet").
+///
+/// Without a bound to check against — no bound declared, or the window's
+/// length is `assumed` rather than `from_field` (a bound declared there is
+/// never consulted; there is nothing in the response to compare it to, and
+/// `validate` refuses that combination at load, so no manifest that actually
+/// parses reaches this arm — the check stays as this function's own defence
+/// in depth) — no classification happens at all: candidates are scanned in
+/// declared order and the first one that isn't null wins, whatever length it
+/// actually carries. A manifest with several containers and no bound is
+/// relying on that order rather than on content to tell its windows apart.
 fn select_container<'v>(w: &WindowConfig, value: &'v Value) -> Option<&'v Value> {
     // One rule, whatever the shape: a length the *response* states is checked
     // against the bounds the manifest declares, and nothing else is checked at
@@ -850,8 +884,9 @@ fn build_window(index: usize, w: &WindowConfig, value: &Value) -> Option<Window>
     // to no window, which for Antigravity's proto3 responses is exactly right:
     // a bucket the server omits at zero means "did not say", never "spent" —
     // claiming a figure the provider did not state would be this app's
-    // invention. The clamp is the window's own scale contract (see
-    // `3f9941d`), applied to both forms identically.
+    // invention. The clamp below is the window's own scale contract — a
+    // percent is always 0..100, whichever path produced it — applied to
+    // both forms identically.
     let used_percent = match (
         &w.source.used_percent_path,
         &w.source.remaining_fraction_path,
@@ -1091,12 +1126,18 @@ fn segments(path: &str) -> Vec<&str> {
 /// to them over time, so "the second one" is not a thing a manifest can mean;
 /// "the one that calls itself this" is. The comparison is against the field's
 /// text — a number or a boolean compares as it prints — because a manifest is
-/// TOML and everything in a path is a string by the time it gets here.
+/// TOML and everything in a path is a string by the time it gets here. Both
+/// halves are trimmed before the comparison, the same reason
+/// [`element_matches`] trims `for_each_where`'s: `limits[kind = weekly_scoped]`
+/// is the natural way to align a manifest's `=` signs, and comparing the
+/// field's text against `" weekly_scoped"` would match nothing forever.
 fn pick<'v>(container: &'v Value, selector: &str) -> Option<&'v Value> {
     let array = container.as_array()?;
     match selector.split_once('=') {
         None => array.get(selector.parse::<usize>().ok()?),
-        Some((field, wanted)) => array.iter().find(|item| field_says(item, field, wanted)),
+        Some((field, wanted)) => array
+            .iter()
+            .find(|item| field_says(item, field.trim(), wanted.trim())),
     }
 }
 
@@ -1123,6 +1164,13 @@ fn pick<'v>(container: &'v Value, selector: &str) -> Option<&'v Value> {
 /// `send_string("")` for a POST with no declared body is a normal, complete
 /// request (see `HttpRequestConfig::body`'s docs on why that split is legal),
 /// not a placeholder for one that failed to build.
+///
+/// `url` must be `https`, checked here before any connection is opened —
+/// `manifest::validate` already refuses a non-`https` `[[http.request]] url`
+/// or `[account] url` at load, so a request reaching this function with any
+/// other scheme means validation was somehow bypassed, not that the token
+/// this function is about to attach was ever meant to leave the machine in
+/// the clear. Defence in depth, the same reasoning as `allowed_hosts` below.
 fn perform(
     url: &str,
     method: HttpMethod,
@@ -1130,6 +1178,13 @@ fn perform(
     headers: &[(String, String)],
     timeout: Duration,
 ) -> Result<Value, Failure> {
+    if super::https_host(url).is_none() {
+        let scheme = url::Url::parse(url).map(|u| u.scheme().to_string());
+        return Err(Failure::transient(match scheme {
+            Ok(scheme) => format!("refusing to fetch a non-https URL (scheme \"{scheme}\")"),
+            Err(_) => format!("refusing to fetch an unparsable URL: {url}"),
+        }));
+    }
     let agent = ureq::AgentBuilder::new().redirects(0).build();
     let mut req = match method {
         HttpMethod::Get => agent.get(url),
@@ -1219,6 +1274,19 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
     }
+
+    /// Guards the three tests below that call `std::env::set_var`/
+    /// `remove_var`: real process environment is process-wide state
+    /// `cargo test`'s default parallelism does not otherwise serialize, and
+    /// each test's own uniquely-named variable stops it from *reading*
+    /// another test's value but not from *racing* the underlying set/remove
+    /// calls themselves. `.unwrap_or_else(|e| e.into_inner())`, not
+    /// `.unwrap()`: one test panicking while holding this lock must not
+    /// poison it for every test queued behind it — the same discipline as
+    /// `auth.rs`'s own, distinct `ENV_TEST_LOCK` (a separate mutex, scoped to
+    /// this module, since env var mutation only races within one test
+    /// binary's shared state either way).
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A Claude-like manifest: `engine = "http-api"`, two explicit surfaces,
     /// each with an `env`-backed auth step so tests never touch the real
@@ -1563,6 +1631,23 @@ mod tests {
         assert_eq!(
             at("additional_rate_limits[limit_name=x].rate_limit[0]"),
             None
+        );
+    }
+
+    #[test]
+    fn a_path_selector_trims_both_halves_the_way_for_each_where_does() {
+        // A human aligning `=` signs writes `limits[kind = weekly_scoped]`,
+        // not `limits[kind=weekly_scoped]` — `pick` has to accept the spaced
+        // form the same way `element_matches` already does for
+        // `for_each_where`, or a manifest that looks right stops matching.
+        let body = json!({
+            "limits": [{ "kind": "weekly_scoped", "used_percent": 40 }]
+        });
+        assert_eq!(
+            json_path_get(&body, "limits[kind = weekly_scoped].used_percent")
+                .and_then(Value::as_u64),
+            Some(40),
+            "spaces around `=` in a path selector must not stop the match"
         );
     }
 
@@ -2363,8 +2448,8 @@ mod tests {
         // A fraction the provider states outside 0..1 (a promo allowance over
         // 100%, or a server glitch) complements to a percent outside 0..100,
         // and the same clamp every window's percent already gets brings it to
-        // the bar's end — the window's scale is this app's own contract (see
-        // commit 3f9941d), applied identically to spent and remaining.
+        // the bar's end — the window's scale is this app's own contract
+        // (always 0..100), applied identically to spent and remaining.
         let w = remaining_win();
         let over = json!({ "remainingFraction": 1.5, "resets_at": 1_800_000_000 });
         assert_eq!(
@@ -2578,37 +2663,30 @@ mod tests {
     }
 
     #[test]
-    fn a_bound_declared_with_an_assumed_period_classifies_nothing() {
+    fn a_bound_declared_on_an_assumed_period_is_never_consulted() {
         // There is no length in the response to check the bound against, so
         // the window reads its candidate rather than rejecting every one of
-        // them and going permanently blank.
-        let toml = r#"
-            id         = "assumed-bound"
-            name       = "AssumedBound"
-            menu_label = "Ab"
-            order      = 1
-            engine     = "http-api"
-            [[windows]]
-            label = "WK"
-            role  = "secondary"
-            [windows.period]
-            mode    = "assumed"
-            assumed = 10080
-            [windows.source]
-            containers         = ["rate_limit.primary_window"]
-            used_percent_path  = "used_percent"
-            resets_at_path     = "reset_at"
-            min_period_minutes = 721
-            [http]
-            [[http.request]]
-            url = "https://example.com/usage"
-        "#;
-        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        // them and going permanently blank. Built directly with `win()`
+        // rather than through `PluginManifest::from_str`: `validate` refuses
+        // this exact combination at load (a bound only means something
+        // alongside `mode = "from_field"`), so no manifest can reach this
+        // shape anymore — this is `select_container`'s own defence in
+        // depth, pinned so it can't quietly start mattering again if that
+        // load-time rule is ever loosened.
+        let mut w = win(
+            ManifestRole::Secondary,
+            PeriodMode::Assumed,
+            None,
+            Some(10_080),
+        );
+        w.source.containers = vec!["rate_limit.primary_window".to_string()];
+        w.source.min_period_minutes = Some(721);
+
         let body =
-            json!({ "rate_limit": { "primary_window": { "used_percent": 3, "reset_at": 7 } } });
-        let w = &reported_windows(&body, &m)[0];
-        assert_eq!(w.used_percent, Some(3.0));
-        assert_eq!(w.period_minutes, Some(10080));
+            json!({ "rate_limit": { "primary_window": { "used_percent": 3, "resets_at": 7 } } });
+        let out = build_window(0, &w, &body).expect("reported");
+        assert_eq!(out.used_percent, Some(3.0));
+        assert_eq!(out.period_minutes, Some(10080));
     }
 
     #[test]
@@ -2748,11 +2826,16 @@ mod tests {
             "a header value that can't be resolved must stop the request, not be sent empty"
         );
 
+        let gone = dir.join("gone.json");
         let missing_file = HttpValueConfig {
-            path: Some(dir.join("gone.json").to_string_lossy().into_owned()),
+            path: Some(gone.to_string_lossy().into_owned()),
             ..ok
         };
-        assert!(resolve_values(&[missing_file]).is_err());
+        let err = resolve_values(&[missing_file]).expect_err("the file does not exist");
+        assert!(
+            err.contains(&gone.to_string_lossy().into_owned()),
+            "the error must name the path it tried to read, not just the value's own name: {err}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2792,6 +2875,7 @@ mod tests {
             var  = "TICKOVER_TEST_ENGINE_HTTP_VALUE_TOKEN"
         "#;
         let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TICKOVER_TEST_ENGINE_HTTP_VALUE_TOKEN", "tok");
         let readings = fetch(&m, &["default".to_string()], &no_options());
         std::env::remove_var("TICKOVER_TEST_ENGINE_HTTP_VALUE_TOKEN");
@@ -2843,6 +2927,12 @@ mod tests {
             resolve_account_from_response(&claude_like_manifest(), &json!({ "email": "x@y.z" })),
             None,
             "only [account] type = \"response-field\" reads the usage body"
+        );
+        assert_eq!(
+            resolve_account_from_response(&m, &json!({ "email": "you@example.com\u{200B}\r" }))
+                .as_deref(),
+            Some("you@example.com"),
+            "an address is response-supplied text like any other and gets the same sanitising"
         );
     }
 
@@ -2909,6 +2999,49 @@ mod tests {
         assert_eq!(
             resolve_tag(&m, surface, Some(&body)).as_deref(),
             Some("PRO")
+        );
+    }
+
+    #[test]
+    fn tag_from_field_sanitises_the_response_value_before_the_chip_sees_it() {
+        let toml = r#"
+            id         = "generic"
+            name       = "Generic"
+            menu_label = "Ge"
+            order      = 1
+            engine     = "http-api"
+            [tag]
+            from = "field"
+            path = "plan"
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "utilization"
+            resets_at_path    = "resets_at"
+            [http]
+            [[http.request]]
+            url = "https://example.com/usage"
+        "#;
+        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let surface = &m.surface[0];
+
+        let body = json!({ "plan": "pro\nplan\u{200B}" });
+        assert_eq!(
+            resolve_tag(&m, surface, Some(&body)).as_deref(),
+            Some("proplan"),
+            "a provider's own field value is response-supplied text like any \
+             other, and gets the same treatment"
+        );
+
+        let body = json!({ "plan": "\u{200B}" });
+        assert_eq!(
+            resolve_tag(&m, surface, Some(&body)),
+            None,
+            "a value that sanitises away to nothing is not a tag"
         );
     }
 
@@ -3110,6 +3243,7 @@ mod tests {
             var  = "TICKOVER_TEST_ENGINE_HTTP_BLOCKED_TOKEN"
         "#;
         let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TICKOVER_TEST_ENGINE_HTTP_BLOCKED_TOKEN", "tok");
         let readings = fetch(&m, &["cli".to_string()], &no_options());
         std::env::remove_var("TICKOVER_TEST_ENGINE_HTTP_BLOCKED_TOKEN");
@@ -3166,6 +3300,7 @@ mod tests {
             var  = "TICKOVER_TEST_ENGINE_HTTP_OPT_URL_TOKEN"
         "#;
         let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TICKOVER_TEST_ENGINE_HTTP_OPT_URL_TOKEN", "tok");
         let mut opts = BTreeMap::new();
         opts.insert("include_beta".to_string(), true);
@@ -3973,5 +4108,46 @@ mod tests {
         assert_eq!(quota_for(json!(7)).flatten(), None);
         // A value that sanitises away to nothing is not a statement.
         assert_eq!(quota_for(json!("\u{200B}\u{200B}")).flatten(), None);
+    }
+
+    // ── perform's scheme guard ────────────────────────────────────────────
+    //
+    // The one corner of `perform` that runs before any network I/O, so it is
+    // the one corner of `perform` a test can exercise at all — no agent is
+    // ever built for a rejected scheme.
+
+    #[test]
+    fn perform_refuses_a_non_https_url_before_opening_any_connection() {
+        let err = perform(
+            "http://example.com/usage",
+            HttpMethod::Get,
+            None,
+            &[],
+            Duration::from_secs(1),
+        )
+        .expect_err("a plaintext URL must never be dispatched");
+        assert!(
+            err.message.contains("https"),
+            "the refusal must name what it wanted: {}",
+            err.message
+        );
+        assert!(
+            !err.terminal,
+            "fixed by editing the manifest, not by a fresh sign-in — this backs off, it does \
+             not stop forever"
+        );
+    }
+
+    #[test]
+    fn perform_refuses_an_unparsable_url_the_same_way() {
+        let err = perform(
+            "not a url at all",
+            HttpMethod::Get,
+            None,
+            &[],
+            Duration::from_secs(1),
+        )
+        .expect_err("nothing not even shaped like a URL may reach an agent");
+        assert!(!err.terminal);
     }
 }

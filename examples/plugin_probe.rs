@@ -50,8 +50,8 @@ fn main() {
         .map(|s| s.id.clone())
         .collect();
 
-    // No `[[option]]` support in this dev probe yet — every declared option
-    // fetches at its manifest default (same as an untouched config).
+    // This dev probe has no flag to override an `[[option]]` — every declared
+    // option fetches at its manifest default (same as an untouched config).
     let options: std::collections::BTreeMap<String, bool> = m
         .option
         .iter()

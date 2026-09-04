@@ -305,6 +305,18 @@ fn rules() -> Vec<Rule> {
             names: "`[[http.request]] url`",
         },
         Rule {
+            // Not a hand-rolled scheme check: a manifest whose URL can't be
+            // read as `https` by `url::Url` — the parser `ureq` itself uses
+            // — is refused the same way a plain `http://` one is.
+            says: "an endpoint that isn't https would send its credential in the clear",
+            broken_by: changed(
+                HTTP,
+                "url = \"https://example.com/usage\"",
+                "url = \"http://example.com/usage\"",
+            ),
+            names: "`[[http.request]] url` must be https",
+        },
+        Rule {
             // A GET has nowhere to put a body — declared, so this trips the
             // body/method rule rather than the backward capability check
             // standing in front of it (same pattern as the window-id rows
@@ -537,6 +549,18 @@ fn rules() -> Vec<Rule> {
             names: "http-api",
         },
         Rule {
+            // `is_empty()` only asks whether every path is absent — a blank
+            // one beside a real one passes it and then reads nothing at
+            // fetch time, the same gap the `[[balances]]` blank check closes
+            // for its own paths.
+            says: "a status path can be present and still be blank",
+            broken_by: plus(
+                &http_declaring(r#"["reading-status"]"#),
+                "[status]\nallowed_path = \"rate_limit.allowed\"\nlimit_reached_path = \"   \"",
+            ),
+            names: "present but blank",
+        },
+        Rule {
             says: "an assumed period has to say what it assumes",
             broken_by: changed(LOGFILE, "assumed = 300", ""),
             names: "period.assumed",
@@ -560,6 +584,24 @@ fn rules() -> Vec<Rule> {
             names: "from_field",
         },
         Rule {
+            // `mode = "assumed"` already states the window's length outright
+            // — there is no candidate left for a bound to measure, so
+            // `engine_http::select_container` never even asks it whether a
+            // candidate fits. `http-api` only: the log-file engine's own
+            // `classify_slot` applies a bound to a record regardless of
+            // `period.mode`, and a `role = "extra"` log-file window needs
+            // one — so the same manifest, on `engine = "log-file"`, is
+            // legal (see `CODEX_LIKE` in `src/plugin/manifest.rs`, which
+            // pairs `mode = "assumed"` with `min_period_minutes` on purpose).
+            says: "a classification bound on a window whose length is assumed reads air on http-api",
+            broken_by: changed(
+                HTTP,
+                "used_percent_path = \"used_percent\"",
+                "min_period_minutes = 60\nused_percent_path = \"used_percent\"",
+            ),
+            names: "min_period_minutes",
+        },
+        Rule {
             says: "a credential never goes in a URL, where whatever fronts the endpoint logs it",
             broken_by: changed(
                 HTTP,
@@ -575,6 +617,14 @@ fn rules() -> Vec<Rule> {
                 "[account]\ntype = \"http\"\nurl = \"https://example.com/me?t={token}\"\njson_path = \"email\"",
             ),
             names: "`[account] url`",
+        },
+        Rule {
+            says: "nor is the profile URL exempt from https",
+            broken_by: plus(
+                HTTP,
+                "[account]\ntype = \"http\"\nurl = \"http://example.com/me\"\njson_path = \"email\"",
+            ),
+            names: "`[account] url` must be https",
         },
         Rule {
             says: "a surface that carries a token has to say where the token may go",
@@ -599,6 +649,15 @@ fn rules() -> Vec<Rule> {
                 "[http]\nbackoff_start_secs = 600\nbackoff_max_secs = 60\n",
             ),
             names: "backoff_max_secs",
+        },
+        Rule {
+            says: "a request timeout of zero would fail before it could ever succeed",
+            broken_by: changed(
+                HTTP,
+                "url = \"https://example.com/usage\"",
+                "url = \"https://example.com/usage\"\ntimeout_secs = 0",
+            ),
+            names: "timeout_secs",
         },
         Rule {
             says: "a header value read from a file has a name",
@@ -883,6 +942,19 @@ fn rules() -> Vec<Rule> {
                  client_secret   = \"literal-secret\"",
             ),
             names: "client_id",
+        },
+        Rule {
+            // Same rule `[[http.request]] url` and `[account] url` carry
+            // above, read the same way (`super::https_host`) — refused
+            // before `auth::oauth_refresh_step` would ever dial it with the
+            // refresh token in tow.
+            says: "nor is a refresh token's own exchange exempt from https",
+            broken_by: changed(
+                &oauth_refresh_client_declaring(r#"["oauth-refresh", "oauth-client-discovery"]"#),
+                "token_url       = \"https://oauth2.googleapis.com/token\"",
+                "token_url       = \"http://oauth2.googleapis.com/token\"",
+            ),
+            names: "`token_url` must be https",
         },
         // ── `requires_reader` (src/plugin/capability.rs) ──────────────────
         //

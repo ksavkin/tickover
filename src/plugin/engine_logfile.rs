@@ -3,11 +3,12 @@
 //! It walks a provider's local rollout/log files (Codex's
 //! `~/.codex/sessions/**/rollout-*.jsonl` is the shape it was built for,
 //! though Codex itself now reads its usage API through the `http-api` engine
-//! instead — no shipped manifest currently declares `engine = "log-file"`;
-//! `tests/reader.rs` is what keeps this engine covered) looking for a JSON
-//! container that carries two named windows, `primary` and `secondary`, each
-//! with a `used_percent` (0–100) and (usually) a `resets_at` and
-//! `window_minutes`.
+//! instead — no shipped manifest currently declares `engine = "log-file"`; a
+//! Codex-like fixture in `tests/reader.rs` and this module's own `tests`
+//! below both keep it covered) looking for a JSON container that carries a
+//! `primary` and/or a `secondary` named window — a container missing one of
+//! the two is read as reporting only the other, not discarded — each with a
+//! `used_percent` (0–100) and (usually) a `resets_at` and `window_minutes`.
 //!
 //! Everything a manifest's `[[windows]]` list can vary — labels, UI role,
 //! nominal-period source (`assumed` vs `from_field`), and the min/max period
@@ -42,7 +43,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::Value;
@@ -82,7 +83,7 @@ pub fn fetch(
             // is a cost with nothing to show for it.
             let glob = crate::plugin::substitute_options(&lf.glob, options);
             let files = collect_log_files(&root, &glob);
-            let mut out = vec![fetch_from_root(m, lf, &root, &files, options)];
+            let mut out = vec![fetch_from_root(m, lf, &root, &files)];
             // Additional rows, one per *other* account whose readings share the
             // same log tree (Codex Desktop signed into a different ChatGPT
             // account than the CLI). Empty unless `[logfile.account_match]` is
@@ -151,12 +152,16 @@ fn resolve_root(lf: &LogFileConfig, options: &BTreeMap<String, bool>) -> PathBuf
 /// The root-injectable core of the engine — everything [`fetch`] does except
 /// resolving `root` from the manifest/env, so tests can point it at a
 /// fixture directory without touching `$HOME` or real env vars.
+///
+/// Takes no `options`: every `{option.<key>}` substitution this engine makes
+/// (`root`, `root_env_join`, `glob`) happens in [`fetch`] before `files` is
+/// ever walked, so by the time a caller reaches this function the option set
+/// has already done its only job.
 fn fetch_from_root(
     m: &PluginManifest,
     lf: &LogFileConfig,
     root: &Path,
-    files: &[(PathBuf, u64)],
-    _options: &BTreeMap<String, bool>,
+    files: &[(PathBuf, SystemTime)],
 ) -> ProviderReading {
     let mut reading = ProviderReading {
         id: m.id.clone(),
@@ -250,7 +255,7 @@ struct PlanGroup {
 fn secondary_accounts(
     m: &PluginManifest,
     lf: &LogFileConfig,
-    files: &[(PathBuf, u64)],
+    files: &[(PathBuf, SystemTime)],
 ) -> Vec<ProviderReading> {
     // No account_match (or an unreadable current login) → no "other accounts"
     // to contrast against. The primary row already stands alone.
@@ -264,7 +269,16 @@ fn secondary_accounts(
     let Some(reference) = groups.values().map(|g| g.ts).max() else {
         return Vec::new();
     };
-    let cutoff = reference.saturating_sub(SECONDARY_RECENCY_SECS);
+    // `reference` is a reading line's own `timestamp` — content a provider's
+    // log wrote, not a clock this app controls. A corrupted line or a clock
+    // running fast could claim a timestamp past "now"; letting that push the
+    // cutoff into the future would silently exclude every genuinely current
+    // account, which is the opposite of what a recency cutoff is for.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(reference);
+    let cutoff = reference.min(now).saturating_sub(SECONDARY_RECENCY_SECS);
 
     // BTreeMap iteration is key-sorted → a deterministic row order without any
     // clock/RNG (both unavailable to the engine).
@@ -324,18 +338,25 @@ fn build_secondary_reading(
 /// a cost bound only (selection is by the line's own `timestamp`), generous
 /// enough that the file-mtime anomaly can't hide a genuinely recent line.
 fn collect_plan_groups(
-    files: &[(PathBuf, u64)],
+    files: &[(PathBuf, SystemTime)],
     container_key: &str,
     field: &str,
 ) -> BTreeMap<String, PlanGroup> {
+    let mtime_secs = |t: SystemTime| {
+        t.duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
     let mut files = files.to_vec();
-    files.sort_by_key(|f| std::cmp::Reverse(f.1)); // newest mtime first
-    let newest_mtime = files.first().map(|(_, mt)| *mt).unwrap_or(0);
+    // Newest first, path as the tiebreak for two files stamped the same
+    // instant — see `latest_reading`'s copy of the same reasoning.
+    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let newest_mtime = files.first().map(|(_, mt)| mtime_secs(*mt)).unwrap_or(0);
     let mtime_floor = newest_mtime.saturating_sub(SECONDARY_RECENCY_SECS.saturating_mul(2));
 
     let mut groups: BTreeMap<String, PlanGroup> = BTreeMap::new();
     for (path, mtime) in &files {
-        if *mtime < mtime_floor {
+        if mtime_secs(*mtime) < mtime_floor {
             break;
         }
         for (value, ts, raw) in parse_file_groups(path, container_key, field) {
@@ -644,7 +665,12 @@ fn resets_at_for(slot: &RawSlot, format: ResetsAtFormat) -> Option<u64> {
     match format {
         ResetsAtFormat::Unix => raw
             .as_u64()
-            .or_else(|| raw.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64)),
+            .or_else(|| raw.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
+            // Providers do quote their numbers sometimes; a reset time is too
+            // useful to drop over the difference between 1787207494 and
+            // "1787207494" (`engine_http::resets_at_value` accepts the same
+            // quoted form for exactly this reason).
+            .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<u64>().ok())),
         ResetsAtFormat::Iso8601 => raw.as_str().and_then(parse_iso8601),
     }
 }
@@ -669,26 +695,44 @@ fn parse_iso8601(s: &str) -> Option<u64> {
 /// login's. A file with no *matching* container falls through to the next,
 /// exactly as an empty file does.
 fn latest_reading(
-    files: &[(PathBuf, u64)],
+    files: &[(PathBuf, SystemTime)],
     container_key: &str,
     account_match: Option<&(String, String)>,
 ) -> Option<RawReading> {
     let mut files = files.to_vec();
-    // Newest first. Files without a readable mtime sort last.
-    files.sort_by_key(|f| std::cmp::Reverse(f.1));
+    // Newest first. Files without a readable mtime sort last (they carry
+    // `UNIX_EPOCH`, the earliest possible value). Two files stamped the same
+    // instant — not impossible on a filesystem some other tool writes to in
+    // a batch — break the tie on path rather than on walkdir's visit order,
+    // which is an accident of the filesystem, not a decision anyone made.
+    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     files
         .into_iter()
         .find_map(|(path, _mtime)| parse_file(&path, container_key, account_match))
 }
 
+/// A recursive walk under `root` has no natural size limit of its own: a
+/// manifest's `root`/`root_env`/`glob` is data this app trusts to be honest
+/// about the provider's own data directory, not data it trusts to be small,
+/// and a mistyped one (or an env var pointed at something far wider) could
+/// hand this walk a home directory instead of a session tree. `LOG_WALK_MAX_ENTRIES`
+/// caps how many directory entries a single collection visits before it stops
+/// and reports whatever it already found; a session tree this engine has ever
+/// been measured against (`fetch`'s doc: 3975 files) is nowhere near the cap,
+/// so this only ever bites a manifest that got its root wrong.
+const LOG_WALK_MAX_ENTRIES: usize = 200_000;
+
 /// All files under `root` whose basename matches `glob`, paired with their
-/// mtime (Unix seconds).
-fn collect_log_files(root: &Path, glob: &str) -> Vec<(PathBuf, u64)> {
+/// mtime (full resolution — truncating to whole seconds before the freshness
+/// sort is what let two files written a fraction of a second apart tie and
+/// fall back to whatever order the filesystem happened to hand them in).
+fn collect_log_files(root: &Path, glob: &str) -> Vec<(PathBuf, SystemTime)> {
     let mut out = Vec::new();
     for entry in walkdir::WalkDir::new(root)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
+        .take(LOG_WALK_MAX_ENTRIES)
     {
         if !entry.file_type().is_file() {
             continue;
@@ -701,9 +745,7 @@ fn collect_log_files(root: &Path, glob: &str) -> Vec<(PathBuf, u64)> {
             .metadata()
             .ok()
             .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .unwrap_or(UNIX_EPOCH);
         out.push((entry.into_path(), mtime));
     }
     out
@@ -713,8 +755,18 @@ fn collect_log_files(root: &Path, glob: &str) -> Vec<(PathBuf, u64)> {
 /// part of `glob` after its final path separator is meaningful — directories
 /// are always walked recursively regardless of a leading `**/`, so
 /// `"**/rollout-*.jsonl"` and `"rollout-*.jsonl"` behave identically.
+///
+/// `\` is a path separator on Windows and an ordinary filename character
+/// everywhere else — a manifest's `glob` is one string shared by every
+/// platform, so splitting on `\` off Windows would treat a literal backslash
+/// in a Unix basename pattern as a directory boundary and quietly discard
+/// everything before it. `rsplit` on a non-empty pattern list always yields
+/// at least the whole string back, so the `unwrap_or` below never actually
+/// falls through — kept because the type still asks for it, not because the
+/// `None` arm is reachable.
 fn glob_matches(glob: &str, name: &str) -> bool {
-    let name_pattern = glob.rsplit(['/', '\\']).next().unwrap_or(glob);
+    let separators: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+    let name_pattern = glob.rsplit(separators).next().unwrap_or(glob);
     match_wildcard(name_pattern, name)
 }
 
@@ -892,7 +944,9 @@ fn first_f64(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<f64>
         .find_map(|k| map.get(*k).and_then(Value::as_f64))
 }
 
-/// First key that yields a non-negative integer (accepts float timestamps).
+/// First key that yields a non-negative integer — `window_minutes`, the one
+/// caller, is a whole number of minutes, but tolerates a provider that
+/// serialises it as a JSON float (`300.0`) rather than an int.
 fn first_u64(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u64> {
     keys.iter().find_map(|k| {
         map.get(*k).and_then(|v| {
@@ -920,10 +974,16 @@ fn json_path<'v>(root: &'v Value, path: &str) -> Option<&'v Value> {
 fn resolve_tag(m: &PluginManifest, container: Option<&Value>) -> Option<String> {
     let raw = match m.tag.from {
         TagFrom::Static => m.tag.value.clone(),
+        // The manifest names the field, but the *value* in it is the
+        // provider's own answer (Codex's `plan_type`, live) — sanitised like
+        // any other response-supplied text before it reaches the tag chip.
         TagFrom::Field => {
             let path = m.tag.path.as_deref()?;
             let value = json_path(container?, path)?;
-            value.as_str().map(str::to_owned)
+            value
+                .as_str()
+                .map(crate::plugin::sanitize_provider_text)
+                .filter(|s| !s.is_empty())
         }
         TagFrom::None => None,
     }?;
@@ -941,7 +1001,13 @@ fn resolve_tag(m: &PluginManifest, container: Option<&Value>) -> Option<String> 
 fn resolve_account(m: &PluginManifest) -> Option<String> {
     let claim = m.account.claim.as_deref()?;
     let claims = jwt_claims(m)?;
-    json_path(&claims, claim)?.as_str().map(str::to_owned)
+    let raw = json_path(&claims, claim)?.as_str()?;
+    // The claim's *name* is the manifest's; the value decoded out of it is
+    // the token's own payload — sanitised like any other provider-supplied
+    // text before it reaches the panel, and rejected outright if that leaves
+    // nothing.
+    let account = crate::plugin::sanitize_provider_text(raw);
+    (!account.is_empty()).then_some(account)
 }
 
 /// Decode the `[account]` jwt-file's claims to a JSON value — the shared step
@@ -1408,6 +1474,20 @@ mod tests {
     }
 
     #[test]
+    fn a_quoted_unix_timestamp_resolves_the_same_as_a_bare_one() {
+        let s = RawSlot {
+            used_percent: 1.0,
+            resets_at_raw: Some(json!("1787207494")),
+            window_minutes: None,
+        };
+        assert_eq!(
+            resets_at_for(&s, ResetsAtFormat::Unix),
+            Some(1_787_207_494),
+            "a provider that quotes its numbers must not lose the reset time"
+        );
+    }
+
+    #[test]
     fn tolerates_alternate_field_spellings() {
         let s =
             parse_raw_slot(&json!({ "usedPercent": 33.0, "resetsAt": 555, "windowMinutes": 300 }))
@@ -1441,6 +1521,17 @@ mod tests {
         assert!(!glob_matches("rollout-*.jsonl", "rollout-x.log"));
     }
 
+    #[test]
+    #[cfg(not(windows))]
+    fn a_literal_backslash_is_part_of_the_basename_off_windows() {
+        // `\` is an ordinary filename character on every platform but
+        // Windows — treating it as a path separator here would drop
+        // everything before it and turn a pattern that should match exactly
+        // into one that matches something looser (or nothing at all).
+        assert!(glob_matches("weird\\name-*.jsonl", "weird\\name-1.jsonl"));
+        assert!(!glob_matches("weird\\name-*.jsonl", "name-1.jsonl"));
+    }
+
     // ── cross-file fallback ──────────────────────────────────────────────
 
     #[test]
@@ -1472,6 +1563,41 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn two_files_stamped_the_same_instant_break_the_tie_on_path() {
+        // Two files an mtime truncated to whole seconds would have called
+        // simultaneous even before this fix — same `SystemTime`, no filename
+        // order to fall back on other than the one the sort itself imposes.
+        let dir = temp_dir("mtime-tie");
+        let a = write_file(
+            &dir,
+            "rollout-a.jsonl",
+            &[json!({ "rate_limits": { "primary": { "used_percent": 5.0 } } }).to_string()],
+        );
+        let b = write_file(
+            &dir,
+            "rollout-b.jsonl",
+            &[json!({ "rate_limits": { "primary": { "used_percent": 99.0 } } }).to_string()],
+        );
+        let same_instant = std::time::SystemTime::now();
+        set_mtime(&a, same_instant);
+        set_mtime(&b, same_instant);
+
+        let raw = latest_reading(
+            &collect_log_files(&dir, "rollout-*.jsonl"),
+            "rate_limits",
+            None,
+        )
+        .expect("either file resolves a reading");
+        assert_eq!(
+            raw.primary.unwrap().used_percent,
+            5.0,
+            "an exact mtime tie must resolve deterministically by path, not by \
+             whatever order the filesystem happened to hand the walk"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ── tag / account ────────────────────────────────────────────────────
 
     #[test]
@@ -1490,6 +1616,22 @@ mod tests {
     }
 
     #[test]
+    fn tag_from_field_sanitises_plan_type_before_the_chip_sees_it() {
+        let m = codex_like_manifest(
+            "TICKOVER_TEST_LOGFILE_NEVER_SET_1B",
+            "/nonexistent",
+            "/nonexistent",
+        );
+        let container =
+            json!({ "primary": { "used_percent": 1.0 }, "plan_type": "pro\u{200B}\nlite" });
+        assert_eq!(
+            resolve_tag(&m, Some(&container)).as_deref(),
+            Some("PROLITE"),
+            "plan_type is response-supplied text like any other in this app"
+        );
+    }
+
+    #[test]
     fn account_email_is_read_from_jwt_file() {
         let dir = temp_dir("account");
         let auth_path = dir.join("auth.json");
@@ -1502,6 +1644,26 @@ mod tests {
 
         let m = codex_like_manifest(
             "TICKOVER_TEST_LOGFILE_NEVER_SET_2",
+            "/nonexistent",
+            &auth_path.to_string_lossy(),
+        );
+        assert_eq!(resolve_account(&m).as_deref(), Some("user@example.com"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn account_email_is_sanitised_the_same_as_any_other_decoded_claim() {
+        let dir = temp_dir("account-sanitise");
+        let auth_path = dir.join("auth.json");
+        let jwt = make_jwt("{\"email\":\"user@example.com\u{200B}\\r\"}");
+        std::fs::write(
+            &auth_path,
+            json!({ "tokens": { "id_token": jwt } }).to_string(),
+        )
+        .unwrap();
+
+        let m = codex_like_manifest(
+            "TICKOVER_TEST_LOGFILE_NEVER_SET_2B",
             "/nonexistent",
             &auth_path.to_string_lossy(),
         );
@@ -1541,13 +1703,7 @@ mod tests {
             &auth_path.to_string_lossy(),
         );
         let lf = m.logfile.as_ref().unwrap();
-        let reading = fetch_from_root(
-            &m,
-            lf,
-            &dir,
-            &collect_log_files(&dir, &lf.glob),
-            &no_options(),
-        );
+        let reading = fetch_from_root(&m, lf, &dir, &collect_log_files(&dir, &lf.glob));
 
         assert_eq!(reading.id, "codex");
         assert_eq!(reading.name, "Codex");
@@ -1585,11 +1741,13 @@ mod tests {
     }
 
     #[test]
-    fn fetch_from_root_substitutes_option_placeholders_in_the_glob() {
+    fn an_already_substituted_glob_decides_which_files_are_found() {
         let dir = temp_dir("option-glob");
         // The file only matches the glob once `{option.enabled}` resolves to
-        // "true" — proving `fetch_from_root` substitutes `lf.glob` before
-        // walking the directory, not just `resolve_root`'s path fields.
+        // "true" — proving that whatever substituted `lf.glob` (`fetch`'s
+        // job, not `fetch_from_root`'s: this function takes no `options` at
+        // all) is what `collect_log_files` actually walks with, not just
+        // `resolve_root`'s path fields.
         write_file(
             &dir,
             "rollout-true-a.jsonl",
@@ -1610,7 +1768,6 @@ mod tests {
             &lf,
             &dir,
             &collect_log_files(&dir, &crate::plugin::substitute_options(&lf.glob, &opts)),
-            &opts,
         );
         assert!(
             reading.error.is_none(),
@@ -1625,7 +1782,6 @@ mod tests {
             &lf,
             &dir,
             &collect_log_files(&dir, &crate::plugin::substitute_options(&lf.glob, &opts)),
-            &opts,
         );
         assert!(
             reading.error.is_some(),
@@ -1669,13 +1825,7 @@ mod tests {
         let label = weekly.label.clone();
 
         let lf = m.logfile.as_ref().unwrap();
-        let reading = fetch_from_root(
-            &m,
-            lf,
-            &dir,
-            &collect_log_files(&dir, &lf.glob),
-            &no_options(),
-        );
+        let reading = fetch_from_root(&m, lf, &dir, &collect_log_files(&dir, &lf.glob));
 
         assert_eq!(
             reading.error.as_deref(),
@@ -1691,7 +1841,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reading_carrying_no_usable_slot_is_empty_rather_than_an_error() {
+    fn a_reading_carrying_no_usable_slot_reads_as_no_data_not_a_broken_window() {
         // The counterpart of the HTTP case: this manifest marks nothing
         // required, so a reading nothing could be got out of is reported as
         // no windows rather than as a broken provider. "Nothing resolved
@@ -1709,13 +1859,7 @@ mod tests {
             "/nonexistent",
         );
         let lf = m.logfile.as_ref().unwrap();
-        let reading = fetch_from_root(
-            &m,
-            lf,
-            &dir,
-            &collect_log_files(&dir, &lf.glob),
-            &no_options(),
-        );
+        let reading = fetch_from_root(&m, lf, &dir, &collect_log_files(&dir, &lf.glob));
 
         // This engine never reaches the window rule for such a line: a
         // container carrying no usable slot is discarded while parsing, so
@@ -1760,13 +1904,7 @@ mod tests {
             "/nonexistent",
         );
         let lf = m.logfile.as_ref().unwrap();
-        let reading = fetch_from_root(
-            &m,
-            lf,
-            &dir,
-            &collect_log_files(&dir, &lf.glob),
-            &no_options(),
-        );
+        let reading = fetch_from_root(&m, lf, &dir, &collect_log_files(&dir, &lf.glob));
 
         assert!(
             reading.error.is_none(),
@@ -1796,13 +1934,7 @@ mod tests {
             "/nonexistent",
         );
         let lf = m.logfile.as_ref().unwrap();
-        let reading = fetch_from_root(
-            &m,
-            lf,
-            &dir,
-            &collect_log_files(&dir, &lf.glob),
-            &no_options(),
-        );
+        let reading = fetch_from_root(&m, lf, &dir, &collect_log_files(&dir, &lf.glob));
 
         assert!(reading.error.is_some());
         assert!(reading.windows.is_empty());
@@ -1935,13 +2067,7 @@ mod tests {
 
         let m = codex_like_manifest_with_match("/nonexistent", &auth_path.to_string_lossy());
         let lf = m.logfile.as_ref().unwrap();
-        let reading = fetch_from_root(
-            &m,
-            lf,
-            &dir,
-            &collect_log_files(&dir, &lf.glob),
-            &no_options(),
-        );
+        let reading = fetch_from_root(&m, lf, &dir, &collect_log_files(&dir, &lf.glob));
 
         assert!(
             reading.error.is_none(),
@@ -1976,13 +2102,7 @@ mod tests {
 
         let m = codex_like_manifest_with_match("/nonexistent", &auth_path.to_string_lossy());
         let lf = m.logfile.as_ref().unwrap();
-        let reading = fetch_from_root(
-            &m,
-            lf,
-            &dir,
-            &collect_log_files(&dir, &lf.glob),
-            &no_options(),
-        );
+        let reading = fetch_from_root(&m, lf, &dir, &collect_log_files(&dir, &lf.glob));
 
         assert!(
             reading.error.is_some(),
@@ -2005,13 +2125,7 @@ mod tests {
 
         let m = codex_like_manifest_with_match("/nonexistent", "/nonexistent/auth.json");
         let lf = m.logfile.as_ref().unwrap();
-        let reading = fetch_from_root(
-            &m,
-            lf,
-            &dir,
-            &collect_log_files(&dir, &lf.glob),
-            &no_options(),
-        );
+        let reading = fetch_from_root(&m, lf, &dir, &collect_log_files(&dir, &lf.glob));
 
         assert!(
             reading.error.is_none(),
@@ -2161,6 +2275,47 @@ mod tests {
             secondary_accounts(&m, lf, &collect_log_files(&dir, &lf.glob)).is_empty(),
             "without a known current account there is no notion of an 'other' account"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_bogus_future_timestamp_on_one_account_cannot_hide_another_that_is_genuinely_current() {
+        // `reference` is `max(ts)` across every account, including the
+        // current login's own line — content this app reads but does not
+        // control. A corrupted or clock-skewed line claiming a year 2099
+        // timestamp must not push the recency cutoff seven days past 2099
+        // and quietly drop a secondary account whose own line is genuinely
+        // from today.
+        let dir = temp_dir("secondary-future");
+        let auth_path = dir.join("auth.json");
+        let jwt = make_jwt(r#"{"email":"me@example.com","acme.auth":{"plan":"prolite"}}"#);
+        std::fs::write(
+            &auth_path,
+            json!({ "tokens": { "id_token": jwt } }).to_string(),
+        )
+        .unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        write_file(
+            &dir,
+            "rollout-a.jsonl",
+            &[
+                ts_weekly_line("2099-01-01T00:00:00Z", "prolite", 9.0), // current login, bogus line
+                ts_weekly_line(&now, "plus", 100.0), // other account, actually current
+            ],
+        );
+
+        let m = codex_like_manifest_with_match("/nonexistent", &auth_path.to_string_lossy());
+        let lf = m.logfile.as_ref().unwrap();
+        let secondaries = secondary_accounts(&m, lf, &collect_log_files(&dir, &lf.glob));
+
+        assert_eq!(
+            secondaries.len(),
+            1,
+            "a bogus future reference must not push the cutoff past now and \
+             exclude a genuinely recent account"
+        );
+        assert_eq!(secondaries[0].id, "codex#plus");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2496,13 +2651,7 @@ mod tests {
         // the "root does not exist" branch of the installed check.
         std::fs::remove_dir_all(&dir).ok();
 
-        let reading = fetch_from_root(
-            &m,
-            &lf,
-            &dir,
-            &collect_log_files(&dir, &lf.glob),
-            &no_options(),
-        );
+        let reading = fetch_from_root(&m, &lf, &dir, &collect_log_files(&dir, &lf.glob));
         assert_eq!(
             reading.error.as_deref(),
             Some("Codex CLI not found.\nInstall: npm i -g @openai/codex")

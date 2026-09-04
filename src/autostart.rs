@@ -34,16 +34,6 @@ fn build_legacy() -> Option<AutoLaunch> {
         .ok()
 }
 
-/// Whether the new entry should end up enabled, given whether the legacy one
-/// was — pulled out of [`retire_legacy_entry`] purely so this one-line
-/// decision has a test of its own. The AutoLaunch calls around it do not:
-/// `is_enabled`, `enable` and `disable` shell out to `osascript` on macOS,
-/// and a test that ran them for real would touch the login items of whatever
-/// machine `cargo test` runs on.
-fn carry_autostart_forward(legacy_was_enabled: bool) -> bool {
-    legacy_was_enabled
-}
-
 /// Turn off the login item this app registered under [`LEGACY_APP_NAME`],
 /// carrying its state forward to [`APP_NAME`] first if it was on — an
 /// upgrader who had launch-at-login enabled must not find it silently off,
@@ -55,9 +45,13 @@ fn carry_autostart_forward(legacy_was_enabled: bool) -> bool {
 /// can raise for one it does not hold.
 ///
 /// Best-effort like the rest of this module: every failure is logged and
-/// swallowed, never surfaced to the user. Returns whether the new entry ended
-/// up enabled — `main` calls this for effect, but the return value is what a
-/// test can hold to.
+/// swallowed, never surfaced to the user. Returns the state actually
+/// achieved for the new entry — the outcome of [`set`], not merely what
+/// this function meant to leave it in.
+///
+/// Not tested here: `is_enabled`, `enable` and `disable` shell out to
+/// `osascript` on macOS, and a test that ran them for real would touch the
+/// login items of whatever machine `cargo test` runs on.
 pub fn retire_legacy_entry() -> bool {
     let Some(legacy) = build_legacy() else {
         return false;
@@ -68,11 +62,11 @@ pub fn retire_legacy_entry() -> bool {
             "could not retire the old \"{LEGACY_APP_NAME}\" login item: {e}"
         ));
     }
-    let enable_new = carry_autostart_forward(was_enabled);
-    if enable_new {
-        set(true);
+    if was_enabled {
+        set(true)
+    } else {
+        false
     }
-    enable_new
 }
 
 /// The path as the platform's own autostart store wants it written.
@@ -86,8 +80,10 @@ pub fn retire_legacy_entry() -> bool {
 /// Only a path with no space in it — the one this was developed against —
 /// happens to work.
 ///
-/// macOS must not be quoted: the path goes into an AppleScript
-/// `POSIX file "…"` literal that supplies the quotes itself.
+/// macOS must not be quoted: `auto-launch` writes the path straight into an
+/// AppleScript string literal of its own (`path:"…"` inside the
+/// `make login item` properties it sends to `osascript`), which already
+/// supplies the surrounding quotes — wrapping it again would double them.
 fn run_key_path(path: &str) -> String {
     if cfg!(target_os = "windows") {
         format!("\"{path}\"")
@@ -119,23 +115,7 @@ pub fn set(enabled: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{carry_autostart_forward, run_key_path};
-
-    /// The whole point of carrying the toggle forward: an upgrader who had
-    /// launch-at-login on keeps it on, and one who had it off is not handed a
-    /// login item they never asked for. `retire_legacy_entry` itself is not
-    /// tested here — see its own doc comment for why.
-    #[test]
-    fn the_new_entry_mirrors_whether_the_legacy_one_was_enabled() {
-        assert!(
-            carry_autostart_forward(true),
-            "on stays on across the migration"
-        );
-        assert!(
-            !carry_autostart_forward(false),
-            "off stays off — no surprise login item"
-        );
-    }
+    use super::run_key_path;
 
     #[test]
     fn a_path_with_a_space_in_it_survives_the_round_trip() {
@@ -150,15 +130,18 @@ mod tests {
         }
     }
 
+    // macOS-only: `run_key_path`'s `if` only has a Windows arm and an
+    // everyone-else arm, so this asserts nothing new on Linux and would
+    // silently pass without checking anything on the Windows CI job too —
+    // cfg'd out there rather than left to assert nothing.
+    #[cfg(target_os = "macos")]
     #[test]
     fn macos_is_left_alone_because_applescript_quotes_it_itself() {
         let path = "/Applications/Tickover.app/Contents/MacOS/tickover";
-        let written = run_key_path(path);
-        if cfg!(target_os = "macos") {
-            assert_eq!(
-                written, path,
-                "a quote here would land inside a POSIX file literal"
-            );
-        }
+        assert_eq!(
+            run_key_path(path),
+            path,
+            "a quote here would land inside auto-launch's own AppleScript string literal"
+        );
     }
 }

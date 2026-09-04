@@ -334,7 +334,7 @@ component ProviderCard inherits VerticalLayout {
 }
 
 export component AppWindow inherits Window {
-    title: "Codex + Claude Limits";
+    title: "Tickover";
     no-frame: true;
     background: transparent;
     // Narrower than the columnar layout needed: each quota window is a stacked
@@ -385,12 +385,13 @@ export component AppWindow inherits Window {
         }
     }
 
-    // Running from the Dock as an ordinary window rather than as a transient
-    // flyout under a status item.
-    in property <bool> dock-mode: false;
     // Whether a press on bare card background starts a system window drag.
-    // Rust decides — see `main.rs`'s `set_draggable` call for why this is not
-    // simply `dock-mode`.
+    // Rust decides this from `platform::dock_mode()` (running from the Dock
+    // as an ordinary window rather than as a transient flyout under a status
+    // item) — see `main.rs`'s `set_draggable` call. Every other dock-mode
+    // difference (placement, focus-loss behaviour, window level) is native
+    // Rust/platform code with nothing for this file to branch on, which is
+    // why there is no separate `dock-mode` property here.
     in property <bool> draggable: false;
     // Label for the toggle that puts the quota figures next to the clock.
     // What that place is called, and what actually appears there, differ per
@@ -1105,7 +1106,7 @@ export component AppWindow inherits Window {
                         VerticalLayout {
                             alignment: center;
                             InfoDot {
-                                hint: "Bar = quota used; white tick = elapsed window time; PACE = usage minus elapsed time, in percent points. Codex is read from local session logs, Claude from the usage API. Settings save immediately.";
+                                hint: "Bar = quota used; white tick = elapsed window time; the bar's tooltip shows usage minus elapsed time, in percent points. Codex is read from local session logs, Claude from the usage API. Settings save immediately.";
                                 // Not a position like the bars use: this dot is
                                 // the only one on the panel, and it is not in
                                 // the provider list, so nothing can collide.

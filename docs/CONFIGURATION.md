@@ -27,7 +27,12 @@ lives in one folder:
 `config.json` and the manifests are plain text and safe to edit by hand
 while the app is not running. On Windows, save them as UTF-8
 **without** a byte-order mark if your editor offers the choice: the app
-strips one if it finds it, other tools reading the same files may not.
+strips one if it finds it, other tools reading the same files may not. A
+hand-edit that leaves `config.json` unparsable is not fatal: the app moves
+the broken file aside to `config.json.corrupt-<unix time>` and starts fresh
+with defaults rather than silently overwriting your edit the next time a
+setting is saved — the renamed copy is yours to recover values from by
+hand.
 
 An install of the app under its previous name (a `codex-limits` folder in
 the same place) is renamed to `tickover` on the first launch, with its
@@ -58,7 +63,7 @@ Copilot, whose allowance is monthly.
 |---|---|
 | `TICKOVER_DOCK=1` / `=0` | keep the panel on screen as an ordinary window, reachable from the Dock or the taskbar and no longer dismissed by a click outside it. Writes the setting, so it sticks; `=0` clears it. See [`DOCK-MODE.md`](DOCK-MODE.md). |
 | `TICKOVER_SHOW_ON_START=1` | open the panel immediately on launch |
-| `TICKOVER_SNAPSHOT=out.png` | render the panel to a PNG and exit — macOS only; add `TICKOVER_SNAPSHOT_SETTINGS=1` for the settings sheet |
+| `TICKOVER_SNAPSHOT=out.png` | render the panel to a PNG and exit — not on Windows; add `TICKOVER_SNAPSHOT_SETTINGS=1` for the settings sheet |
 | `TICKOVER_THEME=light` / `=dark` | force the tray pill's palette instead of following the system appearance |
 | `TICKOVER_DEMO_ACCOUNT=you@example.com` | show this in place of the real account label — for screenshots; it rewrites the label only, never the reading or the token |
 | `CODEX_HOME=/path` | honoured by the `log-file` engine's `root_env`; the shipped Codex manifest no longer uses it |

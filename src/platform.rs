@@ -26,6 +26,10 @@ pub fn set_accessory_policy() {
     use objc::{class, msg_send, sel, sel_impl};
     // NSApplicationActivationPolicyAccessory = 1
     const ACCESSORY: i64 = 1;
+    // SAFETY: `sharedApplication` either returns the process-wide singleton
+    // or nil, never a dangling pointer, and the nil case is checked before
+    // the second message is sent; `setActivationPolicy:` takes a plain
+    // integer, no buffer for either side to misjudge the length of.
     unsafe {
         let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
         if !app.is_null() {
@@ -138,15 +142,6 @@ enum Claim {
 fn claim_instance_lock(path: &std::path::Path) -> Claim {
     use std::os::unix::io::AsRawFd;
 
-    // Declared rather than taken as a dependency: one symbol and two integers
-    // from libc, which every Unix target links anyway. The values are the same
-    // on macOS and Linux.
-    extern "C" {
-        fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
-    }
-    const LOCK_EX: std::os::raw::c_int = 2;
-    const LOCK_NB: std::os::raw::c_int = 4;
-
     let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -157,7 +152,7 @@ fn claim_instance_lock(path: &std::path::Path) -> Claim {
     };
     // SAFETY: `file` owns a valid descriptor for the whole call, and `flock`
     // only reads it.
-    if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         return Claim::Held(file);
     }
     // Only "someone else holds it" means a second instance. A filesystem that
@@ -192,7 +187,12 @@ fn claim_instance_lock(path: &std::path::Path) -> Claim {
     // A sharing violation is how the other instance's claim shows up — and
     // also how an antivirus or indexer that opened this file for a moment
     // shows up. Since the two are indistinguishable, and refusing to start is
-    // the worse mistake, ask once more after the moment has passed.
+    // the worse mistake, ask once more after the moment has passed. One retry
+    // at a fixed 300ms is a guess, not a guarantee: a scanner that still holds
+    // the file past that window reads exactly like a second instance and this
+    // launch exits, same as if it really were one — the failure mode this
+    // trades against (refusing to start at all rather than risk two copies
+    // racing the same on-disk state) is judged the worse of the two.
     std::thread::sleep(std::time::Duration::from_millis(300));
     match open() {
         Ok(file) => Claim::Held(file),
@@ -244,6 +244,9 @@ pub fn claim_single_instance() -> Result<Option<std::fs::File>, AlreadyRunning> 
 pub fn app_is_active() -> bool {
     use objc::runtime::{Object, BOOL, NO};
     use objc::{class, msg_send, sel, sel_impl};
+    // SAFETY: `sharedApplication` either returns the process-wide singleton
+    // or nil, never a dangling pointer, and the nil case is checked before
+    // `isActive` is sent to it; `isActive` takes no arguments to mismatch.
     unsafe {
         let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
         if app.is_null() {
@@ -283,6 +286,20 @@ extern "C" fn on_reopen(
     objc::runtime::NO
 }
 
+/// The ObjC type-encoding string for `on_reopen`'s signature, handed to
+/// `class_addMethod` below. It has to name `BOOL`'s *actual* encoding, and
+/// that differs by architecture: `objc::runtime::BOOL` is `bool` (encoding
+/// `B`) on aarch64, matching Apple's own ABI change for arm64, and `c_schar`
+/// (encoding `c`) everywhere else — this picks the one that matches the
+/// `BOOL` this file actually compiles against, for both the return value and
+/// the `hasVisibleWindows` argument.
+#[cfg(target_os = "macos")]
+const REOPEN_METHOD_TYPES: &std::ffi::CStr = if cfg!(target_arch = "aarch64") {
+    c"B@:@B"
+} else {
+    c"c@:@c"
+};
+
 /// Teach the app delegate to report Dock-icon clicks.
 ///
 /// `isActive` only changes on the *first* click, so it cannot drive a toggle:
@@ -299,8 +316,15 @@ extern "C" fn on_reopen(
 /// delegate, so callers should retry).
 #[cfg(target_os = "macos")]
 pub fn install_reopen_handler() -> bool {
-    use objc::runtime::{Class, Object, BOOL, NO};
+    use objc::runtime::{Class, Object, BOOL};
     use objc::{class, msg_send, sel, sel_impl};
+    // SAFETY: every `msg_send!` below checks its receiver for null before the
+    // next one uses it. The `transmute` turns `on_reopen`'s function-pointer
+    // type into `objc::runtime::Imp`; that is sound because `on_reopen`'s
+    // `extern "C"` signature matches `REOPEN_METHOD_TYPES` argument for
+    // argument, and the pointer stays valid for as long as the class exists
+    // because `on_reopen` is a `'static` item, not a value this stack frame
+    // owns.
     unsafe {
         let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
         if app.is_null() {
@@ -314,16 +338,11 @@ pub fn install_reopen_handler() -> bool {
         if cls.is_null() {
             return false;
         }
-        let added: BOOL = objc::runtime::class_addMethod(
-            cls,
-            sel!(applicationShouldHandleReopen:hasVisibleWindows:),
-            std::mem::transmute::<
-                extern "C" fn(&Object, objc::runtime::Sel, *mut Object, BOOL) -> BOOL,
-                objc::runtime::Imp,
-            >(on_reopen),
-            c"c@:@c".as_ptr(),
-        );
-        // Already implemented upstream → leave it alone, but stop retrying.
+        // `class_addMethod`'s own return says whether it added the method or
+        // found the selector already implemented, but this function has
+        // nothing different to do either way — the handler responds to
+        // reopen either because this call just installed it or because it
+        // was already there — so the result is not read.
         //
         // Adding the selector *after* winit has assigned the delegate is fine:
         // AppKit resolves this one at call time rather than caching the
@@ -332,7 +351,15 @@ pub fn install_reopen_handler() -> bool {
         // `WinitApplicationDelegate`, `class_addMethod` returns true,
         // `respondsToSelector:` is true afterwards, and the handler is entered
         // on a real reopen. So no delegate reassignment is needed here.
-        let _ = added != NO;
+        let _: BOOL = objc::runtime::class_addMethod(
+            cls,
+            sel!(applicationShouldHandleReopen:hasVisibleWindows:),
+            std::mem::transmute::<
+                extern "C" fn(&Object, objc::runtime::Sel, *mut Object, BOOL) -> BOOL,
+                objc::runtime::Imp,
+            >(on_reopen),
+            REOPEN_METHOD_TYPES.as_ptr(),
+        );
         true
     }
 }
@@ -347,6 +374,10 @@ pub fn install_reopen_handler() -> bool {
 pub fn activate_app() {
     use objc::runtime::{Object, YES};
     use objc::{class, msg_send, sel, sel_impl};
+    // SAFETY: `sharedApplication` either returns the process-wide singleton
+    // or nil, never a dangling pointer, and the nil case is checked before
+    // `activateIgnoringOtherApps:` is sent to it; the argument is a plain
+    // `BOOL` constant, no buffer to misjudge the length of.
     unsafe {
         let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
         if !app.is_null() {
@@ -362,6 +393,12 @@ pub fn activate_app() {
 pub fn system_dark_theme() -> bool {
     use objc::runtime::Object;
     use objc::{class, msg_send, sel, sel_impl};
+    // SAFETY: `standardUserDefaults` either returns the process-wide
+    // singleton or nil, never a dangling pointer, and the nil case is
+    // checked before it is used; `c"AppleInterfaceStyle".as_ptr()` is a
+    // NUL-terminated static string, exactly what `stringWithUTF8String:`
+    // requires, so `key` is a valid string object; the final `style`
+    // pointer is only null-tested, never dereferenced.
     unsafe {
         let defaults: *mut Object = msg_send![class!(NSUserDefaults), standardUserDefaults];
         if defaults.is_null() {

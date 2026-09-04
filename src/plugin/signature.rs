@@ -8,11 +8,16 @@
 //! only thing left standing between that and an installed plugin is a trust
 //! dialog a person can click through.
 //!
-//! A signature moves the question from the transport to the publisher. The
-//! index is signed with an ed25519 key whose public half is compiled into
-//! this binary, and the signature is checked *before the index is parsed* —
-//! so an index this app will not vouch for is never even read for what it
-//! claims about itself.
+//! A signature moves the question from the transport to the publisher. Once
+//! a key is pinned (see [`REGISTRY_PUBLIC_KEY`]), the index is signed with an
+//! ed25519 key whose public half is compiled into this binary, and the
+//! signature is checked *before the index is parsed* — so an index this app
+//! will not vouch for is never even read for what it claims about itself.
+//! Today `REGISTRY_PUBLIC_KEY` is `None`, so no key is pinned yet: the check
+//! still runs, but it answers [`Verification::Unverifiable`] rather than
+//! refusing anything, and every index still gets parsed — see that variant's
+//! own doc, and `SECURITY.md`'s "Known gaps" section for the same fact
+//! stated for a reader who is not this source file.
 //!
 //! ## Format
 //!

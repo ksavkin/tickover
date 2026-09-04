@@ -7,10 +7,13 @@
 # app's own "launch at login" toggle writes its own registry entry, so an
 # installer would not add anything a zip does not already give a user.
 #
-# Not cargo-dist: the unit this project ships on macOS is an `.app` with
-# `LSUIElement` set, which is what makes it a menu-bar agent instead of a
-# window that steals focus on launch, and cargo-dist packages a bare binary.
-# `packaging/macos/make-app.sh` already builds the right thing.
+# Not cargo-dist: the unit this project ships on macOS is an `.app` bundle
+# whose binary switches itself to the accessory activation policy at launch
+# (`platform::set_accessory_policy`, the runtime equivalent of `LSUIElement`
+# — there is no such key in `Info.plist`), which is what makes it a menu-bar
+# agent instead of a window that steals focus on launch, and cargo-dist
+# packages a bare binary. `packaging/macos/make-app.sh` already builds the
+# right thing.
 
 name: Release
 

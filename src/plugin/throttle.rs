@@ -39,12 +39,16 @@
 //!    a stop, polling cannot be silenced for good, which this project has
 //!    been bitten by from that side too.
 //!
-//! The state machine ([`State`]) is pure: every method takes the current
-//! [`Instant`], so the tests drive time by hand and nothing here sleeps. Only
-//! [`decide`]/[`record_success`]/[`record_failure`] touch the process-wide
-//! map, and they are thin. Timing is monotonic on purpose — a wall clock
-//! moved backwards (a timezone change, an NTP correction) would otherwise
-//! stretch a cool-off into hours.
+//! The state machine ([`State`]) is pure: every method that needs to know
+//! *when* this is happening takes the current [`Instant`] as an argument —
+//! [`State::decide`], [`State::attempt`], [`State::failure`] — so the tests
+//! drive time by hand and nothing here sleeps. [`State::success`] is the one
+//! exception, deliberately: recording a good answer doesn't depend on when
+//! it arrived, only on the fact that it did. Only [`decide`],
+//! [`record_success`], [`record_failure`] and [`remembered_account`] touch
+//! the process-wide map, and they are thin. Timing is monotonic on purpose —
+//! a wall clock moved backwards (a timezone change, an NTP correction) would
+//! otherwise stretch a cool-off into hours.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
@@ -146,7 +150,11 @@ impl State {
         // The floor applies to every attempt, including one a cool-off just
         // released and one after an attempt that never reported back at all (a
         // fetch thread that died). Two requests closer together than
-        // `min_interval` must not be reachable by any path.
+        // `min_interval`, *for the same credentials*, must not be reachable
+        // by any path — a fingerprint change is the one path that resets
+        // this on purpose (see `State::adopt`): a new login is a new
+        // question, and it is asked at once rather than waiting out the
+        // previous one's floor.
         if self
             .last_attempt
             .is_some_and(|last| now.saturating_duration_since(last) < limits.min_interval)
@@ -230,12 +238,14 @@ impl State {
     }
 }
 
-/// The cool-off after `failures` consecutive failures: `backoff_start`
-/// doubled once per failure, capped at `backoff_max`. Saturating, so a long
-/// outage can't overflow the shift into a tiny (or enormous) delay.
 /// `now + wait`, or — for a manifest whose numbers are large enough that the
-/// clock can't express the result — as far out as the clock will go. Never
-/// `now`: a deadline that has already passed is no deadline at all.
+/// clock can't express the result — as far out as the clock will go, halving
+/// `wait` until the addition fits. `now` itself is returned only as the last
+/// resort of that loop: if even a zero-length wait can't be added without
+/// overflowing, the boundary `Instant` type's own range would already have
+/// to be exhausted, which nothing observed here has ever done — but the loop
+/// still has to terminate rather than spin, so `now` (not "no deadline at
+/// all") is the one answer left once `wait` reaches zero.
 fn deadline(now: Instant, wait: Duration) -> Instant {
     let mut wait = wait;
     loop {
@@ -249,6 +259,9 @@ fn deadline(now: Instant, wait: Duration) -> Instant {
     }
 }
 
+/// The cool-off after `failures` consecutive failures: `backoff_start`
+/// doubled once per failure, capped at `backoff_max`. Saturating, so a long
+/// outage can't overflow the shift into a tiny (or enormous) delay.
 fn backoff_delay(failures: u32, limits: Limits) -> Duration {
     let doublings = failures.saturating_sub(1).min(32);
     let scaled = limits

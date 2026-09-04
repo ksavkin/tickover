@@ -8,13 +8,16 @@
 //! parsing/validation, URL resolution, semver compare, sha256, the lockfile,
 //! the installed-vs-registry diff, and trust disclosure) is unit-testable on
 //! fixtures with zero network access. `src/main.rs`'s registry UI is the only
-//! caller of either: [`fetch_text`] for `index.toml` (parsed as TOML text, so
-//! a UTF-8 decode along the way is harmless), [`fetch_bytes`] for a manifest
-//! file (whose raw transport bytes must survive undecoded — see
-//! [`verify_and_prepare`]'s byte-exact contract). It wires this module's pure
-//! functions together with the actual filesystem writes (this module never
-//! writes a plugin manifest to disk itself — see [`verify_and_prepare`]'s doc
-//! comment for the byte-exact contract that implies).
+//! caller of either: [`fetch_bytes`] for anything a later step checks byte
+//! for byte — `index.toml` itself (its ed25519 signature is over the exact
+//! bytes the server sent, not a UTF-8 round-trip of them) and a manifest file
+//! (see [`verify_and_prepare`]'s byte-exact contract) — and [`fetch_text`]
+//! for the index's `.minisig` signature file, whose own bytes are never
+//! hashed or compared against anything, so decoding them on the way in costs
+//! nothing. It wires this module's pure functions together with the actual
+//! filesystem writes (this module never writes a plugin manifest to disk
+//! itself — see [`verify_and_prepare`]'s doc comment for the byte-exact
+//! contract that implies).
 //!
 //! ```text
 //! schema_version = 1                       # optional, default 1
@@ -44,7 +47,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::plugin::auth::url_host;
+use crate::plugin::https_host;
 use crate::plugin::manifest::{AuthType, EngineKind, PluginManifest};
 
 // ── index.toml schema ────────────────────────────────────────────────────
@@ -172,9 +175,14 @@ fn validate_sha256_hex(id: &str, sha: &str) -> Result<(), String> {
 /// any `..` component (directory traversal). This is what closes "a
 /// compromised index tricks the installer into fetching a manifest from a
 /// different host, or a file outside the registry's own tree" — see the
-/// module docs' Trust model note. Checked on the *raw* string before any
-/// joining happens; [`resolve_manifest_url`] re-checks the joined URL's host
-/// as a second, independent guard.
+/// module docs' Trust model note. The scheme and leading-separator checks run
+/// on the raw string; the `..` check runs on it percent-decoded first (see
+/// [`percent_decode_lossy`]), so a compromised index cannot spell a
+/// traversal component `%2e%2e` and slip past a check written against the
+/// literal bytes — a server on the other end of the resolved URL decodes it
+/// the same way, and would read it as `..` whether or not this check ever
+/// looked at it that way. [`resolve_manifest_url`] re-checks the joined
+/// URL's host as a second, independent guard.
 fn validate_relative_manifest_path(path: &str) -> Result<(), String> {
     if path.trim().is_empty() {
         return Err("`manifest` must not be empty".to_string());
@@ -189,12 +197,45 @@ fn validate_relative_manifest_path(path: &str) -> Result<(), String> {
             "`manifest = \"{path}\"` must be relative (no leading path separator)"
         ));
     }
-    if path.split(['/', '\\']).any(|seg| seg == "..") {
+    if percent_decode_lossy(path)
+        .split(['/', '\\'])
+        .any(|seg| seg == "..")
+    {
         return Err(format!(
             "`manifest = \"{path}\"` must not contain a `..` component"
         ));
     }
     Ok(())
+}
+
+/// Percent-decode `s` for the sole purpose of exposing what it would read as
+/// once a server decodes it — not a full RFC 3986 decoder, just `%XX` -> byte,
+/// with a malformed or trailing `%` left alone rather than rejected. Used
+/// only so [`validate_relative_manifest_path`]'s `..`-component check sees a
+/// manifest path the way the request at the other end will; the result is
+/// never itself sent anywhere or written to disk. Byte-based throughout
+/// (never slices `s` itself) so a multi-byte character sitting where a hex
+/// pair would be expected can't be sliced across a char boundary and panic.
+fn percent_decode_lossy(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            let hi = (bytes[i + 1] as char).to_digit(16).unwrap() as u8;
+            let lo = (bytes[i + 2] as char).to_digit(16).unwrap() as u8;
+            out.push(hi * 16 + lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ── Manifest URL resolution ──────────────────────────────────────────────
@@ -208,7 +249,11 @@ fn validate_relative_manifest_path(path: &str) -> Result<(), String> {
 /// URL's host is re-checked against the base URL's host — belt-and-braces,
 /// since a purely relative path (no scheme, no leading `/`) can't actually
 /// change host through string concatenation alone, but this function is the
-/// one place that would notice if it somehow did.
+/// one place that would notice if it somehow did. Both hosts are read by
+/// [`https_host`], so a base that is not itself `https` yields no host to
+/// compare against and fails closed the same way an unparsable one does —
+/// this app's own registry index is always fetched over `https`, but
+/// nothing here assumes a caller keeps that true.
 pub fn resolve_manifest_url(
     base_index_url: &str,
     relative_manifest: &str,
@@ -216,22 +261,26 @@ pub fn resolve_manifest_url(
     validate_relative_manifest_path(relative_manifest)?;
 
     // A query string or fragment on the index URL is not part of the path a
-    // manifest hangs off. Left on, `strip_suffix("index.toml")` misses, and
+    // manifest hangs off. Left on, `strip_suffix("/index.toml")` misses, and
     // the manifest name gets appended to the query instead of the directory —
     // a URL that resolves to the wrong thing, or to nothing.
     let base = base_index_url
         .split(['?', '#'])
         .next()
         .unwrap_or(base_index_url);
-    let base = base.strip_suffix("index.toml").unwrap_or(base);
+    // Anchored to the path separator, not a bare "index.toml": an index
+    // published under a name that merely *ends* in those letters (a
+    // "custom-index.toml", say) would otherwise have its suffix chopped
+    // instead of its whole filename, mangling the directory this joins onto.
+    let base = base.strip_suffix("/index.toml").unwrap_or(base);
     let base = base.trim_end_matches('/');
     let joined = format!("{base}/{relative_manifest}");
 
-    let base_host = url_host(base_index_url)
+    let base_host = https_host(base_index_url)
         .ok_or_else(|| format!("cannot determine host of index URL \"{base_index_url}\""))?;
-    let joined_host = url_host(&joined)
+    let joined_host = https_host(&joined)
         .ok_or_else(|| format!("cannot determine host of resolved manifest URL \"{joined}\""))?;
-    if !base_host.eq_ignore_ascii_case(joined_host) {
+    if !base_host.eq_ignore_ascii_case(&joined_host) {
         return Err(format!(
             "resolved manifest URL \"{joined}\" left the index's host \"{base_host}\""
         ));
@@ -255,12 +304,18 @@ type SemverParts<'a> = ((u64, u64, u64), Option<&'a str>);
 /// of the same base (`"1.0.0" > "1.0.0-alpha"`), and two prereleases of the
 /// same base compare dot-segment by dot-segment via [`compare_prerelease`].
 /// Build metadata (a trailing `+...`) is stripped and never affects the
-/// comparison (`"1.0.0+build" == "1.0.0"`), per semver. Falls back to plain
-/// string comparison when either side isn't shaped like `x.y.z` (optionally
-/// followed by `-<prerelease>` and/or `+<build>`) at all — a missing
-/// segment, a non-numeric major/minor/patch, empty string, … — a fallback
-/// comparison is still a total order (never panics, never treats the two as
-/// equal unless the strings are identical), just not a semver-aware one.
+/// comparison (`"1.0.0+build" == "1.0.0"`), per semver. When either side
+/// isn't shaped like `x.y.z` (optionally followed by `-<prerelease>` and/or
+/// `+<build>`) at all — a missing segment, a non-numeric major/minor/patch,
+/// empty string, … — that side never counts as *newer* than one that does
+/// parse: a version-shaped string always outranks a non-version-shaped one,
+/// whichever argument position it's in. Without that rule a hostile
+/// registry could publish `version = "beta"` and have it read as newer than
+/// every properly-versioned installed manifest forever, purely because
+/// `'b' > '1'` in ASCII — an update prompt with no version to actually
+/// install and no way to ever resolve. Only when *both* sides fail to parse
+/// does this fall back to plain string comparison, which is still a total
+/// order (never panics), just not a semver-aware one.
 pub fn version_cmp(a: &str, b: &str) -> Ordering {
     match (parse_semver(a), parse_semver(b)) {
         (Some((base_a, pre_a)), Some((base_b, pre_b))) => match base_a.cmp(&base_b) {
@@ -274,7 +329,13 @@ pub fn version_cmp(a: &str, b: &str) -> Ordering {
             },
             other => other,
         },
-        _ => a.cmp(b),
+        // A version-shaped string always outranks one that isn't — see this
+        // function's own doc for why a non-version-shaped side must never
+        // win a "newer" comparison just because its bytes happen to sort
+        // higher.
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => a.cmp(b),
     }
 }
 
@@ -304,15 +365,21 @@ fn parse_semver(v: &str) -> Option<SemverParts<'_>> {
 /// version's `major.minor.patch` by [`parse_semver`], e.g. `"alpha"` or
 /// `"beta.2"`) dot-segment by dot-segment: a segment that parses as a
 /// non-negative integer compares numerically, otherwise both segments
-/// compare as plain ASCII strings. A prerelease with fewer segments than the
-/// other, once every shared segment compares equal, sorts before the longer
-/// one (`"1.0.0-alpha" < "1.0.0-alpha.1"`) — per semver, a larger set of
-/// fields has higher precedence than a smaller set when all preceding
-/// identifiers are equal. This is deliberately the *basic* semver semantics
-/// [`version_cmp`]'s own doc comment scopes itself to — full semver also
-/// ranks any numeric identifier below any alphanumeric one at the same
-/// position and forbids leading zeros in numeric identifiers; neither nuance
-/// is enforced here.
+/// compare as plain ASCII strings — and a segment that parses as a number
+/// always ranks below one that doesn't, whichever side it's on. That last
+/// rule is full semver's own ("a numeric identifier always has lower
+/// precedence than an alphanumeric identifier"), not a simplification of it:
+/// the `(Ok(_), Err(_))`/`(Err(_), Ok(_))` arms below exist to implement it,
+/// not merely to break a tie between two differently-shaped segments. A
+/// prerelease with fewer segments than the other, once every shared segment
+/// compares equal, sorts before the longer one (`"1.0.0-alpha" <
+/// "1.0.0-alpha.1"`) — per semver, a larger set of fields has higher
+/// precedence than a smaller set when all preceding identifiers are equal.
+/// This is deliberately the *basic* semver semantics [`version_cmp`]'s own
+/// doc comment scopes itself to — full semver also forbids leading zeros in
+/// numeric identifiers, the one nuance still not enforced here: a segment
+/// like `"01"` parses and compares as the integer `1`, which real semver
+/// would refuse to accept as a version at all rather than compare.
 fn compare_prerelease(a: &str, b: &str) -> Ordering {
     let mut ai = a.split('.');
     let mut bi = b.split('.');
@@ -652,7 +719,8 @@ fn diff_one(
 
 // ── Trust disclosure (not a verdict) ─────────────────────────────────────
 
-/// Hosts trusted by default — the bundled Claude manifest's own endpoint.
+/// Hosts trusted by default: `api.anthropic.com` (the bundled Claude
+/// manifest's own endpoint) and `chatgpt.com` (the bundled Codex manifest's).
 /// Callers pass their own trusted set; this is just the sensible default a
 /// caller with no opinion can start from.
 pub const TRUSTED_HOSTS: &[&str] = &["api.anthropic.com", "chatgpt.com"];
@@ -664,10 +732,14 @@ pub const TRUSTED_HOSTS: &[&str] = &["api.anthropic.com", "chatgpt.com"];
 /// boundary as everywhere else in this app; see the module docs).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrustDisclosure {
-    /// Local files this manifest reads besides its credential stores:
-    /// `[[http.value]] path`, `[http.version] files`, and an `oauth-refresh`
-    /// step's `[surface.auth.client] files`/`bins`/`id_env`/`secret_env`/
-    /// `id_pattern`/`secret_pattern` — `bins` entries are the *program
+    /// Local files this manifest reads, including its credential stores: any
+    /// `[[surface.auth]] path` (the `credentials-file`/`credentials-map`/
+    /// `reject-when`/`oauth-refresh` file a step actually reads — not
+    /// `token_json_path`, which names a place *inside* that file rather than
+    /// a file of its own), `[[http.value]] path`, `[http.version] files`, and
+    /// an `oauth-refresh` step's `[surface.auth.client] files`/`bins`/
+    /// `id_env`/`secret_env`/`id_pattern`/`secret_pattern` — `bins` entries
+    /// are the *program
     /// names* `bin_candidates` resolves on `PATH`, labelled `"<name>
     /// (resolved on PATH or the usual CLI install directories)"` rather than
     /// a path, since which file that resolves to isn't known until the
@@ -704,8 +776,12 @@ pub struct TrustDisclosure {
     /// across every surface, in first-seen order.
     pub auth_types: Vec<AuthType>,
     /// Every distinct host a request could reach: `[[http.request]].url`
-    /// hosts plus `[account].url`'s host (when `type = "http"`), in
-    /// first-seen order, case-insensitively de-duplicated.
+    /// hosts, `[account].url`'s host (when `type = "http"`), and every
+    /// `oauth-refresh` auth step's `token_url` host — a refresh step sends a
+    /// refresh token there on its own, ahead of the engine's own request, so
+    /// leaving it out would have this disclosure list say nothing about the
+    /// one destination that receives a credential rather than merely a
+    /// bearer token. In first-seen order, case-insensitively de-duplicated.
     pub dest_hosts: Vec<String>,
     /// The subset of `dest_hosts` that is **not** in the `trusted_hosts` set
     /// [`analyze_trust`] was called with, same order/case-insensitive
@@ -739,14 +815,17 @@ pub struct TrustDisclosure {
 
 /// Push `url`'s host onto `dest_hosts` if it has one and isn't already
 /// present (case-insensitive) — the de-duplication helper behind
-/// [`analyze_trust`]'s `dest_hosts` list.
+/// [`analyze_trust`]'s `dest_hosts` list. The host is read by
+/// [`https_host`]; `validate` already requires `url` to be `https`, so a
+/// `None` here only means the URL slipped past validation somehow, and this
+/// disclosure list simply says nothing about it rather than guess.
 fn push_dest_host(url: &str, dest_hosts: &mut Vec<String>) {
-    if let Some(h) = url_host(url) {
+    if let Some(h) = https_host(url) {
         if !dest_hosts
             .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(h))
+            .any(|existing| existing.eq_ignore_ascii_case(&h))
         {
-            dest_hosts.push(h.to_string());
+            dest_hosts.push(h);
         }
     }
 }
@@ -794,6 +873,17 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
     if let Some(url) = &m.account.url {
         push_dest_host(url, &mut dest_hosts);
     }
+    for surface in &m.surface {
+        for step in &surface.auth {
+            // `oauth-refresh` sends a refresh token here on its own, ahead
+            // of the engine's own request — as much a "this manifest reaches
+            // this host" fact as `[[http.request]].url`, and the one that
+            // moves an actual credential rather than a bearer token.
+            if let Some(token_url) = &step.token_url {
+                push_dest_host(token_url, &mut dest_hosts);
+            }
+        }
+    }
 
     let mut local_files: Vec<String> = Vec::new();
     if let Some(http) = &m.http {
@@ -814,6 +904,17 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
     }
     for surface in &m.surface {
         for step in &surface.auth {
+            // The credential file a step actually reads
+            // (`credentials-file`/`credentials-map`/`reject-when`/
+            // `oauth-refresh`) — not `token_json_path`, a place *inside* it,
+            // not a file of its own. Every other store-backed type
+            // (`keychain`, `electron-safe-storage`, `win-credential`) names
+            // its own place a different way and has no `path` to carry.
+            if let Some(path) = &step.path {
+                if !local_files.contains(path) {
+                    local_files.push(path.clone());
+                }
+            }
             let Some(client) = &step.client else { continue };
             for file in &client.files {
                 if !local_files.contains(file) {
@@ -878,31 +979,38 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
         .cloned()
         .collect();
 
-    let store_backed = auth_types.iter().any(|t| {
-        matches!(
-            t,
-            AuthType::CredentialsFile
-                | AuthType::Keychain
-                | AuthType::ElectronSafeStorage
-                | AuthType::WinCredential
-                // Added with the step itself, and nearly not: a `credentials-map`
-                // step reads somebody's credential file exactly like
-                // `credentials-file` does — it only picks the record out of a map
-                // rather than out of a single object — so a manifest whose one
-                // auth step is this used to install with no dialog at all,
-                // because nothing else here would have flagged it. The rule this
-                // list encodes is "does the manifest read a credential", not
-                // "which spelling of reading one", and every future variant has
-                // to be added here in the change that adds it.
-                | AuthType::CredentialsMap
-                // `oauth-refresh` does more than read a credential — it *sends*
-                // one (a refresh token) to the network. If anything here needs
-                // the trust dialog, it does; leaving it out would let a manifest
-                // whose only step is this install with no dialog, reading a local
-                // file and mailing a refresh token to a host. Added with the step
-                // in the same change, exactly as `credentials-map` was.
-                | AuthType::OauthRefresh
-        )
+    // An exhaustive match rather than `matches!`'s implicit wildcard: adding
+    // a variant to `AuthType` without a decision here would otherwise
+    // silently fall through to "not store-backed" — the wrong default for a
+    // check that exists to be conservative — and the compiler catches it
+    // instead of a manifest doing it live.
+    let store_backed = auth_types.iter().any(|t| match t {
+        AuthType::CredentialsFile
+        | AuthType::Keychain
+        | AuthType::ElectronSafeStorage
+        | AuthType::WinCredential => true,
+        // Added with the step itself, and nearly not: a `credentials-map`
+        // step reads somebody's credential file exactly like
+        // `credentials-file` does — it only picks the record out of a map
+        // rather than out of a single object — so a manifest whose one
+        // auth step is this used to install with no dialog at all,
+        // because nothing else here would have flagged it. The rule this
+        // list encodes is "does the manifest read a credential", not
+        // "which spelling of reading one", and every future variant has
+        // to be added here in the change that adds it.
+        AuthType::CredentialsMap => true,
+        // `oauth-refresh` does more than read a credential — it *sends*
+        // one (a refresh token) to the network. If anything here needs
+        // the trust dialog, it does; leaving it out would let a manifest
+        // whose only step is this install with no dialog, reading a local
+        // file and mailing a refresh token to a host. Added with the step
+        // in the same change, exactly as `credentials-map` was.
+        AuthType::OauthRefresh => true,
+        // Not a credential store at all: `env` reads a variable the user
+        // set themselves, and `reject-when` reads nothing but a field that
+        // decides whether the chain stops — see `requires_approval`'s own
+        // doc for why `env` deliberately never gates this flag on its own.
+        AuthType::Env | AuthType::RejectWhen => false,
     });
     // Widened (2026-07): no longer conditioned on `dest_hosts` reaching
     // outside `trusted_hosts` — see `requires_approval`'s doc comment.
@@ -938,18 +1046,20 @@ fn is_https(url: &str) -> bool {
     url.starts_with("https://")
 }
 
-/// GET `url` (`index.toml`) and return the raw response body as text.
-/// HTTPS-only (a plain-`http://` URL is refused before any connection is
-/// attempted — the registry's whole trust story rests on verified sha256
-/// *and* a non-tampered transport). Built like
-/// `crate::plugin::engine_http::perform`: `redirects(0)` (so a compromised/
-/// misconfigured CDN can't silently hand back content from a different
-/// host — the caller's own URL is all that was ever vetted) and an ~8s
-/// timeout.
+/// GET `url` and return the raw response body as text. HTTPS-only (a
+/// plain-`http://` URL is refused before any connection is attempted — the
+/// registry's whole trust story rests on verified integrity *and* a
+/// non-tampered transport). Built like `crate::plugin::engine_http::perform`:
+/// `redirects(0)` (so a compromised/misconfigured CDN can't silently hand
+/// back content from a different host — the caller's own URL is all that was
+/// ever vetted) and an ~8s timeout.
 ///
-/// Only ever used for `index.toml` — see [`fetch_bytes`] for why a manifest
-/// file must go through that function instead. Not exercised by any test in
-/// this module — see the module docs.
+/// Used only for the index's `.minisig` signature file — a short block of
+/// base64 that `signature::verify_index` parses once and never hashes or
+/// compares byte-for-byte, so `into_string`'s UTF-8 decode costs nothing.
+/// `index.toml` itself, and a manifest file, both go through [`fetch_bytes`]
+/// instead — see that function's own docs for why. Not exercised by any test
+/// in this module — see the module docs.
 pub fn fetch_text(url: &str) -> Result<String, String> {
     if !is_https(url) {
         return Err(format!("refusing non-https URL: {url}"));
@@ -966,25 +1076,27 @@ pub fn fetch_text(url: &str) -> Result<String, String> {
     }
 }
 
-/// GET `url` (a manifest file) and return the raw response body as bytes,
-/// **undecoded** — unlike [`fetch_text`]'s `into_string`, which UTF-8-decodes
-/// the body first. That decode is harmless for `index.toml` (parsed as TOML
-/// text anyway), but wrong for a manifest: [`verify_and_prepare`]'s sha256
-/// check is only meaningful against the exact bytes the server sent — a
-/// manifest that isn't UTF-8-clean, or that round-trips through decode/
-/// re-encode with different line endings or a BOM, would then hash to
-/// something other than what `index.toml` actually published, producing a
-/// false mismatch (or, worse, a false match against bytes that were never
-/// actually served). Same HTTPS-only gate, `redirects(0)`, ~8s timeout, and
-/// response-size cap as [`fetch_text`] — see its own docs for the rationale,
-/// which applies here unchanged. The cap matters here specifically because
-/// `Response::into_reader()` (unlike `into_string()`, which applies ureq's
-/// own 10MB `INTO_STRING_LIMIT` internally before ever returning) is
-/// otherwise fully unbounded — without re-imposing the same ceiling here, a
-/// hostile or misbehaving registry could make this function buffer an
-/// unbounded response into memory, and it would do so *before*
-/// [`verify_and_prepare`]'s sha256 check (which only runs once this function
-/// has already returned) ever gets a chance to reject it.
+/// GET `url` and return the raw response body as bytes, **undecoded** —
+/// unlike [`fetch_text`]'s `into_string`, which UTF-8-decodes the body first.
+/// Used for anything a later step verifies against the exact bytes the
+/// server sent: `index.toml` itself (`signature::verify_index` checks its
+/// ed25519 signature over these bytes, not over a UTF-8 round-trip of them)
+/// and a manifest file ([`verify_and_prepare`]'s sha256 check is equally only
+/// meaningful against the exact bytes). Either one that isn't UTF-8-clean, or
+/// that round-trips through decode/re-encode with different line endings or
+/// a BOM, would then verify against something other than what was actually
+/// published — a false mismatch, or worse, a false match against bytes that
+/// were never actually served. Same HTTPS-only gate, `redirects(0)` and ~8s
+/// timeout as [`fetch_text`] — see its own docs for the rationale, which
+/// applies here unchanged; the response-size cap below has no counterpart
+/// documented on `fetch_text`'s side, because it doesn't need one written
+/// out: `into_string()` applies ureq's own 10MB `INTO_STRING_LIMIT`
+/// internally before ever returning, silently, whereas `into_reader()`
+/// enforces nothing at all — so this function re-imposes the same ceiling by
+/// hand. Without it, a hostile or misbehaving registry could make this
+/// function buffer an unbounded response into memory, and it would do so
+/// *before* whichever check downstream (a signature, a sha256) ever gets a
+/// chance to reject it.
 ///
 /// Not exercised by any test in this module — see the module docs.
 pub fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
@@ -1180,6 +1292,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_percent_encoded_dotdot_component() {
+        // The server on the other end of the resolved URL decodes `%2e%2e`
+        // to `..` before it ever looks at the path; a check written against
+        // the literal bytes alone would not.
+        let idx = entry_with("manifest", "manifests/%2e%2e/%2e%2e/secret.toml");
+        let err =
+            RegistryIndex::from_str(&idx).expect_err("percent-encoded traversal must be rejected");
+        assert!(err.contains(".."), "unexpected error: {err}");
+
+        let idx_upper = entry_with("manifest", "manifests/%2E%2E/secret.toml");
+        assert!(
+            RegistryIndex::from_str(&idx_upper).is_err(),
+            "the hex digits are matched case-insensitively"
+        );
+    }
+
+    #[test]
+    fn percent_decode_lossy_decodes_valid_escapes_and_leaves_the_rest_alone() {
+        assert_eq!(percent_decode_lossy("%2e%2e"), "..");
+        assert_eq!(percent_decode_lossy("%2E%2E"), "..");
+        assert_eq!(percent_decode_lossy("plain/path"), "plain/path");
+        // A trailing/malformed escape is left as literal bytes rather than
+        // panicking or being dropped.
+        assert_eq!(percent_decode_lossy("100%"), "100%");
+        assert_eq!(percent_decode_lossy("100%2"), "100%2");
+        assert_eq!(percent_decode_lossy("100%zz"), "100%zz");
+    }
+
+    #[test]
     fn rejects_empty_version() {
         let idx = entry_with("version", "");
         let err = RegistryIndex::from_str(&idx).expect_err("empty version must be rejected");
@@ -1219,6 +1360,24 @@ mod tests {
         let url = resolve_manifest_url("https://example.com/registry/", "manifests/x.toml")
             .expect("resolves");
         assert_eq!(url, "https://example.com/registry/manifests/x.toml");
+    }
+
+    #[test]
+    fn the_index_toml_suffix_strip_is_anchored_to_a_path_separator() {
+        // An unanchored `strip_suffix("index.toml")` would chop only the
+        // letters "index.toml" off the end of "custom-index.toml", mangling
+        // the directory the manifest is joined onto instead of stripping the
+        // whole filename.
+        let url = resolve_manifest_url(
+            "https://example.com/registry/custom-index.toml",
+            "manifests/x.toml",
+        )
+        .expect("resolves");
+        assert_eq!(
+            url, "https://example.com/registry/custom-index.toml/manifests/x.toml",
+            "a filename that merely ends in \"index.toml\" is not the index's own name and \
+             must be left in the base path, not chopped"
+        );
     }
 
     #[test]
@@ -1331,6 +1490,25 @@ mod tests {
             "\"bbb\" > \"aaa\" lexicographically"
         );
         assert!(!update_available("bbb", "aaa"));
+    }
+
+    #[test]
+    fn a_non_version_shaped_string_never_beats_a_real_version_on_ascii_alone() {
+        // The exploit this closes: "beta" > "1.0.0" in plain ASCII order
+        // ('b' > '1'), so a registry publishing `version = "beta"` used to
+        // read as an update available forever against any properly-versioned
+        // installed manifest — a prompt with nothing installable behind it
+        // and no version comparison that could ever resolve it.
+        assert_eq!(version_cmp("beta", "1.0.0"), Ordering::Less);
+        assert_eq!(version_cmp("1.0.0", "beta"), Ordering::Greater);
+        assert!(
+            !update_available("1.0.0", "beta"),
+            "a registry version that isn't shaped like a version must never look newer"
+        );
+        // The reverse direction is symmetric, not specially privileged: an
+        // installed manifest with a garbage version does get offered a real
+        // one, since there is nothing else honest to compare it against.
+        assert!(update_available("garbage", "1.0.0"));
     }
 
     // ── sha256 ────────────────────────────────────────────────────────────
@@ -1625,13 +1803,26 @@ mod tests {
 
     // ── analyze_trust ─────────────────────────────────────────────────────
     //
-    // Widened rule (2026-07): `requires_approval` is now store-backed auth
-    // (credentials-file/keychain/electron-safe-storage/win-credential) AND
-    // `engine = "http-api"` — full stop, no longer conditioned on the
-    // destination host. `dest_hosts`/`untrusted_hosts` are still disclosed
-    // (and still worth asserting on), they just don't gate approval anymore.
+    // Widened rule (2026-07, widened further since): `requires_approval`
+    // fires on any of three things — store-backed auth
+    // (credentials-file/keychain/electron-safe-storage/win-credential/
+    // credentials-map/oauth-refresh) combined with `engine = "http-api"`, a
+    // declared `[ping]`, or a non-empty `local_files` (which now includes
+    // an auth step's own credential `path`, not just `[[http.value]]`/
+    // `client` discovery) — no longer conditioned on the destination host at
+    // all. `dest_hosts`/`untrusted_hosts` are still disclosed (and still
+    // worth asserting on), they just don't gate approval.
 
     fn http_api_manifest(url: &str, auth_type: &str) -> PluginManifest {
+        // `path` is only wired in for the auth types that actually read a
+        // file through it (`credentials-file`/`credentials-map`) — setting
+        // it for `env`/`keychain`/`win-credential` too would have
+        // `analyze_trust` disclose a file none of those steps ever opens,
+        // which is exactly the "not a file" distinction `path`'s own doc on
+        // `TrustDisclosure::local_files` draws.
+        let path_line = matches!(auth_type, "credentials-file" | "credentials-map")
+            .then(|| "path = \"~/.x/creds.json\"")
+            .unwrap_or_default();
         let toml = format!(
             r#"
             id         = "x"
@@ -1657,7 +1848,7 @@ mod tests {
             allowed_hosts = ["example.com"]
             [[surface.auth]]
             type = "{auth_type}"
-            path = "~/.x/creds.json"
+            {path_line}
             token_json_path = "access_token"
             service = "svc"
             var = "SOME_VAR"
@@ -1680,6 +1871,15 @@ mod tests {
             vec!["evil.example.com".to_string()]
         );
         assert_eq!(disclosure.auth_types, vec![AuthType::CredentialsFile]);
+        // The gap this closes: the credential file the step actually reads
+        // used to be missing from `local_files` entirely — the dialog would
+        // have printed "Reads local files: (none)" for a manifest whose
+        // whole reason to need approval is reading a credential off disk.
+        assert_eq!(
+            disclosure.local_files,
+            vec!["~/.x/creds.json".to_string()],
+            "the credentials-file step's own path must be disclosed"
+        );
     }
 
     #[test]
@@ -1802,11 +2002,19 @@ mod tests {
     }
 
     #[test]
-    fn a_client_discovery_tables_files_and_bins_are_disclosed_as_local_files() {
-        // The gap this closes: an `oauth-refresh` step's `client` table reads
-        // local files exactly like `[[http.value]] path` does — a `files`
-        // entry directly, a `bins` name after resolving it on `PATH` — and
-        // nothing else in `analyze_trust` would have noticed either.
+    fn an_oauth_refresh_steps_own_path_and_token_url_host_are_disclosed_the_antigravity_shape() {
+        // The gap this closes, in two halves — this fixture is the shape
+        // `plugins/antigravity.toml` actually ships (a `keychain`-then-
+        // `oauth-refresh` chain reading `~/.gemini/.../antigravity-oauth-token`
+        // and refreshing at `oauth2.googleapis.com`, alongside a request to a
+        // *different* host): the step's own `path` used to be missing from
+        // `local_files` (R2), and `token_url`'s host used to be missing from
+        // `dest_hosts` (E1) — a manifest could read a local credential and
+        // mail it to a second host the trust dialog said nothing about,
+        // while also reading local files exactly like `[[http.value]] path`
+        // does through its `client` table — a `files` entry directly, a
+        // `bins` name after resolving it on `PATH` — and nothing else in
+        // `analyze_trust` would have noticed either of those.
         let toml = r#"
             id = "sample"
             name = "Sample"
@@ -1845,6 +2053,26 @@ mod tests {
         "#;
         let m = PluginManifest::from_str(toml).expect("valid manifest");
         let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        // E1: the refresh endpoint reaches the trust dialog even though no
+        // `[[http.request]]` ever names it.
+        assert_eq!(
+            disclosure.dest_hosts,
+            vec![
+                "example.com".to_string(),
+                "oauth2.googleapis.com".to_string()
+            ],
+            "the oauth-refresh step's token_url host must be disclosed alongside the request host"
+        );
+        // R2: the credential file the step reads before ever exchanging
+        // anything reaches the trust dialog too, not just the client
+        // discovery table's own files/bins/patterns below.
+        assert!(
+            disclosure
+                .local_files
+                .contains(&"~/.gemini/oauth_creds.json".to_string()),
+            "the oauth-refresh step's own path must be disclosed: {:?}",
+            disclosure.local_files
+        );
         assert!(
             disclosure
                 .local_files
@@ -2051,6 +2279,21 @@ mod tests {
                 "profile.example.com".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn push_dest_host_sees_the_backslash_authority_terminator_ureq_sees() {
+        // Same attack `auth::host_allowed`'s own test names: `\` ends a
+        // `https` authority exactly as `/` does, so this URL's host is
+        // `evil.example`, not `api.anthropic.com` — a manifest cannot make
+        // this disclosure list say something the request itself will not
+        // do.
+        let mut hosts = Vec::new();
+        push_dest_host(
+            "https://evil.example\\@api.anthropic.com/api/oauth/usage",
+            &mut hosts,
+        );
+        assert_eq!(hosts, vec!["evil.example".to_string()]);
     }
 
     #[test]

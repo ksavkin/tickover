@@ -82,7 +82,9 @@ is handled by the app.
   notification icon, so *Show stats in the tray icon* draws the bars inside
   the icon itself — one per quota window, grouped by provider, at the tray's
   own icon size so it stays sharp at 100 %, 150 % and 200 % scaling — and
-  puts the figures in the tooltip.
+  puts the figures in the tooltip. Like the macOS pill, it has room for two
+  providers; with more configured, it shows the first two by order and the
+  flyout still lists all of them.
 - **Launch at login** writes an entry under
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, with the path quoted
   so an install under a folder with a space in its name still starts.

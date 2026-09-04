@@ -39,13 +39,15 @@ export global Theme {
 
 // ── Icons ───────────────────────────────────────────────────────────────
 //
-// Stroked outlines on a 24×24 grid, drawn rather than typed. These were
+// Stroked outlines on a 24×24 grid, drawn rather than typed. These four were
 // Unicode characters set in the UI font ("↻", "⚙", "✎", "✕"), which is why
 // they read as undersized and out of place: a glyph's drawn size is a
 // fraction of its font size and varies per character, so no single font-size
 // squared them with each other or with the text beside them, and their stroke
 // weight came from whichever face the system resolved. As paths they take the
-// button's size and the interface's stroke weight.
+// button's size and the interface's stroke weight. Scoped to these four —
+// a spot that still sets an icon from a literal character rather than one of
+// these properties has not been moved over and keeps the old sizing quirk.
 export global Icons {
     // Circular arrow: an almost-closed arc, with the head drawn as two sides
     // of a square at its open end.

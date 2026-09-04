@@ -73,23 +73,25 @@ Each quota window is one block — caption and figures, a full-width bar, the
 reset time beneath:
 
 ```
-WK LIMIT                             86% left  14%
+WK LIMIT                                 14% used
 ▓▓▓▓▓▓▓│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-resets in 5d 13h · 1 Aug 13:19                ↘ −7
+resets in 5d 13h · 1 Aug 13:19
 ```
 
 The headline figure is what has been *used*; the bar's fill and its colour
 say the same thing (mint below 70 %, amber from 70 %, red from 90 %). The
-white tick is how much of the window has elapsed, and the signed figure is
-the gap between the two in percent points — `↗ +22` is burning 22 points
-ahead of the clock. The countdown is recomputed every second from the
-absolute reset time, so it survives sleep. Extra rows carry limits a
-provider reports beside its main windows (Claude's per-model weekly caps,
-Codex's model-specific windows); balances carry calendar-period figures
-(Grok's credit and spend, Codex's credits, Copilot's premium requests); a
-notice above the rows says when a provider reports the account blocked.
-Optionally the reading is drawn in the tray itself — a pill in the macOS
-menu bar, bars inside the icon on Windows.
+white tick is how much of the window has elapsed; hovering the bar shows the
+gap between the two in percent points in its tooltip — `pace +22 pp` is
+burning 22 points ahead of the clock. The countdown is recomputed every
+second from the absolute reset time, so it survives sleep. Extra rows carry
+limits a provider reports beside its main windows (Claude's per-model weekly
+caps, Codex's model-specific windows); balances carry calendar-period
+figures (Grok's credit and spend, Codex's credits, Copilot's premium
+requests); a notice above the rows says when a provider reports the account
+blocked. Optionally the reading is drawn in the tray itself — a pill in the
+macOS menu bar, bars inside the icon on Windows. That widget has room for two
+providers; with more configured, it shows the first two by order and the
+popover still lists all of them.
 
 ## Providers
 
@@ -132,12 +134,14 @@ exception — never *refreshes* one, because renewing a token invalidates the
 copy your CLI is holding. The exception is Antigravity, whose manifest asks
 for the exchange by name; the OAuth client it needs is read from the
 Antigravity app installed on your machine, not shipped in this repository,
-and the result is cached in memory until it expires. Four places in the
-code open a connection: a provider's pinned host on the timer, that token
-exchange, the registry index when you press *Check updates*, and a manifest
-when you then choose to install or update one. The fifth kind of traffic is
-the ping, a local command. No telemetry, no crash reporting, nothing on a
-timer against a host this project controls.
+and the result is cached in memory until shortly before it expires. Four
+places in the code open a connection, carrying five kinds of request between
+them: a provider's pinned host on the timer, that token exchange, the
+registry index and its signature file when you press *Check updates*
+(the same fetch function, called twice), and a manifest when you then choose
+to install or update one. The sixth kind of traffic is the ping, a local
+command. No telemetry, no crash reporting, nothing on a timer against a host
+this project controls.
 [`SECURITY.md`](SECURITY.md) lists all of it and the gaps that remain.
 
 ## Engineering notes
@@ -162,9 +166,11 @@ Six things worth a look:
 - **An edited manifest is never overwritten.** `src/plugin/seed.rs` upgrades
   a shipped copy only while it still hashes to one this app wrote.
 - **Updates are checked before they are parsed.** `src/plugin/registry.rs`
-  hashes the raw bytes first, contains the install path, renames
-  atomically — and says "unverifiable" until a signing key is pinned,
-  rather than letting a checksum pose as a signature.
+  hashes the raw bytes first and contains the install path; a fresh install
+  refuses to clobber an existing file, an update writes a sibling temp file
+  and renames it atomically over the target — and both say "unverifiable"
+  until a signing key is pinned, rather than letting a checksum pose as a
+  signature.
 
 The guided tour is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 

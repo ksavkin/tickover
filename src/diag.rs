@@ -18,10 +18,10 @@
 
 use std::io::Write;
 
-/// Size at which the log is trimmed, and how much of the tail survives.
-/// Trimming keeps the *end*: the last thing that happened is what a diagnostic
-/// is read for.
+/// Size at which the log is trimmed.
 const MAX_BYTES: u64 = 64 * 1024;
+/// How much of the tail survives a trim. Trimming keeps the *end*: the last
+/// thing that happened is what a diagnostic is read for.
 const KEEP_BYTES: usize = 32 * 1024;
 
 /// Only [`append_to_log`] resolves this, and that is compiled out under

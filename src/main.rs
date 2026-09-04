@@ -395,11 +395,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.set_menu_bar_text_label(ss(menu_bar_text_label()));
 
     // ── Frameless popover chrome + hide-on-focus-loss ───────────────────
-    // The UI needs both: dock mode gates window dragging, and only platforms
-    // that draw their own edge around a frameless window want the card flush
-    // with the window bounds (macOS does, Windows does not — there the card's
-    // own border and shadow are the flyout's only chrome).
-    app.set_dock_mode(platform::dock_mode());
+    // Only platforms that draw their own edge around a frameless window want
+    // the card flush with the window bounds (macOS does, Windows does not —
+    // there the card's own border and shadow are the flyout's only chrome).
     app.set_system_window_edge(cfg!(target_os = "macos"));
     // Dock mode always: the panel is an ordinary window there, with no title
     // bar to grab. A tray flyout is a different matter, and the answer is not
@@ -791,7 +789,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Add a third-party plugin: pick a `.toml` via a native file dialog,
         // validate it, and copy it into the plugins directory under
         // `<id>.toml` (not the picked file's own name — see
-        // `reload_and_fetch`'s doc comment for why the id is what matters).
+        // `plugin_manifest_target`'s doc comment for why the id is what
+        // matters, and `find_plugin_manifest_path`'s for why the filename is
+        // only ever a convention, never something later code trusts).
         let weak = app.as_weak();
         let plugins = plugins.clone();
         let cache = cache.clone();
@@ -814,6 +814,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break 'import;
                 }; // Cancel/closed
                 if picked.extension().and_then(|e| e.to_str()) != Some("toml") {
+                    diag::line(format!(
+                        "add-plugin: {} is not a .toml file",
+                        picked.display()
+                    ));
                     show_alert(
                         "Not a plugin manifest",
                         "Choose a \".toml\" plugin manifest file.",
@@ -875,6 +879,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // separate `target.exists()` check — TOCTOU-safe: nothing can
                 // create the file between a check and the write.
                 if plugins.borrow().iter().any(|m| m.id == manifest.id) {
+                    diag::line(format!(
+                        "add-plugin: \"{}\" is already loaded, refusing the import",
+                        manifest.id
+                    ));
                     show_alert(
                         "Plugin already exists",
                         &format!("A plugin with id \"{}\" is already installed.", manifest.id),
@@ -888,6 +896,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
                 if let Err(e) = write_result {
                     if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        diag::line(format!(
+                            "add-plugin: {} already exists on disk, refusing to clobber it",
+                            target.display()
+                        ));
                         show_alert(
                             "Plugin already exists",
                             &format!("A plugin with id \"{}\" is already installed.", manifest.id),
@@ -1043,9 +1055,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.set_registry_status(1); // checking — flips the button to "Checking…"
             }
             let tx = tx.clone();
-            std::thread::spawn(move || {
+            // `Builder::spawn`, not `thread::spawn`: the latter panics if the OS
+            // won't hand out a thread, and by then `registry-status` is already
+            // "checking…" with nothing left to ever move it off that — the same
+            // failure mode `spawn_plugin_fetch`'s own doc comment describes.
+            let spawned = std::thread::Builder::new().spawn(move || {
                 let _ = tx.send(fetch_registry_index(DEFAULT_REGISTRY_URL));
             });
+            if spawned.is_err() {
+                if let Some(app) = weak.upgrade() {
+                    app.set_registry_status(2);
+                    app.set_registry_error(ss("Could not start the update check"));
+                }
+            }
         });
     }
     {
@@ -1076,10 +1098,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             set_registry_row_status(&registry_model, &id, 1, ""); // installing…
             let tx = tx.clone();
-            std::thread::spawn(move || {
+            // `Builder::spawn`, not `thread::spawn`: the latter panics if the OS
+            // won't hand out a thread, landing here after `registry_busy` and the
+            // row's status both went up and before anything exists to take
+            // either down again — the identical failure `spawn_plugin_fetch`'s
+            // own doc comment describes.
+            let spawned = std::thread::Builder::new().spawn(move || {
+                let guard = RegistryGuard {
+                    kind: PendingKind::Install,
+                    entry: Some(entry.clone()),
+                    tx: Some(tx),
+                };
                 let outcome = fetch_and_verify_manifest(DEFAULT_REGISTRY_URL, &entry);
-                let _ = tx.send((PendingKind::Install, entry, outcome));
+                guard.finish(outcome);
             });
+            if spawned.is_err() {
+                registry_busy.borrow_mut().remove(&id);
+                set_registry_row_status(&registry_model, &id, 2, "could not start the install");
+            }
         });
     }
     {
@@ -1109,10 +1145,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             set_plugin_update_status(&plugin_model, &plugins, &id, 1, ""); // updating…
             let tx = tx.clone();
-            std::thread::spawn(move || {
+            // `Builder::spawn`, not `thread::spawn` — see the identical comment
+            // on the Install side above.
+            let spawned = std::thread::Builder::new().spawn(move || {
+                let guard = RegistryGuard {
+                    kind: PendingKind::Update,
+                    entry: Some(entry.clone()),
+                    tx: Some(tx),
+                };
                 let outcome = fetch_and_verify_manifest(DEFAULT_REGISTRY_URL, &entry);
-                let _ = tx.send((PendingKind::Update, entry, outcome));
+                guard.finish(outcome);
             });
+            if spawned.is_err() {
+                registry_busy.borrow_mut().remove(&id);
+                set_plugin_update_status(
+                    &plugin_model,
+                    &plugins,
+                    &id,
+                    2,
+                    "could not start the update",
+                );
+            }
         });
     }
 
@@ -1476,7 +1529,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Auto-ping a plugin's first-surface 5-hour window while it sits
                 // empty (opt-in per plugin, one ping per window — see
-                // [`ping_target`] for why this is a state and not an edge). Only
+                // [`ping_due`] for why this is a state and not an edge). Only
                 // an enabled plugin arms it — a disabled one is skipped even if it
                 // still declares `[ping]`.
                 let current = readings(&plugins.borrow(), &cache.borrow());
@@ -1499,12 +1552,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let ps = plugins.borrow();
                     record_seen_windows(&ps, &current);
                     for m in ps.iter().filter(|m| m.ping.is_some() && plugin_enabled(m)) {
-                        let Some(first_id) = first_surface_reading_id(m) else {
+                        // The filter above already established `plugin_enabled(m)`;
+                        // passed as `true` rather than asked a second time. Checked
+                        // before either lookup below so a plugin whose ping toggle
+                        // is off never pays for `seen_window_for`/`ping_window`.
+                        if !plugin_ping_armed(true, config::plugin_ping(&m.id)) {
                             continue;
-                        };
-                        let Some(window) =
-                            ping_window(m, current.iter().find(|r| r.id == first_id))
-                        else {
+                        }
+                        let Some(first_id) = first_surface_reading_id(m) else {
                             continue;
                         };
                         // `seen_window_for`, not `seen_window_of`: this loop already
@@ -1516,10 +1571,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // costing this provider its auto-ping over a collision the
                         // panel is right to be cautious about and the ping need not
                         // be.
-                        let seen = seen_window_for(m, &first_id, Role::Primary).map_or(0, |s| s.at);
-                        if !plugin_ping_armed(plugin_enabled(m), config::plugin_ping(&m.id)) {
+                        let seen_window = seen_window_for(m, &first_id, Role::Primary);
+                        let Some(window) = ping_window(
+                            m,
+                            current.iter().find(|r| r.id == first_id),
+                            seen_window.as_ref().and_then(|s| s.period_minutes),
+                        ) else {
                             continue;
-                        }
+                        };
+                        let seen = seen_window.map_or(0, |s| s.at);
                         if !ping_due(
                             window.used_percent,
                             window.resets_at,
@@ -1615,11 +1675,14 @@ fn load_plugins() -> Vec<PluginManifest> {
 fn upgrade_builtin_manifests(dir: &std::path::Path) {
     for upgrade in seed::BUILTIN_UPGRADES {
         // Every launch, not once: the remembered "plan tier -> address" cache
-        // is dead weight now that the provider states the address, and an
-        // older build of this app still running alongside a new one writes it
-        // straight back after a one-time cleanup — leaving an email address
-        // sitting in a config file for no reason. Costs a read; writes only if
-        // the key is actually there.
+        // is dead weight now that the provider states the address, and there
+        // is no version gate worth adding just to run this exactly once.
+        // `config::dir`'s rename to Tickover means an install from before it
+        // can no longer share this `config.json` with a build still writing
+        // this cache — the two live under different config directories now —
+        // so this only ever finds something to remove on the first launch
+        // after that one-time migration. Costs a read every other time;
+        // writes only if the key is actually there.
         config::forget_remembered_accounts(upgrade.id);
         if config::builtin_migrated(upgrade.id).as_deref() == Some(upgrade.to_version) {
             // The decision stands — but say so when there is nothing to show
@@ -1661,6 +1724,32 @@ fn upgrade_builtin_manifests(dir: &std::path::Path) {
                     if let Some(note) = decided_yet_absent(dir, upgrade) {
                         diag::line(note);
                     }
+                }
+                // Something is at this path, but it wasn't a plain,
+                // size-bounded, UTF-8 file `upgrade_builtin` could read back —
+                // a directory, a FIFO, an oversized file, a dangling symlink.
+                // Not settled: whatever is blocking the read may be gone by
+                // the next launch (a symlink target that remounts, say), and
+                // marking this version's decision made would leave it that
+                // way for good even after the obstruction clears.
+                if action == seed::UpgradeAction::Unreadable {
+                    diag::line(format!(
+                        "{}: something is there, but it could not be read as a plugin \
+                         manifest — leaving it alone and trying again next launch",
+                        upgrade.file
+                    ));
+                    continue;
+                }
+                // `upgrade.file` names nothing this build ships — a defect in
+                // `BUILTIN_UPGRADES` itself, not a fact about this disk, so
+                // retrying it on a later launch cannot change the outcome;
+                // settled below like every other decided case.
+                if action == seed::UpgradeAction::NoSuchTemplate {
+                    diag::line(format!(
+                        "{}: no such built-in template shipped in this build \
+                         (a defect in tickover's own upgrade table)",
+                        upgrade.file
+                    ));
                 }
                 config::set_builtin_migrated(upgrade.id, upgrade.to_version);
             }
@@ -2037,10 +2126,11 @@ fn open_in_text_editor(path: &std::path::Path) {
 
 /// Escape a string for embedding inside an AppleScript double-quoted string
 /// literal (`"` and `\` are the whole alphabet AppleScript string literals
-/// care about). Defence-in-depth: a plugin id is free text — the manifest
-/// schema only requires it non-empty (see `plugin::manifest::validate`) — so
-/// it must never be able to break out of the `display dialog`/`display
-/// alert` string it gets interpolated into.
+/// care about). Defence-in-depth: `plugin::manifest::validate` already
+/// restricts a plugin id to `[A-Za-z0-9_-]`, none of which needs escaping, but
+/// this runs regardless — a validation rule loosened later, or a string built
+/// from something other than an id, must never be able to break out of the
+/// `display dialog`/`display alert` string it gets interpolated into.
 #[cfg(any(target_os = "macos", test))]
 fn applescript_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -2071,8 +2161,10 @@ fn applescript_escape(s: &str) -> String {
 }
 
 /// Best-effort native "something went wrong" alert. A failure to put anything
-/// on screen at all is swallowed — the `eprintln!` logged next to every call
-/// site is the fallback a developer (not the user) can see.
+/// on screen at all is swallowed — nothing here logs it. Every call site is
+/// expected to call [`diag::line`] of its own alongside this, so a developer
+/// (not the user) can still tell what happened even when the dialog itself
+/// never made it to screen.
 fn show_alert(title: &str, message: &str) {
     #[cfg(target_os = "macos")]
     {
@@ -2216,7 +2308,7 @@ fn pick_toml_file() -> Option<std::path::PathBuf> {
         if !out.status.success() {
             return None; // user cancelled, or osascript itself failed
         }
-        parse_choose_file_output(&String::from_utf8_lossy(&out.stdout))
+        parse_picked_path(&String::from_utf8_lossy(&out.stdout))
     }
     #[cfg(target_os = "windows")]
     {
@@ -2271,27 +2363,15 @@ fn windows_pick_toml_file() -> Option<std::path::PathBuf> {
     parse_picked_path(&String::from_utf16_lossy(&file[..len]))
 }
 
-/// Pure part of the Windows picker: the buffer's contents as a path, or
-/// `None` when there is nothing usable in it. Split out so the same
-/// "never turn nothing into a path" rule as [`parse_choose_file_output`] is
-/// testable without a dialog on screen.
-#[cfg(any(target_os = "windows", test))]
+/// Pure parse of a file picker's raw output — the Windows dialog's buffer, or
+/// `choose file`'s stdout on macOS (the raw POSIX path, trailing newline) —
+/// as a path, or `None` when there is nothing usable in it. One rule for
+/// both: never trust external output blindly, so empty output (shouldn't
+/// happen on a successful pick, but might) yields `None` rather than an
+/// empty path. Split out so that rule is testable without a dialog on screen.
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
 fn parse_picked_path(raw: &str) -> Option<std::path::PathBuf> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(std::path::PathBuf::from(trimmed))
-    }
-}
-
-/// Pure parse of `choose file`'s stdout on success (the raw POSIX path,
-/// trailing newline). Never trust external process output blindly: empty
-/// output (shouldn't happen on a successful exit, but might) yields `None`
-/// rather than an empty path.
-#[cfg(any(target_os = "macos", test))]
-fn parse_choose_file_output(stdout: &str) -> Option<std::path::PathBuf> {
-    let trimmed = stdout.trim();
     if trimmed.is_empty() {
         None
     } else {
@@ -2348,9 +2428,9 @@ fn plugin_options(m: &PluginManifest) -> BTreeMap<String, bool> {
 // ── Fetch scheduling ─────────────────────────────────────────────────────
 
 /// Kick off a background fetch for one plugin, unless it is disabled, or a
-/// fetch is already in flight for it (dedup by plugin id — generalizes the
-/// old `spawn_claude_fetch`'s single `fetching` flag to any number of
-/// plugins). `active_surface_ids`/`options` are resolved by the caller at
+/// fetch is already in flight for it (dedup by plugin id, so any number of
+/// plugins can be tracked with one `fetching` map). `active_surface_ids`/
+/// `options` are resolved by the caller at
 /// spawn time — the same instant a fetch is decided to happen — not inside
 /// the background thread, so a config change mid-flight can't retroactively
 /// alter an already-dispatched fetch.
@@ -2456,6 +2536,12 @@ impl FetchGuard {
 impl Drop for FetchGuard {
     fn drop(&mut self) {
         if let Some(tx) = self.tx.take() {
+            if std::thread::panicking() {
+                diag::line(format!(
+                    "{}: fetch panicked, sending an empty result",
+                    self.id
+                ));
+            }
             let _ = tx.send((self.id.clone(), self.generation, Vec::new()));
         }
     }
@@ -2618,9 +2704,9 @@ fn readings(
 ///   * a reading whose auth chain came back entirely absent
 ///     (`error == "no credentials found"` — every step of
 ///     `plugin::auth::resolve_token`'s chain was Absent) is dropped
-///     entirely — an absent surface shows no row at all, matching the old
-///     `claude::push_reading`'s `CredError::NotFound => {}`. Any other error
-///     is kept and shown inline, unchanged.
+///     entirely — an absent surface shows no row at all, rather than an error
+///     line for a surface the user has simply never signed in to. Any other
+///     error is kept and shown inline, unchanged.
 ///   * `bare_when_sole` is set true for every reading belonging to the
 ///     smallest-`order` plugin that actually produced a *visible* reading
 ///     (plugins are pre-sorted by order, so the first contributor wins),
@@ -2770,7 +2856,19 @@ struct PingWindow {
 /// stops the ping (a provider we cannot read says nothing about its quota, and
 /// pinging on that guess spends the user's own allowance); a clean reading with
 /// no Primary row is the empty window this feature exists for.
-fn ping_window(m: &PluginManifest, reading: Option<&ProviderReading>) -> Option<PingWindow> {
+///
+/// `remembered_period_minutes` is the length the registry last heard stated
+/// for this window (`config::SeenWindow::period_minutes`) — the caller's own
+/// record, not this reading's. It is the only source left once the window has
+/// gone quiet: a `from_field` primary window (Codex) states its length in the
+/// very response that stops arriving, so the manifest has none to declare and
+/// `ASSUMED_WINDOW_SECS` would otherwise stand in for it regardless of how
+/// long the window actually runs.
+fn ping_window(
+    m: &PluginManifest,
+    reading: Option<&ProviderReading>,
+    remembered_period_minutes: Option<u64>,
+) -> Option<PingWindow> {
     let reading = reading?;
     if reading.error.is_some() {
         return None;
@@ -2785,16 +2883,18 @@ fn ping_window(m: &PluginManifest, reading: Option<&ProviderReading>) -> Option<
             resets_at: w.resets_at,
             period_minutes: w.period_minutes,
         },
-        // Nothing reported. The length has to come from the manifest too, and
+        // Nothing reported. The length has to come from somewhere else, and
         // for the provider this matters for (Codex, whose period is read out
-        // of the response) there is nothing to come — which is what
-        // `ping_due`'s `ASSUMED_WINDOW_SECS` fallback is for.
+        // of the response) the manifest itself declares none for `from_field`
+        // — `remembered_period_minutes` is what stands in for it now;
+        // `ping_due`'s `ASSUMED_WINDOW_SECS` remains the fallback for a
+        // window that has never yet been seen at all.
         None => PingWindow {
             used_percent: None,
             resets_at: None,
             period_minutes: match declared.period.mode {
                 manifest::PeriodMode::Assumed => declared.period.assumed,
-                manifest::PeriodMode::FromField => None,
+                manifest::PeriodMode::FromField => remembered_period_minutes,
             },
         },
     })
@@ -3052,10 +3152,13 @@ fn seen_writes<'a>(
     out
 }
 
-/// Window length assumed when the reading doesn't state one — which is the
-/// case that matters, since a provider reporting no 5-hour window reports no
-/// length for it either. It bounds the retry cadence below, so it is a rate
-/// limit as much as a guess: at worst one ping per five hours.
+/// Window length assumed when neither the reading nor the registry states
+/// one — a window this app has never yet seen stated at all, so there is no
+/// remembered [`config::SeenWindow::period_minutes`] for [`ping_window`] to
+/// fall back to either. It bounds the retry cadence below, so it is a rate
+/// limit as much as a guess: at worst one ping per five hours, until the
+/// provider states the window's real length and the registry starts
+/// remembering it.
 const ASSUMED_WINDOW_SECS: u64 = 5 * 3600;
 
 /// How far after a ping a window may still begin and count as the window that
@@ -3140,15 +3243,16 @@ fn ping_due(
     }
     let period = period_minutes
         .filter(|m| *m > 0)
-        .map_or(ASSUMED_WINDOW_SECS, |m| m * 60);
+        .map_or(ASSUMED_WINDOW_SECS, |m| m.saturating_mul(60));
     window_start(resets_at, period, seen_window, now)
         .is_some_and(|start| pinged_at.saturating_add(PING_GRACE_SECS) < start)
 }
 
 /// Whether a plugin's auto-ping may fire at all: both its master enable and
-/// its per-plugin ping toggle must be on. Evaluated when arming the 5s
-/// single-shot *and* re-evaluated inside it, so a plugin disabled (or its
-/// ping switched off) during that delay is never actually pinged.
+/// its per-plugin ping toggle must be on. Asked fresh on every one-second
+/// tick, not armed once and left to fire later — there is no delay between
+/// deciding and running, so a plugin disabled (or its ping switched off) a
+/// moment ago is simply not asked again.
 fn plugin_ping_armed(enabled: bool, ping_on: bool) -> bool {
     enabled && ping_on
 }
@@ -3437,15 +3541,6 @@ fn quota_notice(status: &tickover::model::QuotaStatus) -> String {
     }
 }
 
-/// Build one `WindowData` row from a reading window and the percentage it
-/// reported. The window's `role` decides the tooltip name and clock format
-/// (5-hour vs weekly); its numbers drive the bar, countdown and pace via
-/// [`window_view`].
-///
-/// `used` is passed rather than read back off the window because only a window
-/// that reported one becomes a row at all — the caller establishes that, and
-/// taking it as an argument keeps this from carrying a second, unreachable
-/// shape for the case it has already excluded.
 /// What a quota window is called on screen.
 ///
 /// The manifest's own label is a chip meant for the menu-bar pill — "5H",
@@ -3506,19 +3601,25 @@ fn window_title_of(label: &str, role: Role, period_minutes: Option<u64>) -> Stri
 /// that no longer exists is worse than no row.
 const SEEN_WINDOW_TTL_PERIODS: u64 = 2;
 
-/// Ceiling on the *slack* above, because two periods scales with the window and
-/// the confidence behind it does not. Two periods of a *weekly* window is a
-/// fortnight: an account that loses its weekly allowance would be shown "Weekly
-/// limit — not started" for two weeks, which is the failure the TTL exists to
-/// bound, at the longest possible duration.
+/// A cap on the *total* TTL — `seen_window_ttl_secs` is
+/// `min(2 × period, max(period, SEEN_WINDOW_TTL_CAP_SECS))` — because two
+/// periods scales with the window and the confidence behind it does not. Two
+/// periods of a *weekly* window is a fortnight: an account that loses its
+/// weekly allowance would be shown "Weekly limit — not started" for two
+/// weeks, which is the failure the TTL exists to bound, at the longest
+/// possible duration.
 ///
-/// It is a ceiling on the slack and never on the window itself — see
-/// [`seen_window_ttl_secs`], which never cuts before one full period. Three days
-/// is what a plain `min` would have taken off a weekly row, and taking it would
+/// Never a cap on the window itself — see [`seen_window_ttl_secs`], which
+/// never cuts before one full period: `max(period, CAP)` guarantees that,
+/// whatever `CAP` is, so a period longer than three days (weekly, say) is
+/// left at exactly one period rather than being pulled down to three days.
+/// The three-day figure only ever bites the plain-two-periods answer for a
+/// window whose period is longer than half of it — the flat three days is
+/// what a plain `min` would have taken off a weekly row, and taking it would
 /// have deleted the row four days *inside* a window whose boundary and length
 /// the provider itself gave us: while `now < at + period`, an empty window
 /// explains the silence completely and there is nothing stale to bound.
-const SEEN_WINDOW_TTL_MAX_SLACK_SECS: u64 = 3 * 24 * 3600;
+const SEEN_WINDOW_TTL_CAP_SECS: u64 = 3 * 24 * 3600;
 
 /// How long a remembered window stays on screen after the provider goes quiet:
 /// its own length first — during which "not started" is simply true if nothing
@@ -3531,7 +3632,7 @@ fn seen_window_ttl_secs(period_minutes: u64) -> u64 {
     let period = period_minutes.saturating_mul(60);
     period
         .saturating_mul(SEEN_WINDOW_TTL_PERIODS)
-        .min(period.max(SEEN_WINDOW_TTL_MAX_SLACK_SECS))
+        .min(period.max(SEEN_WINDOW_TTL_CAP_SECS))
 }
 
 /// The rows one provider's panel section shows: the windows it reported, plus
@@ -3659,6 +3760,15 @@ fn not_started_row(label: &str, role: Role, period_minutes: u64) -> WindowData {
     }
 }
 
+/// Build one `WindowData` row from a reading window and the percentage it
+/// reported. The window's `role` decides the tooltip name and clock format
+/// (5-hour vs weekly); its numbers drive the bar, countdown and pace via
+/// [`window_view`].
+///
+/// `used` is passed rather than read back off the window because only a window
+/// that reported one becomes a row at all — the caller establishes that, and
+/// taking it as an argument keeps this from carrying a second, unreachable
+/// shape for the case it has already excluded.
 fn window_data(now: u64, w: &Window, used: f64) -> WindowData {
     // Whether the reset clock carries a date. A week away needs one; five
     // hours away does not. An extra quota can be either length, so it is
@@ -3886,11 +3996,6 @@ fn refresh_plugins_model(plugin_model: &PluginRows, plugins: &[PluginManifest]) 
     plugin_model.set_vec(plugins.iter().map(plugin_row).collect::<Vec<_>>());
 }
 
-/// One plugin's manager row: its identity/engine, its effective enable and
-/// ping state (from config, bridged for the well-known ids), a `SurfaceRow`
-/// for each *opt-in* surface (non-opt-in surfaces are always on, so they
-/// carry no toggle here), and an `OptionRow` for each declarative `[[option]]`
-/// the manifest exposes, resolved to its current value.
 /// A `[ping]` rendered as the command line it will actually run. The toggle
 /// that fires it is a checkbox in Settings, and a checkbox that says "ping"
 /// while running something else is how a third-party manifest would get a
@@ -3903,6 +4008,11 @@ fn ping_command_line(ping: &manifest::PingConfig) -> String {
     }
 }
 
+/// One plugin's manager row: its identity/engine, its effective enable and
+/// ping state (from config, bridged for the well-known ids), a `SurfaceRow`
+/// for each *opt-in* surface (non-opt-in surfaces are always on, so they
+/// carry no toggle here), and an `OptionRow` for each declarative `[[option]]`
+/// the manifest exposes, resolved to its current value.
 fn plugin_row(m: &PluginManifest) -> PluginRow {
     let surfaces: Vec<SurfaceRow> = m
         .surface
@@ -4044,7 +4154,7 @@ fn window_view(
     (rel, clock, tooltip, progress, time_known)
 }
 
-// ── Menu-bar title (Codex + Claude CLI) ──────────────────────────────────────
+// ── Menu-bar title (plain-text fallback) ─────────────────────────────────────
 
 /// Compact used-quota value, matching every other figure this app shows: the
 /// panel's caption, the widget's bar and its number. A trailing `!` is the
@@ -4104,8 +4214,10 @@ fn menu_bar_title(readings: &[ProviderReading]) -> String {
 
 // ── Menu-bar widget (image) with plain-text fallback ─────────────────────────
 
-/// The next occurrence of a reset at or after `now`, given a window that
-/// repeats every `period` seconds.
+/// The next occurrence of a reset strictly after `now`, given a window that
+/// repeats every `period` seconds. A `target` already past `now` is rolled
+/// forward until it is; a `target` equal to `now` still rolls forward one
+/// full period rather than being returned as-is.
 ///
 /// Arithmetic rather than a loop, because the numbers are the provider's:
 /// a reset timestamp far in the past next to a short window — `reset_at: 1`
@@ -4300,18 +4412,6 @@ fn tray_badge_px() -> u32 {
 
 // ── Popover chrome ───────────────────────────────────────────────────────────
 
-/// Where the dock-mode panel should end up after one poll tick.
-///
-/// `clicks` is how many Dock-icon reopen events arrived since the last tick and
-/// `became_active` whether the app went frontmost during it. Both can be true
-/// at once, and the events' relative order is not recoverable, so the tick is
-/// resolved as a net effect rather than replayed.
-///
-/// Activation means "show me the panel", not "toggle": a Dock click on a
-/// background app, or a Cmd-Tab (which sends no reopen event at all), should
-/// never dismiss what the user just asked to see. So activation pins the target
-/// to visible and consumes the click that caused it; every remaining click is a
-/// toggle, and an even number of them cancels out.
 /// How long a status-item click stays responsible for the activation it
 /// causes. Long enough to cover the gap between the click and the app becoming
 /// frontmost (both are delivered on the main thread, so this is scheduling
@@ -4370,6 +4470,18 @@ fn tray_click_dismissed_panel(hidden_by_focus_at: Option<Instant>, now: Instant)
         .is_some_and(|at| now.saturating_duration_since(at) < TRAY_CLICK_DISMISS_WINDOW)
 }
 
+/// Where the dock-mode panel should end up after one poll tick.
+///
+/// `clicks` is how many Dock-icon reopen events arrived since the last tick and
+/// `became_active` whether the app went frontmost during it. Both can be true
+/// at once, and the events' relative order is not recoverable, so the tick is
+/// resolved as a net effect rather than replayed.
+///
+/// Activation means "show me the panel", not "toggle": a Dock click on a
+/// background app, or a Cmd-Tab (which sends no reopen event at all), should
+/// never dismiss what the user just asked to see. So activation pins the target
+/// to visible and consumes the click that caused it; every remaining click is a
+/// toggle, and an even number of them cancels out.
 fn panel_target_visibility(became_active: bool, clicks: usize, visible: bool) -> bool {
     let (base, toggles) = if became_active {
         (true, clicks.saturating_sub(1))
@@ -4587,9 +4699,13 @@ fn position_popover(app: &AppWindow, anchor: &Anchor, shown: Shown) {
     let scale = app.window().scale_factor() as f64;
     let size = app.window().size();
     let anchor = *anchor.borrow();
-    // No monitor to be had: fall back to a screen so large that every fit
-    // test passes, which reproduces the unconstrained placement this had
-    // before there was anything to constrain it with.
+    // No monitor to be had: fall back to a screen so large that the *far*
+    // edge of `clamp_onto`'s range never bites — not fully unconstrained,
+    // since the near edge still pins anything below `POPOVER_MARGIN` (an
+    // anchor at or past `x = 0`/`y = 0`, which a real monitor with a negative
+    // origin in a multi-monitor layout could legitimately want) up to that
+    // margin. Good enough for "winit can name no monitor at all", a state
+    // this app cannot otherwise reason about anyway.
     let screen = anchor_screen(app, anchor).unwrap_or((0.0, 0.0, f64::MAX, f64::MAX));
     let (x, y) = popover_origin(
         anchor,
@@ -4616,20 +4732,40 @@ fn cli_dirs() -> Vec<std::path::PathBuf> {
 
 /// Locate a CLI binary by name (a bundled app has a minimal PATH). Prefers the
 /// real npm/homebrew install over anything in PATH.
+///
+/// On Windows a bare name is resolved through `PATHEXT`, which the plugin
+/// manifests writing `bin = "codex"` have no reason to know about — an
+/// npm-global install ships `codex.cmd`/`codex.exe` side by side, and some
+/// tools ship a `.bat` wrapper instead. Trying `""`, `.exe`, `.cmd`, `.bat` in
+/// that order (extensionless first, so a real binary still wins when one
+/// exists) is the same list `plugin::auth::bin_candidates` tries for
+/// `oauth-refresh` client discovery, so the two resolvers agree on what "this
+/// name is installed" means.
 fn find_bin(name: &str) -> Option<std::path::PathBuf> {
-    let exe = if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_string()
-    };
     let mut dirs_to_check = cli_dirs();
     if let Some(p) = std::env::var_os("PATH") {
         dirs_to_check.extend(std::env::split_paths(&p));
     }
-    dirs_to_check
-        .into_iter()
-        .map(|d| d.join(&exe))
-        .find(|c| c.is_file())
+    find_bin_in(&dirs_to_check, name)
+}
+
+/// The directory-search half of [`find_bin`], split out so a test can hand it
+/// a temp directory instead of mutating the real `PATH`.
+fn find_bin_in(dirs: &[std::path::PathBuf], name: &str) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        dirs.iter()
+            .flat_map(|d| {
+                ["", ".exe", ".cmd", ".bat"]
+                    .iter()
+                    .map(move |suffix| d.join(format!("{name}{suffix}")))
+            })
+            .find(|c| c.is_file())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        dirs.iter().map(|d| d.join(name)).find(|c| c.is_file())
+    }
 }
 
 /// `PATH` for a spawned CLI: whatever this process inherited, **then**
@@ -4662,14 +4798,36 @@ fn cli_path_env() -> Option<std::ffi::OsString> {
 /// instructions — and the ping is a model run on a timer that nobody is
 /// watching and whose output is discarded. Handing it the home directory's
 /// contents as instructions is the ideal setup for a prompt injection; handing
-/// it an empty directory gives it nothing to read. Falls back to the home
-/// directory only if that directory can't be created, since a command with no
-/// working directory at all won't start.
-fn ping_cwd() -> std::path::PathBuf {
+/// it an empty directory gives it nothing to read.
+///
+/// Falls back to a fresh directory under the OS temp dir if the one beside
+/// the plugins folder can't be created (also empty, also this app's own), and
+/// to `None` — skip the ping, do not run it anywhere — if even that fails.
+/// The home directory is never an acceptable fallback here: it is the exact
+/// surface this function exists to keep an unwatched, output-discarded run
+/// away from, so a filesystem wedged enough to defeat both attempts must lose
+/// the ping rather than quietly reopen the hole this replaced.
+fn ping_cwd() -> Option<std::path::PathBuf> {
     let dir = seed::plugins_dir().with_file_name("ping-workdir");
-    match std::fs::create_dir_all(&dir) {
-        Ok(()) => dir,
-        Err(_) => dirs::home_dir().unwrap_or_else(|| ".".into()),
+    if std::fs::create_dir_all(&dir).is_ok() {
+        return Some(dir);
+    }
+    let fallback = std::env::temp_dir().join("tickover-ping-workdir");
+    match std::fs::create_dir_all(&fallback) {
+        Ok(()) => {
+            diag::line(format!(
+                "auto-ping: {} unavailable, using {} instead",
+                dir.display(),
+                fallback.display()
+            ));
+            Some(fallback)
+        }
+        Err(e) => {
+            diag::line(format!(
+                "auto-ping: skipped — no working directory could be created ({e})"
+            ));
+            None
+        }
     }
 }
 
@@ -4742,7 +4900,12 @@ fn run_with_deadline(mut child: std::process::Child, deadline: Duration) -> (Run
     let stderr = child.stderr.take();
     let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     let sink = std::sync::Arc::clone(&collected);
-    std::thread::spawn(move || {
+    // `Builder::spawn`, not `thread::spawn`: the latter panics if the OS won't
+    // hand out a thread. Nothing here is left half-set-up by that failure —
+    // `stderr` is simply dropped along with the closure, same as if the
+    // command had produced none — but a diagnostic beats losing the failure
+    // reason silently.
+    if let Err(e) = std::thread::Builder::new().spawn(move || {
         use std::io::Read;
         if let Some(mut stderr) = stderr {
             let mut chunk = [0u8; 4096];
@@ -4757,7 +4920,11 @@ fn run_with_deadline(mut child: std::process::Child, deadline: Duration) -> (Run
                 }
             }
         }
-    });
+    }) {
+        diag::line(format!(
+            "auto-ping: could not start the stderr drain thread: {e}"
+        ));
+    }
 
     let expiry = Instant::now() + deadline;
     let outcome = loop {
@@ -4767,7 +4934,16 @@ fn run_with_deadline(mut child: std::process::Child, deadline: Duration) -> (Run
                 // Asked once more first: a process that finished during the
                 // last sleep is not one this deadline killed, and reporting it
                 // as killed would send someone looking for a hang that never
-                // happened.
+                // happened — including one that finished with a non-zero exit
+                // code, which is a real failure to report as itself, not as a
+                // hang this deadline invented. Code-reviewed rather than
+                // test-covered: the race this closes is between this
+                // `try_wait` and the loop's own one a moment earlier, a gap of
+                // function-call overhead — nothing a real subprocess's timing
+                // can be made to land inside on purpose.
+                if let Ok(Some(status)) = child.try_wait() {
+                    break RunOutcome::Exited(status);
+                }
                 let _ = child.kill();
                 break match child.wait() {
                     Ok(status) if status.success() => RunOutcome::Exited(status),
@@ -4803,9 +4979,21 @@ fn run_with_deadline(mut child: std::process::Child, deadline: Duration) -> (Run
 /// explains such a failure ("Not inside a trusted directory…") is the one that
 /// used to be thrown away with it.
 fn spawn_hello(bin: std::path::PathBuf, args: Vec<String>) {
-    let cwd = ping_cwd();
+    let Some(cwd) = ping_cwd() else {
+        diag::line(format!(
+            "auto-ping: {} not run — no working directory available",
+            bin.display()
+        ));
+        return;
+    };
     let path = cli_path_env();
-    std::thread::spawn(move || {
+    // `Builder::spawn`, not `thread::spawn`: the latter panics if the OS won't
+    // hand out a thread. Nothing needs unwinding if it does fail — the ping is
+    // already recorded as sent on the same tick that decided to send it (see
+    // that call site's own comment), same as if the command inside had failed
+    // to start.
+    let bin_for_log = bin.clone();
+    if let Err(e) = std::thread::Builder::new().spawn(move || {
         let mut cmd = std::process::Command::new(&bin);
         cmd.args(&args)
             .current_dir(cwd)
@@ -4855,12 +5043,18 @@ fn spawn_hello(bin: std::path::PathBuf, args: Vec<String>) {
                 ));
             }
         }
-    });
+    }) {
+        diag::line(format!(
+            "auto-ping: {} could not start the thread to run it: {e}",
+            bin_for_log.display()
+        ));
+    }
 }
 
 /// Run a plugin's `[ping]` command (e.g. `codex exec hello` / `claude -p
-/// hello`) — fired 5s after its first surface's 5-hour window resets, if the
-/// user opted in (gated by `config::plugin_ping`).
+/// hello`) — fired on the tick that finds its first surface's 5-hour window
+/// empty and not yet pinged since it began (see [`ping_due`]: a state, not an
+/// edge), if the user opted in (gated by `config::plugin_ping`).
 fn send_ping(ping: &manifest::PingConfig) {
     match find_bin(&ping.bin) {
         Some(bin) => spawn_hello(bin, ping.args.clone()),
@@ -4871,12 +5065,14 @@ fn send_ping(ping: &manifest::PingConfig) {
 // ── Registry: Check updates / Install / Update ───────────────────────────
 //
 // `src/plugin/registry.rs` is pure and hermetic except for its two network
-// calls, `fetch_text` (`index.toml`) and `fetch_bytes` (a manifest file,
-// undecoded — see its own docs for why a manifest can't go through
-// `fetch_text`) — parsing/validating `index.toml`, resolving a manifest URL,
-// sha256 verification, the lockfile, the installed-vs-registry diff, and the
-// trust disclosure all live there and are unit-tested with zero network
-// access. Everything below is this app's orchestration of those primitives:
+// calls, `fetch_bytes` (`index.toml` itself and a manifest file, both
+// undecoded — see its own docs for why: a signature or a sha256 is over the
+// exact transport bytes, not a UTF-8 round-trip of them) and `fetch_text`
+// (only the index's `.minisig` signature file, whose bytes are never hashed
+// or compared against anything) — parsing/validating `index.toml`, resolving
+// a manifest URL, sha256 verification, the lockfile, the installed-vs-registry
+// diff, and the trust disclosure all live there and are unit-tested with zero
+// network access. Everything below is this app's orchestration of those primitives:
 // running the fetch on a background thread so it can never freeze the
 // popover, driving the native two-pass trust dialog before a third-party
 // manifest is ever written to disk, and the actual filesystem writes
@@ -4907,12 +5103,15 @@ fn signature_url(index_url: &str) -> String {
 /// body of `check-updates`. Never touches the UI or the filesystem; safe to
 /// run off the calling thread.
 ///
-/// The signature is checked **before** the index is parsed. That order is the
-/// point: an index this app will not vouch for is never read for what it says
-/// about itself, so nothing downstream — not a version comparison, not a
-/// manifest URL, not a `sha256` — ever comes from bytes whose publisher is in
-/// doubt. Everything downstream still happens afterwards, unchanged; this is
-/// a gate in front of them, never a substitute for one.
+/// The signature is checked **before** the index is parsed, once a key is
+/// pinned: an index this app will not vouch for will never be read for what
+/// it says about itself, so nothing downstream — not a version comparison,
+/// not a manifest URL, not a `sha256` — will ever come from bytes whose
+/// publisher is in doubt. Today [`signature::REGISTRY_PUBLIC_KEY`] is `None`,
+/// so [`signature::verify_index`] answers `Unverifiable` for every index and
+/// this still parses it — logged, not refused, on every single check (see the
+/// `Unverifiable` arm below). Everything downstream is unchanged either way;
+/// the check is a gate in front of them, never a substitute for one.
 fn fetch_registry_index(url: &str) -> RegistryCheckMsg {
     // Fetched as bytes rather than text, because a signature is over the
     // bytes a server sent and nothing else. Decoding first and verifying the
@@ -5068,8 +5267,13 @@ fn apply_registry_check(
         }
         RegistryCheckMsg::Malformed => {
             app.set_registry_status(3);
+            // Three different failures collapse into this one variant — a
+            // signature this build refuses, bytes that are not UTF-8, and an
+            // `index.toml` that doesn't parse — and none of them says which
+            // to the user, only to the log (see `RegistryCheckMsg`'s own doc
+            // comment for why). "Failed to parse" would name only the third.
             app.set_registry_error(ss(
-                "Registry index is corrupted (index.toml failed to parse)",
+                "Registry index rejected — see the diagnostic log for the reason",
             ));
         }
         RegistryCheckMsg::Success(index) => {
@@ -5238,6 +5442,53 @@ enum InstallOutcome {
         manifest: Box<PluginManifest>,
         sha_hex: String,
     },
+}
+
+/// Sends an install/update worker's result exactly once — [`RegistryGuard::finish`]
+/// with the real [`InstallOutcome`], or, if the worker never got that far (a
+/// panic unwinding through it), a synthesized [`InstallOutcome::Failed`] on
+/// drop. Built *inside* the spawned closure, same as [`FetchGuard`] and for
+/// the same reason: `registry_busy` is only ever cleared on the UI thread,
+/// when a message for the id arrives (see `main`'s install/update drain
+/// loop) — it is an `Rc<RefCell<_>>`, not `Send`, so the worker thread cannot
+/// touch it directly, and without this a worker that panics sends nothing,
+/// leaving the id in `registry_busy` forever and every later Install/Update
+/// click for it a silent no-op. `Builder::spawn` itself failing — never
+/// reaching this guard at all — is the one failure it cannot cover; its own
+/// call sites handle that the same way [`spawn_plugin_fetch`] does.
+struct RegistryGuard {
+    kind: PendingKind,
+    /// Taken by whichever of [`RegistryGuard::finish`] and `drop` runs first,
+    /// so the id, needed either way, is still there for the one that runs
+    /// second to find nothing left to send.
+    entry: Option<RegistryEntry>,
+    tx: Option<mpsc::Sender<(PendingKind, RegistryEntry, InstallOutcome)>>,
+}
+
+impl RegistryGuard {
+    fn finish(mut self, outcome: InstallOutcome) {
+        if let (Some(tx), Some(entry)) = (self.tx.take(), self.entry.take()) {
+            let _ = tx.send((self.kind, entry, outcome));
+        }
+    }
+}
+
+impl Drop for RegistryGuard {
+    fn drop(&mut self) {
+        if let (Some(tx), Some(entry)) = (self.tx.take(), self.entry.take()) {
+            if std::thread::panicking() {
+                diag::line(format!(
+                    "{}: install/update worker panicked, reporting it as failed",
+                    entry.id
+                ));
+            }
+            let _ = tx.send((
+                self.kind,
+                entry,
+                InstallOutcome::Failed("install/update worker panicked".to_string()),
+            ));
+        }
+    }
 }
 
 /// The network+verification half of install/update — resolve the entry's
@@ -5447,9 +5698,24 @@ fn handle_install_outcome(
             installed_at: now_unix(),
         },
     );
+    // The one part of this operation that can still fail after the manifest
+    // itself has already landed on disk. Left as a log line rather than
+    // surfaced to the user: `handle_install_outcome` runs on the UI thread
+    // inside the fast timer's drain loop, and `show_alert` blocks on a native
+    // dialog on every platform this ships for — turning a rare bookkeeping
+    // miss into a frozen app is a worse outcome than the one it would be
+    // reporting. Nor is there a row-status code for "succeeded, but": 2 means
+    // failed and draws a Retry button, which would ask the user to redo an
+    // install that already worked. The consequence is real and named here
+    // for whoever reads the log: without this entry, the next "Check
+    // updates" has no `origin_sha256` to compare `entry.id`'s file against,
+    // and reads the very manifest it just verified as an unexplained local
+    // edit.
     if let Err(e) = registry::save_lockfile(&lock_path, &lock) {
         diag::line(format!(
-            "could not save registry lockfile {}: {e}",
+            "{kind:?} \"{}\": could not save registry lockfile {} — a later \
+             \"Check updates\" may misread this install as locally edited: {e}",
+            entry.id,
             lock_path.display()
         ));
     }
@@ -5496,14 +5762,6 @@ fn auth_type_label(kind: manifest::AuthType) -> &'static str {
     }
 }
 
-/// The trust-dialog copy for a manifest whose `analyze_trust` disclosure
-/// requires approval: a short first-pass warning and a fuller second-pass
-/// breakdown (id, engine, the ordered auth chain, every destination host
-/// with untrusted ones flagged, the manifest's own declared `allowed_hosts`,
-/// and the fixed `redirects(0)` guarantee — see `registry::fetch_bytes`'s own
-/// docs (the function this trust dialog gates a manifest download through)
-/// for why that's always zero). Pure, so the wording is testable
-/// without any dialog on screen at all — see [`show_trust_dialog`].
 /// `["a", "b", "c"]` as `"a, b and c"` — a list a person reads, not one a
 /// program prints.
 fn join_with_and(parts: &[String]) -> String {
@@ -5514,6 +5772,14 @@ fn join_with_and(parts: &[String]) -> String {
     }
 }
 
+/// The trust-dialog copy for a manifest whose `analyze_trust` disclosure
+/// requires approval: a short first-pass warning and a fuller second-pass
+/// breakdown (id, engine, the ordered auth chain, every destination host
+/// with untrusted ones flagged, the manifest's own declared `allowed_hosts`,
+/// and the fixed `redirects(0)` guarantee — see `registry::fetch_bytes`'s own
+/// docs (the function this trust dialog gates a manifest download through)
+/// for why that's always zero). Pure, so the wording is testable
+/// without any dialog on screen at all — see [`show_trust_dialog`].
 fn build_trust_message(
     id: &str,
     disclosure: &TrustDisclosure,
@@ -6283,9 +6549,15 @@ mod title_tests {
         );
     }
 
+    /// `menu_bar_title` renders from `used_percent` alone — `resets_at` never
+    /// enters into it — so a Primary window whose reset has already lapsed
+    /// still prints its (zero-padded) usage figure exactly like a live one;
+    /// only the weekly slot, unreported here, falls back to the placeholder.
+    /// Named for what this actually checks, not for the reset-projection
+    /// arithmetic the fixture's own comment used to imply it exercised —
+    /// `next_reset_after` (see the test above) is what that belongs to.
     #[test]
-    fn lapsed_reset_projects_forward_one_window() {
-        // Reset was 100s ago on a 5h window → next reset in 300*60-100s = 4h58m.
+    fn menu_bar_title_ignores_a_lapsed_reset_and_placeholders_the_missing_weekly() {
         let windows = vec![
             Window {
                 key: String::new(),
@@ -6604,6 +6876,110 @@ mod title_tests {
         );
         assert!(!dir.join("grok.toml").exists(), "and it stays deleted");
         logged_exactly_for(&dir, &third);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A dangling symlink at a built-in's path — a directory entry exists,
+    /// but nothing behind it can be read — must not be settled the way
+    /// `Absent` is: whatever the obstruction is may clear before the next
+    /// launch (the symlink's target remounting, say), and once
+    /// `builtin_migrated` records this version's decision as made,
+    /// `deliver_if_absent` never gets another chance to act on it. Unix-only:
+    /// planting a dangling symlink is what reaches `UpgradeAction::Unreadable`
+    /// without a platform-specific way to make an unreadable file otherwise.
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_built_in_is_retried_rather_than_settled() {
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-unreadable-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let grok = seed::BUILTIN_UPGRADES
+            .iter()
+            .find(|u| u.id == "grok")
+            .expect("grok ships as a built-in");
+        // "" here means "not yet decided for this version" — the same
+        // sentinel `a_built_in_that_is_settled_and_missing_says_so_on_every_launch`
+        // uses above, and for the same reason: the marker is compared to
+        // `to_version` by equality, so any other value reads as undecided.
+        config::set_builtin_migrated("grok", "");
+        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join(grok.file))
+            .expect("plant a dangling symlink");
+
+        let _ = diag::take_recorded();
+        upgrade_builtin_manifests(&dir);
+        let first = diag::take_recorded();
+        assert!(
+            first
+                .iter()
+                .any(|l| l.contains(grok.file) && l.contains("could not be read")),
+            "expected the unreadable note: {first:?}"
+        );
+        assert_eq!(
+            config::builtin_migrated("grok").as_deref(),
+            Some(""),
+            "not settled — must be retried, not decided, while unreadable"
+        );
+
+        // Retried on the very next launch, not skipped because a decision was
+        // wrongly recorded the first time.
+        let _ = diag::take_recorded();
+        upgrade_builtin_manifests(&dir);
+        let second = diag::take_recorded();
+        assert!(
+            second
+                .iter()
+                .any(|l| l.contains(grok.file) && l.contains("could not be read")),
+            "still unreadable, still not settled: {second:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The regression `remove_plugin_keys` keeping `builtin_migrated` exists
+    /// for. `grok` ships `deliver_if_absent = true`, so before that fix,
+    /// clearing the marker on Remove was indistinguishable from "never
+    /// migrated": the very next launch's `upgrade_builtin` would read
+    /// `Absent` off an empty `dir`, treat that as a first install, and write
+    /// `grok.toml` straight back — undoing the Remove the user just asked
+    /// for.
+    #[test]
+    fn removing_a_plugin_keeps_the_marker_so_the_seed_step_does_not_re_deliver_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-remove-keeps-marker-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let grok = seed::BUILTIN_UPGRADES
+            .iter()
+            .find(|u| u.id == "grok")
+            .expect("grok ships as a built-in");
+
+        // Settled at the current version, the way a real launch leaves it.
+        config::set_builtin_migrated("grok", grok.to_version);
+
+        // Remove: the plugin's generic keys go, but the migration marker must
+        // survive it.
+        config::remove_plugin_keys("grok");
+        assert_eq!(
+            config::builtin_migrated("grok").as_deref(),
+            Some(grok.to_version),
+            "removing the plugin must not clear the migration marker"
+        );
+
+        // No `grok.toml` on disk — the user removed it. The next launch's
+        // seed step must leave it that way.
+        upgrade_builtin_manifests(&dir);
+        assert!(
+            !dir.join("grok.toml").exists(),
+            "a plugin the user removed must not come back after Remove"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -7199,7 +7575,8 @@ mod title_tests {
         // The case this whole feature exists for: Codex is empty, so it reports
         // no 5-hour window at all, and the panel shows only the weekly row.
         let empty = reading_with(vec![weekly.clone()], None);
-        let target = ping_window(&m, Some(&empty)).expect("an empty 5h window is still a window");
+        let target =
+            ping_window(&m, Some(&empty), None).expect("an empty 5h window is still a window");
         assert_eq!(target.used_percent, None);
         assert_eq!(target.resets_at, None);
         assert_eq!(
@@ -7222,7 +7599,7 @@ mod title_tests {
         // the same accident: a provider we could not read says nothing about
         // its quota, and a ping on that guess spends the user's own allowance.
         let unreadable = reading_with(Vec::new(), Some("session expired"));
-        assert!(ping_window(&m, Some(&unreadable)).is_none());
+        assert!(ping_window(&m, Some(&unreadable), None).is_none());
 
         // A reported window is passed through as itself.
         let five = Window {
@@ -7234,29 +7611,79 @@ mod title_tests {
             period_minutes: Some(300),
         };
         let live =
-            ping_window(&m, Some(&reading_with(vec![five, weekly], None))).expect("reported");
+            ping_window(&m, Some(&reading_with(vec![five, weekly], None)), None).expect("reported");
         assert_eq!(live.used_percent, Some(4.0));
         assert_eq!(live.period_minutes, Some(300));
 
         // No reading at all, and a manifest that declares no 5-hour window:
         // neither is something to ping for.
-        assert!(ping_window(&m, None).is_none());
+        assert!(ping_window(&m, None, None).is_none());
         let mut weekly_only = pingable_manifest();
         weekly_only.windows[0].role = manifest::Role::Secondary;
-        assert!(ping_window(&weekly_only, Some(&reading_with(Vec::new(), None))).is_none());
+        assert!(ping_window(&weekly_only, Some(&reading_with(Vec::new(), None)), None).is_none());
     }
 
-    /// An invariant nothing states and two menu-bar functions rely on.
-    ///
-    /// `menu_bar_title` and `widget_rows` read `primary_window()` and
-    /// `secondary_window()` without ever looking at `error`. That is safe only
-    /// because every path that sets an error leaves the window list empty —
-    /// true today in both engines, and nowhere written down. The day a
-    /// reading can be partly wrong and partly usable, the menu bar would
-    /// start printing numbers out of a reading the panel is showing as
-    /// broken. This fails first instead.
+    /// The regression `ping_window`'s `remembered_period_minutes` parameter
+    /// exists for: a `from_field` primary window (Codex-shaped) that has gone
+    /// quiet reports no length of its own, and without a remembered one
+    /// `ping_due` fell back to `ASSUMED_WINDOW_SECS` — five hours — no matter
+    /// how long the window it was silent about actually runs. An hourly
+    /// window silent for sixty minutes is due; `ASSUMED_WINDOW_SECS` would
+    /// have said not for another four.
     #[test]
-    fn an_errored_reading_carries_no_windows_for_the_menu_bar_to_print() {
+    fn ping_window_uses_the_remembered_period_for_a_silent_from_field_window() {
+        let m = pingable_manifest();
+        let empty = reading_with(Vec::new(), None);
+
+        let target =
+            ping_window(&m, Some(&empty), Some(60)).expect("an empty 5h window is still a window");
+        assert_eq!(
+            target.period_minutes,
+            Some(60),
+            "the registry's remembered length stands in for the one nothing reported"
+        );
+
+        // A boundary confirmed 90 minutes ago and a ping sent 60 minutes ago:
+        // one hourly window has rolled over since that ping, so an hourly
+        // window is due; the five-hour assumption would still call this the
+        // same window the 60-minutes-ago ping already covered.
+        let anchor = NOW - 5400;
+        let pinged_at = NOW - 3600;
+        assert!(
+            ping_due(
+                target.used_percent,
+                target.resets_at,
+                target.period_minutes,
+                anchor,
+                pinged_at,
+                NOW
+            ),
+            "an hourly window that rolled over since the last ping is due"
+        );
+        assert!(
+            !ping_due(
+                target.used_percent,
+                target.resets_at,
+                ping_window(&m, Some(&empty), None)
+                    .expect("still a window without a remembered period")
+                    .period_minutes,
+                anchor,
+                pinged_at,
+                NOW
+            ),
+            "without the remembered period, the five-hour assumption says not yet"
+        );
+    }
+
+    /// `menu_bar_title` (its inner `chunk_pair`) and `widget_rows` both check
+    /// `error` explicitly and skip a reading that carries one, regardless of
+    /// what windows it also carries. No engine today produces an error
+    /// *and* windows in the same reading, so this fixture manufactures one
+    /// anyway: the point is that the skip does not depend on the window list
+    /// happening to be empty, in case a future reading is ever partly wrong
+    /// and partly usable.
+    #[test]
+    fn an_errored_reading_is_skipped_by_the_menu_bar_and_the_widget() {
         let broken = ProviderReading {
             windows: vec![Window {
                 key: String::new(),
@@ -7272,7 +7699,11 @@ mod title_tests {
         assert_eq!(
             menu_bar_title(std::slice::from_ref(&broken)),
             menu_bar_title(&[]),
-            "if a reading may carry both an error and windows, the menu bar has to start              checking for the error — it does not"
+            "an errored reading contributes no chunk to the title, windows or not"
+        );
+        assert!(
+            widget_rows(NOW, std::slice::from_ref(&broken)).is_empty(),
+            "an errored reading draws no widget row, windows or not"
         );
     }
 
@@ -7797,7 +8228,7 @@ mod title_tests {
         let m = pingable_manifest();
         let both_empty = reading_with(Vec::new(), None);
 
-        let target = ping_window(&m, Some(&both_empty))
+        let target = ping_window(&m, Some(&both_empty), None)
             .expect("an account with nothing running is still an account with a window");
         assert!(ping_due(
             target.used_percent,
@@ -8282,7 +8713,8 @@ mod title_tests {
             "the panel draws it"
         );
 
-        let target = ping_window(&pingable_manifest(), Some(&empty)).expect("a window to ping for");
+        let target = ping_window(&pingable_manifest(), Some(&empty), seen.period_minutes)
+            .expect("a window to ping for");
         assert!(
             ping_due(
                 target.used_percent,
@@ -8913,6 +9345,20 @@ mod title_tests {
         );
     }
 
+    /// The one property that matters more than which directory this picks:
+    /// it is never `$HOME`, no matter which of the two attempts succeeded.
+    /// Handing an unwatched, output-discarded model run the user's real home
+    /// directory as its working directory is the prompt-injection surface
+    /// `ping_cwd` exists to close.
+    #[test]
+    fn ping_cwd_is_never_the_home_directory() {
+        let cwd = ping_cwd().expect("one of the two attempts succeeds in a test environment");
+        assert!(cwd.exists(), "the returned directory must already exist");
+        if let Some(home) = dirs::home_dir() {
+            assert_ne!(cwd, home, "the ping's cwd must never be $HOME");
+        }
+    }
+
     /// The quoted stderr of a failed ping is cut by characters, because a
     /// lossy decode is *longer* than the bytes it read — one invalid byte
     /// becomes a three-byte `U+FFFD` — so a byte-indexed cut can land inside a
@@ -8942,6 +9388,46 @@ mod title_tests {
         );
     }
 
+    /// A fetch thread that panics still sends its empty result — `Drop` runs
+    /// during unwinding same as on any other exit path — but that used to be
+    /// the only trace of it: the plugin's rows just went quiet, with nothing
+    /// in the log to say why. `std::thread::panicking()` inside `drop` is
+    /// true exactly when this is running as part of an unwind, never on the
+    /// ordinary "finished, sent, dropped" path, so the line only appears when
+    /// it means something.
+    #[test]
+    fn fetch_guard_logs_when_dropped_mid_panic() {
+        diag::take_recorded();
+        let (tx, rx) = mpsc::channel();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = FetchGuard {
+                id: "acme".to_string(),
+                generation: 7,
+                tx: Some(tx),
+            };
+            panic!("simulated fetch panic");
+        }));
+        assert!(unwound.is_err(), "the panic must still propagate out");
+
+        let (id, generation, readings) = rx
+            .recv()
+            .expect("the guard sends on drop even while unwinding");
+        assert_eq!(id, "acme");
+        assert_eq!(generation, 7);
+        assert!(
+            readings.is_empty(),
+            "a panicked fetch has nothing to report"
+        );
+
+        let lines = diag::take_recorded();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("acme") && l.contains("panicked")),
+            "expected a panic diagnostic naming the plugin, got {lines:?}"
+        );
+    }
+
     /// A ping that finds its CLI must also be able to *start* it: several of
     /// these CLIs are wrapper scripts whose shebang needs an interpreter from
     /// the same install dirs (`~/.npm-global/bin/codex` is `codex.js`, needing
@@ -8964,10 +9450,49 @@ mod title_tests {
         );
     }
 
+    #[test]
+    fn find_bin_in_matches_an_extensionless_file_on_every_platform() {
+        let dir = temp_plugins_dir("find-bin-plain");
+        std::fs::write(dir.join("codex"), "#!/bin/sh\n").unwrap();
+        let found = find_bin_in(std::slice::from_ref(&dir), "codex");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(found, Some(dir.join("codex")));
+    }
+
+    /// npm's global installer puts a `.cmd` shim beside the real Windows
+    /// binary, never a bare `codex` — the extensionless probe above would
+    /// never match one of these, and before this test `find_bin` tried only
+    /// `.exe`, so auto-ping silently never fired for an npm-global install.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn find_bin_in_falls_back_to_a_cmd_shim_when_no_exe_exists() {
+        let dir = temp_plugins_dir("find-bin-cmd-shim");
+        std::fs::write(dir.join("codex.cmd"), "@echo off\r\n").unwrap();
+        let found = find_bin_in(std::slice::from_ref(&dir), "codex");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(found, Some(dir.join("codex.cmd")));
+    }
+
+    /// A real `.exe` in an earlier-checked directory must win over a `.cmd`
+    /// shim in a later one, matching `plugin::auth::bin_candidates`'s
+    /// directory-outranks-suffix rule.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn find_bin_in_prefers_an_earlier_directorys_exe_over_a_later_cmd() {
+        let real = temp_plugins_dir("find-bin-real-exe");
+        let shim = temp_plugins_dir("find-bin-shim-cmd");
+        std::fs::write(real.join("codex.exe"), "").unwrap();
+        std::fs::write(shim.join("codex.cmd"), "@echo off\r\n").unwrap();
+        let found = find_bin_in(&[real.clone(), shim.clone()], "codex");
+        std::fs::remove_dir_all(&real).ok();
+        std::fs::remove_dir_all(&shim).ok();
+        assert_eq!(found, Some(real.join("codex.exe")));
+    }
+
     /// The auto-ping gate (fix 2): both the plugin's master enable and its
-    /// ping toggle must be on — checked when arming and re-checked inside the
-    /// 5s single-shot, so a plugin disabled (or its ping cleared) during the
-    /// delay is never actually pinged.
+    /// ping toggle must be on — asked fresh on the tick that would otherwise
+    /// fire the ping, not armed ahead of time, so a plugin disabled (or its
+    /// ping cleared) a moment earlier is simply not asked again.
     #[test]
     fn plugin_ping_armed_requires_both_enable_and_ping_toggle() {
         assert!(plugin_ping_armed(true, true), "enabled + ping on: arm");
@@ -9073,47 +9598,37 @@ mod title_tests {
         );
     }
 
+    /// One function now serves both pickers' raw output: macOS's `choose
+    /// file` stdout (a POSIX path, usually with a trailing newline) and the
+    /// Windows dialog's buffer (read up to its first NUL, no newline at all).
+    /// Both shapes exercised here so merging them didn't quietly drop either
+    /// platform's coverage.
     #[test]
-    fn parse_choose_file_output_trims_and_rejects_empty() {
+    fn parse_picked_path_trims_and_rejects_empty() {
         assert_eq!(
-            parse_choose_file_output("/Users/x/plugin.toml\n"),
-            Some(std::path::PathBuf::from("/Users/x/plugin.toml"))
+            parse_picked_path("/Users/x/plugin.toml\n"),
+            Some(std::path::PathBuf::from("/Users/x/plugin.toml")),
+            "macOS: trailing newline trimmed"
         );
         assert_eq!(
-            parse_choose_file_output("/Users/x/plugin.toml"),
+            parse_picked_path("/Users/x/plugin.toml"),
             Some(std::path::PathBuf::from("/Users/x/plugin.toml")),
             "no trailing newline is also accepted"
         );
         assert_eq!(
-            parse_choose_file_output(""),
-            None,
-            "empty output must not become an empty path"
-        );
-        assert_eq!(
-            parse_choose_file_output("   \n"),
-            None,
-            "whitespace-only output must not become a path"
-        );
-    }
-
-    #[test]
-    fn parse_picked_path_trims_and_rejects_empty() {
-        // The Windows picker's buffer, read up to its first NUL. Same rule as
-        // the macOS side above: a dialog that came back with nothing in it
-        // must not turn into a path that gets read and imported.
-        assert_eq!(
             parse_picked_path(r"C:\Users\x\plugin.toml"),
-            Some(std::path::PathBuf::from(r"C:\Users\x\plugin.toml"))
+            Some(std::path::PathBuf::from(r"C:\Users\x\plugin.toml")),
+            "Windows: no newline to trim, the whole buffer is the path"
         );
         assert_eq!(
             parse_picked_path(""),
             None,
-            "an empty buffer must not become an empty path"
+            "empty output must not become an empty path"
         );
         assert_eq!(
-            parse_picked_path("   "),
+            parse_picked_path("   \n"),
             None,
-            "nor a buffer holding only spaces"
+            "whitespace-only output must not become a path"
         );
     }
 
@@ -9646,7 +10161,20 @@ mod title_tests {
         update_write(&dir, "existing", &new_bytes).expect("overwrite succeeds");
 
         let on_disk = std::fs::read(&path).unwrap();
-        let tmp_left_behind = dir.join("existing.toml.tmp").exists();
+        // The real temp name is `existing.toml.tmp<pid>` (see
+        // `update_write_will_not_follow_a_symlink_planted_on_its_temp_path`
+        // below) — checking the bare `existing.toml.tmp` path never finds
+        // anything, pid suffix or not, so this has to scan the directory for
+        // any entry that starts with the stem instead.
+        let tmp_left_behind = std::fs::read_dir(&dir)
+            .expect("plugins dir still readable")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("existing.toml.tmp")
+            });
         std::fs::remove_dir_all(&dir).ok();
 
         assert_eq!(on_disk, new_bytes);
