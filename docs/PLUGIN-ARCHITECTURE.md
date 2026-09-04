@@ -63,12 +63,12 @@ credential source and calling whatever host it declares. See
 
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `id` | string | yes | — | stable identifier (`"codex"`, `"claude"`); ASCII `[A-Za-z0-9_-]+` only — it names the on-disk `<id>.toml` and must be a safe filename component |
-| `name` | string | yes | — | display name for the popup section header; must not be blank |
-| `menu_label` | string | yes | — | short label for the menu-bar pill/title (`"Cx"` / `"Cl"`); must not be blank |
+| `id` | string | yes | — | stable identifier (`"codex"`, `"claude"`); ASCII `[A-Za-z0-9_-]+` only, and not one of Windows's reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, compared case-insensitively) — it names the on-disk `<id>.toml` and must be a safe filename component on every platform this ships to |
+| `name` | string | yes | — | display name for the popup section header; must not be blank, and at most 64 characters |
+| `menu_label` | string | yes | — | short label for the menu-bar pill/title (`"Cx"` / `"Cl"`); must not be blank, and at most 16 characters |
 | `order` | integer | yes | — | sort key across providers; ties break on `id` |
-| `engine` | `"log-file"` \| `"http-api"` | yes | — | which engine reads this provider's usage data |
-| `refresh_secs` | integer | no | `60` | poll interval, seconds; must be greater than 0 |
+| `engine` | `"log-file"` \| `"http-api"` | yes | — | which engine reads this provider's usage data; a `log-file` manifest may not also declare `[http]` |
+| `refresh_secs` | integer | no | `60` | poll interval, seconds; from 5 to 86 400 (a day) inclusive |
 | `enabled` | bool | no | `true` | whether the plugin is active at all |
 | `requires_reader` | array of strings | no | `[]` | reader capabilities this manifest needs — see [Reader capabilities](#reader-capabilities-requires_reader) |
 | `version` | string | no | — | this manifest's own version. The registry's update check compares it against the index, and the built-in upgrade step records it in `config.json` once a shipped copy is replaced — see [Registry](#registry) |
@@ -268,11 +268,12 @@ section), so an account-profile fetch never needs its own auth block.
 
 One entry per quota window the provider reports (Codex: 5-hour + weekly;
 Claude: same). At most one window may have `role = "primary"` — the
-manifest fails validation with 2+.
+manifest fails validation with 2+. A manifest may declare at most 32
+`[[windows]]` entries.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `id` | string | no (default empty) | stable identity of this window, the key its remembered state is filed under in `config.json`; at most 64 bytes of lowercase ASCII letters, digits and hyphens, starting with a letter or digit. Empty means the entry's position stands in (`wN`) — and a caption is deliberately *not* used as identity, since a label is expected to change freely. Needs `requires_reader = ["window-identity"]` |
+| `id` | string | no (default empty) | stable identity of this window — the `<entry>` half of its `Window::key`, matched across fetches (and, for an enumerating entry, the base a per-element row's key is built from); at most 64 bytes of lowercase ASCII letters, digits and hyphens, starting with a letter or digit. Empty means the entry's position stands in (`wN`) — and a caption is deliberately *not* used as identity, since a label is expected to change freely. Not a `config.json` key: the seen-window registry keys by *role* (`"primary"`/`"secondary"`) and never records an `Extra`-role window at all. Needs `requires_reader = ["window-identity"]` |
 | `label` | string | yes | short row label shown in the popup (`"5H"`, `"WK"`) |
 | `role` | `"primary"` \| `"secondary"` \| `"extra"` | yes | UI slot this window fills; primary drives the auto-ping and the pill's first mini-bar. `extra` fills neither slot: it is a row in the panel and nothing else — see below |
 | `required` | bool | no (default `false`) | whether this provider *always* reports this window, so its absence is the provider's error rather than a fact about the account — see [Presence](#presence-a-window-that-isnt-there). Needs `requires_reader = ["window-presence"]` |
@@ -285,7 +286,7 @@ manifest fails validation with 2+.
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `mode` | `"assumed"` \| `"from_field"` | yes | how the period length is determined |
-| `assumed` | integer (minutes) | when `mode = "assumed"` | fixed period length |
+| `assumed` | integer (minutes) | when `mode = "assumed"` | fixed period length; at least 5 — a manifest-stated period shorter than that reaches `main.rs`'s auto-ping arithmetic as a window that has effectively always just started |
 | `field` | string | when `mode = "from_field"` | dotted JSON path to the period length, read from the reading itself |
 | `unit` | `"minutes"` \| `"seconds"` | no (default `"minutes"`) | unit of the value at `field`; the stored length is always minutes (seconds round down). Codex states `window_minutes` in its logs and `limit_window_seconds` in its API |
 
@@ -497,7 +498,7 @@ No escaping is offered rather than invented. No wildcards.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `containers` | array of strings | empty | `http-api`: candidate objects this window may live in, each a dotted path into the response (e.g. `["rate_limit.primary_window", "rate_limit.secondary_window"]`). The other paths in this section are then read *relative to* the candidate that classifies as this window. Empty = read from the response root, the pre-existing behaviour |
+| `containers` | array of strings | empty | `http-api`: candidate objects this window may live in, each a dotted path into the response (e.g. `["rate_limit.primary_window", "rate_limit.secondary_window"]`); at most 8. The other paths in this section are then read *relative to* the candidate that classifies as this window. Empty = read from the response root, the pre-existing behaviour |
 | `used_percent_path` | string | — (one of two, required) | dotted JSON path to the consumed-percent number, 0–100 |
 | `remaining_fraction_path` | string | — (the other) | dotted JSON path to a **remaining** fraction, 0..1, for a provider that states what is left rather than what is spent (Antigravity's `remainingFraction`). Mutually exclusive with `used_percent_path`; needs `requires_reader = ["remaining-fraction"]` |
 | `resets_at_path` | string | — (required) | dotted JSON path to the absolute reset timestamp |
@@ -584,7 +585,7 @@ provider unwritable as a plugin.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `id` | string | no | stable identity, same charset and cap as `[[windows]] id` (it becomes a segment of a dotted key on disk). Without one the entry falls back to `bN` — never `wN`, so a balance and a window at the same index cannot share a registry entry |
+| `id` | string | no | stable identity, same charset and cap as `[[windows]] id` (it becomes the `<entry>` half of this balance's `Balance::key`, matched across fetches — no `config.json` registry keys a balance by it; balances have no seen-window-style persistence at all today). Without one the entry falls back to `bN` — never `wN`, so a balance and a window at the same index cannot share an identity |
 | `label` | string | yes | row label, a **literal**; never a template, so provider text cannot reach a caption this app vouches for |
 | `[balances.used]` | table | no | what has been spent |
 | `[balances.cap]` | table | no | the ceiling, when the provider states one |
@@ -593,7 +594,8 @@ provider unwritable as a plugin.
 
 An entry must name at least one of `used`, `cap`, `remaining`,
 `source.percent_path` or `source.limit_reached_path` — an entry that reads
-nothing is a caption beside empty space.
+nothing is a caption beside empty space. A manifest may declare at most 16
+`[[balances]]` entries.
 
 #### Amount tables (`used` / `cap` / `remaining`)
 
@@ -694,7 +696,8 @@ Required when `engine = "log-file"`.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `root_env` | string | — (optional) | name of an env var that, if set in the process environment, overrides where the engine searches (mirrors the existing `CODEX_HOME` override) |
-| `root` | string | — (required) | root directory to search; `~` and `{config_dir}` expand (see [Path expansion](#path-expansion)) |
+| `root_env_join` | string | — (optional) | subdirectory appended onto `root_env`'s value when it is set (`"sessions"` so `$CODEX_HOME` resolves to `$CODEX_HOME/sessions`); ignored otherwise. Must be a relative path with no `..` component — it is joined onto the env var's value, never used in its place |
+| `root` | string | — (required) | root directory to search; `~` and `{config_dir}` expand (see [Path expansion](#path-expansion)); no `..` component |
 | `glob` | string | — (required) | glob, relative to `root`, matching the provider's log files (e.g. `"**/rollout-*.jsonl"`) |
 | `format` | string | `"jsonl"` | log file format — currently the only supported value |
 | `select` | string | `"last"` | which reading to keep when a file has more than one — currently the only supported value |
@@ -709,18 +712,21 @@ Required when `engine = "http-api"`.
 |---|---|---|---|
 | `[[http.request]]` | array of tables | — (required) | the request to issue — exactly one; validation refuses a `[http]` with none and one with two or more |
 | `[http.version]` | table | — (optional) | source for the `{version}` header substitution |
-| `[[http.value]]` | array of tables | empty | named values read from local files, substituted into headers as `{value.<name>}` |
-| `min_interval_secs` | integer | `55` | smallest gap between two requests for one surface, however the fetch was triggered — see [Request pacing](#request-pacing) |
-| `backoff_start_secs` | integer | `60` | first cool-off after a failed request |
-| `backoff_max_secs` | integer | `900` | ceiling the doubling cool-off stops at |
-| `unauthorized_retry_secs` | integer | `3600` | how long an expired session stops the polling for, before one more attempt |
+| `[[http.value]]` | array of tables | empty | named values read from local files, substituted into headers as `{value.<name>}`; at most 32 entries |
+| `min_interval_secs` | integer | `55` | smallest gap between two requests for one surface, however the fetch was triggered — see [Request pacing](#request-pacing); must be below `refresh_secs`, or the scheduled refresh is skipped every other tick |
+| `backoff_start_secs` | integer | `60` | first cool-off after a failed request; must be greater than 0 |
+| `backoff_max_secs` | integer | `900` | ceiling the doubling cool-off stops at; at least `backoff_start_secs`, at most 7 days |
+| `unauthorized_retry_secs` | integer | `3600` | how long an expired session stops the polling for, before one more attempt; from 1 second to 7 days |
+
+`engine = "log-file"` may not declare `[http]` at all — the section describes
+a request only the http-api engine ever sends.
 
 #### `[[http.request]]`
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `url` | string | — (required) | request URL; must be `https` |
-| `timeout_secs` | integer | `8` | request timeout, seconds; must be greater than 0 |
+| `timeout_secs` | integer | `8` | request timeout, seconds; from 1 to 120 |
 | `method` | `"get"` \| `"post"` | `"get"` | HTTP verb. Needs `requires_reader = ["http-post"]` |
 | `body` | string | — (optional) | request body for `method = "post"`, substituted exactly like a header value. A GET carrying one fails validation. Needs `requires_reader = ["http-post"]` |
 | `headers` | map<string,string> | empty | header map; values may contain `{token}` / `{version}` / `{option.<key>}` / `{value.<name>}` placeholders |
@@ -765,7 +771,7 @@ Resolves the `{version}` placeholder (Claude's User-Agent needs a real
 
 | Field | Type | Notes |
 |---|---|---|
-| `files` | array of strings | candidate files, tried in order |
+| `files` | array of strings | candidate files, tried in order; at most 16, each non-blank, each an absolute path (`~`, `/`, a drive letter or a UNC prefix — the same rule `[surface.auth.client] files` uses, since a relative one would resolve against whatever directory this process happens to run from) and free of a `..` component. Read verbatim, like `[account] path` and `client.files`: naming `{value.<name>}` or `{option.<key>}` in it is refused (nothing substitutes into it), the same "undeclared/never-substituted placeholder" rule every such field carries |
 | `json_path` | string | dotted JSON path to the version string inside whichever file matched |
 | `fallback` | string | value used if none of `files` exist or parse |
 
@@ -777,19 +783,21 @@ declare zero, one, or several surfaces.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `id` | string | — (required) | stable identifier (`"cli"`, `"desktop"`) |
+| `id` | string | — (required) | stable identifier (`"cli"`, `"desktop"`); ASCII `[A-Za-z0-9_-]+` only, unique within the manifest — it becomes the reading id (`"<plugin id>-<surface id>"`, or the plugin id verbatim for `"default"`) and a throttle key |
 | `label` | string | — (required) | display label (`"CLI"`, `"Desktop"`) |
 | `opt_in` | bool | `false` | if `true`, the surface is off unless the user explicitly enables it (for a credential lookup that needs a scary OS prompt) |
 | `in_menu_bar` | bool | `true` | whether this surface's readings show in the menu-bar pill/title; `false` for popup-only surfaces (e.g. the Claude desktop account) |
-| `allowed_hosts` | array of strings | empty | hosts this surface's requests are allowed to reach — see [Security](#security). Required, and refused when empty, on any surface whose auth chain has a step other than `reject-when`: an empty list would let its token be sent anywhere |
+| `allowed_hosts` | array of strings | empty | hosts this surface's requests are allowed to reach — see [Security](#security). Required, and refused when empty, on any surface whose auth chain has a step other than `reject-when` — regardless of `engine`, since a credential chain can exist ahead of an engine that reads it — an empty list would let its token be sent anywhere |
 | `no_credentials_message` | string | — (optional) | what to show when the whole auth chain came up empty. Unset, that state hides the provider's row entirely (right for a provider that may simply not be installed); set, the row stays and says this instead (Codex: `"Not signed in — run: codex login"`) |
 | `[[surface.auth]]` | array of tables | empty | ordered credential lookup chain — see [Auth chain](#auth-chain-semantics) |
+
+A manifest may declare at most 8 `[[surface]]` entries.
 
 **If `[[surface]]` is omitted entirely**, one is synthesized:
 `id = "default"`, `label = "Default"`, `opt_in = false`, `in_menu_bar = true`,
 `allowed_hosts = []`, `auth = []` — i.e. a single always-present surface with
-no credential chain at all (appropriate for `engine = "log-file"` providers
-like Codex, which don't need one).
+no credential chain at all — the shape a log-file manifest normally has,
+since a log reader authenticates nothing of its own.
 
 #### `[[surface.auth]]`
 
@@ -882,8 +890,8 @@ an order silently.
 | `secret_env` | string | no | environment variable naming the client secret; same charset |
 | `id_pattern` | string | **yes** | regular expression (`regex` crate syntax, compiled as `regex::bytes::Regex` — the engine the scan actually uses) matched against a candidate file's bytes; the first match is the client id |
 | `secret_pattern` | string | **yes** | same, for the client secret |
-| `files` | array of strings | no\* | absolute paths (`~` expanded) to scan first, in order |
-| `bins` | array of strings | no\* | bare program names — no `/`, `\`, `..` component or drive prefix — to resolve on `PATH` (and the usual CLI install directories) and scan next, in order |
+| `files` | array of strings | no\* | absolute paths (`~` expanded), with no `..` component, to scan first, in order — at most 16 |
+| `bins` | array of strings | no\* | bare program names — no `/`, `\`, `..` component or drive prefix — to resolve on `PATH` (and the usual CLI install directories) and scan next, in order — at most 8 |
 
 \* `files` and `bins` may each be empty, but not both — unless `id_env` and
 `secret_env` are both set, in which case there is nothing that must be
@@ -1027,7 +1035,8 @@ option yet, and Settings draws no checkbox for them yet.
 
 A template that spells `{option.<key>}` for a key no `[[option]]` declares is
 refused at load (see [Validation](#validation--forward-compatibility)); a key
-declared twice is refused too.
+declared twice is refused too. A manifest may declare at most 32
+`[[option]]` entries.
 
 ### `[ping]`
 
@@ -1036,8 +1045,15 @@ fresh window (consumes a little quota — opt-in per plugin/user).
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `bin` | string | — (required) | binary to run |
-| `args` | array of strings | empty | arguments |
+| `bin` | string | — (required) | binary to run; a bare program name, not a path — no `/`, `\` or `:` (the last rules out a Windows prefixed-relative path like `C:evil`, which has neither of the other two) |
+| `args` | array of strings | empty | arguments; at most 32, each non-empty and at most 256 bytes — the install-time trust dialog renders the whole command line, and these bounds keep one argument from pushing its untrusted-host warning off the bottom |
+
+No argument, label, hostname, message, or other manifest-supplied string
+listed in this document may contain a control character (C0, DEL) or a
+bidirectional override (U+200E/F, U+202A–E, U+2066–9, or the Unicode line/
+paragraph separators U+2028/9) — refused at load, for the same reason: one of
+these can rewrite a trust dialog, a log line, or the panel around it without
+a single visible character looking wrong.
 
 ### Path expansion
 
@@ -1075,13 +1091,25 @@ here would be a copy that drifts; the corpus is checked on every build.
 Broadly, the rules cover: `requires_reader` naming capabilities that exist,
 are implemented here, and are declared by every manifest that uses their
 fields; the fields every manifest needs and the charset an
-`id` may use (it becomes a filename and a config key); each engine having the
-section it reads, and that section being usable rather than merely present;
-one primary window, and a period that supplies what its own mode needs; the
-pacing knobs making sense as an ordered pair; every credential-carrying
-surface declaring where its token may go; credentials never appearing in a
-URL; every auth step and `[account]` type carrying its own required fields;
-`[ping]` naming a program rather than a path; and every `{value.<name>}` or
+`id` may use (it becomes a filename and a config key, and may not be one of
+Windows's reserved device names); each engine having the section it reads,
+and only that section — a `log-file` manifest may not carry `[http]` — and
+that section being usable rather than merely present; one primary window, and
+a period that supplies what its own mode needs, with `period.assumed` at
+least five minutes; every timing knob (`refresh_secs`, `min_interval_secs`,
+the backoff pair, `unauthorized_retry_secs`, `timeout_secs`) bounded above
+and below, and `min_interval_secs` kept under `refresh_secs`; every
+credential-carrying surface declaring where its token may go, regardless of
+which engine reads it; credentials never appearing in a URL; every auth step
+and `[account]` type carrying its own required fields; `[ping]` naming a
+program rather than a path, with its argument list bounded in count and
+length; every array a manifest can declare (`[[windows]]`, `[[balances]]`,
+`[[option]]`, `[[http.value]]`, `[[surface]]`, `[http.version] files`,
+`source.containers`, `client.files`/`client.bins`) capped in size; no `..`
+component in a path a manifest names (`[account] path`, `[logfile] root`,
+`[[http.value]] path`, `[http.version] files`, an auth step's `path`/
+`config_path`, `client.files`); no control character or bidirectional
+override in a string this app renders or logs; and every `{value.<name>}` or
 `{option.<key>}` a template spells being declared somewhere in the same file
 — an undeclared one is not substituted at runtime, so the request would go
 out with the braces still in it.
@@ -1133,6 +1161,17 @@ against the frozen schema above.
    `resets_at` / `resetsAt` / `reset_at`), then parse `resets_at` per that
    window's `resets_at_format`. `used_percent_path` / `resets_at_path` are
    `http-api` fields and play no part here.
+
+Two caps bound the cost of one fetch regardless of how large the session
+tree under `root` has grown, so a plugin whose glob has matched years'
+worth of files pays a fixed price rather than one proportional to what it
+matched: at most 200 files (`LOG_WALK_MAX_FILES`) are ever opened and read
+— the newest by mtime kept whenever a glob matches more, since both the
+primary lookup and the secondary-accounts lookup already read newest-first
+and only need the freshest handful — and at most 64 MiB total
+(`FETCH_BYTE_BUDGET`) is read out of them, the primary lookup and the
+secondary-accounts lookup each paying this budget separately rather than
+sharing one.
 
 ### `engine = "http-api"`
 
@@ -2135,7 +2174,7 @@ sha256      = "…"                                 # 64 lowercase hex chars
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `schema_version` | integer | no, default `1` | reserved for a future incompatible schema change; not currently branched on by this reader |
-| `[[plugin]]` | array of tables | no, default empty | every plugin the registry publishes; an index with zero entries is valid |
+| `[[plugin]]` | array of tables | no, default empty | every plugin the registry publishes; an index with zero entries is valid, and one listing more than 500 (`MAX_INDEX_ENTRIES`) is rejected wholesale, the same as any other malformed index — no real registry comes close, but a 10 MiB index paid for in short ids rather than useful content could otherwise still hand the UI thread on the order of a hundred thousand rows to sort, diff and draw |
 
 Per `[[plugin]]` entry:
 
@@ -2446,40 +2485,60 @@ written to disk, the caller runs `analyze_trust` on the parsed
 |---|---|
 | `engine` | `log-file` or `http-api` |
 | `auth_types` | every distinct `[[surface.auth]].type` used by any surface, across every surface, in first-seen order — every auth-source type the manifest declares, not just the ones that trigger the mandatory gate below |
-| `dest_hosts` | every distinct destination host the manifest could reach: every `[[http.request]].url` host, plus `[account].url`'s host when `type = "http"`, case-insensitively de-duplicated, in first-seen order |
+| `dest_hosts` | every distinct destination host the manifest could reach: every `[[http.request]].url` host, `[account].url`'s host when `type = "http"`, and every `oauth-refresh` step's `token_url` host — each URL's `{option.<key>}` placeholders substituted at the manifest's own `[[option]]` defaults *before* the host is read off, so a host spelled `{option.beta}.example` discloses the destination it actually resolves to, not the placeholder text — case-insensitively de-duplicated, in first-seen order |
+| `untrusted_hosts` | the subset of `dest_hosts` outside the caller's `trusted_hosts` set — disclosure only, see below for why it doesn't gate `requires_approval` |
+| `local_files` | every local file, or file-*shaped* source, the manifest reads: an auth step's own credential file (`credentials-file`/`credentials-map`/`reject-when`/`oauth-refresh`'s `path`), `[[http.value]] path`, `[http.version] files`, an `oauth-refresh` step's `[surface.auth.client]` discovery (`files`, `bins` labelled by name rather than a path, `id_env`/`secret_env` labelled as an environment variable, `id_pattern`/`secret_pattern` labelled and length-capped), an `electron-safe-storage` step's `config_path`, `engine = "log-file"`'s own `root`/`glob` read scope (one `"<root>/<glob>"` entry, `root` shown literally — `~` included, unexpanded — unless `root_env` is set, in which case it's `"$<root_env>"`, joined with `root_env_join` when the manifest sets one), and `[account] path` (a `jwt-file` lookup's own token file) |
+| `credential_sources` | every `env`/`keychain`/`win-credential`/`electron-safe-storage` auth step's *own* source, named specifically — `"env $VAR"`, `"keychain \"service\""`, one `"credential manager \"target\""` per target tried, `"electron safe storage <config_path> (key \"...\")"` — rather than just the step *kind* `auth_types` already carries; `credentials-file`/`credentials-map` don't repeat here since their file is already in `local_files` |
+| `ping` | the command this manifest runs after a window resets, if it declares one |
 | `requires_approval` | see below |
 
-**Mandatory approval gate.** `requires_approval` is `true` exactly when
-*both* hold at once:
+**Mandatory approval gate.** `requires_approval` is `true` when *any* of the
+following hold:
 
 1. At least one auth step is **store-backed** — `credentials-file`,
-   `keychain`, `electron-safe-storage`, or `win-credential` (i.e. it reads
-   a secret out of some OS- or app-managed store), **not** a plain `env`
-   step. An `env` var is something the user set themselves, not a store
-   this manifest goes digging in — `env`-only auth is still disclosed in
-   `auth_types` like everything else, but it never gates this flag on its
-   own.
-2. `engine = "http-api"` — the manifest can actually send something
-   somewhere, unlike `log-file`, which never touches the network.
+   `keychain`, `electron-safe-storage`, `win-credential`, `credentials-map`,
+   or `oauth-refresh` (i.e. it reads a secret out of some OS-/app-managed
+   store, or sends one to the network on its own) — **and** `engine =
+   "http-api"`, i.e. the manifest can actually send something somewhere,
+   unlike `log-file`, which never touches the network on its own account.
+   A plain `env` step is excluded from "store-backed" here: a var is
+   something the user set themselves, not a store this manifest goes
+   digging in (it can still trip condition 4 below, just not this one).
+2. It declares `[ping]` — an arbitrary local command is worth stopping for
+   whatever the engine.
+3. `local_files` is non-empty — a manifest reading a local file of its own
+   choosing (including `engine = "log-file"`'s own read scope) is the same
+   "something on this machine leaves it, or a manifest picks what a request
+   carries off this machine" shape as a stored credential, whatever the
+   engine.
+4. `credential_sources` is non-empty — naming a specific `env`/`keychain`/
+   `win-credential`/`electron-safe-storage` source is worth a look whatever
+   the engine: a `log-file` manifest whose one auth step reads
+   `AWS_SECRET_ACCESS_KEY` is exactly as much this app's business as an
+   `http-api` one that reads it and sends it on, since nothing stops a later
+   update from adding the sending half once the reading half already
+   installed unseen.
 
-The destination host is deliberately **not** a third condition. Reading a
-real credential store out of a third-party manifest is itself the thing
-worth a confirmation — the manifest author controls the URL, so a plugin
-that reads your Claude token and today posts it to `api.anthropic.com`
-could post it elsewhere tomorrow, and the approval was granted against the
-"safe" version. Everything that comes through the registry install flow is
-third-party by definition (the bundled `codex`/`claude` are *seeded*, never
-installed through this path), so the gate fires for any registry plugin
-that reads a secret over `http-api`, regardless of where it currently sends
-it.
+Condition 1 is the only one still narrowed to `engine = "http-api"`; the
+other three fire whatever the engine declares. Reading a real credential
+store out of a third-party manifest is itself the thing worth a
+confirmation — the manifest author controls the URL, so a plugin that reads
+your Claude token and today posts it to `api.anthropic.com` could post it
+elsewhere tomorrow, and the approval was granted against the "safe" version.
+Everything that comes through the registry install flow is third-party by
+definition (the bundled `codex`/`claude` are *seeded*, never installed
+through this path), so condition 1 fires for any registry plugin that reads
+a secret over `http-api`, regardless of where it currently sends it — and
+the destination host is deliberately not a condition of its own, for any of
+the four.
 
 The destination host still matters for **disclosure**, just not for the
 gate: `analyze_trust` also returns `untrusted_hosts` — the subset of
 `dest_hosts` not in the caller's `trusted_hosts` set (default
-`TRUSTED_HOSTS = ["api.anthropic.com"]`, passed as a parameter, not
-hardcoded in the function). The confirmation dialog highlights those hosts
-so the user sees which destinations are unfamiliar, but the dialog appears
-whether or not any host is untrusted.
+`TRUSTED_HOSTS = ["api.anthropic.com", "chatgpt.com"]`, passed as a
+parameter, not hardcoded in the function). The confirmation dialog
+highlights those hosts so the user sees which destinations are unfamiliar,
+but the dialog appears whether or not any host is untrusted.
 
 `requires_approval` is a **computed disclosure flag**, not an enforced
 gate, by itself — `analyze_trust` only tells the caller whether the

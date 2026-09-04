@@ -167,6 +167,60 @@ fn default_refresh_secs() -> u64 {
     60
 }
 
+/// Floor for `refresh_secs`, checked by `validate`. Below this a poll is not
+/// "fresher", it is a loop against a local file or somebody else's API.
+const MIN_REFRESH_SECS: u64 = 5;
+
+/// Ceiling for `refresh_secs`. A day above the slowest shipped cadence
+/// (Copilot's 300s), not a figure tuned to any one provider.
+const MAX_REFRESH_SECS: u64 = 86_400;
+
+/// Floor for a `[[windows]] period.assumed`, in minutes — `validate`'s own
+/// call site explains why: the shortest real window shipped is 300 minutes,
+/// and this only exists to stop a much smaller number reaching
+/// `main.rs`'s ping arithmetic.
+const MIN_ASSUMED_PERIOD_MINUTES: u64 = 5;
+
+/// Ceiling shared by `[http] unauthorized_retry_secs` and
+/// `[http] backoff_max_secs` — a week. Both are cool-offs after a failure,
+/// and both fail the same way above this: a manifest naming a much larger
+/// value (or the field's own unsigned maximum) turns "back off, then try
+/// again" into "never try again", indistinguishable in practice from the
+/// surface simply having stopped working.
+const MAX_HTTP_COOLDOWN_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Ceiling for `[[http.request]] timeout_secs` — two minutes, far past
+/// anything a provider this app talks to has taken to answer. A manifest
+/// asking for longer holds the fetch thread (and `main.rs`'s `FetchGuard`)
+/// on one slow request instead of failing it and backing off.
+const MAX_TIMEOUT_SECS: u64 = 120;
+
+/// Cap on `name`, the popup's section header — plenty for "Antigravity", the
+/// longest shipped, with room for a third party's longer one.
+const NAME_MAX_CHARS: usize = 64;
+
+/// Cap on `menu_label`, the menu-bar pill — every shipped one is two
+/// characters ("Cx", "Cl", "Cp", "Gk", "Ag"); 16 is headroom, not a fit.
+const MENU_LABEL_MAX_CHARS: usize = 16;
+
+// Count caps on every array a manifest can declare — none tuned to any one
+// provider, all far past what one has ever needed (the largest shipped,
+// Antigravity's four windows and two surfaces, sits well under every figure
+// here). Two reasons to have them at all: `validate` walks several of these
+// arrays against themselves looking for a colliding identity (an O(n²)
+// comparison — see the `[[windows]]`/`[[balances]]` identity checks), and a
+// third-party manifest with hundreds of entries in any of them is a
+// manifest reporting a "quota" no real provider has, not a plugin author's
+// honest mistake.
+const WINDOWS_MAX_COUNT: usize = 32;
+const BALANCES_MAX_COUNT: usize = 16;
+const OPTIONS_MAX_COUNT: usize = 32;
+const HTTP_VALUES_MAX_COUNT: usize = 32;
+const SURFACES_MAX_COUNT: usize = 8;
+const CLIENT_FILES_MAX_COUNT: usize = 16;
+const CLIENT_BINS_MAX_COUNT: usize = 8;
+const SOURCE_CONTAINERS_MAX_COUNT: usize = 8;
+
 fn default_true() -> bool {
     true
 }
@@ -276,20 +330,136 @@ impl PluginManifest {
                 self.id
             ));
         }
+        // The charset above admits every one of Windows's reserved device
+        // names — none of `CON`, `NUL`, `COM1`, `LPT1`… uses a character
+        // outside `[A-Za-z0-9_-]`. `<id>.toml` named exactly one of them
+        // resolves to the device, not a file, on that platform, whatever
+        // extension follows: `find_plugin_manifest_path` would seek a file
+        // that can never be opened for writing, and a plugin manager on
+        // Windows offering to create it would hang or fail on the device
+        // instead.
+        if is_windows_reserved_device_name(&self.id) {
+            return Err(format!(
+                "`id = \"{}\"` is a reserved device name on Windows (CON/PRN/AUX/NUL/COM1-9/LPT1-9) \
+                 — `<id>.toml` would name the device, not a file, on that platform",
+                self.id
+            ));
+        }
         if self.name.trim().is_empty() {
             return Err("`name` must not be empty".to_string());
         }
+        // `name` is the popup's section header — sized to fit that role, not
+        // to carry a sentence. Uncapped, a provider whose manifest is a
+        // third-party (not necessarily malicious) mistake could size the
+        // panel around one string.
+        if self.name.chars().count() > NAME_MAX_CHARS {
+            return Err(format!(
+                "`name` is {} characters — {NAME_MAX_CHARS} is the cap for a section header",
+                self.name.chars().count()
+            ));
+        }
         if self.menu_label.trim().is_empty() {
             return Err("`menu_label` must not be empty".to_string());
+        }
+        // `menu_label` sizes the menu-bar pill — every shipped one is two
+        // characters ("Cx", "Cl", "Cp") — and that allocation, unlike
+        // `name`'s, runs on `main.rs`'s own layout code every tick, not once
+        // per open of the popup.
+        if self.menu_label.chars().count() > MENU_LABEL_MAX_CHARS {
+            return Err(format!(
+                "`menu_label` is {} characters — {MENU_LABEL_MAX_CHARS} is the cap for the \
+                 menu-bar pill",
+                self.menu_label.chars().count()
+            ));
+        }
+
+        // `[[surface]] id` becomes the reading id every engine builds a
+        // `ProviderReading` from (`engine_http`/`engine_logfile`'s own
+        // `surface_reading_id`: the plugin's own `id` verbatim for
+        // `"default"`, `"{plugin.id}-{surface.id}"` otherwise) — the same
+        // identity `throttle::key` paces by and `main.rs` files a panel row
+        // under. The charset mirrors the plugin `id` check above, for the
+        // same filename-stem/config-key reasons that one exists for
+        // (`throttle::key` and a future per-surface config setting would
+        // both make this a dotted-path segment); uniqueness matters more
+        // here than there, since two surfaces sharing an id resolve to one
+        // reading, with one silently standing in for two accounts.
+        if self.surface.len() > SURFACES_MAX_COUNT {
+            return Err(format!(
+                "`[[surface]]` names {} entries — at most {SURFACES_MAX_COUNT}",
+                self.surface.len()
+            ));
+        }
+        let mut seen_surface_ids: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        for surface in &self.surface {
+            if surface.id.trim().is_empty() {
+                return Err("`[[surface]] id` must not be empty".to_string());
+            }
+            if !surface
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return Err(format!(
+                    "`[[surface]] id = \"{}\"` must contain only ASCII letters, digits, \
+                     underscores and hyphens",
+                    surface.id
+                ));
+            }
+            if !seen_surface_ids.insert(surface.id.as_str()) {
+                return Err(format!(
+                    "`[[surface]]` id \"{}\" is declared more than once",
+                    surface.id
+                ));
+            }
         }
 
         if self.refresh_secs == 0 {
             return Err("`refresh_secs` must be greater than 0".to_string());
         }
+        // A cadence under `MIN_REFRESH_SECS` is not "fresher", it is a poll
+        // loop: the log-file engine would re-open and re-scan the same file
+        // several times a second, and the http engine would burn through
+        // `[http] min_interval_secs`'s floor before the timer had any real
+        // gap to close. Every shipped manifest polls at 60s or slower.
+        if self.refresh_secs < MIN_REFRESH_SECS {
+            return Err(format!(
+                "`refresh_secs = {}` is below the {MIN_REFRESH_SECS}-second floor — nothing this \
+                 app reads changes fast enough to be worth polling more often than that",
+                self.refresh_secs
+            ));
+        }
+        // And a day is generous headroom above the slowest shipped cadence
+        // (Copilot's monthly counter, polled every 300s) — a manifest asking
+        // for less than once a day would leave a stale reading on screen for
+        // a window that may have reset hours ago, with `main.rs`'s ping
+        // logic never getting a fresh figure to arm on either.
+        if self.refresh_secs > MAX_REFRESH_SECS {
+            return Err(format!(
+                "`refresh_secs = {}` is above the {MAX_REFRESH_SECS}-second (24h) ceiling",
+                self.refresh_secs
+            ));
+        }
 
         match self.engine {
             EngineKind::LogFile if self.logfile.is_none() => {
                 return Err("engine = \"log-file\" requires a [logfile] section".to_string());
+            }
+            // `[http]` describes the one request only `engine = "http-api"`
+            // ever sends. Accepted on a log-file manifest, it would be a
+            // whole section — a live `[[http.request]]` url, a
+            // credential-bearing surface, backoff knobs — that this app
+            // parses, validates and then never reads at all: exactly the
+            // silent-misread shape the rest of this file exists to refuse,
+            // just not gated by a capability because no older build is
+            // involved, only a copied-and-edited third-party manifest.
+            EngineKind::LogFile if self.http.is_some() => {
+                return Err(
+                    "engine = \"log-file\" does not read an [http] section — only \
+                     engine = \"http-api\" does"
+                        .to_string(),
+                );
             }
             EngineKind::HttpApi => match &self.http {
                 None => {
@@ -319,6 +489,26 @@ impl PluginManifest {
             ];
             if let Some((field, _)) = blank.iter().find(|(_, empty)| *empty) {
                 return Err(format!("`[logfile] {field}` must not be empty"));
+            }
+            // `root_env_join` is joined onto the env var's *value*
+            // (`$CODEX_HOME` → `$CODEX_HOME/sessions`), never onto `root`
+            // itself — it is a subdirectory name, not a path of its own, so
+            // an absolute value would silently discard whatever the
+            // environment named, and a `..` component would walk the search
+            // outside whatever directory that env var pointed at.
+            if let Some(join) = &lf.root_env_join {
+                if is_absolute_on_any_platform(Path::new(join)) {
+                    return Err(format!(
+                        "`[logfile] root_env_join = \"{join}\"` must be a relative subdirectory \
+                         — it is appended to `root_env`'s value, not used in its place"
+                    ));
+                }
+                if has_dotdot_component(join) {
+                    return Err(format!(
+                        "`[logfile] root_env_join = \"{join}\"` must not contain a `..` \
+                         component — it would search outside the directory `root_env` named"
+                    ));
+                }
             }
         }
         // Same for the one endpoint an http manifest calls: an empty URL is a
@@ -350,23 +540,42 @@ impl PluginManifest {
                 );
             }
         }
-        // A `{` earlier in the body than a placeholder — most commonly a JSON
-        // object's own opening brace — can swallow that placeholder before
-        // this app, or the engine, ever reads its name; see
-        // `body_swallows_a_placeholder` for the exact failure this catches.
-        // Checked here, at load, rather than left to be discovered as a
-        // request sent with a literal `{token}` still in it.
+        // A `{` earlier in a body, header value or URL than a real
+        // placeholder — most commonly a JSON object's own opening brace in a
+        // body, but nothing about the shape is body-specific: a header value
+        // someone wrote a JSON fragment into, or a URL whose query string
+        // opens with an unrelated `{`, swallows a later placeholder exactly
+        // the same way — can pair that placeholder's own closing brace with
+        // the earlier `{` before this app, or the engine, ever reads its
+        // name; see `swallowed_placeholder` for the exact failure this
+        // catches. Checked here, at load, rather than left to be discovered
+        // as a request sent with a literal `{token}` still in it. One sweep
+        // over every field of the one request an http-api manifest sends,
+        // the same shape as the control-character and `..` sweeps below.
         if let Some(http) = &self.http {
             for req in &http.request {
+                let mut request_texts: Vec<(String, &str)> =
+                    vec![("`[[http.request]] url`".to_string(), req.url.as_str())];
+                for (header, value) in &req.headers {
+                    request_texts.push((
+                        format!("`[[http.request]]` header `{header}`"),
+                        value.as_str(),
+                    ));
+                }
                 if let Some(body) = &req.body {
-                    if let Some(marker) = body_swallows_a_placeholder(body) {
-                        return Err(format!(
-                            "`[[http.request]] body` names {marker}, but an earlier `{{` in the \
-                             body — typically a JSON object's own opening brace — pairs with that \
-                             placeholder's closing brace before its name is ever read, so it would \
-                             be sent on the wire exactly as written"
-                        ));
-                    }
+                    request_texts.push(("`[[http.request]] body`".to_string(), body.as_str()));
+                }
+                if let Some((where_it_is, marker)) =
+                    request_texts.iter().find_map(|(where_it_is, text)| {
+                        swallowed_placeholder(text).map(|marker| (where_it_is, marker))
+                    })
+                {
+                    return Err(format!(
+                        "{where_it_is} names {marker}, but an earlier `{{` — typically a JSON \
+                         object's own opening brace — pairs with that placeholder's closing brace \
+                         before its name is ever read, so it would be sent on the wire exactly as \
+                         written"
+                    ));
                 }
             }
         }
@@ -380,6 +589,24 @@ impl PluginManifest {
         if self.windows.is_empty() && self.balances.is_empty() {
             return Err("at least one [[windows]] or [[balances]] section is required".to_string());
         }
+        // Every identity check above and below this point (windows against
+        // windows, balances against balances, `for_each` filters) is O(n²)
+        // in the count of the section it walks — cheap at the size any real
+        // provider has ever needed, and a manifest asking for hundreds of
+        // entries is asking this app to do that on every load rather than
+        // reporting an actual quota.
+        if self.windows.len() > WINDOWS_MAX_COUNT {
+            return Err(format!(
+                "`[[windows]]` names {} entries — at most {WINDOWS_MAX_COUNT}",
+                self.windows.len()
+            ));
+        }
+        if self.balances.len() > BALANCES_MAX_COUNT {
+            return Err(format!(
+                "`[[balances]]` names {} entries — at most {BALANCES_MAX_COUNT}",
+                self.balances.len()
+            ));
+        }
 
         let primary_count = self
             .windows
@@ -392,12 +619,15 @@ impl PluginManifest {
             ));
         }
 
-        // `[[windows]] id` becomes a segment of the seen-window registry key in
-        // the user's `config.json`, whose paths are dot-separated — a `.` in it
-        // would split the path and grow a neighbouring table in their config.
-        // The charset is a whitelist for the same reason the plugin `id` above
-        // has one, and the length cap is because the key is written to disk
-        // once per window per tick.
+        // `[[windows]] id` becomes the `<entry>` half of this window's
+        // `crate::model::Window::key` (`window_key`, `WINDOW_ID_MAX_BYTES`'s
+        // own doc says which registry it is not). That key is matched and
+        // compared in-process every fetch — a `for_each` row is found again
+        // by it, and a dedup check walks it — so the charset is a whitelist
+        // for the same reason the plugin `id` above has one: legible without
+        // decoding, even though `encode_key_part` would percent-encode
+        // whatever this refusal didn't catch. The length cap keeps that
+        // comparison, and every log line that quotes the id, cheap.
         for w in &self.windows {
             if w.id.is_empty() {
                 continue;
@@ -791,6 +1021,28 @@ impl PluginManifest {
                 _ => {}
             }
         }
+        // A window this short turns `main.rs`'s `ping_due` arithmetic —
+        // `pinged_at + PING_GRACE_SECS < start` with `start = reset − period`
+        // — into something that can fire on every one-second tick: a
+        // `period.assumed` of 1 minute (or the field's own zero default were
+        // it ever left unset) puts `start` in the past by design, and a
+        // manifest making that number up gets to choose it. Real windows
+        // measure in hours; `MIN_ASSUMED_PERIOD_MINUTES` is a floor far below
+        // the shortest one shipped (Claude/Antigravity's five-hour window,
+        // at 300), not a tight fit around it. `period.mode = "from_field"`
+        // is exempt — that length comes from the provider's own response,
+        // not from a number the manifest author picked.
+        for w in &self.windows {
+            if let (PeriodMode::Assumed, Some(assumed)) = (w.period.mode, w.period.assumed) {
+                if assumed < MIN_ASSUMED_PERIOD_MINUTES {
+                    return Err(format!(
+                        "windows[label = \"{}\"]: period.assumed = {assumed} minutes is shorter \
+                         than the {MIN_ASSUMED_PERIOD_MINUTES}-minute floor",
+                        w.label
+                    ));
+                }
+            }
+        }
 
         // A window that lists more than one candidate container has to be able
         // to tell them apart, and length is the only thing it classifies on
@@ -801,6 +1053,14 @@ impl PluginManifest {
                 return Err(format!(
                     "windows[label = \"{}\"]: source.containers lists {} candidates, so \
                      period.mode must be \"from_field\" to tell them apart by length",
+                    w.label,
+                    w.source.containers.len()
+                ));
+            }
+            if w.source.containers.len() > SOURCE_CONTAINERS_MAX_COUNT {
+                return Err(format!(
+                    "windows[label = \"{}\"]: source.containers lists {} candidates — at most \
+                     {SOURCE_CONTAINERS_MAX_COUNT}",
                     w.label,
                     w.source.containers.len()
                 ));
@@ -840,6 +1100,54 @@ impl PluginManifest {
             }
         }
 
+        // `[account] url`'s two checks used to sit inside `if let Some(http)`
+        // below, which was never the right gate for them: `[account] type =
+        // "http"` sends its own request whatever `self.engine` is (the
+        // log-file engine simply has no use for it today —
+        // `engine_logfile::resolve_account`'s own doc says so — which is a
+        // reason for that engine to ignore the field, not a reason for this
+        // file to stop checking it). A log-file manifest naming a header-only
+        // placeholder or a plain `http://` account URL was loading clean and
+        // would only ever have failed once some future engine read it.
+        if let Some(url) = &self.account.url {
+            if let Some(bad) = url_placeholder(url) {
+                return Err(format!(
+                    "`[account] url` may not contain {bad} — {{token}}, {{version}} and \
+                     {{value.<name>}} are substituted into headers only"
+                ));
+            }
+        }
+        if let Some(url) = &self.account.url {
+            if super::https_host(url).is_none() {
+                return Err(format!(
+                    "`[account] url` must be https — refusing to send a request over {url}"
+                ));
+            }
+        }
+        // A surface that carries a credential must say where it may go. An
+        // empty `allowed_hosts` means "no restriction configured", which is
+        // a fine default for a manifest that sends nothing — and exactly the
+        // wrong one for a manifest that sends a token. Also moved out of
+        // `if let Some(http)`: the rule is about what a *credential* may
+        // reach, not about what `[http]` may reach, and a log-file manifest
+        // can carry a `[[surface.auth]]` chain of its own (feeding `[account]
+        // type = "http"`, or simply written ahead of an engine that will one
+        // day read it) exactly as unguarded as an http-api one was before
+        // this moved.
+        for surface in &self.surface {
+            let carries_credentials = surface
+                .auth
+                .iter()
+                .any(|step| step.kind != AuthType::RejectWhen);
+            if carries_credentials && surface.allowed_hosts.is_empty() {
+                return Err(format!(
+                    "surface \"{}\": a surface with a credential chain must declare \
+                     `allowed_hosts` — an empty list would let its token be sent anywhere",
+                    surface.id
+                ));
+            }
+        }
+
         if let Some(http) = &self.http {
             // `{token}`, `{version}` and `{value.<name>}` are header-only, by
             // design: a URL is where a credential is most easily logged by
@@ -852,14 +1160,6 @@ impl PluginManifest {
                     return Err(format!(
                         "`[[http.request]] url` may not contain {bad} — {{token}}, {{version}} \
                          and {{value.<name>}} are substituted into headers only"
-                    ));
-                }
-            }
-            if let Some(url) = &self.account.url {
-                if let Some(bad) = url_placeholder(url) {
-                    return Err(format!(
-                        "`[account] url` may not contain {bad} — {{token}}, {{version}} and \
-                         {{value.<name>}} are substituted into headers only"
                     ));
                 }
             }
@@ -884,29 +1184,56 @@ impl PluginManifest {
                     ));
                 }
             }
-            if let Some(url) = &self.account.url {
-                if super::https_host(url).is_none() {
+            // `[http.version]` — the `files` candidates `resolve_version`
+            // tries, in order, before falling back to `fallback`. Not gated
+            // on `requires_reader`: an older build ignores the whole table
+            // (there is no capability for it), so the risk this file guards
+            // against elsewhere — a build that half-understands a section —
+            // does not apply here. What does apply is the same shape of
+            // mistake `[logfile]`'s blank check exists for: a manifest that
+            // parses clean and then reads nothing every fetch, silently
+            // falling back to `fallback` forever.
+            if let Some(version) = &http.version {
+                if version.files.len() > HTTP_VERSION_FILES_MAX_COUNT {
                     return Err(format!(
-                        "`[account] url` must be https — refusing to send a request over {url}"
+                        "`[http.version] files` names {} entries — at most \
+                         {HTTP_VERSION_FILES_MAX_COUNT}",
+                        version.files.len()
+                    ));
+                }
+                if let Some(bad) = version.files.iter().find(|f| f.trim().is_empty()) {
+                    return Err(format!(
+                        "`[http.version] files` entry \"{bad}\" must not be blank"
+                    ));
+                }
+                // Same rule and the same reasoning as `client.files` above:
+                // a relative entry resolves against whatever directory this
+                // process happens to be running from, never the intent of
+                // naming an installed client's own version file, and
+                // `is_absolute_on_any_platform` (not `Path::is_absolute`)
+                // because this manifest ships to every platform this app
+                // runs on, not only the one validating it.
+                if let Some(bad) = version
+                    .files
+                    .iter()
+                    .find(|f| !is_absolute_on_any_platform(&super::expand_home(f)))
+                {
+                    return Err(format!(
+                        "`[http.version] files` entry \"{bad}\" must be an absolute path"
                     ));
                 }
             }
-            // A surface that carries a credential must say where it may go.
-            // An empty `allowed_hosts` means "no restriction configured",
-            // which is a fine default for a manifest that sends nothing —
-            // and exactly the wrong one for a manifest that sends a token.
-            for surface in &self.surface {
-                let carries_credentials = surface
-                    .auth
-                    .iter()
-                    .any(|step| step.kind != AuthType::RejectWhen);
-                if carries_credentials && surface.allowed_hosts.is_empty() {
-                    return Err(format!(
-                        "surface \"{}\": a surface with a credential chain must declare \
-                         `allowed_hosts` — an empty list would let its token be sent anywhere",
-                        surface.id
-                    ));
-                }
+            // `min_interval_secs`'s own doc states this: a floor at or above
+            // the scheduled cadence skips every other tick (the timer lands
+            // a hair early against the floor's own clock, so half its runs
+            // are turned away), halving the real refresh rate for a manifest
+            // whose author asked for the opposite of that.
+            if http.min_interval_secs >= self.refresh_secs {
+                return Err(format!(
+                    "`[http] min_interval_secs` ({}) must be below `refresh_secs` ({}) — at or \
+                     above it, the scheduled refresh is skipped every other tick",
+                    http.min_interval_secs, self.refresh_secs
+                ));
             }
             if http.backoff_start_secs == 0 {
                 return Err("`[http] backoff_start_secs` must be greater than 0".to_string());
@@ -914,10 +1241,36 @@ impl PluginManifest {
             if http.unauthorized_retry_secs == 0 {
                 return Err("`[http] unauthorized_retry_secs` must be greater than 0".to_string());
             }
+            // Unbounded, a manifest naming a huge value (or the field's own
+            // max — `u64::MAX` seconds is longer than this app, or its user,
+            // will run) stops polling a surface after its first 401 forever:
+            // nothing short of editing the manifest or reinstalling the
+            // plugin would ever try it again, which is a worse failure mode
+            // than the loop this field exists to prevent. A week is well
+            // past any credential expiry this app has ever measured.
+            if http.unauthorized_retry_secs > MAX_HTTP_COOLDOWN_SECS {
+                return Err(format!(
+                    "`[http] unauthorized_retry_secs` ({}) must be at most {MAX_HTTP_COOLDOWN_SECS} \
+                     seconds (7 days) — longer than that is indistinguishable from never retrying",
+                    http.unauthorized_retry_secs
+                ));
+            }
             if http.backoff_max_secs < http.backoff_start_secs {
                 return Err(format!(
                     "`[http] backoff_max_secs` ({}) must be at least backoff_start_secs ({})",
                     http.backoff_max_secs, http.backoff_start_secs
+                ));
+            }
+            // Same reasoning as `unauthorized_retry_secs` just above, for the
+            // same failure shape: a backoff ceiling this high is a surface
+            // that, once it has failed a handful of times, is retried on a
+            // timescale nobody would recognise as "backing off" rather than
+            // "given up".
+            if http.backoff_max_secs > MAX_HTTP_COOLDOWN_SECS {
+                return Err(format!(
+                    "`[http] backoff_max_secs` ({}) must be at most {MAX_HTTP_COOLDOWN_SECS} \
+                     seconds (7 days)",
+                    http.backoff_max_secs
                 ));
             }
             // A timeout of 0 is not "no timeout" (`ureq` has no such
@@ -929,6 +1282,26 @@ impl PluginManifest {
                         "`[[http.request]] timeout_secs` must be greater than 0".to_string()
                     );
                 }
+            }
+            // And a timeout above two minutes holds the fetch thread (and
+            // whatever `FetchGuard` is waiting on it) far longer than any
+            // provider this app talks to has ever taken to answer or fail —
+            // a manifest asking for one is asking this app to wedge on a
+            // single slow request instead of backing off and trying again.
+            for req in &http.request {
+                if req.timeout_secs > MAX_TIMEOUT_SECS {
+                    return Err(format!(
+                        "`[[http.request]] timeout_secs` ({}) must be at most {MAX_TIMEOUT_SECS} \
+                         seconds",
+                        req.timeout_secs
+                    ));
+                }
+            }
+            if http.value.len() > HTTP_VALUES_MAX_COUNT {
+                return Err(format!(
+                    "`[[http.value]]` names {} entries — at most {HTTP_VALUES_MAX_COUNT}",
+                    http.value.len()
+                ));
             }
             let mut seen_value_names: std::collections::HashSet<&str> =
                 std::collections::HashSet::new();
@@ -1217,14 +1590,29 @@ impl PluginManifest {
                             let max_len = regex_max_match_len(pattern);
                             if !matches!(max_len, Some(len) if len <= super::CLIENT_PATTERN_MAX_MATCH_BYTES)
                             {
+                                // `None` is not always "unbounded": `regex_syntax`'s
+                                // own `maximum_len` also answers `None` for a
+                                // pattern it simply cannot put a byte-length on —
+                                // a purely Unicode-aware construct measured
+                                // against raw bytes, say — where the match is
+                                // not actually infinite, only unmeasurable by
+                                // this analysis. Either way the refusal is the
+                                // same (this check cannot tell "no ceiling"
+                                // from "no answer" apart, and must refuse
+                                // both), so the message says so rather than
+                                // asserting a claim ("unbounded") this app
+                                // cannot back up for the second case.
                                 return Err(format!(
                                     "surface \"{}\": a `{}` auth step's `{field}` may match at most \
-                                     {} bytes ({}) — an unbounded pattern could read an unbounded \
-                                     slice of the file it scans and call the slice the client",
+                                     {} bytes ({}) — a pattern with no measurable ceiling could read \
+                                     an unbounded slice of the file it scans and call the slice the \
+                                     client",
                                     surface.id,
                                     auth_type_name(step.kind),
                                     super::CLIENT_PATTERN_MAX_MATCH_BYTES,
-                                    max_len.map(|n| n.to_string()).unwrap_or_else(|| "unbounded".to_string())
+                                    max_len
+                                        .map(|n| n.to_string())
+                                        .unwrap_or_else(|| "unbounded or unmeasurable".to_string())
                                 ));
                             }
                             // Bounded above is not bounded below: `a*` and
@@ -1269,6 +1657,24 @@ impl PluginManifest {
                                 ));
                             }
                         }
+                    }
+                    if client.files.len() > CLIENT_FILES_MAX_COUNT {
+                        return Err(format!(
+                            "surface \"{}\": a `{}` auth step's `client.files` names {} entries \
+                             — at most {CLIENT_FILES_MAX_COUNT}",
+                            surface.id,
+                            auth_type_name(step.kind),
+                            client.files.len()
+                        ));
+                    }
+                    if client.bins.len() > CLIENT_BINS_MAX_COUNT {
+                        return Err(format!(
+                            "surface \"{}\": a `{}` auth step's `client.bins` names {} entries — \
+                             at most {CLIENT_BINS_MAX_COUNT}",
+                            surface.id,
+                            auth_type_name(step.kind),
+                            client.bins.len()
+                        ));
                     }
                     let blank_entry = client
                         .files
@@ -1430,14 +1836,53 @@ impl PluginManifest {
             if ping.bin.trim().is_empty() {
                 return Err("`[ping] bin` must not be empty".to_string());
             }
-            if ping.bin.contains('/') || ping.bin.contains('\\') {
+            // `:` alone is a no-op on this platform's own charset check —
+            // `contains('/')`/`contains('\\')` already refuse a Unix or
+            // Windows separator — but on Windows `C:evil` is a **prefixed
+            // relative** path (relative to whatever directory drive `C:` is
+            // current on), not the bare name it looks like beside `/`/`\`.
+            if ping.bin.contains(['/', '\\', ':']) {
                 return Err(format!(
                     "`[ping] bin = \"{}\"` must be a bare program name, not a path",
                     ping.bin
                 ));
             }
+            // `[ping] args` reaches the install-time trust dialog verbatim
+            // (`main.rs`'s `build_trust_message` renders the command line a
+            // ping will run) before it is ever spawned as one — the bounds
+            // below are for that dialog, not the spawn itself
+            // (`std::process::Command::arg` takes arbitrary bytes safely
+            // either way): an unbounded count or length lets a manifest push
+            // the untrusted-host warning that dialog carries clean off the
+            // bottom.
+            if ping.args.len() > PING_ARGS_MAX_COUNT {
+                return Err(format!(
+                    "`[ping] args` names {} entries — a ping is a short, fixed command line, and \
+                     {PING_ARGS_MAX_COUNT} is more than any real one needs",
+                    ping.args.len()
+                ));
+            }
+            if ping.args.iter().any(|a| a.is_empty()) {
+                return Err(
+                    "`[ping] args` entries must not be empty — an empty argument says nothing in \
+                     the trust dialog and does nothing on the command line"
+                        .to_string(),
+                );
+            }
+            if let Some(bad) = ping.args.iter().find(|a| a.len() > PING_ARG_MAX_BYTES) {
+                return Err(format!(
+                    "`[ping] args` has an entry of {} bytes — the limit is {PING_ARG_MAX_BYTES}",
+                    bad.len()
+                ));
+            }
         }
 
+        if self.option.len() > OPTIONS_MAX_COUNT {
+            return Err(format!(
+                "`[[option]]` names {} entries — at most {OPTIONS_MAX_COUNT}",
+                self.option.len()
+            ));
+        }
         let mut seen_option_keys: std::collections::HashSet<&str> =
             std::collections::HashSet::new();
         for opt in &self.option {
@@ -1467,6 +1912,223 @@ impl PluginManifest {
                     opt.key
                 ));
             }
+        }
+
+        // A control character or a bidirectional override in any manifest
+        // string reaches somewhere it can do real damage before this app
+        // gets a chance to sanitise it for display: `[ping] args` and
+        // `allowed_hosts` are rendered verbatim into the install-time trust
+        // dialog (`main.rs::build_trust_message`), `message` and
+        // `no_credentials_message` are drawn on the panel, and every one of
+        // these can reach `diag::line`, which writes a manifest string to
+        // the log file exactly as given. A `\n` splits a dialog's single
+        // line in two; a `\r` overwrites what came before it; U+2028/U+2029
+        // do what `\n` does to code that only checked for `\n`; and the bidi
+        // marks/embeddings/overrides/isolates (U+200E/F, U+202A–E,
+        // U+2066–9) can reorder what is printed after them, or hide where a
+        // sentence actually ends, without a single character looking out of
+        // place. `sanitize_provider_text` strips these from a *response*
+        // before it reaches the screen; a manifest is data this app decided
+        // to trust, not a response, so the right answer for it is to refuse
+        // at load rather than launder at render time. One shared check
+        // ([`has_disruptive_control_char`]) over every field named above,
+        // rather than a copy of the same three lines at each site.
+        let mut control_char_fields: Vec<(String, &str)> = vec![
+            ("`name`".to_string(), self.name.as_str()),
+            ("`menu_label`".to_string(), self.menu_label.as_str()),
+        ];
+        if let Some(ping) = &self.ping {
+            for (i, arg) in ping.args.iter().enumerate() {
+                control_char_fields.push((format!("`[ping] args[{i}]`"), arg.as_str()));
+            }
+        }
+        for w in &self.windows {
+            control_char_fields.push((
+                format!("windows[label = \"{}\"]: `label`", w.label),
+                w.label.as_str(),
+            ));
+        }
+        for b in &self.balances {
+            control_char_fields.push((
+                format!("balances[label = \"{}\"]: `label`", b.label),
+                b.label.as_str(),
+            ));
+        }
+        if let Some(http) = &self.http {
+            if let Some(version) = &http.version {
+                for (i, f) in version.files.iter().enumerate() {
+                    control_char_fields.push((format!("`[http.version] files[{i}]`"), f.as_str()));
+                }
+            }
+        }
+        for surface in &self.surface {
+            control_char_fields.push((
+                format!("surface \"{}\": `label`", surface.id),
+                surface.label.as_str(),
+            ));
+            for (i, host) in surface.allowed_hosts.iter().enumerate() {
+                control_char_fields.push((
+                    format!("surface \"{}\": `allowed_hosts[{i}]`", surface.id),
+                    host.as_str(),
+                ));
+            }
+            if let Some(msg) = &surface.no_credentials_message {
+                control_char_fields.push((
+                    format!("surface \"{}\": `no_credentials_message`", surface.id),
+                    msg.as_str(),
+                ));
+            }
+            for step in &surface.auth {
+                let step_name = auth_type_name(step.kind);
+                if let Some(msg) = &step.message {
+                    control_char_fields.push((
+                        format!(
+                            "surface \"{}\": a `{step_name}` auth step's `message`",
+                            surface.id
+                        ),
+                        msg.as_str(),
+                    ));
+                }
+                if let Some(service) = &step.service {
+                    control_char_fields.push((
+                        format!(
+                            "surface \"{}\": a `{step_name}` auth step's `service`",
+                            surface.id
+                        ),
+                        service.as_str(),
+                    ));
+                }
+                for (i, target) in step.targets.iter().flatten().enumerate() {
+                    control_char_fields.push((
+                        format!(
+                            "surface \"{}\": a `{step_name}` auth step's `targets[{i}]`",
+                            surface.id
+                        ),
+                        target.as_str(),
+                    ));
+                }
+                if let Some(client) = &step.client {
+                    if let Some(id_env) = &client.id_env {
+                        control_char_fields.push((
+                            format!(
+                                "surface \"{}\": a `{step_name}` auth step's `client.id_env`",
+                                surface.id
+                            ),
+                            id_env.as_str(),
+                        ));
+                    }
+                    if let Some(secret_env) = &client.secret_env {
+                        control_char_fields.push((
+                            format!(
+                                "surface \"{}\": a `{step_name}` auth step's `client.secret_env`",
+                                surface.id
+                            ),
+                            secret_env.as_str(),
+                        ));
+                    }
+                    for (i, f) in client.files.iter().enumerate() {
+                        control_char_fields.push((
+                            format!(
+                                "surface \"{}\": a `{step_name}` auth step's `client.files[{i}]`",
+                                surface.id
+                            ),
+                            f.as_str(),
+                        ));
+                    }
+                }
+            }
+        }
+        for opt in &self.option {
+            control_char_fields.push((
+                format!("`[[option]] key = \"{}\"`: `label`", opt.key),
+                opt.label.as_str(),
+            ));
+        }
+        if let Some((where_it_is, _)) = control_char_fields
+            .iter()
+            .find(|(_, text)| has_disruptive_control_char(text))
+        {
+            return Err(format!(
+                "{where_it_is} contains a control character or a bidirectional override — refused \
+                 before it can rewrite a trust dialog, a log line or the panel around it"
+            ));
+        }
+
+        // A `..` component walks a path outside whatever directory this app
+        // meant to confine the read to — `[account] path`/`[logfile] root`/
+        // `client.files`/`[http.version] files` name a file to read, and
+        // `[[surface.auth]] path`/`config_path` name a credential store to
+        // read, none of which this app has any business reading past the
+        // directory a manifest author actually named. `is_absolute_on_any_
+        // platform` already lets an absolute value through on purpose (the
+        // shipped Antigravity manifest's `client.files` names one) — this is
+        // the narrower, purely relative escape a `~/.foo/../../.ssh/id_rsa`
+        // shaped value would still get past that check. One shared sweep,
+        // the same shape as the control-character one just above.
+        let mut dotdot_fields: Vec<(String, &str)> = Vec::new();
+        if let Some(path) = &self.account.path {
+            dotdot_fields.push(("`[account] path`".to_string(), path.as_str()));
+        }
+        if let Some(lf) = &self.logfile {
+            dotdot_fields.push(("`[logfile] root`".to_string(), lf.root.as_str()));
+        }
+        if let Some(http) = &self.http {
+            for v in &http.value {
+                if let Some(path) = &v.path {
+                    dotdot_fields.push((
+                        format!("`[[http.value]] name = \"{}\"` path", v.name),
+                        path.as_str(),
+                    ));
+                }
+            }
+            if let Some(version) = &http.version {
+                for (i, f) in version.files.iter().enumerate() {
+                    dotdot_fields.push((format!("`[http.version] files[{i}]`"), f.as_str()));
+                }
+            }
+        }
+        for surface in &self.surface {
+            for step in &surface.auth {
+                let step_name = auth_type_name(step.kind);
+                if let Some(path) = &step.path {
+                    dotdot_fields.push((
+                        format!(
+                            "surface \"{}\": a `{step_name}` auth step's `path`",
+                            surface.id
+                        ),
+                        path.as_str(),
+                    ));
+                }
+                if let Some(config_path) = &step.config_path {
+                    dotdot_fields.push((
+                        format!(
+                            "surface \"{}\": a `{step_name}` auth step's `config_path`",
+                            surface.id
+                        ),
+                        config_path.as_str(),
+                    ));
+                }
+                if let Some(client) = &step.client {
+                    for (i, f) in client.files.iter().enumerate() {
+                        dotdot_fields.push((
+                            format!(
+                                "surface \"{}\": a `{step_name}` auth step's `client.files[{i}]`",
+                                surface.id
+                            ),
+                            f.as_str(),
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some((where_it_is, _)) = dotdot_fields
+            .iter()
+            .find(|(_, text)| has_dotdot_component(text))
+        {
+            return Err(format!(
+                "{where_it_is} contains a `..` component — refused before it can read outside \
+                 the directory this app was meant to confine it to"
+            ));
         }
 
         // A placeholder has to be spelled where something will read it, and it
@@ -1529,6 +2191,19 @@ impl PluginManifest {
                     value.path.as_deref().unwrap_or(""),
                     Substituted::Nothing,
                 ));
+            }
+            // `[http.version] files` — read verbatim by `resolve_version`,
+            // the same as `client.files` below: nothing substitutes a
+            // version file's own path, so a stray `{token}` in one would be
+            // a directory name with braces in it, not a credential.
+            if let Some(version) = &http.version {
+                for (i, f) in version.files.iter().enumerate() {
+                    templates.push((
+                        format!("`[http.version] files[{i}]`"),
+                        f.as_str(),
+                        Substituted::Nothing,
+                    ));
+                }
             }
         }
         if let Some(url) = &self.account.url {
@@ -1711,34 +2386,38 @@ fn placeholders(template: &str) -> Vec<&str> {
     found
 }
 
-/// Whether `body` contains a raw placeholder marker more times than
+/// Whether `text` contains a raw placeholder marker more times than
 /// [`placeholders`] actually recognised out of it — the signature of one
 /// having been swallowed.
 ///
 /// [`placeholders`] (and `engine_http::substitute`, which it mirrors) pairs a
 /// `{` with the *first* `}` that follows it, whatever text sits in between —
-/// exactly right for a header or a URL, neither of which is ever written
-/// starting with an unrelated `{`. A request body can be: every JSON object
-/// opens with `{`, and that leading, purely structural brace pairs with a
-/// real placeholder's own closing one before either scanner ever reads the
-/// placeholder's name — `{"auth":"{token}"}` finds its first `}` closing
-/// `{token}`, not the (later, real) end of the object, so `{token}` is
-/// mailed on the wire exactly as written. The garbled "name" this produces
-/// starts with neither `value.` nor `option.`, so the undeclared-placeholder
-/// loop in `validate` never sees it either — this is the one shape that loop
-/// cannot catch, which is why it gets a check of its own rather than folding
-/// into it.
+/// exactly right for the ordinary case, where nothing is ever written
+/// starting with an unrelated `{`. A request body is the case that motivated
+/// this — every JSON object opens with `{`, and that leading, purely
+/// structural brace pairs with a real placeholder's own closing one before
+/// either scanner ever reads the placeholder's name, so `{"auth":"{token}"}`
+/// finds its first `}` closing `{token}`, not the (later, real) end of the
+/// object, mailing it on the wire exactly as written — but nothing about the
+/// shape is body-specific: a header value someone wrote a JSON fragment
+/// into, or a URL whose query string opens with an unrelated `{`, swallow a
+/// later placeholder the identical way, so this is checked against every
+/// one of a request's texts (`validate`'s own call site), not the body
+/// alone. The garbled "name" this produces starts with neither `value.` nor
+/// `option.`, so the undeclared-placeholder loop in `validate` never sees it
+/// either — this is the one shape that loop cannot catch, which is why it
+/// gets a check of its own rather than folding into it.
 ///
 /// Checked one marker at a time, and by raw-vs-recognised count rather than
 /// by position, because the two counts can disagree in only one direction —
 /// swallowed placeholders are always undercounted, never overcounted — and
-/// because a body can swallow one marker while substituting another
+/// because a text can swallow one marker while substituting another
 /// correctly a few characters later (the case that found this: `{token}`
 /// resolved fine while `{option.plugin}` earlier in the same string did
 /// not).
-fn body_swallows_a_placeholder(body: &str) -> Option<&'static str> {
-    let names = placeholders(body);
-    let raw = |marker: &str| body.matches(marker).count();
+fn swallowed_placeholder(text: &str) -> Option<&'static str> {
+    let names = placeholders(text);
+    let raw = |marker: &str| text.matches(marker).count();
     let recognized_exact = |name: &str| names.iter().filter(|n| **n == name).count();
     let recognized_prefix = |prefix: &str| names.iter().filter(|n| n.starts_with(prefix)).count();
     if raw("{token}") > recognized_exact("token") {
@@ -2001,13 +2680,16 @@ fn template_complaint(label: &str) -> Option<&'static str> {
 /// Cap on `[[windows]] id`, and, sharing the same constant, `[[balances]]
 /// id` (see [`BalanceConfig::entry_key`]).
 ///
-/// Both bound a string that is part of that entry's identity, and both
-/// identities already persist: a window's `id` becomes a segment of the key
-/// `config::seen_key` writes into the user's `config.json` once that window
-/// has been seen, and a balance's `id` becomes part of
-/// [`crate::model::Balance::key`] the same way. Capped here rather than left
-/// open, because a manifest that already shipped with a 4 KB id would have
-/// to keep working.
+/// Both bound a string that is part of that entry's identity: fed through
+/// [`crate::plugin::encode_key_part`] it becomes the `<entry>` half of
+/// [`crate::model::Window::key`]/[`crate::model::Balance::key`]
+/// (`crate::plugin::window_key`/`balance_key`), the identity this app
+/// matches and dedupes readings by across fetches — not, despite an earlier
+/// version of this comment, a segment `config::seen_key` writes: that
+/// registry keys by *role* ("primary"/"secondary"), not by a window's
+/// declared `id`, and never records an `Extra`-role window at all (see
+/// `main.rs`'s `seen_role_key`). Capped here rather than left open, because a
+/// manifest that already shipped with a 4 KB id would have to keep working.
 pub const WINDOW_ID_MAX_BYTES: usize = 64;
 
 impl WindowConfig {
@@ -2578,6 +3260,13 @@ pub struct HttpVersionConfig {
     pub fallback: String,
 }
 
+/// [`HttpVersionConfig::files`]: how many candidates `validate` allows.
+/// `resolve_version` tries each in turn until one exists and parses; the
+/// shipped `claude.toml` names three (one per platform's npm prefix), so 16
+/// is headroom for a provider installed in more places, not a figure any
+/// real manifest is expected to approach.
+const HTTP_VERSION_FILES_MAX_COUNT: usize = 16;
+
 // ── [[surface]] ───────────────────────────────────────────────────────────
 
 /// One `[[surface]]` — a place this provider's usage can be read from (a
@@ -2830,6 +3519,33 @@ pub enum AuthType {
     OauthRefresh,
 }
 
+/// Whether `spec` contains a `..` path component — split on both
+/// separators (a manifest is cross-platform data, so a Windows-shaped value
+/// on this platform's own `Path` still has to be caught), not searched for
+/// as a substring, so a filename that merely contains two literal dots
+/// without being a parent reference (`archive..bak`) is not refused for the
+/// wrong reason.
+fn has_dotdot_component(spec: &str) -> bool {
+    spec.split(['/', '\\']).any(|segment| segment == "..")
+}
+
+/// Windows's reserved device names, compared case-insensitively against a
+/// plugin `id` — `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`. A
+/// file named exactly one of these, with or without an extension, opens the
+/// device instead of a file on that platform: `registry.rs`'s own manifest-id
+/// rule needs the identical list for the same reason (a registry entry's id
+/// becomes the same `<id>.toml`), kept as a comment there rather than a
+/// shared function across a module boundary this file does not own.
+fn is_windows_reserved_device_name(name: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    RESERVED
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
+
 /// [`AuthClientDiscovery::bins`]: a bare program name — no separator, no
 /// `..` component, no drive prefix — the shape `auth::bin_candidates` joins
 /// a directory onto. `files` has no equivalent rule: it is already a path,
@@ -2877,8 +3593,42 @@ fn is_valid_env_var_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Whether `text` carries a control character (C0, DEL, and — for free, from
+/// `char::is_control` — C1) or a character that reorders or terminates a
+/// line without looking like it does: the Unicode line/paragraph separators
+/// `is_control` does not cover (U+2028/U+2029), and the bidi marks,
+/// embeddings/overrides and isolates (U+200E/F, U+202A–E, U+2066–9) that can
+/// visually reorder whatever follows them or hide where a message actually
+/// ends.
+///
+/// The `[[surface.auth]].client` sibling of `is_invisible_or_directional` in
+/// `crate::plugin` — deliberately not the same function: that one also
+/// strips zero-width joiners and the soft hyphen, which change how response
+/// *text* renders but do not split a line or reorder a dialog, and this one
+/// is checked at load against a manifest, not at render time against a
+/// provider's response.
+fn has_disruptive_control_char(text: &str) -> bool {
+    text.chars().any(|c| {
+        c.is_control()
+            || matches!(
+                c,
+                '\u{2028}' | '\u{2029}'
+                    | '\u{200E}' | '\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+    })
+}
+
 /// The most bytes any match of `pattern` could ever return — `None` when
-/// there is no such maximum (an unbounded repeat, e.g. `.*` or `[a-z]+`).
+/// there is no such maximum (an unbounded repeat, e.g. `.*` or `[a-z]+`), and
+/// also, less obviously, when `regex_syntax` simply has no byte-length answer
+/// for the pattern at all rather than a genuinely infinite one — its own
+/// `Properties::maximum_len` does not distinguish the two, so neither does
+/// this. `validate`'s call site treats both alike (a ceiling it cannot
+/// compute is refused exactly like no ceiling), and says so rather than
+/// calling every `None` "unbounded".
+///
 /// Parsed by `regex_syntax` directly rather than derived from a compiled
 /// `regex::bytes::Regex` (which does not expose this): the same grammar
 /// `regex::bytes::Regex` compiles, so a pattern this measures as unbounded is
@@ -2971,6 +3721,16 @@ pub struct PingConfig {
     pub args: Vec<String>,
 }
 
+/// [`PingConfig::args`]: how many arguments `validate` allows. A ping is a
+/// short, fixed command line (`codex exec hello`, three words) — not a
+/// figure tuned to any one provider.
+const PING_ARGS_MAX_COUNT: usize = 32;
+
+/// [`PingConfig::args`]: how many bytes one argument may be. Bounded so a
+/// single entry cannot push the untrusted-host clause off the bottom of the
+/// install-time trust dialog that renders the whole command line.
+const PING_ARG_MAX_BYTES: usize = 256;
+
 // ── [[option]] ────────────────────────────────────────────────────────────
 
 /// One `[[option]]` — a declarative bool option a plugin exposes, resolved by
@@ -3030,7 +3790,14 @@ pub fn load_dir(dir: &Path) -> Vec<Result<PluginManifest, (PathBuf, String)>> {
 }
 
 fn load_one(path: &Path) -> Result<PluginManifest, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    // Plain `read_to_string` would block forever on a FIFO planted at this
+    // path and has no size cap of its own — the same hazard
+    // `read_regular_file`'s own doc describes for a credentials file, and
+    // this one is read on every plugin-directory scan (a fresh install, a
+    // Reset plugins, an "Add plugin"), not once at startup.
+    let text = super::read_regular_file(path, super::SMALL_FILE_MAX_BYTES).ok_or_else(|| {
+        "not a readable regular file, or larger than this app will read".to_string()
+    })?;
     PluginManifest::from_str(&text)
 }
 
@@ -4128,9 +4895,16 @@ mod tests {
         // meant a section that declares values but no request never had them
         // looked at. Nothing shipped is shaped that way; a third-party
         // manifest may be.
-        let toml = format!(
-            "{CODEX_LIKE}\n[http]\n[[http.value]]\nname = \"a\"\ntype = \"json-file\"\n\
-             path = \"~/{{option.where}}/x.json\"\njson_path = \"a\"\n"
+        //
+        // Built on `http_manifest_with` rather than spliced onto `CODEX_LIKE`
+        // (an `engine = "log-file"` fixture): `engine = "log-file"` now
+        // refuses an `[http]` section outright, so appending one would trip
+        // that rule instead of the one this test means to exercise.
+        let toml = http_manifest_with(
+            "",
+            "",
+            "[[http.value]]\nname = \"a\"\ntype = \"json-file\"\n\
+             path = \"~/{option.where}/x.json\"\njson_path = \"a\"",
         );
         let err = PluginManifest::from_str(&toml).expect_err("a placeholder nothing substitutes");
         assert!(
@@ -4571,7 +5345,7 @@ mod tests {
         // — not with the object's real, later end — so `{token}` is never
         // recognised as a placeholder at all and would be sent on the wire
         // exactly as written. Neither `method`/`body` parsing above nor the
-        // undeclared-placeholder rule sees this; only `body_swallows_a_placeholder`
+        // undeclared-placeholder rule sees this; only `swallowed_placeholder`
         // does (see its doc comment for why).
         let toml = HTTP_POST_BASE.replace(
             "url = \"https://example.com/v1internal:retrieveUserQuotaSummary\"",
@@ -4585,6 +5359,43 @@ mod tests {
         assert!(
             err.contains("pairs with"),
             "the refusal must explain why — {err}"
+        );
+    }
+
+    #[test]
+    fn a_json_shaped_header_value_swallows_its_own_placeholder() {
+        // Nothing about `swallowed_placeholder`'s scan is body-specific — a
+        // header value someone wrote a JSON fragment into loses its
+        // placeholder the identical way; this used to only be checked for
+        // `body`.
+        let toml = HTTP_POST_BASE.replace(
+            "Authorization  = \"Bearer {token}\"",
+            "Authorization  = \"{\\\"a\\\":\\\"{token}\\\"}\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a JSON-shaped header value swallows its own placeholder");
+        assert!(err.contains("{token}"), "{err}");
+        assert!(
+            err.contains("header"),
+            "the refusal must name the header — {err}"
+        );
+    }
+
+    #[test]
+    fn a_json_shaped_url_swallows_its_own_placeholder() {
+        // And a URL whose query string opens with an unrelated `{` (not a
+        // realistic URL, but a real string, and the scan does not know the
+        // difference) swallows the same way.
+        let toml = HTTP_POST_BASE.replace(
+            "url = \"https://example.com/v1internal:retrieveUserQuotaSummary\"",
+            "url = \"https://example.com/{\\\"a\\\":\\\"{option.deep}\\\"}\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a JSON-shaped URL swallows its own placeholder");
+        assert!(err.contains("{option.<key>}"), "{err}");
+        assert!(
+            err.contains("`[[http.request]] url`"),
+            "the refusal must name the url — {err}"
         );
     }
 
@@ -5094,13 +5905,29 @@ mod tests {
         // Bounded above (`{0,5}` is a finite, 5-byte match) is not bounded
         // below: it can also match zero bytes, which `auth::discover_client`
         // would otherwise hand to the OAuth exchange as a client id of `""`.
-        let toml = OAUTH_REFRESH_CLIENT_BASE.replace(
-            r#"id_pattern     = "[0-9]{1,20}-[a-z0-9]{1,40}\\.apps\\.googleusercontent\\.com""#,
-            r#"id_pattern     = "[0-9]{0,5}""#,
-        );
-        let err = PluginManifest::from_str(&toml)
-            .expect_err("a pattern that can match the empty string is refused");
-        assert!(err.contains("id_pattern"), "{err}");
+        // `regex_min_match_len`'s own doc names `a*` and `(foo)?` as the
+        // canonical empty-matching shapes; `?` is exercised here too, on top
+        // of `{0,N}` — a bare `*` is not, on purpose: any `*`/`+` submatch
+        // makes the pattern's *maximum* length unmeasurable as well as its
+        // minimum zero, so it is always refused by the match-bound check
+        // first (`a_client_pattern_with_no_bound_on_its_match_length_is_refused`
+        // already covers that shape) and would never actually reach this
+        // rule to prove it.
+        for pattern in ["[0-9]{0,5}", "(?:[0-9]{1,3})?"] {
+            let toml = OAUTH_REFRESH_CLIENT_BASE.replace(
+                r#"id_pattern     = "[0-9]{1,20}-[a-z0-9]{1,40}\\.apps\\.googleusercontent\\.com""#,
+                &format!(r#"id_pattern     = "{pattern}""#),
+            );
+            let err = PluginManifest::from_str(&toml).expect_err(&format!(
+                "a pattern that can match the empty string is refused: {pattern}"
+            ));
+            assert!(err.contains("id_pattern"), "{pattern}: {err}");
+            assert!(
+                err.contains("empty string"),
+                "must name the empty-match rule specifically, not the match-bound one — \
+                 {pattern}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -5111,13 +5938,25 @@ mod tests {
         // `CLIENT_PATTERN_MAX_MATCH_BYTES` while running to kilobytes of
         // source, which is exactly what the trust dialog would have to
         // render.
+        //
+        // `"[0-9]{1,4}"` repeated 52 times is 520 bytes of source (over the
+        // 512-byte cap here) whose match is bounded to 52–208 bytes — well
+        // inside the 256-byte match bound and never empty, so this trips
+        // *only* the text-length rule. A flat `"1".repeat(520)` (a 520-byte
+        // literal) is incidentally over the match bound too, so the assertion
+        // below would pass whichever of the two rules happened to fire first
+        // — checking for "id_pattern" alone cannot tell them apart.
         let toml = OAUTH_REFRESH_CLIENT_BASE.replace(
             r#"id_pattern     = "[0-9]{1,20}-[a-z0-9]{1,40}\\.apps\\.googleusercontent\\.com""#,
-            &format!(r#"id_pattern     = "{}""#, "1".repeat(520)),
+            &format!(r#"id_pattern     = "{}""#, "[0-9]{1,4}".repeat(52)),
         );
         let err = PluginManifest::from_str(&toml)
             .expect_err("520 bytes of pattern text is over the 512-byte limit");
         assert!(err.contains("id_pattern"), "{err}");
+        assert!(
+            err.contains("bytes of pattern text"),
+            "must name the text-length rule specifically, not any rule that mentions id_pattern — {err}"
+        );
     }
 
     #[test]

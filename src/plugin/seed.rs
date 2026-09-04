@@ -34,24 +34,107 @@ pub fn plugins_dir() -> PathBuf {
 }
 
 /// Write every file in `templates` into `dir`, returning the paths written.
+///
+/// Two phases, in this order, so a failure anywhere leaves every path in
+/// `dir` — built-in or not, whether it existed before this call or not —
+/// exactly as it was, never deleted:
+///
+///   1. Every destination has to be a plain file or nothing at all, checked
+///      up front for the *whole* batch via [`check_replaceable`] before a
+///      single byte is written anywhere.
+///   2. Every template's content is staged into a sibling temp file
+///      (`<name>.tmp<pid>`, the same shape `main.rs`'s `update_write` uses),
+///      then renamed over its real destination.
+///
+/// The previous shape wrote straight to each destination in one pass and, on
+/// a later template's failure, rolled back by deleting every path it had
+/// already written — which is exactly wrong for [`reseed_defaults`]: most of
+/// "already written" there means "an existing built-in this call just
+/// correctly rewrote", and deleting it turned one bad manifest (a directory
+/// planted at, say, the third built-in's name) into two providers vanishing
+/// outright — worse than either state the rollback was meant to prevent.
+/// Checking every destination before touching any of them removes the need
+/// for a rollback at all: by the time anything is renamed into place, every
+/// destination in the batch is already known to be safe.
 fn write_templates(dir: &Path, templates: &[(&str, &str)]) -> std::io::Result<Vec<PathBuf>> {
     std::fs::create_dir_all(dir)?;
-    let mut written = Vec::with_capacity(templates.len());
+
+    for (name, _) in templates {
+        check_replaceable(&dir.join(name))?;
+    }
+
+    // Stage every template's content before renaming any of it into place —
+    // a failure here (disk full, permissions) has touched no real
+    // destination yet, so only the temp files this loop itself created need
+    // cleaning up.
+    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(templates.len());
     for (name, contents) in templates {
-        let path = dir.join(name);
-        if let Err(e) = write_new(&path, contents) {
-            // A half-seeded directory is worse than an empty one: it holds a
-            // `*.toml`, so `seed_if_empty` will skip it forever and the
-            // manifest that failed never appears. Undo what this call wrote
-            // and let the next launch try again from scratch.
-            for done in &written {
-                let _ = std::fs::remove_file(done);
+        let target = dir.join(name);
+        match write_temp(&target, contents) {
+            Ok(tmp) => staged.push((tmp, target)),
+            Err(e) => {
+                for (tmp, _) in &staged {
+                    let _ = std::fs::remove_file(tmp);
+                }
+                return Err(e);
             }
+        }
+    }
+
+    // The check above already confirmed every destination is replaceable, so
+    // this should never fail in the ordinary case. If it somehow does (a
+    // destination changed kind between the two phases), templates already
+    // renamed keep their new, valid content — this call has no business
+    // deleting a file it just correctly wrote — and only the not-yet-renamed
+    // temp files are cleaned up.
+    let mut written = Vec::with_capacity(staged.len());
+    for (tmp, target) in &staged {
+        if let Err(e) = std::fs::rename(tmp, target) {
+            let _ = std::fs::remove_file(tmp);
             return Err(e);
         }
-        written.push(path);
+        written.push(target.clone());
     }
     Ok(written)
+}
+
+/// Whether `path` is safe for [`write_templates`]/[`write_new`] to replace: a
+/// plain file (removed and rewritten, or renamed over) or nothing at all.
+/// Anything else — a symlink (live or dangling), a directory, a FIFO — is
+/// refused; see [`write_new`]'s own doc for why a user's own symlink at one
+/// of these names is never something an automatic reseed gets to turn into a
+/// plain file.
+fn check_replaceable(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
+        Ok(_) => Err(std::io::Error::other(format!(
+            "{}: not a plain file — refusing to delete and replace it",
+            path.display()
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Write `contents` to a fresh temp file beside `target`
+/// (`<name>.tmp<pid>`, the same shape `main.rs`'s `update_write` uses),
+/// returning its path. `create_new` refuses to follow a symlink a previous,
+/// interrupted run might have left at this predictable name; whatever is
+/// already there is removed first (removing a symlink removes the link, not
+/// its target), so the create is what actually makes the file.
+fn write_temp(target: &Path, contents: &str) -> std::io::Result<PathBuf> {
+    let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp{}", std::process::id()));
+    let tmp = target.with_file_name(tmp_name);
+    let _ = std::fs::remove_file(&tmp);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    std::io::Write::write_all(&mut file, contents.as_bytes()).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    Ok(tmp)
 }
 
 /// Write `contents` to `path`, replacing whatever is there — but never
@@ -75,18 +158,9 @@ fn write_templates(dir: &Path, templates: &[(&str, &str)]) -> std::io::Result<Ve
 /// manifest into place put it there on purpose, and an automatic upgrade is
 /// not the moment to silently turn their symlink into a plain file.
 fn write_new(path: &Path, contents: &str) -> std::io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_file() => {
-            std::fs::remove_file(path)?;
-        }
-        Ok(_) => {
-            return Err(std::io::Error::other(format!(
-                "{}: not a plain file — refusing to delete and replace it",
-                path.display()
-            )));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+    check_replaceable(path)?;
+    if std::fs::symlink_metadata(path).is_ok() {
+        std::fs::remove_file(path)?;
     }
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -101,11 +175,17 @@ fn write_new(path: &Path, contents: &str) -> std::io::Result<()> {
     })
 }
 
-/// Whether `dir` (already known to exist) contains at least one `*.toml` file.
+/// Whether `dir` (already known to exist) contains at least one `*.toml`
+/// regular file (or a symlink resolving to one). A directory or other
+/// non-file entry merely *named* `*.toml` doesn't count: nothing this app
+/// ever wrote looks like that, and reading it as "a manifest is already
+/// here" would block [`seed_if_empty`] forever on a plugins directory that
+/// in fact holds no manifest at all.
 fn has_any_toml(dir: &Path) -> std::io::Result<bool> {
-    Ok(std::fs::read_dir(dir)?
-        .filter_map(Result::ok)
-        .any(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("toml")))
+    Ok(std::fs::read_dir(dir)?.filter_map(Result::ok).any(|entry| {
+        entry.path().extension().and_then(|e| e.to_str()) == Some("toml")
+            && entry.metadata().map(|m| m.is_file()).unwrap_or(false)
+    }))
 }
 
 /// First-run seeding: create `dir` if needed, then write the built-in
@@ -124,14 +204,16 @@ pub fn seed_if_empty(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// [`DEFAULT_TEMPLATES`] (`codex.toml`, `claude.toml`, `grok.toml`,
 /// `antigravity.toml`, `copilot.toml`) with its shipped default — restoring
 /// each even if the user edited or deleted it, as long as what's at that
-/// name is a plain file or nothing at all. A symlink at one of those names is
-/// left exactly as it is instead: [`write_new`] refuses to delete a
-/// directory entry it can't confirm is a plain file, so this call returns
-/// `Err` rather than silently replacing somebody's deliberate link with a
-/// fresh regular file — and nothing in the batch is written, per
-/// [`write_templates`]'s own all-or-nothing rollback. Any other file in
-/// `dir` (a third-party manifest, a stray `.toml`) is left untouched either
-/// way. Returns the paths written on success.
+/// name is a plain file or nothing at all. A symlink (or directory, or FIFO)
+/// at any one of those five names stops the whole call before anything is
+/// written: [`write_templates`] checks every destination up front
+/// ([`check_replaceable`]) and only stages content into temp files once
+/// every one of them has passed, so a directory planted at, say, the third
+/// name never lets the first two be rewritten only to fail partway through —
+/// this call returns `Err` and every file in `dir`, built-in or not, is
+/// exactly as it was before it ran. Any other file in `dir` (a third-party
+/// manifest, a stray `.toml`) is left untouched either way. Returns the
+/// paths written on success.
 pub fn reseed_defaults(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     write_templates(dir, DEFAULT_TEMPLATES)
 }
@@ -968,29 +1050,32 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_put_back_by_hand_is_only_replaced_once() {
+    fn restoring_an_earlier_builtin_by_hand_classifies_as_replace_which_is_why_the_marker_exists() {
         // Restoring an earlier built-in by hand is something a user may do
         // for any reason. That copy *is* a previous built-in, so hashes alone
         // would migrate it again on the next launch and quietly undo them.
-        // What prevents it is the caller's one-per-version marker
-        // (`config::builtin_migrated`); this test states the half that lives
-        // here — the classification is deliberately unchanged, which is
-        // exactly what makes the marker load-bearing rather than belt-and-
-        // braces.
-        let dir = temp_dir("upgrade-rollback");
-        let upgrade = &fabricated_upgrade();
-        let previous = EARLIER_BUILD.to_string();
-        std::fs::write(dir.join(upgrade.file), &previous).unwrap();
+        // What actually prevents that is the caller's one-per-version marker
+        // (`config::builtin_migrated`), which lives outside this module and
+        // has no test here. Renamed from
+        // `a_manifest_put_back_by_hand_is_only_replaced_once`: that name
+        // claimed to prove "only once", which this test neither does nor
+        // could — it calls `classify_builtin` directly, on fabricated bytes
+        // never read off disk (the previous version's `std::fs::write` was
+        // dead code, asserted on by nothing) — and "only once" is entirely
+        // the marker's doing, not this function's. What this test actually
+        // shows is the *reason* the marker is load-bearing: the
+        // classification below is deliberately unchanged on a second run,
+        // which is indistinguishable from a never-migrated install without
+        // it.
         assert_eq!(
             classify_builtin(
                 builtin_contents("codex.toml").unwrap(),
-                OnDisk::Present(previous.as_bytes()),
-                upgrade.previous_sha256
+                OnDisk::Present(EARLIER_BUILD.as_bytes()),
+                fabricated_upgrade().previous_sha256
             ),
             UpgradeAction::Replace,
             "indistinguishable from a never-migrated install, hence the marker"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1315,6 +1400,27 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_merely_named_dot_toml_does_not_block_seeding() {
+        // The gap `has_any_toml` used to have: an extension check with no
+        // `is_file()` behind it, so a stray directory that happens to be
+        // named `*.toml` — nobody's manifest, nothing this app ever wrote —
+        // read as "a manifest is already here" and blocked seeding forever,
+        // silently, on a plugins directory that in fact holds no manifest at
+        // all.
+        let dir = temp_dir("dir-named-toml");
+        std::fs::create_dir_all(dir.join("notes.toml")).expect("plant a directory, not a file");
+
+        let written = seed_if_empty(&dir).expect("seed");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            written.len(),
+            DEFAULT_TEMPLATES.len(),
+            "a directory merely named *.toml must not read as an existing manifest"
+        );
+    }
+
+    #[test]
     fn reseed_defaults_restores_the_builtins_without_touching_other_files() {
         let dir = temp_dir("reseed");
         seed_if_empty(&dir).expect("initial seed");
@@ -1338,5 +1444,50 @@ mod tests {
             third_party, "id = \"third-party\"",
             "foreign manifest must be untouched"
         );
+    }
+
+    #[test]
+    fn reseed_defaults_leaves_codex_and_claude_untouched_when_grok_toml_is_a_planted_directory() {
+        // The exact shape the bug had: `grok.toml` sits at index 2 of
+        // `DEFAULT_TEMPLATES`, after `codex.toml` and `claude.toml`. The old
+        // `write_templates` wrote straight to each destination in order, so
+        // by the time it reached a directory planted at the third name,
+        // `codex.toml`/`claude.toml` had *already* been deleted and
+        // rewritten — and its rollback then deleted them outright rather
+        // than restoring anything, turning one bad manifest into three
+        // providers gone. `write_templates` now checks every destination
+        // before writing any of them, so this call must fail before it ever
+        // touches `codex.toml` or `claude.toml` at all.
+        let dir = temp_dir("reseed-planted-directory");
+        seed_if_empty(&dir).expect("initial seed");
+        let codex_edit = "# my own notes\nid = \"codex\"";
+        let claude_edit = "# my own notes\nid = \"claude\"";
+        std::fs::write(dir.join("codex.toml"), codex_edit).expect("edit codex.toml");
+        std::fs::write(dir.join("claude.toml"), claude_edit).expect("edit claude.toml");
+        std::fs::remove_file(dir.join("grok.toml")).expect("remove grok.toml");
+        std::fs::create_dir_all(dir.join("grok.toml")).expect("plant a directory in its place");
+
+        reseed_defaults(&dir).expect_err("a directory at grok.toml must refuse the whole batch");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("codex.toml")).expect("still there"),
+            codex_edit,
+            "codex.toml must be neither deleted nor overwritten"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("claude.toml")).expect("still there"),
+            claude_edit,
+            "claude.toml must be neither deleted nor overwritten"
+        );
+        assert!(
+            dir.join("grok.toml").is_dir(),
+            "the planted directory is left exactly as it was"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("antigravity.toml")).expect("still there"),
+            builtin_contents("antigravity.toml").unwrap(),
+            "still the seeded default, whether or not this call ever reached it"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

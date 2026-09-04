@@ -22,17 +22,19 @@ lives in one folder:
 | `registry-state.json` | origin URL, version and sha256 of anything installed from a registry — provenance, and how a local edit is detected |
 | `instance.lock` | held by the running copy, so a second launch opens the first one's panel and exits; released however the process ends, so there is no stale file to clean up |
 | `show-panel` | the hand-off a second launch leaves for the running copy; removed as soon as it is acted on |
-| `ping-workdir/` | the empty directory the auto-ping command runs in, so there is nothing there for it to read |
+| `ping-workdir/` | present only when the OS temp directory can't be used for a ping's working directory. Each ping still gets its own fresh, empty, owner-only subdirectory in here, removed once the command exits — this folder itself is not, so an empty one can persist. The normal case runs the ping from the OS's own temp directory instead, never from here |
 
 `config.json` and the manifests are plain text and safe to edit by hand
 while the app is not running. On Windows, save them as UTF-8
 **without** a byte-order mark if your editor offers the choice: the app
 strips one if it finds it, other tools reading the same files may not. A
-hand-edit that leaves `config.json` unparsable is not fatal: the app moves
-the broken file aside to `config.json.corrupt-<unix time>` and starts fresh
-with defaults rather than silently overwriting your edit the next time a
-setting is saved — the renamed copy is yours to recover values from by
-hand.
+hand-edit that leaves `config.json` unparsable, or turns it into JSON that
+parses but isn't an object (an array, a bare string, a number, `null`), is
+not fatal: the app moves the broken file aside to `config.json.corrupt-<unix
+time>` (or a `-<n>`-suffixed sibling, on the rare chance that name is already
+taken) and starts fresh with defaults rather than silently overwriting your
+edit the next time a setting is saved — the renamed copy is yours to recover
+values from by hand.
 
 An install of the app under its previous name (a `codex-limits` folder in
 the same place) is renamed to `tickover` on the first launch, with its

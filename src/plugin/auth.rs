@@ -341,14 +341,89 @@ fn keychain_token_from_blob(
         })
 }
 
-/// Current wall-clock time as Unix seconds. Split out so `token_is_stale` and
-/// the refresh cache are tested against a fixed "now" without a clock.
+/// Current wall-clock time as Unix seconds, `0` on any error (the clock
+/// reads before the Unix epoch). Reserved for the one thing only the wall
+/// clock can answer — a comparison against a timestamp this process did not
+/// itself produce, e.g. an RFC3339 expiry a provider's own token carries
+/// (`token_is_stale`) — plus seeding [`cache_now`] once at its own first
+/// call. Every purely in-process pacing decision elsewhere in this module
+/// (the refresh cache's expiry/backoff, the client discovery caches' own
+/// backoff) reads [`cache_now`] instead, not this: see that function's own
+/// doc for why a value that can be `0`, or can run backwards under a
+/// stepped-back wall clock, is the wrong clock for a decision nothing
+/// outside this process ever needs to agree with.
 fn now_unix() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// A large, made-up "now" [`cache_now`] falls back to when the wall clock
+/// itself cannot produce one (`now_unix() == 0` — the clock reads before the
+/// Unix epoch). Never compared against a real date; only ever against other
+/// values [`cache_now`] itself built from this same fallback within the same
+/// process, so the only property that matters is that it sits far from both
+/// `0` and any plausible real `now_unix()` reading — `2^40` seconds is well
+/// into the tens of thousands of years past the epoch, comfortably clear of
+/// either.
+const CACHE_CLOCK_FALLBACK_UNIX: i64 = 1i64 << 40;
+
+/// [`cache_now`]'s clock base, set exactly once by whichever call reaches
+/// [`cache_now`] first: the wall-clock reading at that moment (or
+/// [`CACHE_CLOCK_FALLBACK_UNIX`] if the wall clock cannot produce one) paired
+/// with the [`std::time::Instant`] taken in the same breath.
+static CACHE_CLOCK_BASE: std::sync::OnceLock<(std::time::Instant, i64)> =
+    std::sync::OnceLock::new();
+
+/// The clock every purely in-process pacing decision in this module reads —
+/// the refresh cache's `expires_at_unix`/`retry_after_unix`, and the client
+/// discovery caches' own backoff — instead of [`now_unix`]. Built once per
+/// process (see [`CACHE_CLOCK_BASE`]) from a wall-clock reading paired with
+/// an [`std::time::Instant`], then always answered afterward by adding how
+/// far the monotonic clock has moved since — never by reading the wall clock
+/// again. That is what gives it the two properties none of these decisions
+/// can do without, and a plain [`now_unix`] cannot promise:
+///
+/// * **never `0`** — a `0` "now" is `now_unix`'s own sentinel for "the wall
+///   clock is broken", and every backoff/expiry comparison in this module
+///   used to special-case it (`if now != 0 { … }`) rather than trust a
+///   stored value against a broken clock. `cache_now` needs no such
+///   special-casing: its fallback ([`CACHE_CLOCK_FALLBACK_UNIX`]) is nowhere
+///   near `0`, so the comparisons that used to be skipped now simply run.
+/// * **never runs backwards within the process** — [`std::time::Instant`] is
+///   documented never to (on every platform this crate targets), so neither
+///   can a value built only by adding its elapsed time to a base captured
+///   once. A wall clock stepped backwards mid-process (an NTP correction, a
+///   laptop waking with a bad RTC read) would otherwise hand two
+///   consecutive calls a `retry_after` target that moves the wrong way — an
+///   entry that "has not lapsed yet" by one reading and "lapsed already
+///   ages ago" by the next, from the same backoff.
+///
+/// It does not need to be *correct* wall-clock time to do either job — only
+/// monotonic and non-zero — but tracking the real wall clock (bar an actual
+/// mid-process step) rather than counting from `0` keeps its values in the
+/// same range as `now_unix`'s own. That is a resemblance, not an equivalence:
+/// this function floors the wall clock once at init and separately floors
+/// the elapsed time added on top, while `now_unix` floors their sum in one
+/// step, so the two can read a second apart whenever the two fractional
+/// parts carry past a whole second the other has not crossed yet. A test
+/// that reasons about this module's caches — the refresh cache, the client
+/// discovery caches — must build its own `now_before`/`now_after`/lookup
+/// arguments from `cache_now()`, never `now_unix()`: the one second of
+/// slack is exactly wide enough to flip an assertion pinned to a boundary.
+fn cache_now() -> i64 {
+    let &(start, base) = CACHE_CLOCK_BASE.get_or_init(|| {
+        let wall = now_unix();
+        let base = if wall == 0 {
+            CACHE_CLOCK_FALLBACK_UNIX
+        } else {
+            wall
+        };
+        (std::time::Instant::now(), base)
+    });
+    base.saturating_add(start.elapsed().as_secs() as i64)
 }
 
 /// Whether the token in `json` has lapsed, judged by an RFC3339 timestamp at
@@ -471,14 +546,63 @@ fn electron_safe_storage_step(step: &AuthStep) -> Result<Option<String>, String>
 }
 
 /// Extract the token from a decrypted Safe Storage payload, which may carry
-/// trailing bytes after the JSON; trim to the last brace first.
+/// trailing bytes after the JSON (PKCS7 padding remnants, a stray byte the
+/// scheme leaves behind); cut at the JSON's own top-level closing brace
+/// first, via [`first_top_level_object_end`] — not the *last* `}` anywhere
+/// in the buffer, which the trailing bytes can push past the real one (see
+/// that function's own doc).
 fn token_from_decrypted(plain: &[u8], token_json_path: &str) -> Option<String> {
     let json = String::from_utf8_lossy(plain);
-    let json = match json.rfind('}') {
-        Some(i) => &json[..=i],
+    let json = match first_top_level_object_end(&json) {
+        Some(end) => &json[..end],
         None => &json,
     };
     extract_token(json, token_json_path)
+}
+
+/// The byte offset one past the closing `}` of the first top-level JSON
+/// object in `text`, tracking brace depth and skipping the contents of
+/// quoted strings (a `}` or an escaped `"` a value happens to contain must
+/// never be mistaken for a structural one) — `None` if `text` never opens an
+/// object, or never closes the one it opens. Deliberately the *first*
+/// top-level close, not the last `}` anywhere in `text`: a decrypted Safe
+/// Storage payload can carry trailing bytes past the JSON `serde_json`
+/// itself wrote, and if those bytes happen to contain a `}` of their own, a
+/// scan for the last one in the whole buffer would include that garbage in
+/// what gets handed to `serde_json` — reporting an object that fails to
+/// parse instead of the valid one that was actually there.
+fn first_top_level_object_end(text: &str) -> Option<usize> {
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut opened = false;
+    for (i, ch) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                depth += 1;
+                opened = true;
+            }
+            '}' => {
+                depth -= 1;
+                if opened && depth == 0 {
+                    return Some(i + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `Ok(Some(bytes))` — decrypted; `Ok(None)` — either the Keychain item that
@@ -641,8 +765,30 @@ enum CacheLookup {
 /// credential regardless of which currently-configured pair would resolve
 /// right now. The one place the id still matters is a `Backoff` hit: there,
 /// `oauth_refresh_step` resolves the pair specifically to compare it against
-/// the entry's stored `client_id`, so a rotated or corrected pair is retried
-/// immediately rather than punished for a different pair's recent failure.
+/// the entry's stored `client_id` — so a rotated or corrected pair bypasses
+/// the old failure's backoff rather than being punished for it, but only
+/// when `resolve_pair` actually comes back with the new one right then and
+/// there: for a `client` table, that still costs whatever the discovery
+/// scan (or its own miss-cache backoff) costs, "immediately" only in the
+/// sense of "not made to wait out `REFRESH_BACKOFF_SECS` on top". The literal
+/// `client_id`/`client_secret` fields, and the env-var override
+/// (`client_env_pair`), have no cache of their own and *are* re-read fresh
+/// on every single call — for those two sources alone is a rotation retried
+/// immediately in the plain sense.
+///
+/// Nor does the key carry anything about *which surface or manifest* is
+/// asking: two `oauth-refresh` steps — in the same manifest, or two
+/// different ones — that happen to read the same `token_json_path` out of
+/// the same `path` and send it to the same `token_url` collide on this key
+/// and share one entry. Accepted rather than guarded against, because it is
+/// correct, not merely harmless: the token such a pair produces is a fact
+/// about the account behind the OAuth server, not about which manifest's
+/// config asked for it, so a `Fresh` hit for one is a `Fresh` hit for the
+/// other and a `Failed` backoff for one really does mean the other would
+/// fail identically right now — the exact same exchange, byte for byte,
+/// would be sent either way. Two surfaces reading the *same* refresh-token
+/// file already share the credential itself; sharing the pacing cache over
+/// it besides costs nothing beyond what was already shared.
 ///
 /// That separation is by distinctness, not by proof: this is a 64-bit hash,
 /// and two pairs that collided would share an entry. Left as a hash
@@ -650,7 +796,9 @@ enum CacheLookup {
 /// and a manifest that far in can already read the same token file and send
 /// it to a host of its own choosing, so the collision buys nothing that was
 /// not already available. The map is process-local and dies with the
-/// process.
+/// process — and does not merely grow for the rest of it: see
+/// [`refresh_cache_store`]'s own doc for the prune that keeps it from
+/// holding one entry forever per distinct pair this process has ever seen.
 ///
 /// Every `Mutex` this module keeps recovers from poison the same way
 /// (`.lock().unwrap_or_else(|e| e.into_inner())`, `throttle::with_state`'s
@@ -712,12 +860,69 @@ fn refresh_cache_lookup(key: u64, now: i64) -> CacheLookup {
     }
 }
 
-/// Store an entry (fresh token or a failure to back off from) under `key`.
+/// The message the most recent `Failed` entry stored under `key` carries,
+/// whether or not its own `retry_after_unix` has lapsed — unlike
+/// [`refresh_cache_lookup`], which folds a lapsed `Failed` into `Miss`
+/// exactly as if nothing were cached at all, because a `Backoff` result is
+/// specifically "still being retried against". This answers the opposite
+/// question, for the one caller that needs it (`oauth_refresh_step`'s own
+/// `Miss` arm): "did anything fail recently enough to still be worth
+/// reporting", for the window between the refresh backoff itself lapsing
+/// and a `client` table's own, longer discovery-miss backoff still
+/// declining to even attempt a rescan. `None` for a `Fresh` entry too — a
+/// still-valid token was never a failure to report, and
+/// `refresh_cache_lookup` would have served it as a `Hit` long before this
+/// is ever reached — and `None` once [`refresh_cache_store`]'s own grace
+/// period has pruned the entry away entirely.
+fn refresh_cache_last_failed_message(key: u64) -> Option<String> {
+    let guard = REFRESH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_ref()?.get(&key)? {
+        CacheEntry::Failed { message, .. } => Some(message.clone()),
+        CacheEntry::Fresh { .. } => None,
+    }
+}
+
+/// How long a `Failed` entry is kept past its own `retry_after_unix` before
+/// [`refresh_cache_store`]'s prune sweep removes it — longer than
+/// [`REFRESH_BACKOFF_SECS`] itself, and pinned to
+/// [`CLIENT_DISCOVERY_RETRY_SECS`] (the longer of the two client-discovery
+/// backoffs) rather than picked independently, because that is exactly how
+/// long [`refresh_cache_last_failed_message`]'s one caller may still need to
+/// read this entry after the refresh backoff it was stored under has
+/// already lapsed (see that function's own doc, and the `Miss` arm in
+/// `oauth_refresh_step`). A `Fresh` entry needs no such grace — nothing
+/// reads a dead access token's own value once it has expired — so only
+/// `Failed` entries get one; see [`refresh_cache_store`]'s own doc for where
+/// that split is made.
+const REFRESH_CACHE_FAILED_GRACE_SECS: i64 = CLIENT_DISCOVERY_RETRY_SECS;
+
+/// Store an entry (fresh token or a failure to back off from) under `key`,
+/// first dropping every entry in the map — not only this one — whose own
+/// life or backoff (plus, for a `Failed` entry, its
+/// [`REFRESH_CACHE_FAILED_GRACE_SECS`] grace period) has already passed as
+/// of [`cache_now`]. Nothing else in this module ever removes an entry:
+/// without this sweep, a process that goes on to see many distinct
+/// `(token_url, refresh_token)` pairs over its life — an operator rotating
+/// between accounts on the same surface, a manifest reinstalled with a
+/// fresh refresh token — would keep every stale one forever, one `HashMap`
+/// entry per pair for as long as the process runs: cheap individually,
+/// unbounded in aggregate. Pruned on every store rather than capped by
+/// size: a size cap would drop whichever entry a `HashMap`'s own iteration
+/// order happens to land on first, which could just as easily be the one
+/// still live.
 fn refresh_cache_store(key: u64, entry: CacheEntry) {
+    let now = cache_now();
     let mut guard = REFRESH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    guard
-        .get_or_insert_with(std::collections::HashMap::new)
-        .insert(key, entry);
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    map.retain(|_, e| match e {
+        CacheEntry::Fresh {
+            expires_at_unix, ..
+        } => *expires_at_unix > now,
+        CacheEntry::Failed {
+            retry_after_unix, ..
+        } => retry_after_unix.saturating_add(REFRESH_CACHE_FAILED_GRACE_SECS) > now,
+    });
+    map.insert(key, entry);
 }
 
 /// How long a failed exchange is not retried, in seconds. Must be well over one
@@ -745,12 +950,26 @@ const REFRESH_BACKOFF_SECS: i64 = 300;
 /// running, keychain token fresh — never reaches the network at all; this fires
 /// only when that token has lapsed.
 ///
-/// The scheme/host allow-list check runs *before* both the client pair is
-/// resolved and the cache read: a refused `token_url` never pays for a
-/// `client` discovery scan it was always going to throw away. The cache read
-/// itself now runs *before* the pair is resolved (see [`REFRESH_CACHE`]'s own
-/// doc) — a `Hit` needs no client at all, and a `Backoff` resolves one only
-/// to compare it against the entry's own `client_id`.
+/// The scheme/host allow-list check runs *first*, ahead of everything else
+/// this step does: reading `token_url` out of the already-parsed manifest
+/// costs nothing, so a misconfigured (or actively probing) manifest never
+/// gets to charge for even opening the refresh-token file, let alone a
+/// `client` table's discovery scan (a candidate hundreds of megabytes long)
+/// or the cache read that follows. Checked here because `resolve_token` runs
+/// ahead of the engine's own `allowed_hosts` check; an empty list — which
+/// reads as "no restriction" everywhere else `host_allowed` is used — is
+/// refused outright, since this step always sends a credential. The scheme
+/// check reads the host through [`super::https_host`] rather than a
+/// hand-rolled `starts_with("https://")` — the same WHATWG parser
+/// `manifest::validate` reads a `token_url` through at load, so a URL that
+/// passed validation there (`Url::parse` lowercases the scheme, so
+/// `HTTPS://…` is valid `https` to it) is never rejected here, forever, by a
+/// second, stricter parser that disagrees with the first.
+///
+/// The cache read itself runs *before* the pair is resolved (see
+/// [`REFRESH_CACHE`]'s own doc) — a `Hit` needs no client at all, and a
+/// `Backoff` resolves one only to compare it against the entry's own
+/// `client_id`.
 fn oauth_refresh_step(step: &AuthStep, allowed_hosts: &[String]) -> Result<Option<String>, String> {
     let path = require_str("oauth-refresh", "path", step.path.as_deref())?;
     let token_json_path = require_str(
@@ -760,11 +979,24 @@ fn oauth_refresh_step(step: &AuthStep, allowed_hosts: &[String]) -> Result<Optio
     )?;
     let token_url = require_str("oauth-refresh", "token_url", step.token_url.as_deref())?;
 
-    // The refresh-token file first, before the client pair is ever resolved:
-    // a `client` table's discovery can mean scanning a candidate hundreds of
-    // megabytes long, and someone who has never signed in to this surface at
-    // all has nothing at `path` — the common case for most people this
-    // manifest reaches, and the one that must cost nothing.
+    if super::https_host(token_url).is_none() {
+        return Err(format!("`oauth-refresh` token_url must be https — refusing to send a refresh token over {token_url}"));
+    }
+    if allowed_hosts.is_empty() || !host_allowed(allowed_hosts, token_url) {
+        return Err(format!(
+            "surface's `allowed_hosts` does not include `token_url`'s host — refusing to send a \
+             refresh token to {token_url}"
+        ));
+    }
+
+    // The refresh-token file next, now that the request this step would
+    // eventually make is known to be allowed at all: someone who has never
+    // signed in to this surface has nothing at `path` — the common case for
+    // most people this manifest reaches — but that check comes *after* the
+    // allow-list precisely so a manifest whose `token_url` was never going
+    // to be permitted does not even get to read a file that might not be
+    // there, before a `client` table's discovery scan (hundreds of
+    // megabytes) is reached either.
     let file = super::expand_home(path);
     if !file.is_file() {
         return Ok(None); // not signed in here, or never has been
@@ -777,24 +1009,6 @@ fn oauth_refresh_step(step: &AuthStep, allowed_hosts: &[String]) -> Result<Optio
             file.display()
         )
     })?;
-
-    // Scheme and allow-list next, before the client pair is ever resolved: a
-    // refused `token_url` means this step was never going anywhere, and
-    // `client` discovery can mean scanning a candidate hundreds of megabytes
-    // long — a cost a misconfigured (or actively probing) manifest should
-    // never get to charge. Checked here because `resolve_token` runs ahead of
-    // the engine's own `allowed_hosts` check; an empty list — which reads as
-    // "no restriction" everywhere else `host_allowed` is used — is refused
-    // outright, since this step always sends a credential.
-    if !token_url.starts_with("https://") {
-        return Err(format!("`oauth-refresh` token_url must be https — refusing to send a refresh token over {token_url}"));
-    }
-    if allowed_hosts.is_empty() || !host_allowed(allowed_hosts, token_url) {
-        return Err(format!(
-            "surface's `allowed_hosts` does not include `token_url`'s host — refusing to send a \
-             refresh token to {token_url}"
-        ));
-    }
 
     // The installed-app pair, resolved only where it is actually needed
     // below (a cache `Hit` never calls this). Without a `client` table this
@@ -824,85 +1038,119 @@ fn oauth_refresh_step(step: &AuthStep, allowed_hosts: &[String]) -> Result<Optio
 
     // Pacing: a still-live token comes straight back — no client resolved at
     // all — and a recent failure is not retried until its backoff passes,
-    // *unless* the pair has since changed (see `REFRESH_CACHE`'s own doc). A
-    // broken clock (`now == 0`) skips the cache read entirely rather than
-    // trust a stored expiry against it, and always resolves the pair. A
+    // *unless* the pair has since changed (see `REFRESH_CACHE`'s own doc).
+    // `now` comes from `cache_now`, not `now_unix`: every comparison below is
+    // purely in-process (nothing here is checked against a timestamp the
+    // network handed back), so this takes the clock that is guaranteed
+    // never to be zero and never to run backwards mid-process rather than
+    // the wall clock a stepped-back correction could otherwise hand two
+    // consecutive calls in the wrong order — see `cache_now`'s own doc. A
     // `Backoff` hit that cannot resolve *any* pair right now reports the
     // same backoff error a still-current pair would (see that arm below for
     // why) rather than falling to Absent — unlike `Miss`'s own `None` arm,
-    // which has no cached failure to report and stays Absent.
-    let now = now_unix();
+    // which normally has no cached failure to report and stays Absent,
+    // except for the one case that arm itself carves out below.
+    let now = cache_now();
     let key = refresh_cache_key(token_url, &refresh_token);
-    let (client_id, client_secret) = if now != 0 {
-        match refresh_cache_lookup(key, now) {
-            CacheLookup::Hit(token) => return Ok(Some(token)),
-            CacheLookup::Backoff {
-                client_id: cached_id,
-                secret_hash: cached_secret_hash,
-                message,
-            } => match resolve_pair()? {
-                Some(pair) if pair.0 != cached_id || secret_hash(&pair.1) != cached_secret_hash => {
-                    pair
-                }
-                Some(_) => {
-                    return Err(message);
-                }
-                // Nothing resolves right now: unlike `Some(_)` just above
-                // (proven to be the exact same pair that failed), there is
-                // no pair here at all to compare against the one that
-                // failed — no proof either way that it has changed. This
-                // used to resolve Absent anyway, the same as `Miss`'s own
-                // `None` arm below, but a client that cannot currently be
-                // resolved is very often exactly *why* the exchange failed
-                // in the first place — a binary mid-reinstall, or
-                // `on_exchange_error`'s own `client_discovery_evict` having
-                // just armed a fresh discovery-miss backoff over it (see
-                // that function's own doc) — and Absent silently hides the
-                // row instead of explaining it, for as long as this cache
-                // entry's own backoff says the failure is still current.
-                // Reporting the same `message` the proven-unchanged case
-                // above reports keeps the row, and the reason, visible
-                // until this backoff lapses; only then does an
-                // unresolvable client fall back to Absent, same as
-                // `Miss`'s own arm.
-                None => return Err(message),
-            },
-            CacheLookup::Miss => match resolve_pair()? {
+    let (client_id, client_secret) = match refresh_cache_lookup(key, now) {
+        CacheLookup::Hit(token) => return Ok(Some(token)),
+        CacheLookup::Backoff {
+            client_id: cached_id,
+            secret_hash: cached_secret_hash,
+            message,
+        } => match resolve_pair()? {
+            Some(pair) if pair.0 != cached_id || secret_hash(&pair.1) != cached_secret_hash => pair,
+            Some(_) => {
+                return Err(message);
+            }
+            // Nothing resolves right now: unlike `Some(_)` just above
+            // (proven to be the exact same pair that failed), there is
+            // no pair here at all to compare against the one that
+            // failed — no proof either way that it has changed. This
+            // used to resolve Absent anyway, the same as `Miss`'s own
+            // `None` arm below, but a client that cannot currently be
+            // resolved is very often exactly *why* the exchange failed
+            // in the first place — a binary mid-reinstall, or
+            // `on_exchange_error`'s own `client_discovery_evict` having
+            // just armed a fresh discovery-miss backoff over it (see
+            // that function's own doc) — and Absent silently hides the
+            // row instead of explaining it, for as long as this cache
+            // entry's own backoff says the failure is still current.
+            // Reporting the same `message` the proven-unchanged case
+            // above reports keeps the row, and the reason, visible
+            // until this backoff lapses; only then does an
+            // unresolvable client fall back to Absent, same as
+            // `Miss`'s own arm.
+            None => return Err(message),
+        },
+        CacheLookup::Miss => {
+            // Read *before* `resolve_pair` runs, not after: a `client`
+            // table's own discovery arms a fresh miss backoff as a matter
+            // of course whenever a scan completes and finds nothing (see
+            // `discover_client_within`'s own doc), so checking after the
+            // call would always see one just armed by this very attempt —
+            // indistinguishable from a scan that was blocked from running
+            // at all. What this needs is the state *before* the call: was
+            // discovery already declining to even attempt a rescan this
+            // tick, the one case where `resolve_pair` coming back empty
+            // means "backed off", not "looked and found nothing".
+            let discovery_was_already_backed_off = step
+                .client
+                .as_ref()
+                .is_some_and(|client| client_discovery_miss_lookup(client_config_key(client), now));
+            match resolve_pair()? {
                 Some(pair) => pair,
-                None => return Ok(None),
-            },
-        }
-    } else {
-        match resolve_pair()? {
-            Some(pair) => pair,
-            None => return Ok(None),
+                None => {
+                    // `refresh_cache_lookup` reports `Miss` here whether
+                    // nothing was ever cached, or the last failure's own
+                    // `REFRESH_BACKOFF_SECS` backoff has since lapsed — and
+                    // a `client` table's own discovery-miss backoff
+                    // (`CLIENT_DISCOVERY_RETRY_SECS`/`_TRUNCATED_RETRY_SECS`)
+                    // is longer than that refresh backoff, so there is a
+                    // real window where the refresh cache has moved on to
+                    // `Miss` but `resolve_pair` still comes back empty
+                    // because discovery itself declined to even attempt a
+                    // rescan this tick — not because a fresh scan looked and
+                    // found nothing. Reported the same way the `Backoff`
+                    // arm's own unresolvable-client case is: the last
+                    // message this cache entry remembers, if it still
+                    // remembers one, rather than silently falling to Absent
+                    // and losing the reason along with the row. A genuine
+                    // first-time (or backoff-expired) scan that simply finds
+                    // nothing installed stays Absent, exactly as it always
+                    // has.
+                    if discovery_was_already_backed_off {
+                        if let Some(message) = refresh_cache_last_failed_message(key) {
+                            return Err(message);
+                        }
+                    }
+                    return Ok(None);
+                }
+            }
         }
     };
 
-    // A failed exchange, and a 200 that carried no usable token, both back off:
-    // `store_backoff` is a no-op when the clock is broken (`now == 0`), so a
-    // bogus `retry_after` is never written to outlast the bad clock. The
-    // message is stored alongside it, so a later `Backoff` hit that is not
-    // retried can report exactly this failure rather than a placeholder that
-    // only says one happened.
-    let store_backoff = |now: i64, message: String| {
-        if now != 0 {
-            refresh_cache_store(
-                key,
-                CacheEntry::Failed {
-                    retry_after_unix: now.saturating_add(REFRESH_BACKOFF_SECS),
-                    client_id: client_id.clone(),
-                    secret_hash: secret_hash(&client_secret),
-                    message,
-                },
-            );
-        }
+    // A failed exchange, and a 200 that carried no usable token, both back
+    // off, so a stuck endpoint is not hit on every tick with no exchange
+    // ever succeeding. The message is stored alongside it, so a later
+    // `Backoff` hit that is not retried can report exactly this failure
+    // rather than a placeholder that only says one happened.
+    let store_backoff = |message: String| {
+        refresh_cache_store(
+            key,
+            CacheEntry::Failed {
+                retry_after_unix: now.saturating_add(REFRESH_BACKOFF_SECS),
+                client_id: client_id.clone(),
+                secret_hash: secret_hash(&client_secret),
+                message,
+            },
+        );
     };
     let response =
         match oauth_refresh_request(token_url, &client_id, &client_secret, &refresh_token) {
             Ok(r) => r,
             Err(e) => {
-                store_backoff(now, e.clone());
+                store_backoff(e.clone());
                 on_exchange_error(step, &e);
                 return Err(e);
             }
@@ -914,24 +1162,26 @@ fn oauth_refresh_step(step: &AuthStep, allowed_hosts: &[String]) -> Result<Optio
             // still a reason to back off — otherwise a stuck endpoint is hit
             // every tick with no exchange ever succeeding.
             let message = "token refresh response carried no usable access_token".to_string();
-            store_backoff(now, message.clone());
+            store_backoff(message.clone());
             return Err(message);
         }
     };
-    // A 60s margin, same as the keychain step's, so the cached token is retired
-    // before a request would 401 on it. `saturating_*` so a hostile/huge
-    // `expires_in` cannot overflow the clock. `extract_access_token` already
-    // rejected anything `<= 60`, so `expires_at` is always ahead of `now` here.
+    // A 60s margin, same as the keychain step's, so the cached token is
+    // retired before a request would 401 on it. `saturating_*` so a
+    // hostile/huge `expires_in` cannot overflow the clock — belt and braces
+    // alongside `extract_access_token`'s own clamp to `EXPIRES_IN_MAX_SECS`,
+    // which is what actually keeps a dead token from being served forever
+    // (see that constant's own doc). `extract_access_token` already
+    // rejected anything `<= 60`, so `expires_at` is always ahead of `now`
+    // here.
     let expires_at = now.saturating_add(expires_in).saturating_sub(60);
-    if now != 0 {
-        refresh_cache_store(
-            key,
-            CacheEntry::Fresh {
-                access_token: access_token.clone(),
-                expires_at_unix: expires_at,
-            },
-        );
-    }
+    refresh_cache_store(
+        key,
+        CacheEntry::Fresh {
+            access_token: access_token.clone(),
+            expires_at_unix: expires_at,
+        },
+    );
     Ok(Some(access_token))
 }
 
@@ -939,14 +1189,17 @@ fn oauth_refresh_step(step: &AuthStep, allowed_hosts: &[String]) -> Result<Optio
 /// own backoff: `is_invalid_client(err)` means the *pair itself* is wrong,
 /// not merely that this attempt failed — a discovered pair cached from
 /// before the client was reinstalled with a new secret, say. Evicting here
-/// means the next attempt rescans instead of replaying the same stale pair
-/// — and a *found* pair has no expiry of its own to eventually age it out:
-/// [`CLIENT_DISCOVERY_FOUND`] is re-validated by the candidate's length and
-/// modification time on every lookup, not by a clock, so without this the
-/// stale pair would keep being served for as long as the file at that path
-/// keeps the same identity, not merely for some bounded backoff window.
-/// Nothing happens for a step without a `client` table — there is no
-/// discovery cache to evict for one that ships its pair literally.
+/// means the stale pair is never replayed again — but not that the very
+/// next attempt rescans: `client_discovery_evict` also arms a fresh
+/// [`CLIENT_DISCOVERY_RETRY_SECS`] miss backoff over the same config (see
+/// its own doc), so a rescan only happens once *that* has lapsed too, the
+/// same as any other discovery miss. Without evicting the found-cache entry
+/// at all, though, the stale pair would keep being served for as long as
+/// the file at that path keeps the same identity — [`CLIENT_DISCOVERY_FOUND`]
+/// is re-validated by the candidate's length and modification time on every
+/// lookup, not by a clock, so nothing else would ever notice this pair had
+/// gone bad. Nothing happens for a step without a `client` table — there is
+/// no discovery cache to evict for one that ships its pair literally.
 ///
 /// A free function, not inlined into [`oauth_refresh_step`], so it is
 /// directly testable against a stubbed error string rather than a live
@@ -1216,10 +1469,10 @@ fn client_discovery_evict(client: &AuthClientDiscovery) {
     if let Some(map) = guard.as_mut() {
         map.retain(|(config_key, _path), _| *config_key != key);
     }
-    let now = now_unix();
-    if now != 0 {
-        client_discovery_miss_store(key, now.saturating_add(CLIENT_DISCOVERY_RETRY_SECS));
-    }
+    // `cache_now`, not `now_unix`: this backoff is a purely in-process
+    // pacing decision (see `cache_now`'s own doc), never compared against
+    // anything the network sent.
+    client_discovery_miss_store(key, cache_now().saturating_add(CLIENT_DISCOVERY_RETRY_SECS));
 }
 
 /// One process-wide line per *key* that has ever been queued with it — the
@@ -1482,8 +1735,10 @@ fn discover_client_within(
     let secret_pattern = compile_scan_pattern(client.secret_pattern.as_deref()?)?;
 
     let key = client_config_key(client);
-    let now = now_unix();
-    if now != 0 && client_discovery_miss_lookup(key, now) {
+    // `cache_now`, not `now_unix`: this whole backoff is a purely
+    // in-process pacing decision (see `cache_now`'s own doc).
+    let now = cache_now();
+    if client_discovery_miss_lookup(key, now) {
         return None;
     }
 
@@ -1550,14 +1805,12 @@ fn discover_client_within(
     // shorter: it was never a completed attempt, so it must not be mistaken
     // for one at the next tick, but it must not be retried in full on every
     // tick either.
-    if now != 0 {
-        let retry_secs = if had_truncation {
-            CLIENT_DISCOVERY_TRUNCATED_RETRY_SECS
-        } else {
-            CLIENT_DISCOVERY_RETRY_SECS
-        };
-        client_discovery_miss_store(key, now.saturating_add(retry_secs));
-    }
+    let retry_secs = if had_truncation {
+        CLIENT_DISCOVERY_TRUNCATED_RETRY_SECS
+    } else {
+        CLIENT_DISCOVERY_RETRY_SECS
+    };
+    client_discovery_miss_store(key, now.saturating_add(retry_secs));
     if had_truncation {
         queue_diag_once(truncated_key(key), client_truncated_diag());
     }
@@ -1573,8 +1826,14 @@ fn discover_client_within(
 /// — [`super::cli_install_dirs`] is the canonical list; see its own doc for
 /// why it lives here and not beside `find_bin`). Same order both resolvers
 /// search in, so a machine with two installs of the same client on `PATH`
-/// at once cannot have this step discover a different pair from the one
-/// `find_bin` would have pinged. A name not found anywhere contributes
+/// at once has this step discover the same pair `find_bin` would have
+/// pinged — with one deliberate exception, not a parity bug: a relative (or
+/// empty) `PATH` entry is refused below, while `find_bin` still honors one.
+/// That makes the two agree everywhere a relative entry isn't in play, and
+/// disagree only in the one case where refusing it is the safer behaviour
+/// — a bare "current directory" is never where a manifest author had this
+/// app go looking for a client's binary; see `find_bin`'s own call site if
+/// it comes to filter the same way. A name not found anywhere contributes
 /// nothing, exactly like a `files` candidate that doesn't exist — discovery
 /// treats "not installed here" the same way regardless of which list named
 /// the candidate.
@@ -2076,6 +2335,40 @@ fn scan_candidate(
     }
 }
 
+/// The most a token-refresh response body is ever read as, in bytes — 1 MiB,
+/// read through `into_reader().take(...)` on *both* the success and error
+/// paths below (see [`read_capped_body`]) rather than trusting
+/// `Response::into_json` to buffer whatever `token_url` sends: an
+/// `allowed_hosts` entry names a host, not a promise that whatever answers
+/// there behaves, and a token endpoint (compromised, or simply broken) that
+/// streams gigabytes must not be read into memory in full before this ever
+/// gets to look at it. A real access-token response is a handful of short
+/// fields; 1 MiB is generous for that and nowhere near what a captured
+/// endpoint could use to exhaust memory on every refresh attempt.
+const OAUTH_RESPONSE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Read `reader` fully into memory, refusing anything past
+/// [`OAUTH_RESPONSE_MAX_BYTES`] rather than buffering an unbounded body (see
+/// that constant's own doc for why). `take(CAP + 1)`, one byte over the cap
+/// on purpose: a body of *exactly* `CAP` bytes and one that keeps going both
+/// read exactly `CAP` bytes through a plain `take(CAP)`, and would be
+/// indistinguishable from each other — reading the one extra byte is what
+/// lets this tell "ended right at the cap" from "still going" apart.
+fn read_capped_body(reader: impl std::io::Read) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    reader
+        .take(OAUTH_RESPONSE_MAX_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("token refresh: reading the response body failed: {e}"))?;
+    if buf.len() as u64 > OAUTH_RESPONSE_MAX_BYTES {
+        return Err(format!(
+            "token refresh: response body exceeded {OAUTH_RESPONSE_MAX_BYTES} bytes"
+        ));
+    }
+    Ok(buf)
+}
+
 fn oauth_refresh_request(
     token_url: &str,
     client_id: &str,
@@ -2093,16 +2386,21 @@ fn oauth_refresh_request(
         ("grant_type", "refresh_token"),
     ]);
     match result {
-        Ok(r) => r
-            .into_json()
-            .map_err(|e| format!("token refresh: bad response ({e})")),
+        Ok(r) => {
+            let body = read_capped_body(r.into_reader())?;
+            serde_json::from_slice(&body).map_err(|e| format!("token refresh: bad response ({e})"))
+        }
         Err(ureq::Error::Status(code, resp)) => {
             // The `error` field is an OAuth error code (`invalid_grant`,
             // `invalid_client`, …) — safe to name, and the only part worth
-            // naming. The response is consumed for it, nothing else.
-            let oauth_error = resp
-                .into_json::<Value>()
+            // naming. The response is consumed for it, nothing else. A body
+            // over the cap simply fails to yield an `oauth_error` at all —
+            // the match below already degrades an unreadable/unparsed body
+            // to the bare status, the same outcome as if the endpoint had
+            // sent no `error` field to begin with.
+            let oauth_error = read_capped_body(resp.into_reader())
                 .ok()
+                .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
                 .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned));
             // The `error` value comes from the endpoint that just received the
             // secret, so it is never printed raw — only matched against the
@@ -2159,13 +2457,38 @@ fn is_invalid_client(err: &str) -> bool {
     err.starts_with(&format!("{OAUTH_ERROR_PREFIX}invalid_client "))
 }
 
+/// The most a refreshed token is ever cached as living, in seconds — 24
+/// hours. A real OAuth2 access token runs minutes to a handful of hours;
+/// nothing legitimate needs longer, and without this cap a token endpoint
+/// sending an implausible `expires_in` (`i64::MAX`, or simply ten years —
+/// whether by bug or by a captured `token_url` an operator's own
+/// `allowed_hosts` mistakenly let through) would have `oauth_refresh_step`
+/// cache a `Fresh` entry this process goes on serving for as long as it
+/// runs, dead credential and all, with `throttle::fingerprint`'s own escape
+/// hatch (a changed token forces a redraw) never getting the chance to fire.
+/// Clamped, not refused outright — the access token itself is still good;
+/// only the endpoint's claim about how long is not believed past this
+/// point — and logged once per process when it actually bites, since a
+/// provider sending this every single refresh is worth knowing about, not
+/// silently absorbing forever.
+const EXPIRES_IN_MAX_SECS: i64 = 24 * 60 * 60;
+
 /// The two fields this step needs out of a refresh response: the access token
 /// and how long it lasts. Pure, so the success path is tested without a
 /// network call. A non-string/blank `access_token` is "no usable token". A
-/// missing `expires_in` falls back to a conservative hour; one that is zero or
-/// negative is rejected outright (`None`) — a token already dead on arrival
-/// would be cached expired and re-fetched on every tick, reopening the very
-/// pacing hole the cache exists to close.
+/// missing `expires_in` falls back to a conservative hour; one that is zero
+/// or negative is rejected outright (`None`) — a token already dead on
+/// arrival would be cached expired and re-fetched on every tick, reopening
+/// the very pacing hole the cache exists to close — and one implausibly far
+/// in the future is clamped to [`EXPIRES_IN_MAX_SECS`] rather than believed
+/// (see that constant's own doc for why an unbounded value is a real hole,
+/// not merely an odd one). `expires_in` itself is read as whatever shape an
+/// OAuth2 server actually sends it in — a JSON integer, a JSON float
+/// (`3599.0`, truncated: a fractional second of validity is not worth
+/// keeping), or a numeric string (`"3600"`) some deployments send instead —
+/// through [`numeric_expires_in`] rather than `Value::as_i64` alone, which
+/// silently reads `None` (and so the conservative-hour default, potentially
+/// wrong either way) for any of the last two.
 fn extract_access_token(value: &Value) -> Option<(String, i64)> {
     let token = value.get("access_token")?.as_str()?.trim();
     if token.is_empty() {
@@ -2173,7 +2496,7 @@ fn extract_access_token(value: &Value) -> Option<(String, i64)> {
     }
     let expires_in = value
         .get("expires_in")
-        .and_then(Value::as_i64)
+        .and_then(numeric_expires_in)
         .unwrap_or(3600);
     // `<= 60`, not just `<= 0`: a token that outlives the 60s cache margin by
     // nothing would be cached already expired (`now + expires_in - 60 <= now`)
@@ -2182,7 +2505,49 @@ fn extract_access_token(value: &Value) -> Option<(String, i64)> {
     if expires_in <= 60 {
         return None;
     }
+    let expires_in = if expires_in > EXPIRES_IN_MAX_SECS {
+        queue_diag_once(
+            expires_in_clamped_key(),
+            format!(
+                "oauth-refresh: token endpoint sent expires_in={expires_in}s — clamped to \
+                 {EXPIRES_IN_MAX_SECS}s"
+            ),
+        );
+        EXPIRES_IN_MAX_SECS
+    } else {
+        expires_in
+    };
     Some((token.to_string(), expires_in))
+}
+
+/// Dedup key for [`queue_diag_once`]'s once-per-process "expires_in
+/// clamped" notice — a fixed value, not derived from anything about the
+/// call it is about: a token endpoint sending one implausible value tonight
+/// and another tomorrow does not need two lines saying essentially the same
+/// thing.
+fn expires_in_clamped_key() -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_part(&mut hasher, "expires_in-clamped");
+    hasher.finish()
+}
+
+/// `expires_in` as OAuth2 servers actually send it: a JSON integer in the
+/// common case, sometimes a JSON float, and at least one deployment we've
+/// measured sends it as a numeric string. Anything else (`null`, an object,
+/// `"soon"`) reads back `None`, the same as the field being absent
+/// altogether, so the caller's own default takes over rather than this
+/// guessing at a number. Truncates toward zero on a fractional value —
+/// `3599.7` is kept as `3599`, never rounded up past what the endpoint
+/// actually promised.
+fn numeric_expires_in(value: &Value) -> Option<i64> {
+    if let Some(i) = value.as_i64() {
+        return Some(i);
+    }
+    if let Some(f) = value.as_f64() {
+        return Some(f as i64);
+    }
+    value.as_str()?.trim().parse::<f64>().ok().map(|f| f as i64)
 }
 
 // ── JSON token-path helpers ───────────────────────────────────────────────
@@ -2241,16 +2606,151 @@ fn require_vec<'a>(
 
 // ── macOS credential helpers ──────────────────────────────────────────────
 
+/// How long `keychain_password` waits for `security find-generic-password`
+/// before treating it as hung, killing it, and reporting a timeout instead
+/// of blocking this step — and the throttle gate behind it in
+/// `resolve_token`, and every other surface this process is watching along
+/// with it — for as long as a wedged Keychain daemon (or a first-run access
+/// prompt nobody is there to answer) keeps `security` from ever exiting.
+/// Thirty seconds: a prompt a user is actually answering can take a while,
+/// but nothing legitimate needs longer than that.
+#[cfg(any(target_os = "macos", test))]
+const KEYCHAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Read a Keychain "generic password" item. `Ok(None)` means the item
 /// doesn't exist (Absent); `Err` means it exists but couldn't be read
-/// (usually a denied access prompt).
+/// (usually a denied access prompt) — or that `security` did not finish
+/// within [`KEYCHAIN_DEADLINE`] and was killed.
 #[cfg(target_os = "macos")]
 fn keychain_password(service: &str) -> Result<Option<String>, String> {
-    let out = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", service, "-w"])
-        .output()
-        .map_err(|e| e.to_string())?;
-    classify_keychain_output(out.status.success(), &out.stdout, &out.stderr, service)
+    let out = run_command_with_deadline(
+        "security",
+        &["find-generic-password", "-s", service, "-w"],
+        KEYCHAIN_DEADLINE,
+    )?;
+    classify_keychain_output(out.success, &out.stdout, &out.stderr, service)
+}
+
+/// What [`run_command_with_deadline`] collected: whatever a command wrote to
+/// each stream, and whether it exited successfully — the same three things
+/// `std::process::Output` carries, kept as a struct of this module's own
+/// rather than reusing that type directly: a timed-out run has no real
+/// `ExitStatus` to report (the command was killed, not exited), and
+/// `run_command_with_deadline` reports that case as `Err` instead, so this
+/// only ever needs to represent a run that actually finished.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug)]
+struct DeadlineOutput {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Spawn `program` with `args`, capturing both stdout and stderr, and wait at
+/// most `deadline` for it to exit — the pattern `main.rs`'s own
+/// `run_with_deadline` established for the auto-ping subprocess (kill on
+/// timeout, drain the pipes on threads of their own rather than block
+/// reading them while also blocking on the wait), reimplemented here rather
+/// than imported: this is the library crate, `run_with_deadline` belongs to
+/// the binary, and nothing under `src/plugin` can reach across that
+/// boundary. `program`/`args` are parameters, not a `security` call baked
+/// in, precisely so a test can point this at a stand-in (`sleep`, `sh -c
+/// …`) and prove the kill without a real Keychain ever hanging a test.
+///
+/// Killed and reported (`Err`) on timeout, never left running: the whole
+/// point is that a caller waiting on this gets an answer inside `deadline`,
+/// one way or another. Stdout/stderr are drained on threads of their own
+/// while this waits rather than read after the fact, the same "shared, not
+/// joined" reasoning `main.rs`'s own version documents for its stderr drain
+/// — a killed command's pipe can still be held open by a grandchild it
+/// spawned, and joining the drain thread here would reinstate, inside this
+/// function's own cleanup, the exact hang the deadline exists to end.
+#[cfg(any(target_os = "macos", test))]
+fn run_command_with_deadline(
+    program: &str,
+    args: &[&str],
+    deadline: std::time::Duration,
+) -> Result<DeadlineOutput, String> {
+    use std::time::Instant;
+
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{program}: {e}"))?;
+
+    let stdout_buf = drain_pipe(child.stdout.take());
+    let stderr_buf = drain_pipe(child.stderr.take());
+
+    let expiry = Instant::now() + deadline;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() >= expiry => {
+                // One more check first, the same race `main.rs`'s own
+                // version closes the same way: a process that finished
+                // during the last sleep is not one this deadline killed.
+                if let Ok(Some(status)) = child.try_wait() {
+                    break Some(status);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            // Polled rather than blocked on, because a blocking wait can't
+            // be woken by a deadline.
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let Some(status) = status else {
+        return Err(format!(
+            "{program} did not finish within {}s — killed",
+            deadline.as_secs()
+        ));
+    };
+    Ok(DeadlineOutput {
+        success: status.success(),
+        stdout: stdout_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+        stderr: stderr_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+    })
+}
+
+/// Drain `pipe` into a buffer on a thread of its own, handing back the other
+/// end of that same buffer rather than the thread's `JoinHandle` — see
+/// [`run_command_with_deadline`]'s own doc for why that thread is never
+/// joined. `None` (no pipe at all, or the OS refused to hand out a thread)
+/// reads back as an empty buffer, the same as a command that wrote nothing
+/// on this stream.
+#[cfg(any(target_os = "macos", test))]
+fn drain_pipe(
+    pipe: Option<impl std::io::Read + Send + 'static>,
+) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let Some(mut pipe) = pipe else {
+        return buf;
+    };
+    let sink = std::sync::Arc::clone(&buf);
+    let _ = std::thread::Builder::new().spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut kept) = sink.lock() {
+                        kept.extend_from_slice(&chunk[..n]);
+                    }
+                }
+            }
+        }
+    });
+    buf
 }
 
 /// Classify the raw result of `security find-generic-password …` into the
@@ -2554,6 +3054,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn read_capped_body_accepts_a_response_exactly_at_the_cap() {
+        let body = vec![b'a'; OAUTH_RESPONSE_MAX_BYTES as usize];
+        let out = read_capped_body(std::io::Cursor::new(body.clone()))
+            .expect("exactly at the cap is fine");
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn read_capped_body_refuses_a_response_one_byte_over_the_cap() {
+        let body = vec![b'a'; (OAUTH_RESPONSE_MAX_BYTES + 1) as usize];
+        let err = read_capped_body(std::io::Cursor::new(body))
+            .expect_err("one byte over the cap must be refused, not silently truncated");
+        assert!(err.contains("exceeded"), "{err}");
+    }
+
     // ── oauth-refresh (up to, but not touching, the network) ─────────────
 
     fn oauth_refresh_step_for(dir: &std::path::Path, body: &str) -> AuthStep {
@@ -2633,14 +3149,40 @@ mod tests {
     }
 
     #[test]
+    fn oauth_refresh_step_refuses_a_blocked_host_without_ever_reading_the_refresh_token_file() {
+        // `path` never resolves to a real file — if the allow-list check
+        // ran *after* the file read (the old order), this would hit the
+        // "not signed in here" branch first and resolve `Ok(None)`, not an
+        // error. Getting the `allowed_hosts` error instead proves the check
+        // now runs before the file is ever touched.
+        let dir = temp_dir("oauth-blocked-host-no-file");
+        let mut step = oauth_refresh_step_for(&dir, r#"{"refresh_token":"r-1"}"#);
+        step.path = Some(
+            dir.join("does-not-exist.json")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let err = oauth_refresh_step(&step, &["example.com".to_string()]).expect_err(
+            "a token_url outside allowed_hosts must be refused before the missing \
+                         refresh-token file is ever reached",
+        );
+        assert!(err.contains("allowed_hosts"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn oauth_refresh_step_refuses_a_plaintext_token_url() {
         // A credential-bearing request must be over TLS — an http token_url,
         // even to an allowed host, would put the refresh token and secret on
-        // the wire in the clear.
+        // the wire in the clear. A non-routable local address, not a real
+        // host: this must never be reached at all, but a test naming one
+        // gives a false sense that it was ever going to be, and a real
+        // domain has no reason to appear in a fixture that is never
+        // actually contacted.
         let dir = temp_dir("oauth-http");
         let mut step = oauth_refresh_step_for(&dir, r#"{"refresh_token":"r-1"}"#);
-        step.token_url = Some("http://oauth2.googleapis.com/token".to_string());
-        let err = oauth_refresh_step(&step, &["oauth2.googleapis.com".to_string()])
+        step.token_url = Some("http://127.0.0.1:1/token".to_string());
+        let err = oauth_refresh_step(&step, &["127.0.0.1".to_string()])
             .expect_err("an http token_url must be refused before any request");
         assert!(err.contains("https"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
@@ -3507,7 +4049,7 @@ mod tests {
             key,
             CacheEntry::Fresh {
                 access_token: "still-valid-cached-token".to_string(),
-                expires_at_unix: now_unix() + 3600,
+                expires_at_unix: cache_now() + 3600,
             },
         );
 
@@ -3530,7 +4072,7 @@ mod tests {
         refresh_cache_store(
             key,
             CacheEntry::Failed {
-                retry_after_unix: now_unix() + 300,
+                retry_after_unix: cache_now() + 300,
                 client_id: "test-client-id".to_string(),
                 secret_hash: secret_hash("test-client-secret"),
                 message: "stale mock failure message".to_string(),
@@ -3560,7 +4102,7 @@ mod tests {
         refresh_cache_store(
             key,
             CacheEntry::Failed {
-                retry_after_unix: now_unix() + 300,
+                retry_after_unix: cache_now() + 300,
                 client_id: "test-client-id".to_string(),
                 secret_hash: secret_hash("test-client-secret"),
                 message: "stale mock failure message".to_string(),
@@ -3592,7 +4134,7 @@ mod tests {
         refresh_cache_store(
             key,
             CacheEntry::Failed {
-                retry_after_unix: now_unix() + 300,
+                retry_after_unix: cache_now() + 300,
                 client_id: "an-old-superseded-client-id".to_string(),
                 secret_hash: secret_hash("an-old-superseded-client-secret"),
                 message: "stale mock failure message".to_string(),
@@ -3633,7 +4175,7 @@ mod tests {
         refresh_cache_store(
             key,
             CacheEntry::Failed {
-                retry_after_unix: now_unix() + 300,
+                retry_after_unix: cache_now() + 300,
                 client_id: "some-old-client-id".to_string(),
                 secret_hash: secret_hash("some-old-client-secret"),
                 message: "stale mock failure message".to_string(),
@@ -3677,7 +4219,7 @@ mod tests {
         refresh_cache_store(
             key,
             CacheEntry::Failed {
-                retry_after_unix: now_unix() - 1,
+                retry_after_unix: cache_now() - 1,
                 client_id: "some-old-client-id".to_string(),
                 secret_hash: secret_hash("some-old-client-secret"),
                 message: "stale mock failure message".to_string(),
@@ -3739,7 +4281,7 @@ mod tests {
         refresh_cache_store(
             key,
             CacheEntry::Failed {
-                retry_after_unix: now_unix() + 300,
+                retry_after_unix: cache_now() + 300,
                 client_id: id.clone(),
                 secret_hash: secret_hash(&secret),
                 message: message.clone(),
@@ -3779,6 +4321,62 @@ mod tests {
              replay the stale backoff message: {err}"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn oauth_refresh_step_reports_the_last_failure_while_only_the_discovery_miss_backoff_is_still_armed(
+    ) {
+        // The window between the refresh backoff (`REFRESH_BACKOFF_SECS`,
+        // 300s) itself lapsing and a `client` table's own, longer
+        // discovery-miss backoff (`CLIENT_DISCOVERY_RETRY_SECS`, 600s)
+        // still declining to even attempt a rescan — t in [300, 600) after
+        // the original failure. `refresh_cache_lookup` reports `Miss`, not
+        // `Backoff`, here — without the `Miss` arm's own fallback this
+        // would silently go Absent even though the refresh cache still
+        // remembers exactly why the last attempt failed.
+        let dir = temp_dir("oauth-miss-with-armed-discovery-backoff");
+        let mut step =
+            oauth_refresh_step_for(&dir, r#"{"refresh_token":"r-discovery-miss-window"}"#);
+        step.client_id = None;
+        step.client_secret = None;
+        let client = AuthClientDiscovery {
+            id_env: None,
+            secret_env: None,
+            id_pattern: Some(synthetic_id_pattern()),
+            secret_pattern: Some(synthetic_secret_pattern()),
+            files: vec![dir.join("would-be-scanned").to_string_lossy().into_owned()],
+            bins: Vec::new(),
+        };
+        step.client = Some(client.clone());
+
+        let key = refresh_cache_key(
+            step.token_url.as_deref().unwrap(),
+            "r-discovery-miss-window",
+        );
+        let message = "token refresh failed: invalid_client (HTTP 400)".to_string();
+        // The refresh backoff itself has already lapsed — `refresh_cache_lookup`
+        // reports `Miss`, exactly the arm this test is about.
+        refresh_cache_store(
+            key,
+            CacheEntry::Failed {
+                retry_after_unix: cache_now() - 1,
+                client_id: "some-client-id".to_string(),
+                secret_hash: secret_hash("some-client-secret"),
+                message: message.clone(),
+            },
+        );
+        // The client-discovery miss backoff, armed separately and still
+        // live — `discover_client_within`'s own top-of-function gate
+        // returns `None` without even attempting a scan.
+        client_discovery_miss_store(client_config_key(&client), cache_now() + 500);
+
+        assert_eq!(
+            oauth_refresh_step(&step, &["oauth2.googleapis.com".to_string()]),
+            Err(message),
+            "the last known failure must still be reported while the discovery-miss backoff is \
+             armed, rather than silently going Absent"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3998,7 +4596,7 @@ mod tests {
         client_discovery_evict(&client);
 
         assert!(
-            client_discovery_miss_lookup(key, now_unix()),
+            client_discovery_miss_lookup(key, cache_now()),
             "eviction must arm a miss backoff, not merely clear one — a persistently invalid \
              pair must not be rescanned on the very next call"
         );
@@ -4172,24 +4770,41 @@ mod tests {
         let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A relative (or empty) `PATH` entry means "the current directory" —
         // never where this app should go looking for a client's binary.
+        // Proving that needs a relative entry that would actually resolve
+        // if `bin_candidates`'s own `is_absolute()` filter were deleted:
+        // `cargo test` runs with the crate root as its working directory
+        // (confirmed empirically, not merely assumed), so a directory
+        // created *under* it, named by a path relative to it, is exactly
+        // such an entry. This fixture used to name only a directory's own
+        // `file_name()` under `std::env::temp_dir()` — a relative path that
+        // could never resolve from the crate root no matter what
+        // `bin_candidates` did with it, so the assertion below passed
+        // whether the filter it was meant to prove existed or not.
+        //
         // This *does* mutate the real `PATH` env var (restored below,
         // before any assertion) — there is no other way to reach the branch
         // in `bin_candidates` that reads it. The replacement `PATH` is the
-        // relative entry *alone*, not the relative one plus the real,
-        // absolute one: the directories this app *always* appends
+        // relative entry (plus an empty component, the other shape
+        // `is_absolute()` refuses) *alone*, not those plus the real,
+        // absolute `PATH`: the directories this app *always* appends
         // (`super::cli_install_dirs`) are still there regardless, and would
         // otherwise make a false positive indistinguishable from a true one
         // on a machine that happens to have a matching binary in one of
         // them — mixing in the rest of the real `PATH` on top of that would
         // only add more ways for an unrelated absolute entry to explain a
         // pass, not fewer.
-        let dir = temp_dir("bin-candidates-relative");
+        let relative = format!("target/tickover-test-bin-candidates-{}", std::process::id());
+        let dir = std::env::current_dir()
+            .expect("cwd resolvable in test env")
+            .join(&relative);
+        std::fs::create_dir_all(&dir).unwrap();
         let name = format!("tickover-test-bin-{}", std::process::id());
         std::fs::write(dir.join(&name), "#!/bin/sh\n").unwrap();
-        let relative = dir.file_name().unwrap().to_string_lossy().into_owned();
 
         let real_path = std::env::var_os("PATH");
-        let joined = std::env::join_paths([std::path::PathBuf::from(&relative)]).unwrap();
+        let joined =
+            std::env::join_paths([std::ffi::OsStr::new(""), std::ffi::OsStr::new(&relative)])
+                .unwrap();
         std::env::set_var("PATH", &joined);
         let found = bin_candidates(&[name]);
         if let Some(p) = real_path {
@@ -4200,7 +4815,8 @@ mod tests {
 
         assert!(
             found.is_empty(),
-            "a relative PATH entry must never be searched: {found:?}"
+            "a relative PATH entry (including the empty component) must never be searched, \
+             even one that would actually resolve from the crate root: {found:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4346,6 +4962,11 @@ mod tests {
         // permissions outright — skip rather than false-fail somewhere that
         // isn't actually exercising the denial this test is about.
         if std::fs::File::open(&file).is_ok() {
+            eprintln!(
+                "skip: scan_candidate_reports_a_permission_error_distinctly_from_not_found — \
+                 running as root (or a sandbox that ignores file permissions), so a chmod 0 \
+                 file still opens and there is no denial left to exercise"
+            );
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).ok();
             std::fs::remove_dir_all(&dir).ok();
             return;
@@ -4388,6 +5009,11 @@ mod tests {
         std::fs::write(&file, fake_client_id("111222", "permdiscover")).unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::File::open(&file).is_ok() {
+            eprintln!(
+                "skip: discover_client_backs_off_on_a_read_error_with_its_own_diagnostic — \
+                 running as root (or a sandbox that ignores file permissions), so a chmod 0 \
+                 file still opens and there is no denial left to exercise"
+            );
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).ok();
             std::fs::remove_dir_all(&dir).ok();
             return;
@@ -4404,7 +5030,7 @@ mod tests {
 
         assert_eq!(discover_client(&client), None);
         let key = client_config_key(&client);
-        let now = now_unix();
+        let now = cache_now();
         assert!(
             client_discovery_miss_lookup(key, now),
             "a read error must buy the same backoff a genuine miss does — a permanently \
@@ -4511,9 +5137,9 @@ mod tests {
         // `t_call >= now_before`, so it must be at least `now_before +
         // CLIENT_DISCOVERY_TRUNCATED_RETRY_SECS`, whatever the call itself
         // cost.
-        let now_before = now_unix();
+        let now_before = cache_now();
         assert_eq!(discover_client_within(&client, tiny), None);
-        let now_after = now_unix();
+        let now_after = cache_now();
         assert!(
             client_discovery_miss_lookup(
                 key,
@@ -4558,7 +5184,7 @@ mod tests {
         // clears that gate — it arms a fresh backoff of its own (see its
         // own doc) — so what actually needs clearing here, and what this
         // does directly, is the stored retry-after itself: zeroing it (any
-        // real `now_unix()` is `> 0`) is "not in backoff" without touching
+        // real `cache_now()` is `> 0`) is "not in backoff" without touching
         // `CLIENT_DISCOVERY_LOGGED`, unlike eviction. The call below
         // genuinely re-runs the scan to the same truncation, reaches
         // `queue_diag_once` a second time with the same key, and it is
@@ -4651,9 +5277,9 @@ mod tests {
 
         // See the sibling test above for why `now_before` (captured ahead
         // of the call) gives an elapsed-time-independent lower bound.
-        let now_before = now_unix();
+        let now_before = cache_now();
         assert_eq!(discover_client_within(&client, tiny), None);
-        let now_after = now_unix();
+        let now_after = cache_now();
         assert!(
             client_discovery_miss_lookup(
                 key,
@@ -4751,7 +5377,7 @@ mod tests {
             "a candidate cut short by the per-file cap must not stop the pass — the pair in \
              the next candidate must still resolve"
         );
-        let now_after = now_unix();
+        let now_after = cache_now();
         assert!(
             !client_discovery_miss_lookup(key, now_after),
             "a found result must not also store a miss backoff"
@@ -4840,7 +5466,7 @@ mod tests {
              budget is exhausted by candidates ahead of it"
         );
         assert!(
-            !client_discovery_miss_lookup(key, now_unix()),
+            !client_discovery_miss_lookup(key, cache_now()),
             "a cache hit must not also store a truncated-pass backoff"
         );
         let drained = take_pending_diagnostics();
@@ -4990,38 +5616,106 @@ mod tests {
     }
 
     #[test]
+    fn extract_access_token_clamps_an_implausibly_long_expires_in() {
+        assert_eq!(
+            extract_access_token(&json!({ "access_token": "x", "expires_in": i64::MAX })),
+            Some(("x".to_string(), EXPIRES_IN_MAX_SECS)),
+            "a hostile or buggy expires_in must never cache a token that outlives \
+             EXPIRES_IN_MAX_SECS"
+        );
+        // Just past the cap is clamped down to it; just at the cap is left
+        // alone — the clamp is `>`, not `>=`.
+        assert_eq!(
+            extract_access_token(
+                &json!({ "access_token": "x", "expires_in": EXPIRES_IN_MAX_SECS + 1 })
+            ),
+            Some(("x".to_string(), EXPIRES_IN_MAX_SECS))
+        );
+        assert_eq!(
+            extract_access_token(
+                &json!({ "access_token": "x", "expires_in": EXPIRES_IN_MAX_SECS })
+            ),
+            Some(("x".to_string(), EXPIRES_IN_MAX_SECS))
+        );
+    }
+
+    #[test]
+    fn extract_access_token_accepts_expires_in_as_a_float_or_a_numeric_string() {
+        // A float, truncated toward zero rather than rounded.
+        assert_eq!(
+            extract_access_token(&json!({ "access_token": "x", "expires_in": 3599.9 })),
+            Some(("x".to_string(), 3599))
+        );
+        // A numeric string, the shape at least one real deployment sends.
+        assert_eq!(
+            extract_access_token(&json!({ "access_token": "x", "expires_in": "3600" })),
+            Some(("x".to_string(), 3600))
+        );
+        // `"0"` as a string must be read as the number `0`, not silently
+        // fall through to the conservative-hour default the way reading
+        // only `Value::as_i64` would (a JSON string is never an `i64`).
+        assert_eq!(
+            extract_access_token(&json!({ "access_token": "x", "expires_in": "0" })),
+            None,
+            "a zero expires_in sent as a string must be rejected, not defaulted to an hour"
+        );
+        // A float string, and garbage that parses as neither.
+        assert_eq!(
+            extract_access_token(&json!({ "access_token": "x", "expires_in": "3599.0" })),
+            Some(("x".to_string(), 3599))
+        );
+        assert_eq!(
+            extract_access_token(&json!({ "access_token": "x", "expires_in": "soon" })),
+            Some(("x".to_string(), 3600)),
+            "unparseable falls back to the conservative-hour default, same as absent"
+        );
+    }
+
+    #[test]
     fn refresh_cache_serves_a_token_until_it_expires_then_misses() {
         // Distinct key per run so parallel tests never share the process-wide
-        // static.
+        // static. The expiry is anchored to `cache_now()`, not a small
+        // literal like `1000` — `refresh_cache_store`'s own prune sweep (see
+        // its doc) judges every other entry in the map against the real
+        // `cache_now()` on every call, and a literal that far in the past by
+        // that clock could be pruned away by some unrelated, concurrently
+        // running test's own store before this test ever gets to look it up.
+        // Offset comfortably clear of both the real clock and
+        // `REFRESH_CACHE_FAILED_GRACE_SECS`/`REFRESH_BACKOFF_SECS`, the same
+        // relative before/at/after structure just measured from there.
         let key = refresh_cache_key("u", &format!("rt-fresh-{}", std::process::id()));
+        let base = cache_now() + 1_000_000;
         refresh_cache_store(
             key,
             CacheEntry::Fresh {
                 access_token: "cached".to_string(),
-                expires_at_unix: 1000,
+                expires_at_unix: base,
             },
         );
         assert!(
-            matches!(refresh_cache_lookup(key, 999), CacheLookup::Hit(t) if t == "cached"),
+            matches!(refresh_cache_lookup(key, base - 1), CacheLookup::Hit(t) if t == "cached"),
             "before expiry"
         );
         assert!(
-            matches!(refresh_cache_lookup(key, 1000), CacheLookup::Miss),
+            matches!(refresh_cache_lookup(key, base), CacheLookup::Miss),
             "at expiry, retired"
         );
         assert!(
-            matches!(refresh_cache_lookup(key, 1001), CacheLookup::Miss),
+            matches!(refresh_cache_lookup(key, base + 1), CacheLookup::Miss),
             "past expiry"
         );
     }
 
     #[test]
     fn refresh_cache_backs_off_a_recent_failure() {
+        // See the sibling test above for why this is anchored to
+        // `cache_now()` rather than a small literal.
         let key = refresh_cache_key("u", &format!("rt-fail-{}", std::process::id()));
+        let base = cache_now() + 1_000_000;
         refresh_cache_store(
             key,
             CacheEntry::Failed {
-                retry_after_unix: 1000,
+                retry_after_unix: base,
                 client_id: "c".to_string(),
                 secret_hash: secret_hash("s"),
                 message: "exchange failed".to_string(),
@@ -5029,14 +5723,14 @@ mod tests {
         );
         assert!(
             matches!(
-                refresh_cache_lookup(key, 999),
+                refresh_cache_lookup(key, base - 1),
                 CacheLookup::Backoff { client_id, secret_hash: sh, message }
                     if client_id == "c" && sh == secret_hash("s") && message == "exchange failed"
             ),
             "inside backoff, carrying the client_id/secret_hash/message it failed with"
         );
         assert!(
-            matches!(refresh_cache_lookup(key, 1000), CacheLookup::Miss),
+            matches!(refresh_cache_lookup(key, base), CacheLookup::Miss),
             "backoff over, retry"
         );
     }
@@ -5057,6 +5751,114 @@ mod tests {
             refresh_cache_key("https://a/token", &rt),
             refresh_cache_key("https://a/token", &rt2),
             "different refresh_token must not collide"
+        );
+    }
+
+    #[test]
+    fn cache_now_is_never_zero_and_never_runs_backwards() {
+        let a = cache_now();
+        assert!(
+            a > 0,
+            "cache_now must never be zero or negative, unlike now_unix on a broken clock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let b = cache_now();
+        assert!(
+            b >= a,
+            "cache_now must never run backwards within the process: {a} then {b}"
+        );
+    }
+
+    #[test]
+    fn refresh_cache_store_prunes_a_failed_entry_once_its_grace_period_has_passed() {
+        // Distinct keys so this cannot collide with any other test's own
+        // entries in the shared, process-wide `REFRESH_CACHE`.
+        let stale_key = refresh_cache_key(
+            "https://example.test/prune-grace-elapsed",
+            &format!("prune-grace-elapsed-{}", std::process::id()),
+        );
+        let now = cache_now();
+        // Past its own `retry_after_unix` *and* past the grace period this
+        // module keeps a `Failed` entry alive for afterward (see
+        // `REFRESH_CACHE_FAILED_GRACE_SECS`'s own doc) — nothing should
+        // still want to read this one.
+        refresh_cache_store(
+            stale_key,
+            CacheEntry::Failed {
+                retry_after_unix: now - REFRESH_CACHE_FAILED_GRACE_SECS - 100,
+                client_id: "irrelevant".to_string(),
+                secret_hash: 0,
+                message: "irrelevant".to_string(),
+            },
+        );
+        // A second, unrelated store — the only way `refresh_cache_store`
+        // ever prunes anything (see its own doc: pruning happens on store,
+        // not on a timer).
+        let other_key = refresh_cache_key(
+            "https://example.test/prune-grace-other",
+            &format!("prune-grace-other-{}", std::process::id()),
+        );
+        refresh_cache_store(
+            other_key,
+            CacheEntry::Failed {
+                retry_after_unix: now + REFRESH_BACKOFF_SECS,
+                client_id: "irrelevant".to_string(),
+                secret_hash: 0,
+                message: "irrelevant".to_string(),
+            },
+        );
+
+        let guard = REFRESH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let map = guard.as_ref().expect("something was stored");
+        assert!(
+            !map.contains_key(&stale_key),
+            "an entry past its own grace period must be pruned once another store call runs"
+        );
+        assert!(
+            map.contains_key(&other_key),
+            "storing one entry must not prune a still-live one"
+        );
+    }
+
+    #[test]
+    fn refresh_cache_store_keeps_a_recently_lapsed_failed_entry_within_its_grace_period() {
+        // The other side of the sibling test above: a `Failed` entry whose
+        // own backoff has lapsed, but not by more than
+        // `REFRESH_CACHE_FAILED_GRACE_SECS` yet, must survive a subsequent
+        // store call — this is exactly the window
+        // `refresh_cache_last_failed_message` exists to still read from.
+        let recent_key = refresh_cache_key(
+            "https://example.test/prune-grace-recent",
+            &format!("prune-grace-recent-{}", std::process::id()),
+        );
+        let now = cache_now();
+        refresh_cache_store(
+            recent_key,
+            CacheEntry::Failed {
+                retry_after_unix: now - 1,
+                client_id: "irrelevant".to_string(),
+                secret_hash: 0,
+                message: "still within grace".to_string(),
+            },
+        );
+        let other_key = refresh_cache_key(
+            "https://example.test/prune-grace-recent-other",
+            &format!("prune-grace-recent-other-{}", std::process::id()),
+        );
+        refresh_cache_store(
+            other_key,
+            CacheEntry::Failed {
+                retry_after_unix: now + REFRESH_BACKOFF_SECS,
+                client_id: "irrelevant".to_string(),
+                secret_hash: 0,
+                message: "irrelevant".to_string(),
+            },
+        );
+
+        assert_eq!(
+            refresh_cache_last_failed_message(recent_key).as_deref(),
+            Some("still within grace"),
+            "a `Failed` entry inside its grace period must survive another key's store call"
         );
     }
 
@@ -5158,6 +5960,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn token_from_decrypted_cuts_at_the_first_top_level_close_not_the_last() {
+        // Trailing garbage that itself contains a `}` — proves this finds
+        // the JSON's own top-level close, not merely the last `}` anywhere
+        // in the buffer. The last `}` here sits inside "garbage}more{stuff",
+        // which would hand `serde_json` `{...}garbage}` (a trailing-garbage
+        // parse failure) were this still cutting at `rfind('}')`.
+        let plain = b"{\"claudeAiOauth\":{\"accessToken\":\"tok-desktop\"}}garbage}more{stuff";
+        assert_eq!(
+            token_from_decrypted(plain, "claudeAiOauth.accessToken|access_token").as_deref(),
+            Some("tok-desktop")
+        );
+    }
+
+    #[test]
+    fn first_top_level_object_end_skips_braces_inside_quoted_strings() {
+        // A value carrying a literal `}` (escaped, as valid JSON requires)
+        // must not be mistaken for the object's own close.
+        let text = r#"{"a":"x}y","b":1}"#;
+        assert_eq!(first_top_level_object_end(text), Some(text.len()));
+        assert_eq!(first_top_level_object_end("no braces here"), None);
+        assert_eq!(first_top_level_object_end("{\"unterminated\": 1"), None);
+    }
+
     /// Round-trip through the real Safe Storage scheme: encrypt with the
     /// same derivation (PBKDF2-SHA1/saltysalt/1003 -> AES-128-CBC, IV =
     /// spaces) and a `v10` prefix, then decrypt with the code under test.
@@ -5234,6 +6060,52 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(err.contains("Keychain access"), "unexpected error: {err}");
+    }
+
+    /// The stand-in `run_command_with_deadline`'s own doc promises: `security`
+    /// needs a real Keychain, but the deadline logic itself does not — a
+    /// command guaranteed to outlive the deadline proves the kill.
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_deadline_kills_a_command_that_outlives_it() {
+        let started = std::time::Instant::now();
+        let err = run_command_with_deadline(
+            "sh",
+            &["-c", "sleep 30"],
+            std::time::Duration::from_millis(300),
+        )
+        .expect_err("a command that outlives the deadline must be reported, not returned");
+        assert!(err.contains("did not finish"), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "returned promptly, not after the full sleep"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_deadline_reports_a_command_that_ends_on_its_own() {
+        let out = run_command_with_deadline(
+            "sh",
+            &["-c", "printf ok; exit 0"],
+            std::time::Duration::from_secs(30),
+        )
+        .expect("a command that exits well within the deadline must not be treated as a timeout");
+        assert!(out.success);
+        assert_eq!(out.stdout, b"ok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_deadline_reports_a_failing_command_as_unsuccessful_not_an_error() {
+        let out = run_command_with_deadline(
+            "sh",
+            &["-c", "printf trouble 1>&2; exit 3"],
+            std::time::Duration::from_secs(30),
+        )
+        .expect("a command that runs to completion, even with a non-zero exit, is not a timeout");
+        assert!(!out.success);
+        assert_eq!(out.stderr, b"trouble");
     }
 
     // ── reject-when step ──────────────────────────────────────────────────

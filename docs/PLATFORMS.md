@@ -47,7 +47,12 @@ older macOS has been tried; treat that floor as declared, not measured.
   say when an item was dropped. The reasoning, and the rules for who moves
   the window and when, are in [`DOCK-MODE.md`](DOCK-MODE.md).
 - **Launch at login** is a login item, added and removed by the toggle in
-  the panel or the tray menu.
+  the panel or the tray menu. An install carried over from the app's
+  pre-rename name retires that old "Codex Limits" login item by matching its
+  **path**, not its name: `auto-launch` derives a macOS login item's name
+  from the executable it was given rather than the name its caller asked
+  for, so a name-based lookup for the old app would just find this app's own
+  current entry and delete that instead.
 - `TICKOVER_SNAPSHOT=out.png` renders the panel to a PNG and exits — this is
   how the panel screenshots in this repository were taken (the menu-bar
   pill comes from the `widget_probe` example).

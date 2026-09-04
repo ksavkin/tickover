@@ -121,8 +121,14 @@ impl Band {
     }
 }
 
-/// See [`Band`].
+/// See [`Band`]. Classifies `used.round()`, not the raw value: the panel
+/// (`ui/widgets.slint`'s `used-rounded`) rounds the percentage *before*
+/// handing it to `Theme.sev`, so a raw `89.6` compared against `>= 90.0`
+/// here disagreed with the panel, which had already rounded 89.6 to 90 and
+/// turned the row red — the menu bar's own pill stayed amber for the exact
+/// same reading.
 fn severity_band(used: f64) -> Band {
+    let used = used.round();
     if used >= CRIT_AT {
         Band::Crit
     } else if used >= WARN_AT {
@@ -205,6 +211,28 @@ fn fill_rrect(img: &mut RgbaImage, x: f32, y: f32, w: f32, h: f32, r: f32, c: [u
             let dist = outside + inside - r;
             blend(img, px, py, c, 0.5 - dist);
         }
+    }
+}
+
+/// The most characters of a [`ProviderRow::label`] [`render`] will ever
+/// measure or draw. Shipped labels are chip captions ("Cx", "Cl") — nowhere
+/// near this cap — so it only ever bites a label from a manifest this app
+/// hasn't validated as tightly as it should (`menu_label` has its own cap in
+/// `manifest::validate`, but this module doesn't get to assume that always
+/// ran first): [`render`] sizes its own allocation off this string's
+/// measured width, and an unbounded label would size that allocation off
+/// text nothing here has bounded.
+const LABEL_MAX_CHARS: usize = 16;
+
+/// `label`, cut to [`LABEL_MAX_CHARS`] Unicode scalar values. Applied once,
+/// before either measuring or drawing — doing it separately in each place
+/// would let the two disagree and draw something wider than what was
+/// actually allocated for it.
+fn capped_label(label: &str) -> String {
+    if label.chars().count() <= LABEL_MAX_CHARS {
+        label.to_string()
+    } else {
+        label.chars().take(LABEL_MAX_CHARS).collect()
     }
 }
 
@@ -359,7 +387,16 @@ fn draw_text_bold(
 /// `scale` is the pixel density (2.0 for retina). Returns `None` when there
 /// is nothing to draw or no font is available.
 pub fn render(rows: &[ProviderRow], dark: bool, scale: f32) -> Option<RgbaImage> {
-    let rows: Vec<&ProviderRow> = rows.iter().take(2).collect();
+    // Capped once, here, and used for both measuring and drawing below — a
+    // provider's own `label` reaches this module from its manifest's
+    // `menu_label` (or the plan-derived tag), unbounded on this side of that
+    // boundary; without this, an absurd label sizes the allocation a few
+    // lines down (`RgbaImage::new`) off a width nothing validated.
+    let rows: Vec<(&ProviderRow, String)> = rows
+        .iter()
+        .take(2)
+        .map(|r| (r, capped_label(&r.label)))
+        .collect();
     if rows.is_empty() {
         return None;
     }
@@ -394,17 +431,17 @@ pub fn render(rows: &[ProviderRow], dark: bool, scale: f32) -> Option<RgbaImage>
             + text_width(f, val_px, &used_num(&r.weekly))
             + val_px * 0.1
     };
-    let group_w = |r: &ProviderRow| -> f32 {
-        let label_w = text_width(f, label_px, &r.label) + label_px * 0.05;
+    let group_w = |r: &ProviderRow, label: &str| -> f32 {
+        let label_w = text_width(f, label_px, label) + label_px * 0.05;
         label_w + gap + bar_w + gap + val_pair_w(r)
     };
 
     let mut w = pad + icon + 4.0 * s;
-    for (i, r) in rows.iter().enumerate() {
+    for (i, (r, label)) in rows.iter().enumerate() {
         if i > 0 {
             w += 4.0 * s + sep_w + 4.0 * s;
         }
-        w += group_w(r);
+        w += group_w(r, label);
     }
     w += pad;
 
@@ -455,15 +492,15 @@ pub fn render(rows: &[ProviderRow], dark: bool, scale: f32) -> Option<RgbaImage>
         }
     };
 
-    for (i, row) in rows.iter().enumerate() {
+    for (i, (row, label)) in rows.iter().enumerate() {
         if i > 0 {
             x += 4.0 * s;
             draw_text(&mut img, f, label_px, x, baseline, "·", p.faint);
             x += sep_w + 4.0 * s;
         }
 
-        draw_text_bold(&mut img, f, label_px, x, baseline, &row.label, p.ink);
-        x += text_width(f, label_px, &row.label) + label_px * 0.05 + gap;
+        draw_text_bold(&mut img, f, label_px, x, baseline, label, p.ink);
+        x += text_width(f, label_px, label) + label_px * 0.05 + gap;
 
         // Stacked bars: 5-hour above, weekly below.
         draw_bar(&mut img, x, cy - (bar_h + bar_gap) / 2.0, &row.five_hour);
@@ -642,6 +679,24 @@ mod tests {
     }
     use super::*;
 
+    #[test]
+    fn severity_band_classifies_the_rounded_percentage_like_the_panel_does() {
+        // `ui/widgets.slint`'s `used-rounded` rounds the percentage before
+        // `Theme.sev` ever sees it — 89.6 reads as 90 there, at the crit
+        // threshold, and 69.5 reads as 70, at the warn one. Comparing the
+        // raw value here disagreed with the panel right at those boundaries.
+        assert_eq!(
+            severity_band(89.6),
+            Band::Crit,
+            "89.6 rounds to 90 — the panel's own row would already be red"
+        );
+        assert_eq!(
+            severity_band(69.5),
+            Band::Warn,
+            "69.5 rounds to 70 — the panel's own row would already be amber"
+        );
+    }
+
     fn rows() -> Vec<ProviderRow> {
         vec![
             ProviderRow {
@@ -775,6 +830,32 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_absurdly_long_label_is_truncated_before_it_ever_reaches_the_allocation() {
+        let mut normal = rows();
+        normal.truncate(1);
+        let baseline = render(&normal, true, 2.0).expect("system font present");
+
+        let mut huge = rows();
+        huge.truncate(1);
+        huge[0].label = "x".repeat(10_000);
+        let capped = render(&huge, true, 2.0).expect("system font present");
+
+        assert_eq!(
+            capped.height(),
+            baseline.height(),
+            "height never depends on the label at all"
+        );
+        assert!(
+            capped.width() < baseline.width() * 10,
+            "a 10 000-char label produced {}px against a normal label's {}px — \
+             the cap did not bite",
+            capped.width(),
+            baseline.width()
+        );
+    }
+
     #[test]
     fn the_number_beside_a_bar_is_what_the_bar_shows() {
         // The widget used to print what was left while its own bar filled with
@@ -806,8 +887,12 @@ mod tests {
         // Percentages and progress fractions arrive from a provider's JSON.
         // A NaN reaching a coordinate is a range built from NaN; a scale of
         // zero or a negative one is an allocation of nothing or of everything.
+        // The label is absurdly long for the same reason: `render` sizes its
+        // own allocation off the label's measured width, and a manifest's
+        // `menu_label` is this module's problem to bound too, not only
+        // `manifest::validate`'s.
         let odd = ProviderRow {
-            label: "Cx".to_string(),
+            label: "x".repeat(10_000),
             five_hour: Some(WindowStat {
                 used_percent: f64::NAN,
                 time_progress: Some(f32::NAN),

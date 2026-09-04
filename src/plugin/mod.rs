@@ -12,6 +12,10 @@
 //! * [`auth`] — the ordered credential-lookup chain (`[[surface.auth]]`).
 //! * [`engine_logfile`] — the `engine = "log-file"` reader (Codex-style).
 //! * [`engine_http`] — the `engine = "http-api"` reader (Claude-style).
+//! * [`time`] — timestamp parsing shared by [`engine_logfile`] and
+//!   [`engine_http`]: an RFC3339 parser, a Unix-seconds reader tolerant of a
+//!   provider that quotes its numbers, and the ten-year plausibility check
+//!   neither engine used to enforce on its own.
 //! * [`seed`] — the manifests shipped built-in with the app.
 //! * [`scheduler`] — generic engine dispatch + refresh-cadence check, used by
 //!   `src/main.rs`'s per-plugin fetch loop.
@@ -40,6 +44,7 @@ pub mod scheduler;
 pub mod seed;
 pub mod signature;
 pub mod throttle;
+pub mod time;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -189,7 +194,8 @@ pub fn https_host(url: &str) -> Option<String> {
 /// Expand a manifest path spec.
 ///
 /// Two prefixes are recognised, checked only at the very start of the
-/// string:
+/// string, and only when what follows is either nothing or a path
+/// separator (see [`strip_prefix_at_boundary`]):
 /// * `~` — the user's home directory ([`dirs::home_dir`]).
 /// * `{config_dir}` — the OS config directory ([`dirs::config_dir`]; e.g.
 ///   `~/Library/Application Support` on macOS, `%APPDATA%` on Windows).
@@ -199,19 +205,38 @@ pub fn https_host(url: &str) -> Option<String> {
 /// path (better a confusing path than a panic) — callers should still treat
 /// the result as best-effort.
 pub fn expand_home(spec: &str) -> PathBuf {
-    if let Some(rest) = spec.strip_prefix("{config_dir}") {
+    if let Some(rest) = strip_prefix_at_boundary(spec, "{config_dir}") {
         return match dirs::config_dir() {
             Some(dir) => join_rest(dir, rest),
             None => PathBuf::from(spec),
         };
     }
-    if let Some(rest) = spec.strip_prefix('~') {
+    if let Some(rest) = strip_prefix_at_boundary(spec, "~") {
         return match dirs::home_dir() {
             Some(home) => join_rest(home, rest),
             None => PathBuf::from(spec),
         };
     }
     PathBuf::from(spec)
+}
+
+/// `spec` with `prefix` removed, but only when what follows is either
+/// nothing or a path separator — never when it merely looks like more of
+/// the same word. Without this boundary, `~otheruser/x` would strip to
+/// `otheruser/x` and join it onto *this* user's home directory rather than
+/// `otheruser`'s (`~` names a user's home only when it stands alone or is
+/// immediately followed by `/`; `~otheruser` is a different, POSIX-defined
+/// shell expansion this app has never implemented and must not silently
+/// mimic half of), and `{config_dir}rc` — a literal string that merely
+/// starts with the placeholder's own text — would resolve as `<config
+/// dir>/rc` rather than being left as the literal path it actually is.
+fn strip_prefix_at_boundary<'a>(spec: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = spec.strip_prefix(prefix)?;
+    if rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\') {
+        Some(rest)
+    } else {
+        None
+    }
 }
 
 /// Join whatever followed a recognised prefix onto `base`, stripping a
@@ -243,6 +268,14 @@ fn join_rest(base: PathBuf, rest: &str) -> PathBuf {
 /// open handle — the same two-stat technique `auth::scan_candidate` uses for
 /// the identical race. The cap keeps an unexpectedly enormous file from being
 /// pulled into memory whole.
+///
+/// The non-blocking open below that actually closes the race for a FIFO
+/// swapped in between the two stats — `O_NONBLOCK` — is `cfg(unix)`; on a
+/// platform without it, the first `metadata` call is still a cheap early
+/// exit for the *ordinary* case (a FIFO already sitting there when this is
+/// called), but a path that changes kind at exactly the wrong moment could
+/// still block the open on that platform. Same qualification
+/// `auth::scan_candidate`'s own doc gives its identical guard.
 pub fn read_regular_file(path: &std::path::Path, max_bytes: u64) -> Option<String> {
     use std::io::Read;
     // Follows a symlink (unlike `symlink_metadata`) — a cheap early exit for
@@ -474,7 +507,11 @@ pub fn sanitize_provider_text(text: &str) -> String {
 /// directional marks (`U+200E`/`U+200F`), the word joiner and, worst of the
 /// set, the Unicode line and paragraph separators. `char::is_control` does
 /// not cover `U+2028`/`U+2029`, so a provider could still end a line in the
-/// middle of one.
+/// middle of one. The tag characters (`U+E0000`–`U+E007F`) and variation
+/// selectors supplement (`U+E0100`–`U+E01EF`) round the set out: both ranges
+/// render as nothing at all in a normal font, and a run of tag characters
+/// used to be able to smuggle arbitrary text invisibly inside what looked
+/// like an ordinary short caption.
 fn is_invisible_or_directional(c: char) -> bool {
     matches!(
         c,
@@ -491,6 +528,10 @@ fn is_invisible_or_directional(c: char) -> bool {
             | '\u{00AD}'              // soft hyphen
             // Line and paragraph separators, which `is_control` does not catch.
             | '\u{2028}' | '\u{2029}'
+            // Tag characters and the variation selectors supplement: render
+            // as nothing, and can carry a whole hidden string of their own.
+            | '\u{E0000}'..='\u{E007F}'
+            | '\u{E0100}'..='\u{E01EF}'
     )
 }
 
@@ -643,6 +684,31 @@ mod tests {
         assert_eq!(expand_home("relative/path"), PathBuf::from("relative/path"));
     }
 
+    #[test]
+    fn a_tilde_immediately_followed_by_more_letters_is_not_this_users_home() {
+        // `~otheruser/x` names *otheruser's* home directory in a real shell,
+        // a POSIX expansion this app has never implemented — stripping the
+        // bare `~` and joining the rest onto *this* user's home directory
+        // instead would silently mimic half of that expansion and land on a
+        // path nobody asked for.
+        assert_eq!(
+            expand_home("~otheruser/x"),
+            PathBuf::from("~otheruser/x"),
+            "left as a literal path, not resolved against this user's home"
+        );
+    }
+
+    #[test]
+    fn a_config_dir_placeholder_immediately_followed_by_more_letters_is_left_literal() {
+        // `{config_dir}rc` merely starts with the placeholder's own text —
+        // without a separator right after it, it isn't the placeholder at
+        // all, and must not resolve as `<config dir>/rc`.
+        assert_eq!(
+            expand_home("{config_dir}rc"),
+            PathBuf::from("{config_dir}rc")
+        );
+    }
+
     // ── substitute_options ───────────────────────────────────────────────
 
     #[test]
@@ -713,6 +779,15 @@ mod tests {
         let made = std::process::Command::new("mkfifo").arg(&fifo).status();
         if matches!(made, Ok(s) if s.success()) {
             assert_eq!(read_regular_file(&fifo, SMALL_FILE_MAX_BYTES), None);
+        } else {
+            // `mkfifo` isn't guaranteed present everywhere this test runs —
+            // silently asserting nothing here used to look identical to the
+            // FIFO case actually having been exercised. Print rather than
+            // skip outright: a CI log that never shows this line is the one
+            // place this gap would otherwise go unnoticed.
+            eprintln!(
+                "SKIP: read_regular_file_refuses_anything_that_is_not_one — mkfifo unavailable"
+            );
         }
 
         std::fs::remove_dir_all(&dir).ok();
@@ -754,5 +829,14 @@ mod tests {
             "capping before trimming would have spent ten characters of the budget on the \
              leading padding instead of on content: {sanitized:?}"
         );
+    }
+
+    #[test]
+    fn sanitize_provider_text_strips_tag_characters_and_the_variation_selectors_supplement() {
+        // Both ranges render as nothing in a normal font — a caption could
+        // otherwise carry a whole hidden string of its own, invisibly, past
+        // whatever the person approving the install actually reads on screen.
+        let hidden = format!("visible{}{}", '\u{E0041}', '\u{E01EF}');
+        assert_eq!(sanitize_provider_text(&hidden), "visible");
     }
 }

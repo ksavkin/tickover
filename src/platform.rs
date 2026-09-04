@@ -104,12 +104,36 @@ fn show_request_path() -> Option<std::path::PathBuf> {
 ///
 /// A file rather than a signal or a socket, because the running instance
 /// already looks at the filesystem once a second and this needs nothing else
-/// to exist. Best-effort: a note that can't be written costs a panel that
-/// doesn't open, which is what would have happened anyway.
+/// to exist — a same-user channel, exactly as private as `config.json`
+/// itself, not a cross-user one. Best-effort: a note that can't be written
+/// costs a panel that doesn't open, which is what would have happened
+/// anyway.
+///
+/// `create_new`, never `std::fs::write`'s `create().truncate()`: the path is
+/// predictable, and `write` follows a symlink anything running as this user
+/// could have left there, truncating whatever it points at instead of
+/// leaving the note. `create_new` refuses to touch anything already at the
+/// path — a symlink, or simply a note [`take_show_request`] hasn't consumed
+/// yet — rather than write through or over it; either way the outcome is
+/// the same as any other failure here, a panel that doesn't open this once.
 pub fn leave_show_request() {
-    if let Some(path) = show_request_path() {
-        let _ = std::fs::write(path, b"");
-    }
+    let Some(path) = show_request_path() else {
+        return;
+    };
+    leave_show_request_at(&path);
+}
+
+/// [`leave_show_request`]'s own logic against an explicit path — split out
+/// so it has a test: `show_request_path` resolves through
+/// `crate::config::dir`, which has no test override (unlike, say,
+/// `diag::path`), so the public function itself can't be called from a test
+/// without touching whatever config directory `cargo test` happens to run
+/// under.
+fn leave_show_request_at(path: &std::path::Path) {
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path);
 }
 
 /// Take that note if one is there, removing it. False when there is none.
@@ -462,4 +486,68 @@ pub fn activate_app() {}
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn system_dark_theme() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::leave_show_request_at;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-platform-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn leave_show_request_creates_a_fresh_note() {
+        let dir = temp_dir("fresh");
+        let path = dir.join("show-panel");
+        leave_show_request_at(&path);
+        assert!(path.is_file());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn leave_show_request_never_writes_through_a_symlink_planted_at_the_note_path() {
+        // The gap this closes: `std::fs::write` follows a symlink, so a link
+        // planted at the predictable "show-panel" path — by anything running
+        // as this user — would have its *target* truncated instead of the
+        // note being left, the target being whatever file that symlink
+        // happens to point at.
+        let dir = temp_dir("symlink");
+        let target = dir.join("elsewhere");
+        std::fs::write(&target, "do not touch").unwrap();
+        let link = dir.join("show-panel");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        leave_show_request_at(&link);
+
+        assert!(link.is_symlink(), "the symlink itself must survive");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "do not touch",
+            "and never written through"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn leave_show_request_does_not_error_when_a_note_is_already_there() {
+        // A note `take_show_request` hasn't consumed yet is not a failure —
+        // there is already something for the running instance to find.
+        let dir = temp_dir("already-there");
+        let path = dir.join("show-panel");
+        leave_show_request_at(&path);
+        leave_show_request_at(&path); // must not panic, must not remove it
+        assert!(path.is_file());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

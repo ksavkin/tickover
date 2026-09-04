@@ -39,7 +39,7 @@
 //! picture this only summarizes.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::plugin::https_host;
-use crate::plugin::manifest::{AuthType, EngineKind, PluginManifest};
+use crate::plugin::manifest::{AuthStep, AuthType, EngineKind, LogFileConfig, PluginManifest};
 
 // ── index.toml schema ────────────────────────────────────────────────────
 
@@ -78,11 +78,16 @@ pub struct RegistryEntry {
     /// (`^[A-Za-z0-9_-]+$`), since it becomes the installed manifest's
     /// filename stem too.
     pub id: String,
-    /// Display name.
+    /// Display name — reaches the install/update UI unsanitised and
+    /// unbounded, aside from what [`RegistryIndex::validate`] checks at
+    /// parse time: no control characters, and at most
+    /// [`REGISTRY_NAME_MAX_CHARS`].
     pub name: String,
     /// Publisher-declared version (compared with [`version_cmp`]).
     pub version: String,
-    /// Optional one-line description shown before install.
+    /// Optional one-line description shown before install — same two
+    /// checks as [`Self::name`], bounded instead by
+    /// [`REGISTRY_DESCRIPTION_MAX_CHARS`].
     #[serde(default)]
     pub description: Option<String>,
     /// Path to the manifest file, **relative to the index's own directory**
@@ -112,18 +117,37 @@ impl RegistryIndex {
     }
 
     fn validate(&self) -> Result<(), String> {
+        if self.plugins.len() > MAX_INDEX_ENTRIES {
+            return Err(format!(
+                "index lists {} plugins, more than the {MAX_INDEX_ENTRIES} this app will ever \
+                 read — a corrupted or dishonest index is rejected wholesale",
+                self.plugins.len()
+            ));
+        }
         let mut seen_ids: HashSet<&str> = HashSet::new();
         for p in &self.plugins {
             validate_registry_id(&p.id)?;
             if p.name.trim().is_empty() {
                 return Err(format!("plugin \"{}\": `name` must not be empty", p.id));
             }
+            refuse_control_chars(&p.id, "name", &p.name)?;
+            refuse_too_long(&p.id, "name", &p.name, REGISTRY_NAME_MAX_CHARS)?;
             if p.version.trim().is_empty() {
                 return Err(format!("plugin \"{}\": `version` must not be empty", p.id));
+            }
+            if let Some(description) = &p.description {
+                refuse_control_chars(&p.id, "description", description)?;
+                refuse_too_long(
+                    &p.id,
+                    "description",
+                    description,
+                    REGISTRY_DESCRIPTION_MAX_CHARS,
+                )?;
             }
             validate_sha256_hex(&p.id, &p.sha256)?;
             validate_relative_manifest_path(&p.manifest)
                 .map_err(|e| format!("plugin \"{}\": {e}", p.id))?;
+            refuse_control_chars(&p.id, "manifest", &p.manifest)?;
             if !seen_ids.insert(p.id.as_str()) {
                 return Err(format!(
                     "duplicate plugin id \"{}\" in index — a corrupted or dishonest index is \
@@ -134,6 +158,57 @@ impl RegistryIndex {
         }
         Ok(())
     }
+}
+
+/// [`RegistryEntry::name`]'s cap — plenty for any real provider's display
+/// name, and short enough that a hostile index can't hand the install/update
+/// UI a caption built to overflow it. A constant of its own rather than
+/// reusing `crate::plugin::PROVIDER_TEXT_MAX_CHARS`: that one bounds a
+/// provider *response* string this app sanitises at every render because it
+/// changes without notice, where registry text is validated once, here, at
+/// index-parse time.
+const REGISTRY_NAME_MAX_CHARS: usize = 64;
+
+/// [`RegistryEntry::description`]'s cap — a one-line summary shown before
+/// install, not a changelog.
+const REGISTRY_DESCRIPTION_MAX_CHARS: usize = 256;
+
+/// The most `[[plugin]]` entries an index may list. No real registry
+/// approaches this (this repo ships a handful) — it exists purely so a 10
+/// MiB [`fetch_bytes`]-capped index can't still hand the UI thread on the
+/// order of a hundred thousand rows to sort, diff and draw, which an index
+/// that paid for its size in short ids rather than useful content could
+/// otherwise reach well inside that byte cap.
+const MAX_INDEX_ENTRIES: usize = 500;
+
+/// Refuse a control character anywhere in `value` (`field`, on plugin `id`'s
+/// entry) — the same class [`crate::plugin::sanitize_provider_text`] strips
+/// from a provider *response*, refused outright here instead since this text
+/// is checked once, at load, rather than sanitised at every render. A
+/// `name`/`description`/`manifest` carrying a raw `\n` could otherwise split
+/// one log line into two, or a dialog caption into a shape its own layout
+/// never accounted for.
+fn refuse_control_chars(id: &str, field: &str, value: &str) -> Result<(), String> {
+    if value.chars().any(|c| c.is_control()) {
+        return Err(format!(
+            "plugin \"{id}\": `{field}` must not contain control characters"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse `value` (`field`, on plugin `id`'s entry) past `max_chars` Unicode
+/// scalar values — mirrors [`crate::plugin::PROVIDER_TEXT_MAX_CHARS`]'s own
+/// "characters" unit (a byte count would cut a multi-byte code point in
+/// half; a grapheme-cluster count is a third thing again).
+fn refuse_too_long(id: &str, field: &str, value: &str, max_chars: usize) -> Result<(), String> {
+    let len = value.chars().count();
+    if len > max_chars {
+        return Err(format!(
+            "plugin \"{id}\": `{field}` must be at most {max_chars} characters, got {len}"
+        ));
+    }
+    Ok(())
 }
 
 /// Same charset rule as [`PluginManifest::validate`]'s `id` check — the
@@ -150,7 +225,34 @@ fn validate_registry_id(id: &str) -> Result<(), String> {
             "`id = \"{id}\"` must contain only ASCII letters, digits, underscores and hyphens"
         ));
     }
+    if is_windows_reserved_device_name(id) {
+        return Err(format!(
+            "`id = \"{id}\"` is a Windows reserved device name — `{id}.toml` is not an \
+             ordinary file there"
+        ));
+    }
     Ok(())
+}
+
+/// The Windows device names no id may share the (extension-insensitive)
+/// base of — `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`. An
+/// installed registry entry's id becomes exactly `<id>.toml`, and on Windows
+/// `CON.toml` is not an ordinary file at all — opening it for writing
+/// addresses the same reserved device `CON` does, whatever extension
+/// follows. Checked case-insensitively, matching Windows itself. A trailing
+/// dot or space is the other classic Windows device-name trap, but
+/// [`validate_registry_id`]'s own charset check already refuses both (`.`
+/// and ` ` are outside `[A-Za-z0-9_-]`), so there is nothing left here for
+/// this function to add for that half.
+const WINDOWS_RESERVED_DEVICE_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+fn is_windows_reserved_device_name(id: &str) -> bool {
+    WINDOWS_RESERVED_DEVICE_NAMES
+        .iter()
+        .any(|reserved| id.eq_ignore_ascii_case(reserved))
 }
 
 /// A sha256 hex string must be exactly 64 characters, every one of them a
@@ -171,12 +273,19 @@ fn validate_sha256_hex(id: &str, sha: &str) -> Result<(), String> {
 }
 
 /// Reject anything that isn't a plain relative path under the index's own
-/// tree: a URL scheme (`://`), a leading path separator (absolute path), or
-/// any `..` component (directory traversal). This is what closes "a
-/// compromised index tricks the installer into fetching a manifest from a
-/// different host, or a file outside the registry's own tree" — see the
-/// module docs' Trust model note. The scheme and leading-separator checks run
-/// on the raw string; the `..` check runs on it percent-decoded first (see
+/// tree: a URL scheme (`://`), a leading path separator (absolute path), a
+/// `?`/`#` (a query string or fragment — [`resolve_manifest_url`] appends
+/// this path straight onto the index's own URL by string concatenation, and
+/// either character would have the appended text read as part of the
+/// *query*/*fragment* rather than the path once a real URL parser sees the
+/// joined string, which is exactly the kind of reinterpretation
+/// [`resolve_manifest_url`]'s own host re-check exists to catch but a bare
+/// string check like this one otherwise couldn't), or any `..` component
+/// (directory traversal). This is what closes "a compromised index tricks
+/// the installer into fetching a manifest from a different host, or a file
+/// outside the registry's own tree" — see the module docs' Trust model note.
+/// The scheme, leading-separator and query/fragment checks run on the raw
+/// string; the `..` check runs on it percent-decoded first (see
 /// [`percent_decode_lossy`]), so a compromised index cannot spell a
 /// traversal component `%2e%2e` and slip past a check written against the
 /// literal bytes — a server on the other end of the resolved URL decodes it
@@ -195,6 +304,11 @@ fn validate_relative_manifest_path(path: &str) -> Result<(), String> {
     if path.starts_with('/') || path.starts_with('\\') {
         return Err(format!(
             "`manifest = \"{path}\"` must be relative (no leading path separator)"
+        ));
+    }
+    if path.contains('?') || path.contains('#') {
+        return Err(format!(
+            "`manifest = \"{path}\"` must not contain a `?` or `#`"
         ));
     }
     if percent_decode_lossy(path)
@@ -313,9 +427,16 @@ type SemverParts<'a> = ((u64, u64, u64), Option<&'a str>);
 /// registry could publish `version = "beta"` and have it read as newer than
 /// every properly-versioned installed manifest forever, purely because
 /// `'b' > '1'` in ASCII — an update prompt with no version to actually
-/// install and no way to ever resolve. Only when *both* sides fail to parse
-/// does this fall back to plain string comparison, which is still a total
-/// order (never panics), just not a semver-aware one.
+/// install and no way to ever resolve. When *both* sides fail to parse, they
+/// compare as `Equal` rather than falling back to a plain string compare —
+/// two strings this pair was never meant to hold a version-shaped opinion
+/// about don't get to disagree about which is newer just because their
+/// bytes happen to sort one way, and [`PluginManifest::version`] is
+/// free-form, defaulting to `""` for a manifest that predates the plugin
+/// registry entirely (see that field's own doc): exactly the shape that used
+/// to make the registry's own declared version look "newer" purely from
+/// being non-empty, and nag "update available" forever with nothing real to
+/// update.
 pub fn version_cmp(a: &str, b: &str) -> Ordering {
     match (parse_semver(a), parse_semver(b)) {
         (Some((base_a, pre_a)), Some((base_b, pre_b))) => match base_a.cmp(&base_b) {
@@ -335,7 +456,11 @@ pub fn version_cmp(a: &str, b: &str) -> Ordering {
         // higher.
         (Some(_), None) => Ordering::Greater,
         (None, Some(_)) => Ordering::Less,
-        (None, None) => a.cmp(b),
+        // Neither side is version-shaped at all — see this function's own
+        // doc for why a string-sort tiebreak here would be exactly the same
+        // meaningless-bytes problem the asymmetric rule above closes, just
+        // for the case where both sides have it at once.
+        (None, None) => Ordering::Equal,
     }
 }
 
@@ -541,11 +666,86 @@ pub fn lockfile_path() -> PathBuf {
 /// than an error — a missing/corrupt lockfile must never block reading or
 /// installing plugins, only degrade the "was this locally modified"
 /// provenance check in [`diff_installed`] to the no-record branch.
+///
+/// Read through [`crate::plugin::read_regular_file`] rather than a plain
+/// `std::fs::read_to_string`: this runs on every "check updates" tick, and a
+/// FIFO planted at this predictable path would otherwise hang it forever the
+/// same way one at `config.json` would hang the app's own tick.
 pub fn load_lockfile(path: &Path) -> RegistryLockState {
-    std::fs::read_to_string(path)
-        .ok()
+    crate::plugin::read_regular_file(path, crate::plugin::SMALL_FILE_MAX_BYTES)
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// How many `.corrupt-<unix secs>[-<n>]` names [`backup_if_corrupt`] tries
+/// before giving up on saving a backup at all — mirrors `config.rs`'s own
+/// `CORRUPT_BACKUP_MAX_ATTEMPTS` and the same reasoning: the name is only
+/// second-resolution, so two corrupt lockfiles backed up inside the same
+/// second would otherwise fight over one name. The count matches; the
+/// numbering doesn't — `config.rs`'s first retry after the bare name is
+/// `-2` (its own counter starts at the attempt number, 1, for the bare
+/// name), where this one's first retry is `-1` (its own counter starts at
+/// 0). Neither sequence is load-bearing outside its own module, so nothing
+/// depends on the two agreeing.
+const LOCKFILE_BACKUP_MAX_ATTEMPTS: u32 = 100;
+
+/// Back up `path`'s current content, if any, before it's about to be
+/// overwritten and doesn't parse as a [`RegistryLockState`] — mirrors
+/// `config.rs`'s own `backup_if_corrupt` for `config.json`, for the same
+/// reason: [`load_lockfile`] silently treats anything that doesn't parse as
+/// an empty lockfile, so without this a corrupt lockfile is simply gone the
+/// moment the next install/update writes a fresh one over it, taking every
+/// provenance record it held with it. Best-effort and silent, unlike
+/// `config.rs`'s own version, which logs via `diag::line`: this module lives
+/// in the library crate, which `diag` (a binary-crate-only module, like
+/// `config` itself) is not part of — there is no sink here to log to. A
+/// caller that wants to know can still see for itself: the backup, when one
+/// was made, sits right beside `path` as `<name>.corrupt-<unix-seconds>` (or
+/// a `-<n>`-suffixed sibling, see [`LOCKFILE_BACKUP_MAX_ATTEMPTS`]).
+///
+/// Read through [`crate::plugin::read_regular_file`], not a plain
+/// `std::fs::read_to_string` — same reason [`load_lockfile`] itself is: a
+/// FIFO planted at this predictable path must not hang the save that is
+/// about to happen. Written via `create_new`, never `std::fs::copy` — that
+/// destination name is exactly as predictable (this second, not this
+/// process), and `copy` opens its destination with truncate, following a
+/// symlink planted there and overwriting whatever it points to rather than
+/// the intended backup; `create_new` refuses any directory entry already at
+/// that path, symlink included, and falls through to the next
+/// counter-suffixed name instead.
+fn backup_if_corrupt(path: &Path) {
+    let Some(existing) =
+        crate::plugin::read_regular_file(path, crate::plugin::SMALL_FILE_MAX_BYTES)
+    else {
+        return; // absent, unreadable, or not a regular file: nothing to save
+    };
+    if serde_json::from_str::<RegistryLockState>(&existing).is_ok() {
+        return; // parses fine — an ordinary overwrite, nothing at risk
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let stem = path.file_name().unwrap_or_default().to_os_string();
+    for attempt in 0..LOCKFILE_BACKUP_MAX_ATTEMPTS {
+        let mut backup_name = stem.clone();
+        if attempt == 0 {
+            backup_name.push(format!(".corrupt-{secs}"));
+        } else {
+            backup_name.push(format!(".corrupt-{secs}-{attempt}"));
+        }
+        let backup = path.with_file_name(backup_name);
+        let result = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, existing.as_bytes()));
+        match result {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return, // best-effort, and no sink here to log it to — see this function's own doc
+        }
+    }
 }
 
 /// Persist `state` to `path`, creating its parent directory if needed
@@ -555,6 +755,7 @@ pub fn save_lockfile(path: &Path, state: &RegistryLockState) -> std::io::Result<
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    backup_if_corrupt(path);
     let text =
         serde_json::to_string_pretty(state).map_err(|e| std::io::Error::other(e.to_string()))?;
     // Temp file then rename, for the same reason `config.rs` does it: a
@@ -602,8 +803,11 @@ pub enum RegistryPluginState {
     /// no-lockfile-record branch of [`diff_installed`], where the file's
     /// origin is simply unknown and this is the best that can be said.
     UpToDate { locally_modified: bool },
-    /// The registry has something newer (or, with no lockfile record at all,
-    /// a version that simply differs — see [`diff_installed`]) to offer.
+    /// The registry has a strictly newer version to offer, per
+    /// [`version_cmp`] — including the no-lockfile-record branch of
+    /// [`diff_installed`], which resolves `local_version`/`entry.version`
+    /// through [`update_available`] (the same strict-newer check) rather
+    /// than merely noticing the two differ.
     UpdateAvailable {
         /// `true` only when a lockfile record proves the installed file
         /// still matches what was last installed — overwriting it destroys
@@ -654,20 +858,29 @@ pub fn diff_installed(
     installed: &[(String, String, String)],
     lockfile: &RegistryLockState,
 ) -> Vec<RegistryPluginState> {
+    // One pass to build a lookup, rather than `diff_one` re-scanning
+    // `installed` with `.find()` once per index entry: `installed` already
+    // has unique ids by the time it reaches here (`main.rs` builds it from
+    // the loaded, de-duplicated plugin set), so collecting it into a map
+    // loses nothing and turns what used to be an `entries × installed`
+    // linear scan on every "check updates" click into one lookup per entry.
+    let by_id: BTreeMap<&str, &(String, String, String)> = installed
+        .iter()
+        .map(|entry| (entry.0.as_str(), entry))
+        .collect();
     index
         .plugins
         .iter()
-        .map(|entry| diff_one(entry, installed, lockfile))
+        .map(|entry| diff_one(entry, &by_id, lockfile))
         .collect()
 }
 
 fn diff_one(
     entry: &RegistryEntry,
-    installed: &[(String, String, String)],
+    installed: &BTreeMap<&str, &(String, String, String)>,
     lockfile: &RegistryLockState,
 ) -> RegistryPluginState {
-    let Some((_, local_sha, local_version)) = installed.iter().find(|(id, _, _)| id == &entry.id)
-    else {
+    let Some((_, local_sha, local_version)) = installed.get(entry.id.as_str()).copied() else {
         return RegistryPluginState::New;
     };
 
@@ -739,11 +952,17 @@ pub struct TrustDisclosure {
     /// a file of its own), `[[http.value]] path`, `[http.version] files`, and
     /// an `oauth-refresh` step's `[surface.auth.client] files`/`bins`/
     /// `id_env`/`secret_env`/`id_pattern`/`secret_pattern` — `bins` entries
-    /// are the *program
-    /// names* `bin_candidates` resolves on `PATH`, labelled `"<name>
-    /// (resolved on PATH or the usual CLI install directories)"` rather than
+    /// are the *program names* `bin_candidates` resolves on `PATH`, labelled
+    /// `"<name> (resolved on PATH, or in ~/.local/bin, ~/.cargo/bin, nvm, or
+    /// one of this app's other usual CLI install directories)"` rather than
     /// a path, since which file that resolves to isn't known until the
-    /// client is actually installed; `id_env`/`secret_env` are not a file at
+    /// client is actually installed — naming a few of those directories
+    /// rather than the vaguer "the usual CLI install directories" this used
+    /// to say: they are exactly the *user-writable* ones
+    /// `crate::plugin::cli_install_dirs` searches, which is the fact worth a
+    /// approving user's attention (anything running as this user can drop a binary
+    /// in any of them), not merely that a search happens; `id_env`/
+    /// `secret_env` are not a file at
     /// all, labelled `"$NAME (environment variable)"` so a registry manifest
     /// cannot name, say, `AWS_SECRET_ACCESS_KEY` and install unseen just
     /// because nothing here is technically a path; `id_pattern`/
@@ -766,7 +985,56 @@ pub struct TrustDisclosure {
     /// `auth::resolve_client`) but are exactly as much "this manifest reads
     /// a credential from somewhere of its own choosing" as the other two,
     /// and the installer has to be told before, not after, either way.
+    ///
+    /// Two more sources, added once it was clear the list above still had
+    /// gaps a manifest could hide behind: `engine = "log-file"`'s own read
+    /// scope — `[logfile] root`/`glob` rendered as one `"<root>/<glob>"`
+    /// entry (`root` shown literally, `~` and all, exactly like every other
+    /// entry in this list rather than resolved to a real path — this is a
+    /// disclosure of what the manifest *says*, not a filesystem walk of its
+    /// own; when `root_env` is set, `<root>` is `"$<root_env>"` instead,
+    /// optionally joined with `root_env_join`, since that is what the engine
+    /// actually reads whenever the named variable is set — which for a
+    /// provider's own CLI it almost always is), so a manifest whose whole
+    /// shape is `root = "~"`, `glob = "**/*.json"` cannot walk the entire
+    /// home directory without the dialog naming exactly that; and `[account]
+    /// path` (the `jwt-file` account lookup's own token file), missing
+    /// before for the same reason a credential-file auth step's `path` once
+    /// was. An `electron-safe-storage` step's `config_path` lands here too —
+    /// see [`credential_sources`](TrustDisclosure::credential_sources)'s own
+    /// doc for why it is named twice, once here as a file and once there as
+    /// a credential source.
     pub local_files: Vec<String>,
+    /// Every `[[surface.auth]]` step whose credential does not already show
+    /// up as a path in `local_files` — `credentials-file`/`credentials-map`
+    /// (and `oauth-refresh`, whose own `path` is the file it reads a refresh
+    /// token out of) all read a named file, already disclosed there; this
+    /// field exists for the kinds that read a credential from somewhere
+    /// `local_files` has no room to name because it names files, not places:
+    /// * `env` — `"env $<VAR>"`, the variable name itself, not merely the
+    ///   word "env" — a registry manifest naming, say,
+    ///   `AWS_SECRET_ACCESS_KEY` has to say so plainly, not hide behind
+    ///   `auth_types` listing a step *kind* nobody reads twice.
+    /// * `keychain` — `"keychain \"<service>\""`, the OS keychain service
+    ///   queried.
+    /// * `win-credential` — `"credential manager \"<target>\""`, one entry
+    ///   per target tried, in the order the manifest lists them.
+    ///
+    /// `electron-safe-storage` gets both a `local_files` entry (its
+    /// `config_path`, the file actually opened) and one here (`"electron
+    /// safe storage <config_path> (key \"<macos_keychain_key>\")"`, the
+    /// macOS keychain entry that unlocks it, omitted on the platforms/steps
+    /// that leave it unset) — it is the one step that reads from a file and
+    /// a second store at once, and neither list alone says both.
+    ///
+    /// Deliberately not populated for `reject-when` (reads nothing but a
+    /// field that decides whether the chain stops) or `oauth-refresh` (its
+    /// `path`/`token_url`/`client.*` are each already disclosed by name
+    /// elsewhere in this struct — adding a fourth label for the same step
+    /// would repeat, not add, information). Same first-seen order/dedup
+    /// idiom as every other list here. See `requires_approval`'s own doc for
+    /// why this list gates on its own, unlike `auth_types`.
+    pub credential_sources: Vec<String>,
     /// The command this manifest runs after a window resets (`[ping]`), if it
     /// declares one. It is the only field in a manifest that executes
     /// anything, so it is the last one that should be invisible here.
@@ -805,11 +1073,22 @@ pub struct TrustDisclosure {
     /// (today) point at a trusted host but could point anywhere after an
     /// update. `dest_hosts`/`untrusted_hosts` are still disclosed so the UI
     /// can call out unfamiliar destinations, they just no longer decide
-    /// whether approval is *required*. `env`-only auth is disclosed in
-    /// `auth_types` like everything else, but deliberately never gates this
-    /// flag on its own (see that doc's rationale: an env var is something
-    /// the user put there themselves, not a store this manifest goes
-    /// digging in).
+    /// whether approval is *required*.
+    ///
+    /// Also `true` whenever `local_files` or `credential_sources` is
+    /// non-empty, whatever the engine: a manifest that names a local file of
+    /// its own choosing, or an `env`/`keychain`/`win-credential`/
+    /// `electron-safe-storage` credential source, needs a look regardless of
+    /// whether it happens to be paired with `http-api` — a `log-file`
+    /// manifest whose one auth step reads `AWS_SECRET_ACCESS_KEY` is exactly
+    /// as worth stopping for as an `http-api` one that reads it and mails it
+    /// somewhere, since nothing stops a later update from adding the mailing
+    /// half once this one has already installed unseen. This is *not* the
+    /// same test as `store_backed` above: `store_backed` only ever asks
+    /// "does this combine a credential store with `http-api`", and `env`
+    /// deliberately answers no to that one regardless — see its own match
+    /// arm's comment — while still reaching a dialog through this clause the
+    /// moment it names a variable.
     pub requires_approval: bool,
 }
 
@@ -827,6 +1106,73 @@ fn push_dest_host(url: &str, dest_hosts: &mut Vec<String>) {
         {
             dest_hosts.push(h);
         }
+    }
+}
+
+/// [`push_dest_host`], but first substituting every `{option.<key>}` in
+/// `url` at `option_defaults` — the plugin's own declared defaults, since
+/// this disclosure runs before any config for the plugin exists to override
+/// them (see [`analyze_trust`]'s own `option_defaults` for why the manifest
+/// default is the only value there is). Without this, a request URL reading
+/// `https://{option.beta}.evil.example/` would disclose the placeholder text
+/// itself rather than the host it actually resolves to — `option.beta` reads
+/// as a variable name, not a destination the person approving the install would stop at.
+///
+/// `{`/`}` are not forbidden host code points under the WHATWG URL standard
+/// (the same parser `ureq` builds a request through) — they read as
+/// ordinary host characters, same as any letter. So an unresolved
+/// placeholder (one naming an option this manifest never declared) still
+/// parses and still reaches `dest_hosts` verbatim through the ordinary path
+/// below; nothing here needs to special-case it. The one shape that *can*
+/// defeat the ordinary parse is
+/// a placeholder sitting somewhere stricter than a hostname label, most
+/// concretely a port (`https://host:{option.x}/`, `InvalidPort` however
+/// `option.x` resolves) — `validate` only requires `[[http.request]] url`
+/// and `[account] url` to be `https`-parseable when `[http]` is present at
+/// all, so a `log-file` manifest's `[account] url` can carry exactly that
+/// shape and still load. [`https_host`] returning `None` there would
+/// otherwise make the destination vanish from this disclosure rather than
+/// merely go unresolved — the fallback below catches that by reading the
+/// authority text itself rather than trusting a real parser to make sense
+/// of it.
+fn push_dest_host_for_disclosure(
+    url: &str,
+    option_defaults: &BTreeMap<String, bool>,
+    dest_hosts: &mut Vec<String>,
+) {
+    let substituted = crate::plugin::substitute_options(url, option_defaults);
+    if https_host(&substituted).is_some() {
+        push_dest_host(&substituted, dest_hosts);
+        return;
+    }
+    if let Some(authority) = raw_authority(&substituted) {
+        if authority.contains('{')
+            && !dest_hosts
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(authority))
+        {
+            dest_hosts.push(authority.to_string());
+        }
+    }
+}
+
+/// `url`'s authority, read by eye rather than through a real URL parser:
+/// everything after the first `//` up to the next `/`, `?` or `#` (or the
+/// end of the string). Used only as
+/// [`push_dest_host_for_disclosure`]'s fallback for a `url` [`https_host`]
+/// can't make sense of at all — good enough to show *something* rather than
+/// let a destination go missing from the dialog, never a stand-in for the
+/// real parse anywhere a request is actually sent.
+fn raw_authority(url: &str) -> Option<&str> {
+    let after_scheme = url.split_once("//")?.1;
+    let end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..end];
+    if authority.is_empty() {
+        None
+    } else {
+        Some(authority)
     }
 }
 
@@ -852,6 +1198,69 @@ fn truncate_for_display(s: &str) -> String {
     format!("{}…", &s[..cut])
 }
 
+/// The read scope `engine = "log-file"` declares, rendered as one
+/// [`TrustDisclosure::local_files`] entry, `"<root>/<glob>"` — see that
+/// field's own doc for the rationale. `<root>` is `lf.root` shown literally
+/// (`~` included, unexpanded, exactly like every other entry in that list)
+/// unless `root_env` is set, in which case it is `"$<root_env>"` instead —
+/// joined with `root_env_join` when the manifest sets one — since that is
+/// what [`crate::plugin::engine_logfile`]'s own `resolve_root` actually
+/// reads whenever the named variable is set.
+fn logfile_scope(lf: &LogFileConfig) -> String {
+    let root = match &lf.root_env {
+        Some(env_name) => match &lf.root_env_join {
+            Some(join) => format!("${env_name}/{join}"),
+            None => format!("${env_name}"),
+        },
+        None => lf.root.clone(),
+    };
+    format!("{root}/{}", lf.glob)
+}
+
+/// [`TrustDisclosure::credential_sources`] entries for one `[[surface.auth]]`
+/// step — see that field's own doc for the full rationale, including why
+/// `credentials-file`/`credentials-map`/`reject-when`/`oauth-refresh` return
+/// nothing here (already disclosed, by path, in `local_files`). Every other
+/// field this reads (`var`/`service`/`targets`/`config_path`) is required by
+/// `manifest::validate` for the matching `kind`, but each is still read
+/// through an `if let`/`for` rather than assumed present — a step whose
+/// `kind` this match doesn't recognise as needing one falls through to no
+/// entries rather than a field access that could panic on a manifest shape
+/// this function hasn't been taught yet.
+fn credential_source_labels(step: &AuthStep) -> Vec<String> {
+    let mut labels = Vec::new();
+    match step.kind {
+        AuthType::Env => {
+            if let Some(var) = &step.var {
+                labels.push(format!("env ${var}"));
+            }
+        }
+        AuthType::Keychain => {
+            if let Some(service) = &step.service {
+                labels.push(format!("keychain \"{service}\""));
+            }
+        }
+        AuthType::WinCredential => {
+            for target in step.targets.iter().flatten() {
+                labels.push(format!("credential manager \"{target}\""));
+            }
+        }
+        AuthType::ElectronSafeStorage => {
+            if let Some(path) = &step.config_path {
+                labels.push(match &step.macos_keychain_key {
+                    Some(key) => format!("electron safe storage {path} (key \"{key}\")"),
+                    None => format!("electron safe storage {path}"),
+                });
+            }
+        }
+        AuthType::CredentialsFile
+        | AuthType::CredentialsMap
+        | AuthType::RejectWhen
+        | AuthType::OauthRefresh => {}
+    }
+    labels
+}
+
 /// Build a [`TrustDisclosure`] for `m` against `trusted_hosts` (pass
 /// [`TRUSTED_HOSTS`] for the built-in default).
 pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclosure {
@@ -864,14 +1273,27 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
         }
     }
 
+    // A manifest's own declared `[[option]]` defaults — the value each
+    // `{option.<key>}` placeholder resolves to until a user (or, here, an
+    // install that hasn't happened yet) overrides it. This disclosure runs
+    // before any config for the plugin exists, so the manifest's own default
+    // is the only value there is to substitute; see
+    // `push_dest_host_for_disclosure`'s doc for why substituting at all
+    // matters for a host.
+    let option_defaults: BTreeMap<String, bool> = m
+        .option
+        .iter()
+        .map(|o| (o.key.clone(), o.default))
+        .collect();
+
     let mut dest_hosts: Vec<String> = Vec::new();
     if let Some(http) = &m.http {
         for req in &http.request {
-            push_dest_host(&req.url, &mut dest_hosts);
+            push_dest_host_for_disclosure(&req.url, &option_defaults, &mut dest_hosts);
         }
     }
     if let Some(url) = &m.account.url {
-        push_dest_host(url, &mut dest_hosts);
+        push_dest_host_for_disclosure(url, &option_defaults, &mut dest_hosts);
     }
     for surface in &m.surface {
         for step in &surface.auth {
@@ -880,12 +1302,28 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
             // this host" fact as `[[http.request]].url`, and the one that
             // moves an actual credential rather than a bearer token.
             if let Some(token_url) = &step.token_url {
-                push_dest_host(token_url, &mut dest_hosts);
+                push_dest_host_for_disclosure(token_url, &option_defaults, &mut dest_hosts);
             }
         }
     }
 
     let mut local_files: Vec<String> = Vec::new();
+    // Scoped read of the whole filesystem under `root`, not a single named
+    // file — the reason it goes first: it's the shape most worth naming
+    // plainly, ahead of any narrower path below.
+    if let Some(lf) = &m.logfile {
+        let scope = logfile_scope(lf);
+        if !local_files.contains(&scope) {
+            local_files.push(scope);
+        }
+    }
+    // `jwt-file`'s own token file — the same gap a credential-file auth
+    // step's own `path` once was: nothing else here would have named it.
+    if let Some(path) = &m.account.path {
+        if !local_files.contains(path) {
+            local_files.push(path.clone());
+        }
+    }
     if let Some(http) = &m.http {
         for v in &http.value {
             if let Some(path) = &v.path {
@@ -902,6 +1340,7 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
             }
         }
     }
+    let mut credential_sources: Vec<String> = Vec::new();
     for surface in &m.surface {
         for step in &surface.auth {
             // The credential file a step actually reads
@@ -915,6 +1354,23 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
                     local_files.push(path.clone());
                 }
             }
+            for label in credential_source_labels(step) {
+                if !credential_sources.contains(&label) {
+                    credential_sources.push(label);
+                }
+            }
+            // `electron-safe-storage`'s own config file: named above as a
+            // credential source, and read here into `local_files` too —
+            // it's the one step that reads from both a file and a second
+            // store at once, and neither list alone says both (see
+            // `TrustDisclosure::local_files`'s own doc).
+            if step.kind == AuthType::ElectronSafeStorage {
+                if let Some(path) = &step.config_path {
+                    if !local_files.contains(path) {
+                        local_files.push(path.clone());
+                    }
+                }
+            }
             let Some(client) = &step.client else { continue };
             for file in &client.files {
                 if !local_files.contains(file) {
@@ -922,8 +1378,10 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
                 }
             }
             for name in &client.bins {
-                let label =
-                    format!("{name} (resolved on PATH or the usual CLI install directories)");
+                let label = format!(
+                    "{name} (resolved on PATH, or in ~/.local/bin, ~/.cargo/bin, nvm, or one \
+                     of this app's other usual CLI install directories)"
+                );
                 if !local_files.contains(&label) {
                     local_files.push(label);
                 }
@@ -1006,10 +1464,15 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
         // file and mailing a refresh token to a host. Added with the step
         // in the same change, exactly as `credentials-map` was.
         AuthType::OauthRefresh => true,
-        // Not a credential store at all: `env` reads a variable the user
-        // set themselves, and `reject-when` reads nothing but a field that
-        // decides whether the chain stops — see `requires_approval`'s own
-        // doc for why `env` deliberately never gates this flag on its own.
+        // Not a credential *store* — `env` reads a variable the user set
+        // themselves, not one this manifest goes digging for, and
+        // `reject-when` reads nothing but a field that decides whether the
+        // chain stops. Neither makes this predicate true, which only ever
+        // feeds the http-api-plus-credential-store combination below; `env`
+        // still gates `requires_approval` on its own once it names a
+        // variable — through `credential_sources`, not through here — see
+        // that field's own doc for why the two are no longer the same
+        // question.
         AuthType::Env | AuthType::RejectWhen => false,
     });
     // Widened (2026-07): no longer conditioned on `dest_hosts` reaching
@@ -1022,9 +1485,15 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
     // files of its own choosing into a request header: that is the same
     // "somebody's file leaves this machine" shape as a credential, minus the
     // word credential.
+    //
+    // Widened again (complete trust disclosure): `credential_sources` gates
+    // on its own, whatever the engine — a `log-file` manifest naming an
+    // `env` credential step is exactly the shape this closes, and it is not
+    // an `http-api` manifest for `store_backed` to have ever flagged.
     let requires_approval = (store_backed && m.engine == EngineKind::HttpApi)
         || ping.is_some()
-        || !local_files.is_empty();
+        || !local_files.is_empty()
+        || !credential_sources.is_empty();
 
     TrustDisclosure {
         engine: m.engine,
@@ -1032,6 +1501,7 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
         dest_hosts,
         untrusted_hosts,
         local_files,
+        credential_sources,
         ping,
         requires_approval,
     }
@@ -1041,9 +1511,15 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
 
 /// Whether `url` uses `https://` — split out of [`fetch_text`]/[`fetch_bytes`]
 /// so the gate itself is testable without ever calling either networked
-/// function.
+/// function. Delegates to [`https_host`] (already the one parser this module
+/// trusts for "does this URL use `https`", used a few lines down in
+/// [`resolve_manifest_url`]) rather than a bespoke prefix check: a bespoke
+/// `starts_with("https://")` is case-sensitive where a real URL parser's
+/// scheme is not, so an `HTTPS://…` URL used to read as non-https here and
+/// get refused for a reason that had nothing to do with the transport being
+/// insecure.
 fn is_https(url: &str) -> bool {
-    url.starts_with("https://")
+    https_host(url).is_some()
 }
 
 /// GET `url` and return the raw response body as text. HTTPS-only (a
@@ -1058,8 +1534,17 @@ fn is_https(url: &str) -> bool {
 /// base64 that `signature::verify_index` parses once and never hashes or
 /// compares byte-for-byte, so `into_string`'s UTF-8 decode costs nothing.
 /// `index.toml` itself, and a manifest file, both go through [`fetch_bytes`]
-/// instead — see that function's own docs for why. Not exercised by any test
-/// in this module — see the module docs.
+/// instead — see that function's own docs for why.
+///
+/// Capped at [`MAX_MINISIG_BYTES`], read through `into_reader()` rather than
+/// `into_string()`'s own unbounded-by-comparison 10 MiB `INTO_STRING_LIMIT`:
+/// a minisig block is a handful of lines of base64, nowhere near either
+/// ceiling, so there is no reason for this function's one caller to ever
+/// buffer megabytes of "signature" from a hostile or misbehaving server
+/// before `signature::verify_index` gets a chance to reject it — the same
+/// reasoning [`fetch_bytes`]'s own cap already gives, sized to what this
+/// function is actually ever asked to fetch instead. Not exercised by any
+/// test in this module — see the module docs.
 pub fn fetch_text(url: &str) -> Result<String, String> {
     if !is_https(url) {
         return Err(format!("refusing non-https URL: {url}"));
@@ -1070,11 +1555,26 @@ pub fn fetch_text(url: &str) -> Result<String, String> {
         Ok(r) if (300..400).contains(&r.status()) => {
             Err(format!("HTTP {} (redirect blocked)", r.status()))
         }
-        Ok(r) => r.into_string().map_err(|e| format!("bad response: {e}")),
+        Ok(r) => {
+            let mut buf = Vec::new();
+            r.into_reader()
+                .take(MAX_MINISIG_BYTES + 1)
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("bad response: {e}"))?;
+            if buf.len() as u64 > MAX_MINISIG_BYTES {
+                return Err("response too big for fetch_text".to_string());
+            }
+            String::from_utf8(buf).map_err(|e| format!("bad response: {e}"))
+        }
         Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
         Err(e) => Err(format!("network error: {e}")),
     }
 }
+
+/// [`fetch_text`]'s response-size cap — see its own doc comment for why 8
+/// KiB, generous for a minisig block, is the right order of magnitude rather
+/// than borrowing [`fetch_bytes`]'s much larger one.
+const MAX_MINISIG_BYTES: u64 = 8 * 1024;
 
 /// GET `url` and return the raw response body as bytes, **undecoded** —
 /// unlike [`fetch_text`]'s `into_string`, which UTF-8-decodes the body first.
@@ -1412,8 +1912,24 @@ mod tests {
     }
 
     #[test]
-    fn version_cmp_unparsable_falls_back_to_string_comparison() {
-        assert_eq!(version_cmp("abc", "abd"), Ordering::Less);
+    fn version_cmp_when_neither_side_parses_they_compare_equal_not_by_string() {
+        // Renamed from `version_cmp_unparsable_falls_back_to_string_comparison`:
+        // that name (and the assertion it made) described exactly the
+        // meaningless-bytes problem the doc comment now explains — two
+        // non-version-shaped strings that happen to sort one way in ASCII
+        // must not read as "newer", the same way an asymmetric pair already
+        // never did.
+        assert_eq!(
+            version_cmp("abc", "abd"),
+            Ordering::Equal,
+            "neither side is version-shaped, so neither wins"
+        );
+        assert_eq!(
+            version_cmp("", ""),
+            Ordering::Equal,
+            "the shape a manifest predating the plugin registry ships \
+             (`PluginManifest::version` defaults to \"\")"
+        );
         assert_eq!(version_cmp("1.2.3-beta", "1.2.3-beta"), Ordering::Equal);
         assert_ne!(
             version_cmp("1.2", "1.2.0"),
@@ -1484,12 +2000,24 @@ mod tests {
     }
 
     #[test]
-    fn update_available_unparsable_versions_compare_as_unequal_strings() {
-        assert!(
-            update_available("aaa", "bbb"),
-            "\"bbb\" > \"aaa\" lexicographically"
-        );
+    fn update_available_is_false_when_neither_version_parses() {
+        // Renamed from
+        // `update_available_unparsable_versions_compare_as_unequal_strings`,
+        // whose own name described exactly the bug: two non-version-shaped
+        // strings comparing as "newer"/"older" purely from an ASCII sort
+        // that means nothing for either of them. `PluginManifest::version`
+        // is free-form and defaults to `""` for a manifest that predates the
+        // plugin registry (see that field's own doc) — this is the shape
+        // that used to make a registry's own declared version look "newer"
+        // than an installed manifest with no version at all, purely from
+        // being non-empty, and nag "update available" forever with nothing
+        // real behind it.
+        assert!(!update_available("aaa", "bbb"));
         assert!(!update_available("bbb", "aaa"));
+        assert!(
+            !update_available("", "1.2"),
+            "neither side is a real version"
+        );
     }
 
     #[test]
@@ -1652,6 +2180,110 @@ mod tests {
     }
 
     #[test]
+    fn saving_over_a_corrupt_lockfile_backs_it_up_first() {
+        // Without this, `load_lockfile`'s own "corrupt reads as empty" rule
+        // means the very next install/update overwrites the corrupt file
+        // with a fresh, empty-looking lockfile — taking every provenance
+        // record it held (however it got corrupted) with it, with nothing
+        // left to recover from.
+        let dir = temp_dir("lockfile-backup-corrupt");
+        let path = dir.join("registry-state.json");
+        std::fs::write(&path, "not json at all").unwrap();
+
+        save_lockfile(&path, &RegistryLockState::default()).expect("save");
+
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("registry-state.json.corrupt-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "exactly one backup of the corrupt file");
+        assert_eq!(
+            std::fs::read_to_string(backups[0].path()).unwrap(),
+            "not json at all",
+            "the backup holds what was actually there"
+        );
+        assert!(
+            load_lockfile(&path).plugins.is_empty(),
+            "the real path now holds the freshly-saved (empty) state"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The backup name is predictable — this second, not this process — so
+    /// anything running as this user can plant a symlink on it ahead of
+    /// time. `std::fs::copy`'s destination-truncate would have followed that
+    /// link and overwritten whatever it pointed to; `create_new` instead
+    /// refuses the occupied name outright and falls through to the next
+    /// counter-suffixed one, so the backup still lands somewhere.
+    #[test]
+    #[cfg(unix)]
+    fn saving_over_a_corrupt_lockfile_will_not_follow_a_symlink_planted_on_its_backup_name() {
+        let dir = temp_dir("lockfile-backup-symlink");
+        let path = dir.join("registry-state.json");
+        let corrupt = "not json at all";
+        std::fs::write(&path, corrupt).unwrap();
+
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let stem = path.file_name().unwrap().to_os_string();
+        let name_for = |suffix: &str| {
+            let mut n = stem.clone();
+            n.push(suffix);
+            path.with_file_name(n)
+        };
+        let predicted = name_for(&format!(".corrupt-{secs}"));
+        let suffixed = name_for(&format!(".corrupt-{secs}-1"));
+
+        let outside = path.with_file_name("precious-lockfile-backup-victim.txt");
+        std::fs::write(&outside, b"do not touch").unwrap();
+        std::os::unix::fs::symlink(&outside, &predicted).expect("plant the link");
+
+        save_lockfile(&path, &RegistryLockState::default()).expect("save");
+
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"do not touch",
+            "the link's target must be untouched"
+        );
+        assert!(
+            std::fs::symlink_metadata(&predicted)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            "the link itself is left exactly as it was — refused, not cleared to make room"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&suffixed).unwrap(),
+            corrupt,
+            "the backup still lands, under the next name"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn saving_over_a_valid_lockfile_leaves_no_backup_behind() {
+        let dir = temp_dir("lockfile-backup-not-needed");
+        let path = dir.join("registry-state.json");
+        save_lockfile(&path, &RegistryLockState::default()).expect("first save");
+        save_lockfile(&path, &RegistryLockState::default()).expect("second save");
+
+        let backups = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .count();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(backups, 0, "an ordinary overwrite backs up nothing");
+    }
+
+    #[test]
     fn lockfile_set_and_remove() {
         let mut state = RegistryLockState::default();
         state.set(
@@ -1804,14 +2436,17 @@ mod tests {
     // ── analyze_trust ─────────────────────────────────────────────────────
     //
     // Widened rule (2026-07, widened further since): `requires_approval`
-    // fires on any of three things — store-backed auth
+    // fires on any of four things — store-backed auth
     // (credentials-file/keychain/electron-safe-storage/win-credential/
     // credentials-map/oauth-refresh) combined with `engine = "http-api"`, a
-    // declared `[ping]`, or a non-empty `local_files` (which now includes
-    // an auth step's own credential `path`, not just `[[http.value]]`/
-    // `client` discovery) — no longer conditioned on the destination host at
-    // all. `dest_hosts`/`untrusted_hosts` are still disclosed (and still
-    // worth asserting on), they just don't gate approval.
+    // declared `[ping]`, a non-empty `local_files` (which now includes an
+    // auth step's own credential `path`, `[logfile] root`/`glob`, `[account]
+    // path` and `[[surface.auth.client]]` discovery — not just
+    // `[[http.value]]`), or a non-empty `credential_sources` (env/keychain/
+    // win-credential/electron-safe-storage, whatever the engine) — no longer
+    // conditioned on the destination host at all. `dest_hosts`/
+    // `untrusted_hosts` are still disclosed (and still worth asserting on),
+    // they just don't gate approval.
 
     fn http_api_manifest(url: &str, auth_type: &str) -> PluginManifest {
         // `path` is only wired in for the auth types that actually read a
@@ -2082,9 +2717,12 @@ mod tests {
         );
         assert!(
             disclosure.local_files.contains(
-                &"sample-cli (resolved on PATH or the usual CLI install directories)".to_string()
+                &"sample-cli (resolved on PATH, or in ~/.local/bin, ~/.cargo/bin, nvm, or one \
+                  of this app's other usual CLI install directories)"
+                    .to_string()
             ),
-            "a `bins` name is disclosed labelled, not as a bare path nobody can act on — {:?}",
+            "a `bins` name is disclosed labelled, naming the actual user-writable directories \
+             searched, not as a bare path nobody can act on — {:?}",
             disclosure.local_files
         );
         // The env override is a way to hand this app a credential without
@@ -2196,7 +2834,16 @@ mod tests {
     }
 
     #[test]
-    fn log_file_manifest_with_no_auth_does_not_require_approval() {
+    fn log_file_manifest_with_no_auth_still_requires_approval_for_its_own_read_scope() {
+        // Widened (complete trust disclosure): `engine = "log-file"`'s own
+        // `root`/`glob` used to be invisible to `analyze_trust` entirely — a
+        // manifest with no `[[surface.auth]]`, no `[ping]`, and no `[http]`
+        // installed with no dialog at all while still walking whatever
+        // `root`/`glob` named, however broad. This fixture's own scope is
+        // narrow (`~/.x/*.jsonl`), which is the point: the gate is on
+        // reading a local file *at all*, not on how wide the glob happens
+        // to be — the same "reading a local file, however it's named, needs
+        // approval" rule every other `local_files` source already obeys.
         let toml = r#"
             id         = "x"
             name       = "X"
@@ -2219,25 +2866,338 @@ mod tests {
         "#;
         let m = PluginManifest::from_str(toml).expect("valid manifest");
         let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
-        assert!(!disclosure.requires_approval);
+        assert!(disclosure.requires_approval);
+        assert_eq!(disclosure.local_files, vec!["~/.x/*.jsonl".to_string()]);
         assert!(disclosure.auth_types.is_empty());
         assert!(disclosure.dest_hosts.is_empty());
         assert_eq!(disclosure.engine, EngineKind::LogFile);
     }
 
     #[test]
-    fn env_only_auth_is_disclosed_but_never_gates_approval() {
+    fn a_log_file_manifest_walking_the_whole_home_directory_discloses_that_scope() {
+        // The exact shape the gap named: no surface, no auth, no ping, no
+        // http — a registry manifest with only `[logfile] root = "~"`,
+        // `glob = "**/*.json"` used to install with no dialog at all and
+        // walk the user's entire home directory looking for JSON files.
+        let toml = r#"
+            id         = "x"
+            name       = "X"
+            menu_label = "X"
+            order      = 1
+            engine     = "log-file"
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [logfile]
+            root = "~"
+            glob = "**/*.json"
+            container_key = "rate_limits"
+        "#;
+        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert!(disclosure.requires_approval);
+        assert_eq!(
+            disclosure.local_files,
+            vec!["~/**/*.json".to_string()],
+            "the dialog must say plainly that this walks the home directory: {:?}",
+            disclosure.local_files
+        );
+    }
+
+    #[test]
+    fn logfile_scope_prefers_root_env_and_joins_root_env_join_when_set() {
+        // A manifest's `root` fallback is not what the engine actually reads
+        // whenever `root_env` names a variable that is set — see
+        // `resolve_root` — so the disclosure has to say `$VAR`, not the
+        // fallback text, or it names something the manifest will not
+        // actually touch.
+        let toml = r#"
+            id         = "x"
+            name       = "X"
+            menu_label = "X"
+            order      = 1
+            engine     = "log-file"
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [logfile]
+            root_env      = "CODEX_HOME"
+            root_env_join = "sessions"
+            root          = "~/.codex"
+            glob          = "**/rollout-*.jsonl"
+            container_key = "rate_limits"
+        "#;
+        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert_eq!(
+            disclosure.local_files,
+            vec!["$CODEX_HOME/sessions/**/rollout-*.jsonl".to_string()]
+        );
+    }
+
+    #[test]
+    fn env_only_auth_now_gates_approval_through_credential_sources() {
+        // Widened (complete trust disclosure): naming the environment
+        // variable a manifest reads a credential from is exactly the shape
+        // this closes — a registry manifest whose one auth step is `env`,
+        // `var = "AWS_SECRET_ACCESS_KEY"` used to disclose only the step
+        // *kind* ("env") and install with no dialog at all. `store_backed`
+        // (the http-api combination rule) still answers no for `env` — see
+        // its own match arm — but `credential_sources` gates on its own now,
+        // whatever the engine.
         let m = http_api_manifest("https://evil.example.com/usage", "env");
         let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
         assert_eq!(
             disclosure.auth_types,
             vec![AuthType::Env],
-            "env is still disclosed"
+            "env is still disclosed in auth_types too"
+        );
+        assert_eq!(
+            disclosure.credential_sources,
+            vec!["env $SOME_VAR".to_string()],
+            "the variable name itself must be named, not just the step kind"
         );
         assert!(
-            !disclosure.requires_approval,
-            "env-only auth (a var the user set themselves) never mandates approval on its own"
+            disclosure.requires_approval,
+            "naming a specific environment variable to read a credential from needs a look"
         );
+    }
+
+    #[test]
+    fn keychain_auth_names_the_service_in_credential_sources() {
+        let m = http_api_manifest("https://evil.example.com/usage", "keychain");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert_eq!(
+            disclosure.credential_sources,
+            vec!["keychain \"svc\"".to_string()]
+        );
+    }
+
+    #[test]
+    fn win_credential_auth_names_every_target_in_credential_sources() {
+        // The shape `plugins/claude.toml`'s own Windows surface ships: more
+        // than one target tried in order. Both have to be named, not just
+        // the step kind — a manifest could name a target belonging to a
+        // completely different application.
+        let toml = r#"
+            id         = "x"
+            name       = "X"
+            menu_label = "X"
+            order      = 1
+            engine     = "http-api"
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [http]
+            [[http.request]]
+            url = "https://example.com/usage"
+            [[surface]]
+            id = "cli"
+            label = "CLI"
+            allowed_hosts = ["example.com"]
+            [[surface.auth]]
+            type            = "win-credential"
+            targets         = ["Provider-credentials", "Provider"]
+            token_json_path = "access_token"
+        "#;
+        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert_eq!(
+            disclosure.credential_sources,
+            vec![
+                "credential manager \"Provider-credentials\"".to_string(),
+                "credential manager \"Provider\"".to_string(),
+            ]
+        );
+        assert!(disclosure.requires_approval);
+    }
+
+    #[test]
+    fn electron_safe_storage_auth_names_the_config_file_and_keychain_key_and_discloses_the_file_too(
+    ) {
+        // The one auth kind that reads from both a file and a second store
+        // at once — `config_path` has to land in both `local_files` (it is
+        // a file this manifest opens) and `credential_sources` (the macOS
+        // keychain entry that unlocks what's inside it), or one list would
+        // say only half of what this step actually does.
+        let toml = r#"
+            id         = "x"
+            name       = "X"
+            menu_label = "X"
+            order      = 1
+            engine     = "http-api"
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [http]
+            [[http.request]]
+            url = "https://example.com/usage"
+            [[surface]]
+            id = "desktop"
+            label = "Desktop"
+            allowed_hosts = ["example.com"]
+            [[surface.auth]]
+            type                = "electron-safe-storage"
+            config_path         = "{config_dir}/Sample/config.json"
+            blob_json_path      = "blob"
+            macos_keychain_key  = "Sample Safe Storage"
+        "#;
+        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert_eq!(
+            disclosure.credential_sources,
+            vec!["electron safe storage {config_dir}/Sample/config.json (key \"Sample Safe Storage\")"
+                .to_string()]
+        );
+        assert!(
+            disclosure
+                .local_files
+                .contains(&"{config_dir}/Sample/config.json".to_string()),
+            "the file the step actually opens must be disclosed too: {:?}",
+            disclosure.local_files
+        );
+        assert!(disclosure.requires_approval);
+    }
+
+    #[test]
+    fn jwt_file_account_path_is_disclosed_in_local_files() {
+        let toml = r#"
+            id         = "x"
+            name       = "X"
+            menu_label = "X"
+            order      = 1
+            engine     = "log-file"
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [logfile]
+            root = "~/.x"
+            glob = "*.jsonl"
+            container_key = "rate_limits"
+            [account]
+            type       = "jwt-file"
+            path       = "~/.x/token.jwt"
+            token_path = "token"
+            claim      = "email"
+        "#;
+        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert!(
+            disclosure
+                .local_files
+                .contains(&"~/.x/token.jwt".to_string()),
+            "{:?}",
+            disclosure.local_files
+        );
+    }
+
+    #[test]
+    fn an_option_placeholder_in_a_request_host_is_disclosed_substituted_at_its_default() {
+        // `push_dest_host` used to run on the pre-substitution URL, so a
+        // host reading `{option.beta}.evil.example` disclosed the
+        // placeholder text itself rather than the destination it actually
+        // resolves to.
+        let toml = r#"
+            id         = "x"
+            name       = "X"
+            menu_label = "X"
+            order      = 1
+            engine     = "http-api"
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [http]
+            [[http.request]]
+            url = "https://{option.beta}.evil.example/usage"
+            [[surface]]
+            id = "cli"
+            label = "CLI"
+            [[option]]
+            key     = "beta"
+            label   = "Beta"
+            default = true
+        "#;
+        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert_eq!(disclosure.dest_hosts, vec!["true.evil.example".to_string()]);
+    }
+
+    #[test]
+    fn push_dest_host_for_disclosure_leaves_an_unknown_placeholder_verbatim() {
+        // `manifest::validate` already refuses a `{option.<key>}` naming an
+        // option nothing declares, so no manifest that loads can actually
+        // carry this shape — exercised directly against the function itself
+        // (empty `option_defaults`, standing in for a key `substitute_options`
+        // has never heard of) rather than through a manifest for that
+        // reason, the same way `push_dest_host_sees_the_backslash_authority…`
+        // exercises `push_dest_host` itself. Worth keeping anyway: `{`/`}`
+        // are not forbidden host code points, so an unresolved placeholder
+        // still parses and still has to be disclosed, not silently dropped,
+        // whatever put it there.
+        let mut hosts = Vec::new();
+        push_dest_host_for_disclosure(
+            "https://{option.x}.evil.example/usage",
+            &BTreeMap::new(),
+            &mut hosts,
+        );
+        assert_eq!(hosts, vec!["{option.x}.evil.example".to_string()]);
+    }
+
+    #[test]
+    fn push_dest_host_for_disclosure_falls_back_to_the_raw_authority_when_https_host_cannot_parse_it(
+    ) {
+        // The one shape `https_host` cannot make sense of at all: a
+        // placeholder sitting in the port rather than the hostname
+        // (`InvalidPort`, however the placeholder resolves). `validate`
+        // only requires `[[http.request]] url`/`[account] url` to be
+        // `https`-parseable when `[http]` is declared at all, so a
+        // `log-file` manifest's `[account] url` can carry exactly this
+        // shape and still load — exercised directly here (not through a
+        // manifest round trip) since that is the one place the ordinary
+        // path cannot reach.
+        let mut hosts = Vec::new();
+        push_dest_host_for_disclosure(
+            "https://{option.x}:{option.y}/me",
+            &BTreeMap::new(),
+            &mut hosts,
+        );
+        assert_eq!(hosts, vec!["{option.x}:{option.y}".to_string()]);
     }
 
     #[test]
@@ -2349,5 +3309,15 @@ mod tests {
         assert!(!is_https("http://example.com/index.toml"));
         assert!(!is_https("ftp://example.com/index.toml"));
         assert!(!is_https("example.com/index.toml"));
+    }
+
+    #[test]
+    fn is_https_is_case_insensitive_on_the_scheme_unlike_a_bare_prefix_check() {
+        // A bespoke `starts_with("https://")` is case-sensitive; the
+        // real URL parser `https_host` delegates to lowercases the scheme
+        // during parsing, matching the scheme rule a browser or any other
+        // spec-following client applies.
+        assert!(is_https("HTTPS://example.com/index.toml"));
+        assert!(is_https("HttpS://example.com/index.toml"));
     }
 }

@@ -265,9 +265,52 @@ fn rules() -> Vec<Rule> {
             names: "`id = \"../evil\"`",
         },
         Rule {
+            says: "[[surface]] has a count cap",
+            broken_by: plus(
+                LOGFILE,
+                &(0..9)
+                    .map(|i| format!("[[surface]]\nid = \"s{i}\"\nlabel = \"S{i}\""))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            names: "at most 8",
+        },
+        Rule {
+            says: "a surface has an id",
+            broken_by: plus(LOGFILE, "[[surface]]\nid = \"  \"\nlabel = \"X\""),
+            names: "`[[surface]] id`",
+        },
+        Rule {
+            says: "a surface id is a reading id and a throttle key, so it holds no dots",
+            broken_by: plus(LOGFILE, "[[surface]]\nid = \"a.b\"\nlabel = \"X\""),
+            names: "`[[surface]] id = \"a.b\"`",
+        },
+        Rule {
+            says: "two surfaces cannot share an id — they would resolve to one reading",
+            broken_by: plus(
+                LOGFILE,
+                "[[surface]]\nid = \"a\"\nlabel = \"A\"\n[[surface]]\nid = \"a\"\nlabel = \"B\"",
+            ),
+            names: "declared more than once",
+        },
+        Rule {
+            says: "an id shaped like a Windows device name would open the device, not a file",
+            broken_by: changed(LOGFILE, r#"id         = "sample""#, r#"id = "con""#),
+            names: "reserved device name",
+        },
+        Rule {
             says: "a manifest has a name",
             broken_by: changed(LOGFILE, r#"name       = "Sample""#, r#"name = """#),
             names: "`name`",
+        },
+        Rule {
+            says: "a name is a section header, not a paragraph",
+            broken_by: changed(
+                LOGFILE,
+                r#"name       = "Sample""#,
+                &format!(r#"name = "{}""#, "x".repeat(65)),
+            ),
+            names: "cap for a section header",
         },
         Rule {
             says: "a manifest has a menu-bar label",
@@ -275,9 +318,32 @@ fn rules() -> Vec<Rule> {
             names: "`menu_label`",
         },
         Rule {
+            says: "a menu-bar label sizes a pill drawn every tick, not a caption",
+            broken_by: changed(
+                LOGFILE,
+                r#"menu_label = "Sa""#,
+                &format!(r#"menu_label = "{}""#, "x".repeat(17)),
+            ),
+            names: "cap for the menu-bar pill",
+        },
+        Rule {
             says: "a refresh interval of zero is not an interval",
             broken_by: changed(LOGFILE, "order      = 1", "order = 1\nrefresh_secs = 0"),
             names: "`refresh_secs`",
+        },
+        Rule {
+            says: "a refresh interval under 5 seconds is a poll loop, not a cadence",
+            broken_by: changed(LOGFILE, "order      = 1", "order = 1\nrefresh_secs = 1"),
+            names: "5-second floor",
+        },
+        Rule {
+            says: "a refresh interval over a day would leave a stale reading on screen for hours",
+            broken_by: changed(
+                LOGFILE,
+                "order      = 1",
+                "order = 1\nrefresh_secs = 86401",
+            ),
+            names: "86400-second (24h) ceiling",
         },
         Rule {
             says: "the log-file engine needs a [logfile] section to read",
@@ -288,6 +354,18 @@ fn rules() -> Vec<Rule> {
             says: "the http engine needs an [http] section to call",
             broken_by: changed(LOGFILE, r#"engine     = "log-file""#, r#"engine = "http-api""#),
             names: "[http]",
+        },
+        Rule {
+            // The log-file engine has nowhere to send the request `[http]`
+            // describes — accepting the section anyway would let a manifest
+            // carry a whole unread table, the same silent-misread shape the
+            // rest of this file exists to refuse.
+            says: "the log-file engine has no use for an [http] section, so it may not declare one",
+            broken_by: plus(
+                LOGFILE,
+                "[http]\n[[http.request]]\nurl = \"https://example.com/usage\"",
+            ),
+            names: "does not read an [http] section",
         },
         Rule {
             says: "the http engine calls exactly one endpoint, not two",
@@ -477,6 +555,39 @@ fn rules() -> Vec<Rule> {
             names: "resolve to the same identity",
         },
         Rule {
+            says: "[[balances]] has a count cap, like every other array a manifest declares",
+            broken_by: plus(
+                &http_declaring(r#"["reading-balances"]"#),
+                &(0..17)
+                    .map(|i| {
+                        format!(
+                            "[[balances]]\nlabel = \"B{i}\"\n[balances.remaining]\n\
+                             kind = \"text\"\npath = \"p{i}\""
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            names: "at most 16",
+        },
+        Rule {
+            says: "[[windows]] has a count cap too — the identity checks over it are O(n²)",
+            broken_by: plus(
+                LOGFILE,
+                &(0..32)
+                    .map(|i| {
+                        format!(
+                            "[[windows]]\nlabel = \"W{i}\"\nrole = \"extra\"\n\
+                             [windows.period]\nmode = \"assumed\"\nassumed = 300\n\
+                             [windows.source]\nresets_at_path = \"r\""
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            names: "at most 32",
+        },
+        Rule {
             says: "only one window can be the primary one",
             broken_by: plus(
                 LOGFILE,
@@ -566,6 +677,13 @@ fn rules() -> Vec<Rule> {
             names: "period.assumed",
         },
         Rule {
+            // A window this short turns `main.rs`'s `ping_due` arithmetic
+            // into a spawn loop; the shortest real window shipped is 300.
+            says: "an assumed period under 5 minutes is a number nobody stated, not a window",
+            broken_by: changed(LOGFILE, "assumed = 300", "assumed = 1"),
+            names: "minute floor",
+        },
+        Rule {
             says: "a period read from a field has to say which field",
             broken_by: changed(
                 LOGFILE,
@@ -573,6 +691,25 @@ fn rules() -> Vec<Rule> {
                 "mode = \"from_field\"",
             ),
             names: "period.field",
+        },
+        Rule {
+            says: "source.containers has a count cap of its own, past the from_field requirement",
+            broken_by: changed(
+                &changed(
+                    LOGFILE,
+                    "mode    = \"assumed\"\nassumed = 300",
+                    "mode = \"from_field\"\nfield = \"window_minutes\"",
+                ),
+                "used_percent_path = \"used_percent\"",
+                &format!(
+                    "containers = [{}]\nused_percent_path = \"used_percent\"",
+                    (0..9)
+                        .map(|i| format!("\"c{i}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ),
+            names: "at most 8",
         },
         Rule {
             says: "several candidate containers can only be told apart by length",
@@ -632,6 +769,14 @@ fn rules() -> Vec<Rule> {
             names: "allowed_hosts",
         },
         Rule {
+            // `refresh_secs` defaults to 60 here (`HTTP` never sets it), so a
+            // floor at that same figure lands exactly on the timer's own
+            // clock and skips every other scheduled tick.
+            says: "a request floor at or above the refresh cadence skips every other scheduled tick",
+            broken_by: changed(HTTP, "[http]\n", "[http]\nmin_interval_secs = 60\n"),
+            names: "min_interval_secs",
+        },
+        Rule {
             says: "a cool-off that starts at zero is a retry loop",
             broken_by: changed(HTTP, "[http]\n", "[http]\nbackoff_start_secs = 0\n"),
             names: "backoff_start_secs",
@@ -640,6 +785,17 @@ fn rules() -> Vec<Rule> {
             says: "so is an expired-session wait of zero",
             broken_by: changed(HTTP, "[http]\n", "[http]\nunauthorized_retry_secs = 0\n"),
             names: "unauthorized_retry_secs",
+        },
+        Rule {
+            // A stop that only lifts at u64::MAX seconds is, in practice,
+            // never — the exact loop this field exists to break out of.
+            says: "an expired-session wait over 7 days is indistinguishable from never retrying",
+            broken_by: changed(
+                HTTP,
+                "[http]\n",
+                "[http]\nunauthorized_retry_secs = 604801\n",
+            ),
+            names: "7 days",
         },
         Rule {
             says: "a cool-off cannot be capped below where it starts",
@@ -651,6 +807,15 @@ fn rules() -> Vec<Rule> {
             names: "backoff_max_secs",
         },
         Rule {
+            says: "a cool-off ceiling over 7 days has given up, not backed off",
+            broken_by: changed(
+                HTTP,
+                "[http]\n",
+                "[http]\nbackoff_max_secs = 604801\n",
+            ),
+            names: "7 days",
+        },
+        Rule {
             says: "a request timeout of zero would fail before it could ever succeed",
             broken_by: changed(
                 HTTP,
@@ -658,6 +823,62 @@ fn rules() -> Vec<Rule> {
                 "url = \"https://example.com/usage\"\ntimeout_secs = 0",
             ),
             names: "timeout_secs",
+        },
+        Rule {
+            says: "a request timeout over two minutes wedges the fetch thread on one slow request",
+            broken_by: changed(
+                HTTP,
+                "url = \"https://example.com/usage\"",
+                "url = \"https://example.com/usage\"\ntimeout_secs = 121",
+            ),
+            names: "`[[http.request]] timeout_secs`",
+        },
+        Rule {
+            says: "[http.version] files has a count cap, like every other candidate list",
+            broken_by: plus(
+                HTTP,
+                &format!(
+                    "[http.version]\nfiles = [{}]\njson_path = \"version\"\nfallback = \"1.0\"",
+                    (0..17)
+                        .map(|i| format!("\"/v{i}.json\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ),
+            names: "at most 16",
+        },
+        Rule {
+            says: "a blank [http.version] files entry matches no file, ever",
+            broken_by: plus(
+                HTTP,
+                "[http.version]\nfiles = [\"   \"]\njson_path = \"version\"\nfallback = \"1.0\"",
+            ),
+            names: "must not be blank",
+        },
+        Rule {
+            says: "a relative [http.version] files entry resolves against whatever directory this process runs from",
+            broken_by: plus(
+                HTTP,
+                "[http.version]\nfiles = [\"relative/version.json\"]\njson_path = \"version\"\n\
+                 fallback = \"1.0\"",
+            ),
+            names: "must be an absolute path",
+        },
+        Rule {
+            says: "[[http.value]] has a count cap",
+            broken_by: plus(
+                HTTP,
+                &(0..33)
+                    .map(|i| {
+                        format!(
+                            "[[http.value]]\nname = \"v{i}\"\ntype = \"json-file\"\n\
+                             path = \"~/x{i}.json\"\njson_path = \"a\""
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            names: "at most 32",
         },
         Rule {
             says: "a header value read from a file has a name",
@@ -713,6 +934,79 @@ fn rules() -> Vec<Rule> {
             says: "a ping runs a program by name; a path is a worse sentence to put in a trust dialog",
             broken_by: plus(LOGFILE, "[ping]\nbin = \"/usr/local/bin/thing\"\nargs = []"),
             names: "bare program name",
+        },
+        Rule {
+            says: "a ping's argument count is bounded, so it cannot push the trust dialog's warning off screen",
+            broken_by: plus(
+                LOGFILE,
+                &format!(
+                    "[ping]\nbin = \"codex\"\nargs = [{}]",
+                    (0..33).map(|i| format!("\"a{i}\"")).collect::<Vec<_>>().join(", ")
+                ),
+            ),
+            names: "more than any real one needs",
+        },
+        Rule {
+            says: "an empty ping argument says nothing in the dialog and does nothing on the command line",
+            broken_by: plus(LOGFILE, "[ping]\nbin = \"codex\"\nargs = [\"exec\", \"\"]"),
+            names: "must not be empty",
+        },
+        Rule {
+            says: "a single ping argument is bounded too, for the same dialog",
+            broken_by: plus(
+                LOGFILE,
+                &format!("[ping]\nbin = \"codex\"\nargs = [\"{}\"]", "a".repeat(257)),
+            ),
+            names: "257 bytes",
+        },
+        Rule {
+            // One shared helper, one row: every field it covers (`allowed_hosts`
+            // here, but the same check reaches `[ping] args`, every label,
+            // `message`, `service`, `targets`, `client.id_env`/`secret_env`,
+            // `client.files` and `[http.version] files` too) trips the same
+            // refusal.
+            says: "a control character or bidi override in a manifest string is refused at load",
+            broken_by: changed(
+                HTTP,
+                "allowed_hosts = [\"example.com\"]",
+                "allowed_hosts = [\"exa\\u000Ample.com\"]",
+            ),
+            names: "bidirectional override",
+        },
+        Rule {
+            says: "root_env_join is appended to root_env's value, not used in its place",
+            broken_by: plus(LOGFILE, "root_env_join = \"/absolute\""),
+            names: "must be a relative subdirectory",
+        },
+        Rule {
+            says: "root_env_join must not walk outside the directory root_env named",
+            broken_by: plus(LOGFILE, "root_env_join = \"../escape\""),
+            names: "must not contain a `..`",
+        },
+        Rule {
+            // One shared sweep, the same shape as the control-character one
+            // above: `[account] path` here, but the same check reaches
+            // `[logfile] root`, `[[http.value]] path`, `[http.version]
+            // files`, `[[surface.auth]] path`/`config_path` and
+            // `client.files` too.
+            says: "a `..` component in a manifest path field is refused at load",
+            broken_by: plus(
+                LOGFILE,
+                "[account]\ntype = \"jwt-file\"\npath = \"~/.sample/../etc/auth.json\"\n\
+                 token_path = \"t\"\nclaim = \"c\"",
+            ),
+            names: "contains a `..` component",
+        },
+        Rule {
+            says: "[[option]] has a count cap",
+            broken_by: plus(
+                LOGFILE,
+                &(0..33)
+                    .map(|i| format!("[[option]]\nkey = \"k{i}\"\nlabel = \"L{i}\""))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            names: "at most 32",
         },
         Rule {
             says: "an option has a key",
@@ -804,6 +1098,36 @@ fn rules() -> Vec<Rule> {
             names: "id_pattern",
         },
         Rule {
+            says: "client.files has a count cap",
+            broken_by: changed(
+                &oauth_refresh_client_declaring(r#"["oauth-refresh", "oauth-client-discovery"]"#),
+                r#"files          = ["~/.sample/client-binary"]"#,
+                &format!(
+                    "files          = [{}]",
+                    (0..17)
+                        .map(|i| format!("\"~/.sample/client-binary-{i}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ),
+            names: "at most 16",
+        },
+        Rule {
+            says: "client.bins has a count cap too",
+            broken_by: changed(
+                &oauth_refresh_client_declaring(r#"["oauth-refresh", "oauth-client-discovery"]"#),
+                r#"bins           = ["sample-cli"]"#,
+                &format!(
+                    "bins           = [{}]",
+                    (0..9)
+                        .map(|i| format!("\"sample-cli-{i}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ),
+            names: "at most 8",
+        },
+        Rule {
             says: "a client `files`/`bins` entry can be present and still say nothing",
             broken_by: changed(
                 &oauth_refresh_client_declaring(r#"["oauth-refresh", "oauth-client-discovery"]"#),
@@ -893,12 +1217,19 @@ fn rules() -> Vec<Rule> {
             // exactly what the trust dialog renders before installing
             // anything.
             says: "a client pattern's own source text has a length limit, separate from what it can match",
+            // `"[0-9]{1,4}"` repeated 52 times is 520 bytes of source (over
+            // the 512-byte text cap) whose match is bounded to at most 208
+            // bytes and at least 52 — cleanly over only the text limit, not
+            // also the (256-byte) match-bound or the can't-be-empty rule,
+            // unlike `"1".repeat(520)` (a 520-byte literal, which is
+            // incidentally over the match bound too and would still say
+            // "id_pattern" no matter which of the three rules fired).
             broken_by: changed(
                 &oauth_refresh_client_declaring(r#"["oauth-refresh", "oauth-client-discovery"]"#),
                 r#"id_pattern     = "[0-9]{1,20}-[a-z0-9]{1,40}\\.apps\\.googleusercontent\\.com""#,
-                &format!(r#"id_pattern     = "{}""#, "1".repeat(520)),
+                &format!(r#"id_pattern     = "{}""#, "[0-9]{1,4}".repeat(52)),
             ),
-            names: "id_pattern",
+            names: "bytes of pattern text",
         },
         Rule {
             // `std::env::var` would simply never find anything for a name

@@ -9,7 +9,7 @@ windows of Codex, Claude and Antigravity, the balances of Grok, GitHub
 Copilot and Codex credits, in the macOS menu bar or the Windows system tray, with a countdown
 that ticks every second.
 
-Rust + [Slint](https://slint.dev). One small native binary (about 7 MB per
+Rust + [Slint](https://slint.dev). One small native binary (about 8 MB per
 architecture), no runtime, no account to create, no telemetry. **Every
 provider is a TOML file**, not a module: when an endpoint changes shape, the
 fix is an edit, not a release.
@@ -59,10 +59,13 @@ watches each provider's primary window and, when it sees it sitting
 starts at the first request, a weekly window that had reset starts with it.
 
 The test is "empty", not "the reset just happened", so a machine asleep at
-the boundary pings when it wakes instead of losing the window for good. One
-ping per window, remembered across restarts; a ping that failed is owed
-again one window later, never more often. The command runs in an empty
-directory the app owns (nothing there for a prompt to pick up), with the
+the boundary pings when it wakes instead of losing the window for good — but
+never before the window has actually started, and never more than once every
+ten minutes, whatever a manifest's own numbers say. One ping per window,
+remembered across restarts; a ping that failed is owed again one window
+later, never more often. The command runs in a directory created fresh for
+that one run — normally under the OS temp directory, removed once the
+command exits — so there is nothing there for a prompt to pick up, with the
 Codex sandbox read-only and the usual CLI directories *appended* to `PATH`.
 Off by default, a switch per provider; costs a few tokens per window. The
 Codex and Claude manifests declare one today.
@@ -138,7 +141,8 @@ and the result is cached in memory until shortly before it expires. Four
 places in the code open a connection, carrying five kinds of request between
 them: a provider's pinned host on the timer, that token exchange, the
 registry index and its signature file when you press *Check updates*
-(the same fetch function, called twice), and a manifest when you then choose
+(two fetches, the index as bytes and the signature as text), and a manifest
+when you then choose
 to install or update one. The sixth kind of traffic is the ping, a local
 command. No telemetry, no crash reporting, nothing on a timer against a host
 this project controls.

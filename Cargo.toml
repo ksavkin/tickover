@@ -146,4 +146,13 @@ winresource = "0.1"
 opt-level = "s"
 lto = true
 strip = true
-panic = "abort"
+# Not `panic = "abort"`. `main.rs`'s `FetchGuard` and `RegistryGuard` exist to
+# turn a panic on a background fetch/install thread into an empty/failed
+# result sent on `drop`, so the plugin it was fetching for goes quiet instead
+# of staying marked in-flight forever — and the tray app itself keeps running.
+# Both depend on the panic unwinding through that `drop`, which "abort" skips
+# by ending the process at the panic site instead. The cost is real, not a
+# rounding error: measured on this tree, removing `panic = "abort"` grew the
+# stripped macOS arm64 binary from 6,836,096 to 8,489,312 bytes, about 24%.
+# Losing the guards' recovery on every panic a background thread throws — not
+# just a rare one — is judged the worse failure mode of the two.

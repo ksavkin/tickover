@@ -122,13 +122,18 @@ state, not an edge — so a machine asleep at the boundary pings when it
 wakes instead of losing the window for good. One ping per window is
 enforced by a timestamp (`pinged_at`) compared against the window's start,
 because the same window is named differently by the provider before and
-after the ping makes it report again. A window whose ping failed has its
-boundary projected forward one period, so the retry is owed at most once per
-window and never zero. The command runs in an empty directory the app owns
-(nothing there for a prompt injection to read), with the Codex sandbox set
-to read-only, and with the usual CLI install directories *appended* to
-`PATH` rather than prepended, because every one of them is user-writable and
-this command runs unattended.
+after the ping makes it report again. Two guards sit on top of that
+arithmetic, because the reset time comes from the provider: a ping is never
+due before the window has actually begun, and never twice within ten
+minutes, whatever a response says about its reset. A window whose ping
+failed has its boundary projected forward one period, so the retry is owed
+at most once per window and never zero. The command runs in a fresh,
+uniquely named temporary directory created for that one run and removed
+afterwards (nothing there for a prompt injection to read, and nothing under
+the home directory for a CLI to walk up into), with the Codex sandbox set to
+read-only, and with the usual CLI install directories *appended* to `PATH`
+rather than prepended, because every one of them is user-writable and this
+command runs unattended.
 
 ## Keeping the folder honest
 
@@ -187,8 +192,8 @@ by `src/menubar.rs`.
 ## Numbers
 
 About 31,000 lines of Rust, three Slint files, some 600 test functions, a
-release binary of about 7 MB per architecture (the macOS binary is
-universal, so twice that on disk; the zip is about 7 MB). CI builds and tests on macOS and Windows,
+release binary of about 8 MB per architecture (the macOS binary is
+universal, so twice that on disk; the zip is about 8 MB). CI builds and tests on macOS and Windows,
 with clippy at `-D warnings` on macOS — the half that can be reproduced on
 the machine this is developed on — actions pinned by commit, and the
 checkout token not persisted. A release run repeats the suite on both

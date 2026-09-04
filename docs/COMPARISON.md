@@ -10,7 +10,7 @@ Corrections welcome.
 |---|---|---|---|---|---|
 | Starts the next window for you (pre-warm) | yes — per provider, off by default | — | — | — | — |
 | Platforms | macOS, Windows — one codebase | macOS 14+ (Windows is a separate project; Linux via community ports) | macOS 15+ | macOS 12+, Windows 10/11 | macOS 26+ |
-| Built with | Rust + Slint, about 7 MB per architecture | Swift | Swift 6.2 | Python | Swift 6 / SwiftUI |
+| Built with | Rust + Slint, about 8 MB per architecture | Swift | Swift 6.2 | Python | Swift 6 / SwiftUI |
 | Providers shipped | 5 | 68+ | 13 | 4 | 7 |
 | Where a quota comes from | the provider's usage API, with the login your CLI holds; host pinned per manifest | provider configs, local logs, browser cookies (opt-in) | probes the CLIs; APIs; browser cookies for one | local log files (Claude, Codex); Google's endpoint (Antigravity) | first-party endpoints with existing credentials |
 | Adding a provider | a TOML file, no rebuild | ? | a Swift probe | ? | ? |

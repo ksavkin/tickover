@@ -43,6 +43,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -53,6 +54,7 @@ use crate::plugin::manifest::{
     AccountMatchConfig, AccountType, LogFileConfig, PeriodMode, PluginManifest, ResetsAtFormat,
     Role as ManifestRole, TagFrom, TagTransform, WindowConfig,
 };
+use crate::plugin::time::parse_iso8601;
 
 // ── Public entry point ───────────────────────────────────────────────────
 
@@ -82,7 +84,7 @@ pub fn fetch(
             // author's machine — so walking them twice to answer one question
             // is a cost with nothing to show for it.
             let glob = crate::plugin::substitute_options(&lf.glob, options);
-            let files = collect_log_files(&root, &glob);
+            let files = cap_to_newest_files(collect_log_files(&root, &glob), &m.id);
             let mut out = vec![fetch_from_root(m, lf, &root, &files)];
             // Additional rows, one per *other* account whose readings share the
             // same log tree (Codex Desktop signed into a different ChatGPT
@@ -180,7 +182,7 @@ fn fetch_from_root(
     };
 
     let account_match = resolve_account_match(m, lf);
-    match latest_reading(files, &lf.container_key, account_match.as_ref()) {
+    match latest_reading(files, &m.id, &lf.container_key, account_match.as_ref()) {
         Some(raw) => {
             reading.tag = resolve_tag(m, Some(&raw.container));
             match windows_from_raw(m, lf, &raw) {
@@ -262,7 +264,7 @@ fn secondary_accounts(
     let Some((field, expected)) = resolve_account_match(m, lf) else {
         return Vec::new();
     };
-    let groups = collect_plan_groups(files, &lf.container_key, &field);
+    let groups = collect_plan_groups(files, &m.id, &lf.container_key, &field);
 
     // Recency is measured against the freshest reading of *any* account, so a
     // quiet-but-current login still anchors "recent" for its busier siblings.
@@ -301,8 +303,24 @@ fn build_secondary_reading(
     // A secondary account row carries the same verdict as the primary one: a
     // reading nothing could be got out of is an error here too, rather than an
     // account whose section is silently blank.
+    //
+    // `value` is `account_match.container_field`'s raw text out of a log
+    // line a provider wrote — control characters, bidi overrides, up to
+    // `MAX_LINE_BYTES` of it — and this id becomes a config key and the
+    // popup's per-row model key, the same two things a window's key becomes
+    // (`crate::plugin::window_key`). Sanitised for the same reason
+    // `sanitize_provider_text` exists (this text is not merely displayed —
+    // this exact string is what this id is built from) and capped by it
+    // before `encode_key_part` ever sees it, so a provider filling this
+    // field with a megabyte cannot inflate the id to three times that in
+    // `%XX` escapes.
+    let id = format!(
+        "{}#{}",
+        m.id,
+        crate::plugin::encode_key_part(&crate::plugin::sanitize_provider_text(value))
+    );
     let mut reading = ProviderReading {
-        id: format!("{}#{}", m.id, value),
+        id,
         name: m.name.clone(),
         short: m.menu_label.clone(),
         tag: resolve_tag(m, Some(&raw.container)),
@@ -337,8 +355,14 @@ fn build_secondary_reading(
 /// walk stops once mtime falls a couple of weekly windows behind the newest —
 /// a cost bound only (selection is by the line's own `timestamp`), generous
 /// enough that the file-mtime anomaly can't hide a genuinely recent line.
+///
+/// Bounded by its own [`FETCH_BYTE_BUDGET`], separate from
+/// [`latest_reading`]'s own — the two run one after the other in [`fetch`]
+/// and a shared budget would let whichever ran first spend all of it.
+/// `plugin_id` is for the one diagnostic this can produce.
 fn collect_plan_groups(
     files: &[(PathBuf, SystemTime)],
+    plugin_id: &str,
     container_key: &str,
     field: &str,
 ) -> BTreeMap<String, PlanGroup> {
@@ -355,10 +379,22 @@ fn collect_plan_groups(
     let mtime_floor = newest_mtime.saturating_sub(SECONDARY_RECENCY_SECS.saturating_mul(2));
 
     let mut groups: BTreeMap<String, PlanGroup> = BTreeMap::new();
+    let mut budget = FETCH_BYTE_BUDGET;
     for (path, mtime) in &files {
         if mtime_secs(*mtime) < mtime_floor {
             break;
         }
+        let cost = file_read_cost(path);
+        if cost > budget {
+            queue_diag_once(plugin_id, "secondary-byte-budget", || {
+                format!(
+                    "{plugin_id}: the secondary-accounts log scan hit its \
+                     {FETCH_BYTE_BUDGET}-byte-per-fetch limit before finishing every matched file"
+                )
+            });
+            break;
+        }
+        budget -= cost;
         for (value, ts, raw) in parse_file_groups(path, container_key, field) {
             let newer = groups.get(&value).is_none_or(|g| ts > g.ts);
             if newer {
@@ -660,26 +696,14 @@ fn build_window(index: usize, w: &WindowConfig, slot: Option<&RawSlot>) -> Optio
     })
 }
 
+/// This slot's `resets_at`, in whichever format the manifest declares —
+/// [`crate::plugin::time::resets_at`] does the actual parsing (both the
+/// number-or-quoted-number reading and the RFC3339 one) and the one thing
+/// this engine and `engine_http` both need after it: a value more than ten
+/// years from now is treated as absent (see that function's own doc).
 fn resets_at_for(slot: &RawSlot, format: ResetsAtFormat) -> Option<u64> {
     let raw = slot.resets_at_raw.as_ref()?;
-    match format {
-        ResetsAtFormat::Unix => raw
-            .as_u64()
-            .or_else(|| raw.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
-            // Providers do quote their numbers sometimes; a reset time is too
-            // useful to drop over the difference between 1787207494 and
-            // "1787207494" (`engine_http::resets_at_value` accepts the same
-            // quoted form for exactly this reason).
-            .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<u64>().ok())),
-        ResetsAtFormat::Iso8601 => raw.as_str().and_then(parse_iso8601),
-    }
-}
-
-/// Parse an RFC3339 / ISO-8601 timestamp to Unix seconds.
-fn parse_iso8601(s: &str) -> Option<u64> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|dt| dt.timestamp().max(0) as u64)
+    crate::plugin::time::resets_at(raw, format)
 }
 
 // ── File discovery ───────────────────────────────────────────────────────
@@ -694,8 +718,16 @@ fn parse_iso8601(s: &str) -> Option<u64> {
 /// interleaves several accounts' readings only ever yields the current
 /// login's. A file with no *matching* container falls through to the next,
 /// exactly as an empty file does.
+///
+/// Bounded by its own [`FETCH_BYTE_BUDGET`], separate from
+/// [`collect_plan_groups`]'s own — see that constant's doc. A file whose read
+/// would exceed the remaining budget is never opened; the ones already found
+/// stand, and whatever reading a file past the cut might have carried is
+/// simply not looked for this fetch. `plugin_id` is for the one diagnostic
+/// this can produce, nothing else — the search itself does not change.
 fn latest_reading(
     files: &[(PathBuf, SystemTime)],
+    plugin_id: &str,
     container_key: &str,
     account_match: Option<&(String, String)>,
 ) -> Option<RawReading> {
@@ -706,9 +738,24 @@ fn latest_reading(
     // a batch — break the tie on path rather than on walkdir's visit order,
     // which is an accident of the filesystem, not a decision anyone made.
     files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    files
-        .into_iter()
-        .find_map(|(path, _mtime)| parse_file(&path, container_key, account_match))
+    let mut budget = FETCH_BYTE_BUDGET;
+    for (path, _mtime) in files {
+        let cost = file_read_cost(&path);
+        if cost > budget {
+            queue_diag_once(plugin_id, "primary-byte-budget", || {
+                format!(
+                    "{plugin_id}: the primary log scan hit its {FETCH_BYTE_BUDGET}-byte-per-fetch \
+                     limit before finishing every matched file"
+                )
+            });
+            break;
+        }
+        budget -= cost;
+        if let Some(found) = parse_file(&path, container_key, account_match) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// A recursive walk under `root` has no natural size limit of its own: a
@@ -749,6 +796,100 @@ fn collect_log_files(root: &Path, glob: &str) -> Vec<(PathBuf, SystemTime)> {
         out.push((entry.into_path(), mtime));
     }
     out
+}
+
+/// How many *matched* files ([`collect_log_files`]'s own output, not the
+/// directory entries `LOG_WALK_MAX_ENTRIES` bounds) one fetch will actually
+/// hand to [`latest_reading`]/[`secondary_accounts`] to open and read.
+///
+/// A session tree well inside the entry-walk cap can still match far more
+/// files than either reader could ever need: both already read newest-first
+/// and only care about the freshest handful, so a plugin whose glob has
+/// matched a few hundred files for years would otherwise have every one of
+/// them opened and tail-read again on every refresh, for a question only the
+/// newest ones can ever answer.
+const LOG_WALK_MAX_FILES: usize = 200;
+
+/// Keep only the newest [`LOG_WALK_MAX_FILES`] of `files` by mtime (the same
+/// tie-break [`latest_reading`]/[`collect_plan_groups`] each already use —
+/// sorting here first only means their own sort has nothing left to do),
+/// logging once per plugin when anything is actually dropped.
+fn cap_to_newest_files(
+    mut files: Vec<(PathBuf, SystemTime)>,
+    plugin_id: &str,
+) -> Vec<(PathBuf, SystemTime)> {
+    if files.len() <= LOG_WALK_MAX_FILES {
+        return files;
+    }
+    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let matched = files.len();
+    files.truncate(LOG_WALK_MAX_FILES);
+    queue_diag_once(plugin_id, "matched-files", || {
+        format!(
+            "{plugin_id}: {matched} files matched the log glob; only the newest \
+             {LOG_WALK_MAX_FILES} were read"
+        )
+    });
+    files
+}
+
+/// Total bytes either [`latest_reading`] or [`collect_plan_groups`] will pull
+/// out of files in one call, its own budget rather than one shared between
+/// the two: a session tree of a couple hundred files near the
+/// [`TAIL_BYTES`] window each would otherwise cost hundreds of megabytes of
+/// reads on every refresh, the primary lookup and the secondary-accounts
+/// lookup each paying it separately today regardless of this cap.
+const FETCH_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
+
+/// A file's cost against [`FETCH_BYTE_BUDGET`]: what [`tail_reader`] will
+/// actually read from it, capped at [`TAIL_BYTES`] — an upper bound, not an
+/// exact accounting (a file with few matching lines reads less than this),
+/// which is the right direction to round a *budget* rather than a report.
+fn file_read_cost(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|m| m.len())
+        .unwrap_or(0)
+        .min(TAIL_BYTES)
+}
+
+/// Diagnostics only the binary can write — `crate::diag` lives in `main.rs`'s
+/// binary crate, not this library one (see `crate::plugin::auth`'s own
+/// `PENDING_DIAGNOSTICS` for the identical split, and its own doc for why
+/// this crate does not reach into either directly). Queued here, meant to be
+/// drained once per fetch pass by `main.rs` via
+/// [`take_pending_diagnostics`].
+static PENDING_DIAGNOSTICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Every `(plugin id, reason)` pair this process has already logged once —
+/// shared by both diagnostics this module queues, so a session tree that
+/// keeps tripping the same cap on every refresh gets one line for it, not
+/// one per refresh.
+static ALREADY_LOGGED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+/// Queue `build_message()`'s result under `(plugin_id, reason)`, the first
+/// time only. `build_message` is a closure rather than a plain `String` so
+/// the (trivial) formatting cost is paid only when this is actually the
+/// first time — not on every refresh a cap keeps tripping on.
+fn queue_diag_once(plugin_id: &str, reason: &str, build_message: impl FnOnce() -> String) {
+    let should_log = ALREADY_LOGGED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(format!("{plugin_id}\u{1}{reason}"));
+    if should_log {
+        PENDING_DIAGNOSTICS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(build_message());
+    }
+}
+
+/// Every diagnostic line queued since the last call, removing them.
+pub fn take_pending_diagnostics() -> Vec<String> {
+    let mut guard = PENDING_DIAGNOSTICS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *guard)
 }
 
 /// Whether `name` (a bare file name, no directories) matches `glob`. Only the
@@ -930,7 +1071,13 @@ fn parse_raw_slot(value: &Value) -> Option<RawSlot> {
         .iter()
         .find_map(|k| map.get(*k))
         .cloned();
-    let window_minutes = first_u64(map, &["window_minutes", "windowMinutes"]);
+    // A saturating `as u64` on an absurd float, or a field a provider fills
+    // in a different unit than declared, is a length nothing here should
+    // classify a window against — the same ten-year rule
+    // `crate::plugin::time::resets_at` applies to a point in time, restated
+    // for a duration.
+    let window_minutes = first_u64(map, &["window_minutes", "windowMinutes"])
+        .filter(|&m| crate::plugin::time::plausible_period_minutes(m));
     Some(RawSlot {
         used_percent: used_percent.clamp(0.0, 100.0),
         resets_at_raw,
@@ -1060,6 +1207,17 @@ mod tests {
     use serde_json::json;
 
     use crate::plugin::manifest::{PeriodConfig, PeriodUnit, SourceConfig};
+
+    /// Guards every test below that calls `std::env::set_var`/`remove_var`:
+    /// real process environment is process-wide state `cargo test`'s default
+    /// parallelism does not otherwise serialize, and each test's own
+    /// uniquely-named variable stops it from *reading* another test's value
+    /// but not from *racing* the underlying set/remove calls themselves —
+    /// the same discipline as `engine_http`'s own, distinct `ENV_TEST_LOCK`.
+    /// `.unwrap_or_else(|e| e.into_inner())`, not `.unwrap()`: one test
+    /// panicking while holding this lock must not poison it for every test
+    /// queued behind it.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The invariant is stated as a property of **every path that builds a
     /// reading**, not of `ProviderReading::fail`: a test that calls `fail` and
@@ -1257,26 +1415,124 @@ mod tests {
 
     #[test]
     fn only_the_tail_of_a_large_file_is_read() {
-        // A file bigger than the window: the reading in its tail is found, the
-        // one buried near its start is not looked for, and neither costs a
-        // full pass over the file.
+        // A file bigger than the window: the reading buried near its start is
+        // never even *seen* — not merely outrun by a newer one, which the
+        // ordinary newest-line-wins rule would do on its own, `tail_reader`
+        // or not, since a later line in the file always wins over an earlier
+        // one. Proving the read is bounded needs the buried reading to be the
+        // *only* one — no later line to have won regardless.
         let dir = temp_dir("tail");
         let path = dir.join("rollout-big.jsonl");
-        let old = r#"{"rate_limits":{"primary":{"used_percent":1.0,"window_minutes":300,"resets_at":100}}}"#;
-        let new = r#"{"rate_limits":{"primary":{"used_percent":42.0,"window_minutes":300,"resets_at":200}}}"#;
+        let buried = r#"{"rate_limits":{"primary":{"used_percent":1.0,"window_minutes":300,"resets_at":100}}}"#;
         let filler = format!("{{\"noise\":\"{}\"}}\n", "x".repeat(64 * 1024));
         let mut text = String::with_capacity(TAIL_BYTES as usize + 1024 * 1024);
-        text.push_str(old);
+        text.push_str(buried);
         text.push('\n');
         while text.len() < TAIL_BYTES as usize + 512 * 1024 {
             text.push_str(&filler);
         }
+        std::fs::write(&path, &text).unwrap();
+
+        assert!(
+            parse_file(&path, "rate_limits", None).is_none(),
+            "the only reading in the file sits before the tail window and must never be read"
+        );
+
+        // The same file, with a second reading appended inside the window:
+        // now it is found, proving the window itself is not simply empty.
+        let new = r#"{"rate_limits":{"primary":{"used_percent":42.0,"window_minutes":300,"resets_at":200}}}"#;
         text.push_str(new);
         text.push('\n');
         std::fs::write(&path, &text).unwrap();
 
         let reading = parse_file(&path, "rate_limits", None).expect("the tail's reading is found");
         assert_eq!(reading.primary.as_ref().map(|s| s.used_percent), Some(42.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── per-fetch caps: matched files, bytes scanned ─────────────────────
+
+    #[test]
+    fn cap_to_newest_files_keeps_the_newest_and_reports_the_drop_once() {
+        let base = std::time::SystemTime::now();
+        let files: Vec<(PathBuf, SystemTime)> = (0..(LOG_WALK_MAX_FILES + 10))
+            .map(|i| {
+                (
+                    PathBuf::from(format!("rollout-{i}.jsonl")),
+                    base - std::time::Duration::from_secs(i as u64),
+                )
+            })
+            .collect();
+        // Index 0 is the newest (smallest offset from `base`); the newest
+        // `LOG_WALK_MAX_FILES` of them are indices 0..LOG_WALK_MAX_FILES.
+        let capped = cap_to_newest_files(files, "cap-test-plugin");
+        assert_eq!(capped.len(), LOG_WALK_MAX_FILES);
+        let index_of = |p: &Path| -> usize {
+            p.to_string_lossy()
+                .trim_start_matches("rollout-")
+                .trim_end_matches(".jsonl")
+                .parse()
+                .expect("test fixture names are always `rollout-{i}.jsonl`")
+        };
+        assert!(
+            capped.iter().all(|(p, _)| index_of(p) < LOG_WALK_MAX_FILES),
+            "only the newest files (the lowest indices) survive the cap"
+        );
+
+        let diag = take_pending_diagnostics();
+        assert!(
+            diag.iter().any(|l| l.contains("cap-test-plugin")),
+            "the truncation is reported once: {diag:?}"
+        );
+    }
+
+    #[test]
+    fn cap_to_newest_files_is_a_no_op_under_the_cap() {
+        let files = vec![(PathBuf::from("a"), std::time::SystemTime::now())];
+        let capped = cap_to_newest_files(files.clone(), "under-cap-plugin");
+        assert_eq!(capped, files);
+        assert!(take_pending_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn latest_reading_stops_once_its_byte_budget_is_spent() {
+        // Filler files sized just over `TAIL_BYTES`, so each costs exactly
+        // `TAIL_BYTES` against the budget regardless of the (sparse, near-
+        // free to create) size actually claimed on disk. Enough of them to
+        // exhaust `FETCH_BYTE_BUDGET` exactly.
+        let dir = temp_dir("byte-budget");
+        let filler_size = TAIL_BYTES + 1024;
+        let filler_count = (FETCH_BYTE_BUDGET / TAIL_BYTES) as usize;
+        let base = std::time::SystemTime::now();
+        for i in 0..filler_count {
+            let path = dir.join(format!("rollout-filler-{i}.jsonl"));
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_len(filler_size).unwrap();
+            // Newest first, so the walk spends the whole budget on these
+            // before it would ever reach the real one below.
+            set_mtime(&path, base - std::time::Duration::from_secs(i as u64));
+        }
+        let real = write_file(
+            &dir,
+            "rollout-real.jsonl",
+            &[json!({ "rate_limits": { "primary": { "used_percent": 77.0 } } }).to_string()],
+        );
+        set_mtime(
+            &real,
+            base - std::time::Duration::from_secs(filler_count as u64 + 10),
+        );
+
+        let files = collect_log_files(&dir, "rollout-*.jsonl");
+        assert!(
+            latest_reading(&files, "byte-budget-plugin", "rate_limits", None).is_none(),
+            "the real reading sits past the byte budget and must never be opened"
+        );
+
+        let diag = take_pending_diagnostics();
+        assert!(
+            diag.iter().any(|l| l.contains("byte-budget-plugin")),
+            "the cutoff is reported once: {diag:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1473,6 +1729,31 @@ mod tests {
         assert_eq!(resets_at_for(&s, ResetsAtFormat::Unix), None);
     }
 
+    /// The window contract is 0..100 whichever engine produced it — a
+    /// negative figure clamps to 0 the same way `engine_http::build_window`
+    /// clamps a remaining-fraction complement out of range.
+    #[test]
+    fn a_negative_used_percent_clamps_to_zero() {
+        let s = parse_raw_slot(&json!({ "used_percent": -4.0 })).unwrap();
+        assert_eq!(s.used_percent, 0.0);
+    }
+
+    /// The same saturating-cast defence `crate::plugin::time::resets_at`
+    /// applies to a point in time, restated for a duration: a `window_minutes`
+    /// far beyond any real quota window is treated as absent rather than fed
+    /// to classification.
+    #[test]
+    fn an_implausible_window_minutes_is_treated_as_absent() {
+        let ordinary =
+            parse_raw_slot(&json!({ "used_percent": 1.0, "window_minutes": 10_080 })).unwrap();
+        assert_eq!(ordinary.window_minutes, Some(10_080));
+
+        let absurd =
+            parse_raw_slot(&json!({ "used_percent": 1.0, "window_minutes": 999_999_999_999u64 }))
+                .unwrap();
+        assert_eq!(absurd.window_minutes, None);
+    }
+
     #[test]
     fn a_quoted_unix_timestamp_resolves_the_same_as_a_bare_one() {
         let s = RawSlot {
@@ -1485,6 +1766,19 @@ mod tests {
             Some(1_787_207_494),
             "a provider that quotes its numbers must not lose the reset time"
         );
+    }
+
+    /// `resets_at_for` delegates to `crate::plugin::time::resets_at`, so a
+    /// ms-vs-s confusion (or any value more than ten years out) is treated as
+    /// absent here exactly as it is in `engine_http` — one rule, one place.
+    #[test]
+    fn an_implausible_resets_at_is_treated_as_absent() {
+        let s = RawSlot {
+            used_percent: 1.0,
+            resets_at_raw: Some(json!(9_999_999_999_999u64)),
+            window_minutes: None,
+        };
+        assert_eq!(resets_at_for(&s, ResetsAtFormat::Unix), None);
     }
 
     #[test]
@@ -1555,6 +1849,7 @@ mod tests {
 
         let raw = latest_reading(
             &collect_log_files(&dir, "rollout-*.jsonl"),
+            "test-plugin",
             "rate_limits",
             None,
         )
@@ -1585,6 +1880,7 @@ mod tests {
 
         let raw = latest_reading(
             &collect_log_files(&dir, "rollout-*.jsonl"),
+            "test-plugin",
             "rate_limits",
             None,
         )
@@ -2195,6 +2491,7 @@ mod tests {
 
         let groups = collect_plan_groups(
             &collect_log_files(&dir, "rollout-*.jsonl"),
+            "test-plugin",
             "rate_limits",
             "plan_type",
         );
@@ -2257,6 +2554,47 @@ mod tests {
         );
         assert_eq!(plus.secondary_window().unwrap().used_percent, Some(100.0));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `value` is a plan-tier string straight out of a log line a provider
+    /// wrote, not a manifest author's — control characters, a newline, any
+    /// length up to `MAX_LINE_BYTES`. It becomes this row's id, which is a
+    /// config key and the popup's per-row model key, so it goes through the
+    /// same sanitise-then-encode `sanitized_account`/`fill_label` already
+    /// use for other response-supplied text, capped before it is encoded so
+    /// a hostile value cannot inflate threefold in `%XX` escapes.
+    #[test]
+    fn a_secondary_reading_id_is_sanitised_and_encoded_before_becoming_a_config_key() {
+        let m = codex_like_manifest("/nonexistent", "/nonexistent", "/nonexistent");
+        let lf = m.logfile.as_ref().unwrap();
+        let raw = RawReading {
+            primary: Some(slot(10.0, Some(300))),
+            secondary: None,
+            container: json!({}),
+        };
+        let hostile = format!("pro\u{202E}\nteam{}", "x".repeat(200));
+        let reading = build_secondary_reading(&m, lf, &hostile, &raw);
+
+        assert!(
+            reading.id.starts_with("codex#"),
+            "keeps the plugin id prefix: {}",
+            reading.id
+        );
+        assert!(
+            !reading.id.contains('\n'),
+            "a raw newline must never reach a config key: {:?}",
+            reading.id
+        );
+        assert!(
+            reading.id.len() < 250,
+            "sanitising to PROVIDER_TEXT_MAX_CHARS before encoding bounds the id, {} bytes",
+            reading.id.len()
+        );
+
+        // An ordinary plan value still becomes exactly the id it always did —
+        // the fix must not change the case every shipped manifest relies on.
+        let plain = build_secondary_reading(&m, lf, "plus", &raw);
+        assert_eq!(plain.id, "codex#plus");
     }
 
     #[test]
@@ -2376,6 +2714,7 @@ mod tests {
             &[json!({ "rate_limits": { "primary": { "used_percent": 5.0 } } }).to_string()],
         );
 
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let env_name = "TICKOVER_TEST_ENGINE_LOGFILE_ROOT";
         std::env::set_var(env_name, &dir);
         let m = codex_like_manifest(env_name, "/nonexistent-should-not-be-used", "/nonexistent");
@@ -2396,6 +2735,7 @@ mod tests {
 
     #[test]
     fn resolve_root_falls_back_to_configured_root_when_env_unset() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let unset_env = "TICKOVER_TEST_ENGINE_LOGFILE_ROOT_UNSET";
         std::env::remove_var(unset_env);
         let lf = LogFileConfig {
@@ -2418,6 +2758,7 @@ mod tests {
 
     #[test]
     fn resolve_root_joins_root_env_join_onto_the_env_override() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let env_name = "TICKOVER_TEST_ENGINE_LOGFILE_ROOT_JOIN";
         std::env::set_var(env_name, "/tmp/x");
         let lf = LogFileConfig {
@@ -2443,6 +2784,7 @@ mod tests {
 
     #[test]
     fn resolve_root_substitutes_option_placeholders_in_root_env_join() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let env_name = "TICKOVER_TEST_ENGINE_LOGFILE_ROOT_OPTION_JOIN";
         std::env::set_var(env_name, "/tmp/x");
         let lf = LogFileConfig {
@@ -2470,6 +2812,7 @@ mod tests {
 
     #[test]
     fn resolve_root_substitutes_option_placeholders_in_the_plain_root_fallback() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let unset_env = "TICKOVER_TEST_ENGINE_LOGFILE_ROOT_OPTION_PLAIN_UNSET";
         std::env::remove_var(unset_env);
         let lf = LogFileConfig {
@@ -2494,6 +2837,7 @@ mod tests {
 
     #[test]
     fn resolve_root_ignores_root_env_join_when_env_unset() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let unset_env = "TICKOVER_TEST_ENGINE_LOGFILE_ROOT_JOIN_UNSET";
         std::env::remove_var(unset_env);
         let lf = LogFileConfig {

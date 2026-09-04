@@ -42,8 +42,7 @@ what it does with them — and what it refuses to do.
 
 Four call sites, all of them `ureq` with redirects disabled — `grep -n ureq -r src`
 finds every one — carrying five kinds of request between them, since the
-registry's own fetch function is reused for both the index and its signature
-file. All four are `https`-only, each enforced where it is sent: the usage
+registry's byte fetch serves both the index and a manifest file. All four are `https`-only, each enforced where it is sent: the usage
 endpoint's URL is refused at load (`PluginManifest::validate`) and refused
 again by the generic HTTP engine right before it would open a connection; the
 `oauth-refresh` token exchange refuses a non-`https` `token_url` of its own
@@ -65,6 +64,35 @@ fetches carry the same gate at their own call site.
    install or update one of the plugins it lists. Its bytes are checked
    against the sha256 the index stated before anything is parsed or written —
    see the gap about provenance below.
+
+Every response this app reads is bounded before it is buffered into memory,
+not read until the connection closes: a provider's usage response is capped
+at 4 MB (`engine_http::MAX_PROVIDER_RESPONSE_BYTES`), an index or manifest
+download at 10 MB and the signature file at 8 KB (`registry::fetch_bytes`'s
+and `fetch_text`'s own caps) — so a compromised or merely broken host cannot
+exhaust memory by answering at length instead of answering correctly. A
+response shaped to make one manifest enumerate an unbounded number of rows
+through `for_each` is capped the same way, at 64 elements considered
+(`engine_http::FOR_EACH_MAX_ELEMENTS`); past that point the rest of the array
+is simply not read, and a line in the log says so once for the life of the
+process, not once per plugin or per tick.
+
+The same principle bounds what is read off disk and how long this process
+will wait on anything. A `log-file` plugin's session-tree glob opens at
+most 200 matched files per fetch (`engine_logfile::LOG_WALK_MAX_FILES`, the
+newest by mtime kept when a glob matches more) and reads at most 64 MiB out
+of them per lookup (`engine_logfile::FETCH_BYTE_BUDGET`; the primary
+lookup and the secondary-accounts lookup each get their own), so years of
+session history cost a fixed amount of work rather than one proportional
+to how much has piled up. A registry index listing more than 500 plugins
+(`registry::MAX_INDEX_ENTRIES`) is rejected wholesale rather than handed to
+the install UI to sort and draw. A refreshed OAuth token is never cached as
+living longer than 24 hours (`auth::EXPIRES_IN_MAX_SECS`), whatever a token
+endpoint's own `expires_in` claims. And a macOS Keychain read that hangs —
+a wedged daemon, or a first-run access prompt nobody is there to answer —
+is killed and reported as a timeout after 30 seconds
+(`auth::KEYCHAIN_DEADLINE`), rather than blocking that surface, and the
+throttle gate behind it, forever.
 
 ### A request this app makes something *else* make
 
@@ -98,11 +126,16 @@ a program you did not read.
 **And one part of it is a program in the ordinary sense.** A manifest may
 declare `[ping]` — a binary and its arguments — which this app runs shortly
 after that provider's window resets, to start a fresh one. That is an
-arbitrary local command with your user's privileges. Three things bound it:
-the toggle is **off unless you turn it on**, per plugin, in Settings; it fires
-at most once per window reset; and a manifest that declares `[ping]` at all
-cannot be installed from a registry without the confirmation dialog, which
-shows the exact command line.
+arbitrary local command with your user's privileges. Four things bound it:
+the toggle is **off unless you turn it on**, per plugin, in Settings; it never
+fires before the window it targets has actually started, and never more than
+once every ten minutes regardless of what a manifest's own numbers claim,
+which is what stops a misconfigured or malicious manifest from turning this
+into a loop; it runs in a directory created fresh for that one command,
+normally under the OS temp directory and removed once the command exits, so
+there is nothing already on disk for it to read; and a manifest that declares
+`[ping]` at all cannot be installed from a registry without the confirmation
+dialog, which shows the exact command line.
 
 The manifests that ship with the app (`plugins/*.toml`) are reviewed and
 versioned in this repository, and are seeded rather than installed — they never
@@ -120,12 +153,23 @@ sections "Auth chain semantics" and "Security".
   against comes from the same index, over the same connection, so it is
   transport integrity — not provenance. Until a key is pinned, treat installing
   from the registry as trusting the host that served the index.
-- **The confirmation before a registry install is a prompt, not a proof.** It
-  fires on any of three things (`registry::analyze_trust`): reading a secret
-  out of an OS/app store while calling an endpoint, declaring `[ping]`, or
-  reading local files of its own choosing into a request. It shows the hosts,
-  the files and the ping command line — and then a person decides, which is
-  the part no code here can do for them.
+- **The confirmation before a registry install is a prompt, not a proof.**
+  The same gate runs for a manifest picked off disk through "Add plugin" —
+  a file you chose yourself is exactly as third-party as one the registry
+  would have downloaded, and nothing here special-cases it. It fires on any
+  of four things (`registry::analyze_trust`): reading a secret
+  out of an OS/app store while calling an endpoint, declaring `[ping]`,
+  reading local files of its own choosing into a request, or naming a
+  specific `env`/keychain/Credential Manager/Electron Safe Storage source to
+  read a credential from — whatever the engine, so a `log-file` manifest
+  reading an environment variable asks exactly as loudly as an `http-api`
+  one does. It shows the hosts (each URL's option placeholders substituted
+  at the manifest's own defaults first, so a host is never shown as raw
+  `{option.…}` text when it names a real destination), the files (including
+  a `log-file` manifest's own read scope and a `jwt-file` account lookup's
+  token file, not just a credential store's own path), the specific
+  credential source named above, and the ping command line — and then a
+  person decides, which is the part no code here can do for them.
 - **The Windows credential paths have been built and run, but not against a
   real item.** The app has since been built and run on Windows 11 (x86_64,
   MSVC); the Credential Manager (`CredRead`) and DPAPI desktop-token steps

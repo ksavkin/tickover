@@ -198,45 +198,106 @@ fn migrate_legacy_dir_at(old: &Path, new: &Path) -> Result<bool, std::io::Error>
     Ok(true)
 }
 
+/// How many `.corrupt-<unix secs>[-<n>]` names [`backup_if_corrupt`] tries
+/// before giving up on saving a backup at all. The name is only
+/// second-resolution, so two corrupt files backed up inside the same second
+/// would otherwise fight over one name — implausible for one `config.json`
+/// (fixing the first backup's corruption is what the write right after it
+/// does), but not worth assuming can never happen when the cost of being
+/// wrong is silently skipping a backup instead of trying the next name.
+const CORRUPT_BACKUP_MAX_ATTEMPTS: u32 = 100;
+
 /// Save whatever is at `path` right now aside as `<name>.corrupt-<unix
-/// secs>`, if — and only if — it doesn't parse as JSON. [`load`] treats
-/// unparsable the same as "nothing here": every setter builds its new value
-/// from an empty object and then overwrites the file, so a corrupt
-/// `config.json` was one preference change away from being gone for good,
-/// with nothing left on disk to even show what it had contained. A copy
-/// (never a rename) — the normal write below still has to land at `path`
-/// either way, and leaving the original in place is one less way for a
-/// failed backup to turn a corrupt file into a missing one.
+/// secs>` (or a `-<n>`-suffixed sibling, see [`CORRUPT_BACKUP_MAX_ATTEMPTS`]),
+/// unless it already parses as a JSON **object**. [`load`] treats anything
+/// else — unparsable, or valid JSON that isn't an object (`[]`, `"x"`,
+/// `42`, `null`) — the same as "nothing here", and every setter builds its
+/// new value from an empty object and then overwrites the file. Without this
+/// check naming both failure shapes, a `config.json` that was somehow made
+/// into a bare JSON array would parse *fine* by `from_str::<Value>`'s own
+/// measure, so the corrupt-detection above it used to wave it through: every
+/// setter's `as_object_mut()` would then find nothing to insert into, silently
+/// discard the change, and re-save the same non-object right back — a setting
+/// that can never be written again, with nothing on screen or in the log to
+/// say so. Backing it up and starting fresh (an empty object) is what
+/// [`load`] does too, so the two agree on what "not a usable config" means.
+///
+/// A copy of the content (never a rename) either way — the normal write
+/// below still has to land at `path` regardless of which shape was wrong,
+/// and leaving the original in place is one less way for a failed backup to
+/// turn a bad file into a missing one.
+///
+/// Written via `create_new`, never `std::fs::copy`/a plain write into
+/// the backup name — that name is predictable (this second, this pid's
+/// process is not part of it, unlike `write_atomically`'s temp path), and
+/// `copy` opens its destination with truncate, following a symlink planted
+/// there and overwriting whatever it points to rather than the intended
+/// backup. `create_new` refuses any directory entry already at that path,
+/// symlink included, rather than opening through it — the same guarantee
+/// `write_atomically`'s own temp file relies on, here without the
+/// remove-first step that only works because that path's suffix is unique to
+/// this process.
 ///
 /// Best-effort like the rest of this module: a backup that can't be written
 /// is logged and given up on, not allowed to block the write it was meant to
 /// precede.
 fn backup_if_corrupt(path: &std::path::Path) {
-    let Ok(existing) = std::fs::read_to_string(path) else {
-        return; // absent, or unreadable for some other reason: nothing to save
+    let Some(existing) =
+        tickover::plugin::read_regular_file(path, tickover::plugin::SMALL_FILE_MAX_BYTES)
+    else {
+        return; // absent, not a regular file, or unreadable for some other reason: nothing to save
     };
-    if serde_json::from_str::<Value>(tickover::plugin::strip_bom(&existing)).is_ok() {
-        return; // parses fine — an ordinary overwrite, nothing at risk
-    }
+    // Named apart so the line below can say which is true: `[]` did
+    // parse, and saying it "did not parse" beside a copy that plainly does
+    // would be this app's own diagnostic contradicting the file it just
+    // wrote out.
+    let reason = match serde_json::from_str::<Value>(tickover::plugin::strip_bom(&existing)) {
+        Ok(v) if v.is_object() => return, // a usable config — an ordinary overwrite, nothing at risk
+        Ok(_) => "parsed, but wasn't a JSON object",
+        Err(_) => "did not parse as JSON",
+    };
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut backup_name = path.file_name().unwrap_or_default().to_os_string();
-    backup_name.push(format!(".corrupt-{secs}"));
-    let backup = path.with_file_name(backup_name);
-    match std::fs::copy(path, &backup) {
-        Ok(_) => crate::diag::line(format!(
-            "{} did not parse — the unreadable copy was saved as {} before it was overwritten",
-            path.display(),
-            backup.display()
-        )),
-        Err(e) => crate::diag::line(format!(
-            "{} did not parse, and the unreadable copy could not be backed up to {}: {e}",
-            path.display(),
-            backup.display()
-        )),
+    let stem = path.file_name().unwrap_or_default().to_os_string();
+    for attempt in 1..=CORRUPT_BACKUP_MAX_ATTEMPTS {
+        let mut backup_name = stem.clone();
+        if attempt == 1 {
+            backup_name.push(format!(".corrupt-{secs}"));
+        } else {
+            backup_name.push(format!(".corrupt-{secs}-{attempt}"));
+        }
+        let backup = path.with_file_name(backup_name);
+        let result = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, existing.as_bytes()));
+        match result {
+            Ok(()) => {
+                crate::diag::line(format!(
+                    "{} {reason} — the previous copy was saved as {} before it was overwritten",
+                    path.display(),
+                    backup.display()
+                ));
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                crate::diag::line(format!(
+                    "{} {reason}, and the previous copy could not be backed up to {}: {e}",
+                    path.display(),
+                    backup.display()
+                ));
+                return;
+            }
+        }
     }
+    crate::diag::line(format!(
+        "{} {reason}, and no unused backup name was found after {CORRUPT_BACKUP_MAX_ATTEMPTS} tries",
+        path.display()
+    ));
 }
 
 #[cfg(test)]
@@ -298,13 +359,38 @@ fn write_atomically(path: &std::path::Path, text: &str) {
 }
 
 fn load() -> Value {
-    path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+    let Some(p) = path() else {
+        return json!({});
+    };
+    let text = tickover::plugin::read_regular_file(&p, tickover::plugin::SMALL_FILE_MAX_BYTES);
+    // `read_regular_file` also returns `None` for a plain missing file — the
+    // ordinary first-run case, silent by design — so this only fires when
+    // something is actually sitting at `p` and got refused for its kind
+    // (a FIFO, a device, a directory) or its size (over
+    // `SMALL_FILE_MAX_BYTES`): loud rather than the same silent
+    // "no config" a genuinely absent file gets, since this is a file this
+    // app is about to overwrite on the next setting change without whoever
+    // put it there ever finding out why nothing they wrote through it back
+    // was ever read.
+    if text.is_none() && p.exists() {
+        crate::diag::line(format!(
+            "{} exists but is not a regular file under 4 MiB (or a symlink to one) — reading as no config",
+            p.display()
+        ));
+    }
+    text
         // A byte-order mark makes `from_str` fail, which this treats as an
         // empty config — and the next write then persists that emptiness
         // over every setting the file held. One editor that saves a BOM is
         // enough to silently reset the lot; see `plugin::strip_bom`.
-        .and_then(|s| serde_json::from_str(tickover::plugin::strip_bom(&s)).ok())
+        .and_then(|s| serde_json::from_str::<Value>(tickover::plugin::strip_bom(&s)).ok())
+        // Valid JSON that isn't an object (`[]`, a bare string, `null`…)
+        // is exactly as unusable as unparsable text — every setter below
+        // reads and writes through `as_object_mut()`, which finds nothing on
+        // anything else and silently no-ops. Filtered here so this and
+        // `backup_if_corrupt` (which runs first, on the raw text, and backs
+        // up precisely this shape) agree on what counts as "nothing here".
+        .filter(Value::is_object)
         .unwrap_or_else(|| json!({}))
 }
 
@@ -822,6 +908,164 @@ mod tests {
                     .any(|l| l.contains("did not parse") && l.contains("corrupt-")),
                 "expected a diagnostic naming the backup: {lines:?}"
             );
+        });
+    }
+
+    /// The backup name is predictable — this second, not this
+    /// process, unlike `write_atomically`'s own temp path — so anything
+    /// running as this user can plant a symlink on it ahead of time.
+    /// `std::fs::copy`'s destination-truncate would have followed that link
+    /// and overwritten whatever it pointed to; `create_new` instead refuses
+    /// the occupied name outright and falls through to the next
+    /// counter-suffixed one, so the backup still lands somewhere.
+    #[test]
+    #[cfg(unix)]
+    fn a_corrupt_backup_will_not_follow_a_symlink_planted_on_its_predictable_name() {
+        with_test_config_path(|| {
+            let p = path().expect("test config path resolves");
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            let corrupt = "{not valid json";
+            std::fs::write(&p, corrupt).expect("seed a corrupt file");
+
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let stem = p.file_name().unwrap().to_os_string();
+            let name_for = |suffix: &str| {
+                let mut n = stem.clone();
+                n.push(suffix);
+                p.with_file_name(n)
+            };
+            let predicted = name_for(&format!(".corrupt-{secs}"));
+            let suffixed = name_for(&format!(".corrupt-{secs}-2"));
+
+            let outside = p.with_file_name("precious-config-backup-victim.txt");
+            std::fs::write(&outside, b"do not touch").unwrap();
+            std::os::unix::fs::symlink(&outside, &predicted).expect("plant the link");
+
+            set_plugin_enabled("acme", true);
+
+            assert_eq!(
+                std::fs::read(&outside).unwrap(),
+                b"do not touch",
+                "the link's target must be untouched"
+            );
+            assert!(
+                std::fs::symlink_metadata(&predicted)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false),
+                "the link itself is left exactly as it was — refused, not cleared to make room"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&suffixed).unwrap(),
+                corrupt,
+                "the backup still lands, under the next name"
+            );
+
+            let _ = std::fs::remove_file(&outside);
+            let _ = std::fs::remove_file(&predicted);
+            let _ = std::fs::remove_file(&suffixed);
+        });
+    }
+
+    /// A `config.json` holding valid JSON that isn't an object (here,
+    /// `[]`) used to parse *fine* by `from_str::<Value>`'s own measure — so
+    /// `backup_if_corrupt` waved it through, and every setter's
+    /// `as_object_mut()` found nothing to insert into and silently discarded
+    /// the change, then re-saved the same bare array right back. A setting
+    /// could never be written again, with nothing on screen or in the log to
+    /// say why.
+    #[test]
+    fn a_valid_but_non_object_config_is_treated_as_corrupt() {
+        with_test_config_path(|| {
+            let p = path().expect("test config path resolves");
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "[]").expect("seed a non-object config");
+            let _ = crate::diag::take_recorded();
+
+            set_plugin_enabled("acme", true);
+
+            assert!(
+                plugin_enabled("acme", false),
+                "the write must actually take, not silently no-op against the bare array"
+            );
+
+            let backups: Vec<_> = std::fs::read_dir(p.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("config.json.corrupt-")
+                })
+                .collect();
+            assert_eq!(
+                backups.len(),
+                1,
+                "the bare array is backed up exactly like unparsable text"
+            );
+            assert_eq!(std::fs::read_to_string(backups[0].path()).unwrap(), "[]");
+
+            let lines = crate::diag::take_recorded();
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("wasn't a JSON object") && l.contains("corrupt-")),
+                "expected a diagnostic naming the backup, and not claiming the array \
+                 \"did not parse\" when it plainly did: {lines:?}"
+            );
+        });
+    }
+
+    /// Reading `config.json` through a plain `std::fs::read_to_string` used
+    /// to mean a FIFO planted at that path (deliberately, or a leftover from
+    /// something else entirely) blocked `load` forever — every read of a
+    /// preference, on every startup, hangs waiting for a writer that will
+    /// never come. `read_regular_file` refuses anything that is not a
+    /// regular file (or a symlink to one) before ever opening it in a way
+    /// that could block, so this must come back with "no config" — the same
+    /// as a missing file — not hang the test (and not the app) waiting on
+    /// it. Unlike a missing file, though, something really is sitting at
+    /// that path, refused for its kind rather than its absence, so `load`
+    /// says so once rather than reading as indistinguishable from a fresh
+    /// install.
+    #[test]
+    #[cfg(unix)]
+    fn load_of_a_fifo_reads_as_no_config_instead_of_hanging() {
+        with_test_config_path(|| {
+            let p = path().expect("test config path resolves");
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            let made = std::process::Command::new("mkfifo").arg(&p).status();
+            if !matches!(made, Ok(s) if s.success()) {
+                // `mkfifo` isn't guaranteed present everywhere this test runs —
+                // silently asserting nothing here used to look identical to the
+                // FIFO case actually having been exercised. Print rather than
+                // skip outright: a CI log that never shows this line is the one
+                // place this gap would otherwise go unnoticed.
+                eprintln!(
+                    "SKIP: load_of_a_fifo_reads_as_no_config_instead_of_hanging — mkfifo unavailable"
+                );
+                return;
+            }
+            let _ = crate::diag::take_recorded(); // drain anything left on this thread
+
+            assert_eq!(
+                load(),
+                json!({}),
+                "a FIFO at config.json must read as no config, not hang"
+            );
+
+            let lines = crate::diag::take_recorded();
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("not a regular file")
+                        && l.contains(&p.display().to_string())),
+                "expected a diagnostic naming the FIFO, not silence: {lines:?}"
+            );
+
+            std::fs::remove_file(&p).ok();
         });
     }
 

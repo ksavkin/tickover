@@ -53,7 +53,15 @@ static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// wrote `duplicate id "codex" … loaded set was [codex, codex]` into the log a
 /// user reads. It was investigated as a real defect of the running app, twice,
 /// and a diagnostic commit was written to chase it. The app never did it.
+///
+/// `message` often carries text this app didn't write itself — a manifest's
+/// own strings (a header name, a `[ping] args` entry, a client's own
+/// discovered id), or an error `{e}`-formatted from one. [`escape_control_chars`]
+/// runs on it first: both sinks below are read one line per line, and a raw
+/// `\n`/`\r` in `message` would otherwise print as more than one line, one of
+/// them made to look like a diagnostic this app never actually emitted.
 pub fn line(message: String) {
+    let message = escape_control_chars(&message);
     eprintln!("[tickover] {message}");
     // The tests below drive `trim_if_large` against their own temp files, which
     // is the part worth testing; what is skipped here is only the choice of
@@ -62,6 +70,23 @@ pub fn line(message: String) {
     append_to_log(&message);
     #[cfg(test)]
     RECORDED.with(|r| r.borrow_mut().push(message));
+}
+
+/// Escape every C0 control character (`\n`/`\r` spelled out, everything else
+/// `\xHH`) in `message` — see [`line`]'s own doc for why. DEL (`\u{7F}`) is
+/// folded in with C0 for the same reason: neither is printable, and a stray
+/// one is exactly as capable of confusing a line-oriented reader.
+fn escape_control_chars(message: &str) -> String {
+    let mut escaped = String::with_capacity(message.len());
+    for c in message.chars() {
+        match c as u32 {
+            0x0A => escaped.push_str("\\n"),
+            0x0D => escaped.push_str("\\r"),
+            0x00..=0x1F | 0x7F => escaped.push_str(&format!("\\x{:02x}", c as u32)),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 // What [`line`] was called with on this thread, under `cargo test` only.
@@ -118,35 +143,51 @@ fn append_to_log(message: &str) {
 /// the last [`KEEP_BYTES`] from the first line boundary inside them — so the
 /// file never grows without bound and never starts mid-line.
 ///
+/// Reads only the tail — seeking to `len - KEEP_BYTES` rather than
+/// `std::fs::read`ing the whole file — so a log that has grown large reads
+/// [`KEEP_BYTES`] worth of bytes on every single line this app ever writes
+/// once it's over the trim threshold, not the whole (ever-growing) file.
+///
 /// Written through a temporary neighbour and renamed, the same way
 /// [`crate::config`] writes: a truncate-in-place interrupted half-way would
 /// leave the log unreadable, which is the one thing a log must not become.
 fn trim_if_large(path: &std::path::Path) {
+    use std::io::{Read, Seek};
     let Ok(meta) = std::fs::metadata(path) else {
         return;
     };
-    if meta.len() <= MAX_BYTES {
+    let len = meta.len();
+    if len <= MAX_BYTES {
         return;
     }
-    let Ok(bytes) = std::fs::read(path) else {
+    let cut = len.saturating_sub(KEEP_BYTES as u64);
+    let Ok(mut file) = std::fs::File::open(path) else {
         return;
     };
-    let cut = bytes.len().saturating_sub(KEEP_BYTES);
-    // From the byte after the next newline at or past `cut`, so the first
-    // surviving line is whole. With no newline in the tail at all — one
-    // pathological line longer than the whole keep size — leave the file
-    // alone: half a line is worse to read than an oversized log.
-    let Some(offset) = bytes[cut..].iter().position(|b| *b == b'\n') else {
+    if file.seek(std::io::SeekFrom::Start(cut)).is_err() {
         return;
-    };
-    let start = cut + offset + 1;
+    }
+    let mut tail = Vec::new();
+    if file.read_to_end(&mut tail).is_err() {
+        return;
+    }
+    // From the byte after the next newline, so the first surviving line is
+    // whole. With no newline anywhere in the tail — one pathological line
+    // longer than the whole keep size — cut at the keep size regardless
+    // rather than leaving the file alone: a half line at the very start of
+    // what survives is worse to read than the rest of the log, but a file
+    // this function can never shrink is worse still — every future write
+    // would re-read the same oversized, still-growing tail from here on,
+    // for good, since nothing about a line-less tail ever changes that on
+    // its own.
+    let start = tail.iter().position(|b| *b == b'\n').map_or(0, |i| i + 1);
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let written = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&tmp)
-        .and_then(|mut f| f.write_all(&bytes[start..]));
+        .and_then(|mut f| f.write_all(&tail[start..]));
     if written.is_ok() {
         if std::fs::rename(&tmp, path).is_err() {
             let _ = std::fs::remove_file(&tmp);
@@ -211,20 +252,31 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// One line longer than the whole keep size leaves nothing to cut on. Half
-    /// a line is worse to read than an oversized log, so the file is left as
-    /// it is rather than sliced mid-line.
+    /// One line longer than the whole keep size leaves nothing to cut *on a
+    /// line boundary* — but the file still has to shrink, or every future
+    /// write re-reads the same oversized tail forever. Renamed from
+    /// `trim_leaves_a_log_with_no_line_boundary_alone`, whose own name and
+    /// body described the opposite of what `trim_if_large` does now: that
+    /// version was never reachable from [`line`] at all (nothing this app
+    /// writes produces a line-less log short of a synthetic fixture exactly
+    /// like this one), and left unbounded, it was an unbounded re-read on
+    /// every log line once triggered.
     #[test]
-    fn trim_leaves_a_log_with_no_line_boundary_alone() {
+    fn trim_cuts_at_keep_bytes_even_with_no_line_boundary_in_the_tail() {
         let dir = temp_dir("noboundary");
         let path = dir.join("tickover.log");
         let one_huge_line = "x".repeat(MAX_BYTES as usize + 4096);
         std::fs::write(&path, &one_huge_line).expect("seed log");
         trim_if_large(&path);
+        let after = std::fs::read(&path).expect("still there");
         assert_eq!(
-            std::fs::metadata(&path).expect("still there").len(),
-            one_huge_line.len() as u64,
-            "left alone rather than cut mid-line"
+            after.len(),
+            KEEP_BYTES,
+            "cut at the keep size, not left growing forever"
+        );
+        assert!(
+            one_huge_line.as_bytes().ends_with(&after),
+            "what survives is still the tail of what was there"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -235,5 +287,42 @@ mod tests {
         trim_if_large(&dir.join("tickover.log")); // must not panic
         assert!(!dir.join("tickover.log").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn escape_control_chars_spells_out_newline_and_carriage_return() {
+        assert_eq!(
+            escape_control_chars("first\nsecond\rthird"),
+            "first\\nsecond\\rthird"
+        );
+    }
+
+    #[test]
+    fn escape_control_chars_hex_escapes_every_other_c0_control_and_del() {
+        assert_eq!(escape_control_chars("bell\x07here"), "bell\\x07here");
+        assert_eq!(escape_control_chars("tab\there"), "tab\\x09here");
+        assert_eq!(escape_control_chars("del\x7fhere"), "del\\x7fhere");
+    }
+
+    #[test]
+    fn escape_control_chars_leaves_ordinary_text_untouched() {
+        assert_eq!(
+            escape_control_chars("plain diagnostic text, 100% fine"),
+            "plain diagnostic text, 100% fine"
+        );
+    }
+
+    #[test]
+    fn line_escapes_control_characters_so_one_call_cannot_forge_extra_log_lines() {
+        // A manifest string (or an error formatted from one) reaching `line`
+        // could carry a real `\n` of its own — without the escape, one call
+        // here would print as more than one line, one of them made to look
+        // like a diagnostic this app never actually emitted.
+        take_recorded(); // drain whatever an earlier test on this thread left
+        line("legit line\nFAKE: pretend this is a different diagnostic".to_string());
+        assert_eq!(
+            take_recorded(),
+            vec!["legit line\\nFAKE: pretend this is a different diagnostic".to_string()]
+        );
     }
 }

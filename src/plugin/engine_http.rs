@@ -39,16 +39,20 @@
 //! `crate::plugin::engine_logfile` split between file/JSON parsing and I/O.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::Read as _;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::model::{ProviderReading, Window};
 use crate::plugin::auth;
 use crate::plugin::manifest::{
     AccountType, AmountConfig, AmountKind, BalanceConfig, HttpMethod, HttpRequestConfig,
-    HttpValueConfig, HttpValueType, HttpVersionConfig, PeriodMode, PluginManifest, ResetsAtFormat,
-    SurfaceConfig, TagFrom, TagTransform, WindowConfig,
+    HttpValueConfig, HttpValueType, HttpVersionConfig, PeriodMode, PluginManifest, SurfaceConfig,
+    TagFrom, TagTransform, WindowConfig,
 };
 use crate::plugin::throttle;
 
@@ -134,28 +138,13 @@ fn fetch_surface(
         reading.fail("[http] section has no [[http.request]] entries".to_string());
         return reading;
     };
-    let version = http
-        .version
-        .as_ref()
-        .map(resolve_version)
-        .unwrap_or_default();
-    // Header values a request can't be built without ({value.<name>}): a
-    // request sent with an unresolved placeholder would be answered — wrongly,
-    // or with a 4xx that reads like an auth failure — so it is never sent.
-    let values = match resolve_values(&http.value) {
-        Ok(v) => v,
-        Err(e) => {
-            reading.fail(e);
-            return reading;
-        }
-    };
-    let (url, headers, timeout) = build_request(req, &token, &version, options, &values);
-    // Same substitution set as a header value, kept out of `build_request`
-    // itself so that function's existing signature (and the tests pinned to
-    // it) stay exactly as they were — a request's body is one more
-    // substituted string, not a reason to reshape what already works.
-    let body = build_body(req, &token, &version, options, &values);
 
+    // The URL needs only `{option.<key>}` substitution (`{token}`/`{version}`
+    // never reach it — see `build_request`'s docs), so it costs nothing to
+    // resolve ahead of everything below. Checking `allowed_hosts` here, before
+    // `resolve_version`/`resolve_values` do any file I/O, means a blocked host
+    // is refused without either of those ever running.
+    let url = crate::plugin::substitute_options(&req.url, options);
     if !auth::host_allowed(&surface.allowed_hosts, &url) {
         // Defence in depth: never let a surface's token reach a host the
         // manifest didn't explicitly allow — no request of any kind for this
@@ -164,11 +153,29 @@ fn fetch_surface(
         return reading;
     }
 
+    // Header values a request can't be built without ({value.<name>}): a
+    // request sent with an unresolved placeholder would be answered — wrongly,
+    // or with a 4xx that reads like an auth failure — so it is never sent.
+    // Resolved here, ahead of `resolve_version`, because the throttle
+    // fingerprint below needs it — `{version}` never enters a fingerprint, so
+    // reading it can wait until there is actually a request to make.
+    let values = match resolve_values(&http.value) {
+        Ok(v) => v,
+        Err(e) => {
+            reading.fail(e);
+            return reading;
+        }
+    };
+
     // How often this surface may be asked at all — see `crate::plugin::throttle`.
     // The gate sits ahead of *every* request this function makes, the
     // account/profile lookup included, and it is keyed on the credentials so
     // signing in as somebody else is never answered from the previous
-    // account's cache.
+    // account's cache. Everything above this point is either free (the URL
+    // substitution) or needed to compute the fingerprint itself (`values`);
+    // everything below is real work — a file read for `{version}`, a network
+    // request — that a `Serve`/`Blocked` decision means this tick never has
+    // to pay for.
     let throttle_key = throttle::key(&m.id, &surface.id);
     let fingerprint = throttle::fingerprint(&token, &values);
     let limits = throttle::Limits::from_http(http);
@@ -180,6 +187,28 @@ fn fetch_surface(
             reading.fail(message);
             return reading;
         }
+    }
+
+    let version = http
+        .version
+        .as_ref()
+        .map(resolve_version)
+        .unwrap_or_default();
+    let (url, headers, timeout) = build_request(req, &token, &version, options, &values);
+    // Same substitution set as a header value, kept out of `build_request`
+    // itself so that function's existing signature (and the tests pinned to
+    // it) stay exactly as they were — a request's body is one more
+    // substituted string, not a reason to reshape what already works.
+    let body = build_body(req, &token, &version, options, &values);
+
+    // After substitution, never before: `{token}`/`{value.<name>}` are a live
+    // credential's own bytes, not something `validate` can check at load
+    // time. A violation here is refused by name only — see this function's
+    // doc and `perform`'s BadHeader arm for why the value itself must never
+    // reach a message this app writes anywhere.
+    if let Err(e) = refuse_unsafe_header_values(&headers) {
+        reading.fail(e);
+        return reading;
     }
 
     // Account/profile lookup is a separate request to a different endpoint
@@ -195,8 +224,15 @@ fn fetch_surface(
     // this, a provider with `[account] type = "http"` quietly made two
     // requests per refresh — and a profile lookup that failed was swallowed
     // whole, so it never even reached the pacing that would have slowed it.
-    reading.account = throttle::remembered_account(&throttle_key, fingerprint)
-        .or_else(|| resolve_account(m, surface, req, &token, &version, options, &values));
+    reading.account = throttle::remembered_account(&throttle_key, fingerprint).or_else(|| {
+        let ctx = RequestContext {
+            token: &token,
+            version: &version,
+            options,
+            values: &values,
+        };
+        resolve_account(m, surface, req, ctx, limits.min_interval)
+    });
 
     match perform(&url, req.method, body.as_deref(), &headers, timeout) {
         Ok(value) => {
@@ -313,6 +349,16 @@ fn resolve_tag(
     })
 }
 
+/// The four values every header substitution needs, bundled only so
+/// [`resolve_account`] doesn't have to take them as four separate arguments
+/// on top of everything else it needs — see its own doc.
+struct RequestContext<'a> {
+    token: &'a str,
+    version: &'a str,
+    options: &'a BTreeMap<String, bool>,
+    values: &'a BTreeMap<String, String>,
+}
+
 /// `[account]` resolution for `type = "http"`: GET `account.url` with the
 /// same headers/token as the main `[[http.request]]` entry, then read
 /// `account.json_path` out of the JSON body. Best-effort: a missing URL, a
@@ -323,21 +369,99 @@ fn resolve_tag(
 /// Always a GET, whatever `req.method` is: a profile lookup is a read
 /// against a *different* endpoint than the main request, not a repeat of it,
 /// and no provider's account/profile endpoint has needed anything else.
+///
+/// `min_interval` (the surface's own `http.min_interval_secs`) paces this
+/// endpoint's *failures* apart from the main request's own pacing: before
+/// this, a profile lookup that started failing was retried with the token on
+/// every single fetch of the main usage endpoint, however that one was
+/// paced, because a `None` here has always been silent and free-looking to
+/// its caller. [`account_lookup_recently_failed`] holds it back instead,
+/// keyed the same way the main request's throttle state is (`m.id` +
+/// `surface.id`, a *different* map — this is not that pacing, only the same
+/// key shape).
+///
+/// `ctx` bundles the four values a header substitution needs
+/// (`token`/`version`/`options`/`values`) — for this function's own argument
+/// count only. `build_request`/`build_body`/`substitute_headers` keep taking
+/// them separately, unbundled here right before the one call that needs
+/// them, so their signatures (and the tests pinned to them) stay exactly as
+/// they were.
 fn resolve_account(
     m: &PluginManifest,
     surface: &SurfaceConfig,
     req: &HttpRequestConfig,
-    token: &str,
-    version: &str,
-    options: &BTreeMap<String, bool>,
-    values: &BTreeMap<String, String>,
+    ctx: RequestContext<'_>,
+    min_interval: Duration,
 ) -> Option<String> {
-    let url = resolve_account_url(m, surface, options)?;
+    let url = resolve_account_url(m, surface, ctx.options)?;
     let json_path = m.account.json_path.as_deref()?;
-    let headers = substitute_headers(&req.headers, token, version, options, values);
+    let key = throttle::key(&m.id, &surface.id);
+    let now = Instant::now();
+    if account_lookup_recently_failed(&key, min_interval, now) {
+        return None;
+    }
+    let headers = substitute_headers(
+        &req.headers,
+        ctx.token,
+        ctx.version,
+        ctx.options,
+        ctx.values,
+    );
+    if refuse_unsafe_header_values(&headers).is_err() {
+        return None;
+    }
     let timeout = Duration::from_secs(req.timeout_secs);
-    let value = perform(&url, HttpMethod::Get, None, &headers, timeout).ok()?;
-    sanitized_account(json_path_get(&value, json_path)?.as_str()?)
+    match perform(&url, HttpMethod::Get, None, &headers, timeout) {
+        Ok(value) => {
+            record_account_lookup_success(&key);
+            sanitized_account(json_path_get(&value, json_path)?.as_str()?)
+        }
+        Err(_) => {
+            record_account_lookup_failure(&key, now);
+            None
+        }
+    }
+}
+
+/// How long a failing `[account] type = "http"` profile lookup goes unretried
+/// once it has failed, keyed per surface. A separate map from
+/// `crate::plugin::throttle`'s own `STATES` on purpose: that one paces (and
+/// caches the outcome of) the *main* usage request, and a profile endpoint
+/// going down must not stop or slow that request in any way, nor should a
+/// slow main endpoint's own backoff pace a profile lookup that is answering
+/// fine.
+static ACCOUNT_LOOKUP_FAILED_AT: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+
+/// Whether `key`'s profile lookup failed within the last `min_interval`, and
+/// so should not be attempted again yet.
+fn account_lookup_recently_failed(key: &str, min_interval: Duration, now: Instant) -> bool {
+    ACCOUNT_LOOKUP_FAILED_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(key).copied())
+        .is_some_and(|last| now.saturating_duration_since(last) < min_interval)
+}
+
+fn record_account_lookup_failure(key: &str, now: Instant) {
+    ACCOUNT_LOOKUP_FAILED_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(key.to_string(), now);
+}
+
+/// Clears a previously recorded failure: the endpoint just answered, so the
+/// next attempt should be tried on its own terms rather than inheriting a
+/// cool-off from before it recovered.
+fn record_account_lookup_success(key: &str) {
+    if let Some(map) = ACCOUNT_LOOKUP_FAILED_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        map.remove(key);
+    }
 }
 
 /// `[account]` resolution for `type = "response-field"` — the email is
@@ -490,6 +614,39 @@ fn substitute_headers(
     out
 }
 
+/// Fixed text for a header `ureq` itself refuses to send. Never `ureq`'s own
+/// message, which quotes the whole `"Name: value"` line — see `perform`'s
+/// `BadHeader` arm.
+const BAD_HEADER_MESSAGE: &str = "a header value is not valid ASCII";
+
+/// After substitution, every header value must be visible ASCII — the RFC
+/// 7230 `field-value` grammar (`SP`/`HTAB`/`0x21`–`0x7E`) that `ureq` itself
+/// enforces before sending anything. Checked here, ahead of every call this
+/// engine makes, so a violation is a `reading.error` this engine wrote rather
+/// than whatever `ureq`'s own refusal happens to quote (`perform`'s
+/// `BadHeader` arm is the backstop for the one case this cannot run ahead
+/// of: `ureq` validates its own synthesized headers too, past whatever this
+/// engine passed in).
+///
+/// `validate` cannot enforce this at load time: `{token}` and
+/// `{value.<name>}` are unknown until substitution runs, and a violating byte
+/// then is a live credential's own bytes, not a manifest mistake — which is
+/// exactly why the message below names the header, never the value. That
+/// byte must not appear in anything this app writes to the panel or the log.
+fn refuse_unsafe_header_values(headers: &[(String, String)]) -> Result<(), String> {
+    for (name, value) in headers {
+        let safe = value
+            .bytes()
+            .all(|b| b == b'\t' || b == b' ' || (0x21..=0x7E).contains(&b));
+        if !safe {
+            return Err(format!(
+                "header `{name}` contains a byte that is not valid ASCII"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Replace every `{token}`/`{version}`/`{option.<key>}`/`{value.<name>}`
 /// placeholder in `template`. A header may name any subset of these, or none.
 fn substitute(
@@ -575,6 +732,48 @@ fn parse_usage(value: &Value, m: &PluginManifest) -> Result<Vec<Window>, String>
     crate::plugin::collect_windows(m, "response", |i, w| build_windows(i, w, value))
 }
 
+/// How many elements of a `for_each` array [`build_windows`] will ever look
+/// at. A provider's array is data this app trusts to be honest about its own
+/// account, not data it trusts to be small, and nothing shipped has ever come
+/// close — Claude's `limits[]` runs to a handful of entries. 64 leaves
+/// headroom for a plan with many scoped models while still bounding the
+/// per-element work (a filter check, an identity read, a label fill) at a
+/// fixed cost regardless of what a provider actually sends.
+const FOR_EACH_MAX_ELEMENTS: usize = 64;
+
+/// Diagnostics only the binary can write — the same split as
+/// `crate::plugin::time`'s own `PENDING_DIAGNOSTICS` (`crate::diag` lives in
+/// `main.rs`'s binary crate, not this library one), kept as this engine's own
+/// queue rather than borrowed from `time`'s: what gets queued here is about a
+/// `for_each` array, not a timestamp.
+static PENDING_DIAGNOSTICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether the one diagnostic this queue ever carries has already gone out,
+/// this process. A single flag, not a per-label key: a manifest whose
+/// `for_each` array is oversized says so on the first window it happens to,
+/// and does not need a second line to say the same thing about a second one.
+static FOR_EACH_TRUNCATED_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn queue_for_each_truncated_diag(label: &str) {
+    if !FOR_EACH_TRUNCATED_LOGGED.swap(true, Ordering::SeqCst) {
+        PENDING_DIAGNOSTICS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(format!(
+                "a `for_each` array for \"{label}\" carried more than \
+                 {FOR_EACH_MAX_ELEMENTS} elements; the rest were not considered"
+            ));
+    }
+}
+
+/// Every diagnostic line queued since the last call, removing them.
+pub fn take_pending_diagnostics() -> Vec<String> {
+    let mut guard = PENDING_DIAGNOSTICS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *guard)
+}
+
 /// The rows one `[[windows]]` entry produces: exactly one, as it always was,
 /// unless the entry enumerates (`for_each`) — then one per element of the
 /// array it names that survives its filter and can be named.
@@ -586,6 +785,15 @@ fn parse_usage(value: &Value, m: &PluginManifest) -> Result<Vec<Window>, String>
 /// How many of those an account has is the provider's business and changes
 /// with its plan, so no fixed number of entries can describe it: a selector
 /// would take the first and drop the rest, silently.
+///
+/// Elements *considered* are capped at [`FOR_EACH_MAX_ELEMENTS`], applied
+/// before `for_each_where` rather than after: the cost this bounds is
+/// scanning and building a row for each one, and a filter that happened to
+/// keep only elements past the cap would still have paid that cost for every
+/// element ahead of them. A provider is free to answer with more than that —
+/// nothing here has ever been observed to — and the elements past the cap
+/// are silently unreachable rather than reported one by one; the truncation
+/// itself is reported once, not each one it drops.
 fn build_windows(index: usize, w: &WindowConfig, value: &Value) -> Vec<Window> {
     let Some(path) = w
         .for_each
@@ -602,8 +810,12 @@ fn build_windows(index: usize, w: &WindowConfig, value: &Value) -> Vec<Window> {
     let Some(elements) = json_path_get(value, path).and_then(Value::as_array) else {
         return Vec::new();
     };
+    if elements.len() > FOR_EACH_MAX_ELEMENTS {
+        queue_for_each_truncated_diag(&w.label);
+    }
     let mut produced: Vec<Window> = elements
         .iter()
+        .take(FOR_EACH_MAX_ELEMENTS)
         .filter(|element| element_matches(element, w.for_each_where.as_deref()))
         .filter_map(|element| build_enumerated_window(index, w, element))
         .collect();
@@ -690,6 +902,15 @@ fn build_enumerated_window(index: usize, w: &WindowConfig, element: &Value) -> O
 /// from the network (`reached_type` takes the same route): this text lands in
 /// the panel, and a caption is not a place a provider gets to put a newline or
 /// a bidi override.
+///
+/// The sanitiser caps each *substitution* at `PROVIDER_TEXT_MAX_CHARS`, not
+/// the label as a whole — a template naming two or three placeholders
+/// (`"{a} weekly, {b}"`) can still run well past that cap once they are all
+/// concatenated with the template's own literal text. So the finished label
+/// is capped again here, the same trim-then-cut-then-trim order
+/// `sanitize_provider_text` uses and for the same reason: cutting first would
+/// spend the budget on whatever padding sits at either end rather than on
+/// content.
 fn fill_label(template: &str, element: &Value) -> Option<String> {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
@@ -707,6 +928,11 @@ fn fill_label(template: &str, element: &Value) -> Option<String> {
         rest = &rest[close + 1..];
     }
     out.push_str(rest);
+    let out: String = out
+        .trim()
+        .chars()
+        .take(crate::plugin::PROVIDER_TEXT_MAX_CHARS)
+        .collect();
     let out = out.trim().to_string();
     (!out.is_empty()).then_some(out)
 }
@@ -730,19 +956,61 @@ fn element_text(element: &Value, path: &str) -> Option<String> {
 /// **Not sanitised, deliberately.** Sanitising is for text that reaches the
 /// screen, and it is lossy: two model names differing only by a directional
 /// mark come out identical, and two rows would then share one path in the
-/// user's config. The identity instead goes through `encode_key_part`, which
-/// is not lossy — every byte outside `[A-Za-z0-9_-]` becomes `%XX`, including
-/// the `%` and the `:` that would otherwise forge a separator. Bounded by the
-/// same character cap the sanitiser applies, since a provider is free to send
-/// a name of any length and this becomes a path segment on disk.
+/// user's config. The identity instead goes through `encode_key_part`
+/// ([`window_element_key`](crate::plugin::window_element_key), where the
+/// caller encodes it), which is not lossy — every byte outside
+/// `[A-Za-z0-9_-]` becomes `%XX`, including the `%` and the `:` that would
+/// otherwise forge a separator.
+///
+/// Bounded, since a provider is free to send a name of any length and this
+/// becomes a path segment on disk — but *truncating* the raw text before
+/// that single encode step, the way this used to, reopens the same collision
+/// the encoder exists to close: two names sharing their first
+/// [`crate::plugin::PROVIDER_TEXT_MAX_CHARS`] characters would truncate to
+/// one identical identity, and `build_windows`' dedup (which has nothing but
+/// this to key on) would then keep one row and drop the other silently. So a
+/// name past the cap is truncated *and* given a fixed-width hash suffix of
+/// the whole raw text, in the same character budget — two names differing
+/// anywhere, including past the visible prefix, hash apart. (Two names that
+/// happen to be genuinely identical still collide, which is the dedup this
+/// function exists to make possible in the first place. And a provider
+/// naming something that literally *is* `<truncated prefix>#<16 hex
+/// digits>` could in principle collide with a hashed one — a boundary this
+/// scheme cannot express, the same way `json_path_get`'s own grammar has
+/// one; nothing observed here has ever come close.)
+///
+/// The hash is [`Sha256`], truncated to its first 8 bytes, never `std`'s
+/// `DefaultHasher`: this suffix lands in `config.json`'s own keys through
+/// `window_element_key`, so it has to keep producing the same value for the
+/// same name across every future toolchain this app is ever rebuilt with.
+/// `DefaultHasher`'s algorithm is an unspecified implementation detail of
+/// the standard library, free to change between Rust releases — a change
+/// that would silently reshuffle every stored per-window key on the next
+/// upgrade, the same class of break a cryptographic hash's fixed
+/// specification does not have.
 fn element_identity(element: &Value, path: &str) -> Option<String> {
     let raw = element_text(element, path)?;
-    let capped: String = raw
-        .trim()
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let cap = crate::plugin::PROVIDER_TEXT_MAX_CHARS;
+    if trimmed.chars().count() <= cap {
+        return Some(trimmed.to_string());
+    }
+    let digest = Sha256::digest(trimmed.as_bytes());
+    let suffix = format!(
+        "#{}",
+        digest[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    let head: String = trimmed
         .chars()
-        .take(crate::plugin::PROVIDER_TEXT_MAX_CHARS)
+        .take(cap.saturating_sub(suffix.chars().count()))
         .collect();
-    (!capped.is_empty()).then_some(capped)
+    Some(format!("{head}{suffix}"))
 }
 
 /// What the response says about the quota itself, or `None` when the manifest
@@ -773,6 +1041,13 @@ fn parse_quota(value: &Value, m: &PluginManifest) -> Option<crate::model::QuotaS
         // text from the network. A non-string is not coerced — a provider that
         // answers with an object has changed shape, and inventing a rendering
         // for it would hide that.
+        // `"none"`/`"null"` count as not naming anything, the same as an
+        // absent or blank field: `QuotaStatus::limit_was_reached` infers a
+        // refusal from this field being present at all when neither boolean
+        // above was, and a provider that fills it with one of these words in
+        // the *ordinary*, not-blocked case (the comment on `is_blocked`
+        // names exactly this shape: `"type": "none"`) would otherwise be
+        // read as refusing every account it has.
         reached_type: cfg
             .reached_type_path
             .as_deref()
@@ -781,7 +1056,8 @@ fn parse_quota(value: &Value, m: &PluginManifest) -> Option<crate::model::QuotaS
             .and_then(|p| json_path_get(value, p))
             .and_then(Value::as_str)
             .map(crate::plugin::sanitize_provider_text)
-            .filter(|s| !s.is_empty()),
+            .filter(|s| !s.is_empty())
+            .filter(|s| !matches!(s.to_ascii_lowercase().as_str(), "none" | "null")),
     };
     // A section that resolved to nothing is a response that did not answer,
     // and saying so with an empty status would be this app inventing the
@@ -855,13 +1131,21 @@ fn select_container<'v>(w: &WindowConfig, value: &'v Value) -> Option<&'v Value>
 
 /// This window's declared length as read out of `container`, in minutes.
 /// `None` for `period.mode = "assumed"` (the length is a constant, not
-/// something the response states) or when the field is missing/unparsable.
+/// something the response states), when the field is missing/unparsable, or
+/// when the value is not [`crate::plugin::time::plausible_period_minutes`] —
+/// a saturating `as u64` on an absurd float, or a field a provider fills in a
+/// different unit than declared, is a length nothing here should draw a
+/// window from. The one implementation both [`select_container`]'s
+/// classification and [`build_window`]'s own `period_minutes` field call —
+/// they used to carry a second copy of this, which is exactly the kind of
+/// place a bound like this is easy to add to one and forget on the other.
 fn container_period_minutes(w: &WindowConfig, container: &Value) -> Option<u64> {
     if w.period.mode != PeriodMode::FromField {
         return None;
     }
     let raw = json_path_get(container, w.period.field.as_deref()?).and_then(Value::as_u64)?;
-    Some(w.period.unit.to_minutes(raw))
+    let minutes = w.period.unit.to_minutes(raw);
+    crate::plugin::time::plausible_period_minutes(minutes).then_some(minutes)
 }
 
 /// This window as the response reports it, or `None` when the response does
@@ -904,16 +1188,10 @@ fn build_window(index: usize, w: &WindowConfig, value: &Value) -> Option<Window>
     // missing one. The `?` above is that same rule, said once and earlier:
     // past it there *is* a figure, so nothing here needs to ask again.
     let resets_at = json_path_get(value, &w.source.resets_at_path)
-        .and_then(|v| resets_at_value(v, w.source.resets_at_format));
+        .and_then(|v| crate::plugin::time::resets_at(v, w.source.resets_at_format));
     let period_minutes = match w.period.mode {
         PeriodMode::Assumed => w.period.assumed,
-        PeriodMode::FromField => w
-            .period
-            .field
-            .as_deref()
-            .and_then(|p| json_path_get(value, p))
-            .and_then(Value::as_u64)
-            .map(|raw| w.period.unit.to_minutes(raw)),
+        PeriodMode::FromField => container_period_minutes(w, value),
     };
     Some(Window {
         // The declared entry, never the container this window resolved to: at
@@ -969,7 +1247,7 @@ fn build_balance(index: usize, b: &BalanceConfig, value: &Value) -> Option<crate
             .filter(|p| p.is_finite()),
         period_end: path_of(&b.source.period_end_path)
             .and_then(|p| json_path_get(value, p))
-            .and_then(|v| resets_at_value(v, b.source.period_end_format)),
+            .and_then(|v| crate::plugin::time::resets_at(v, b.source.period_end_format)),
         limit_reached: path_of(&b.source.limit_reached_path)
             .and_then(|p| json_path_get(value, p))
             .and_then(Value::as_bool),
@@ -1036,26 +1314,6 @@ fn read_amount(value: &Value, cfg: &AmountConfig) -> Option<crate::model::Balanc
             (!s.is_empty()).then_some(crate::model::BalanceAmount::Text(s))
         }
     }
-}
-
-fn resets_at_value(v: &Value, format: ResetsAtFormat) -> Option<u64> {
-    match format {
-        ResetsAtFormat::Unix => v
-            .as_u64()
-            .or_else(|| v.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
-            // Providers do quote their numbers sometimes; a reset time is too
-            // useful to drop over the difference between 1787207494 and
-            // "1787207494".
-            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok())),
-        ResetsAtFormat::Iso8601 => v.as_str().and_then(parse_iso8601),
-    }
-}
-
-/// Parse an RFC3339 / ISO-8601 timestamp to Unix seconds.
-fn parse_iso8601(s: &str) -> Option<u64> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|dt| dt.timestamp().max(0) as u64)
 }
 
 /// Resolve a dotted JSON path (`"a.b.c"`) against an arbitrary value — object
@@ -1203,9 +1461,7 @@ fn perform(
             "HTTP {} (redirect blocked)",
             r.status()
         ))),
-        Ok(r) => r
-            .into_json()
-            .map_err(|e| Failure::transient(format!("bad response: {e}"))),
+        Ok(r) => read_json_body(r).map_err(Failure::transient),
         // Terminal, and the only one: this app never spends a provider's
         // refresh token (that can invalidate the copy the provider's own CLI
         // holds), so a dead access token stays dead until the user signs in
@@ -1217,7 +1473,72 @@ fn perform(
         Err(ureq::Error::Status(401, _)) => Err(Failure::terminal(UNAUTHORIZED)),
         Err(ureq::Error::Status(429, _)) => Err(Failure::transient("rate-limited (try later)")),
         Err(ureq::Error::Status(code, _)) => Err(Failure::transient(format!("HTTP {code}"))),
-        Err(e) => Err(Failure::transient(format!("network error: {e}"))),
+        // `ureq` validates every header — including its own, synthesized
+        // ones — right before it sends anything (`Header::validate`), and its
+        // own message for a violation quotes the whole `"Name: value"` line.
+        // `refuse_unsafe_header_values` already keeps this from firing for a
+        // header this engine built; this is the backstop for one it did not
+        // (a proxy's own default header, say), so the token can never surface
+        // through this path either.
+        Err(ureq::Error::Transport(t)) if t.kind() == ureq::ErrorKind::BadHeader => {
+            Err(Failure::transient(BAD_HEADER_MESSAGE))
+        }
+        Err(e) => Err(Failure::transient(redact_header_values(
+            &format!("network error: {e}"),
+            headers,
+        ))),
+    }
+}
+
+/// Ceiling on a provider response body, checked before any JSON parsing is
+/// attempted. `Response::into_json` (`ureq`'s own helper) hands the raw
+/// stream straight to `serde_json::from_reader` with no limit of its own — a
+/// provider (or anything sitting between this app and it) answering with an
+/// unbounded stream would have this app read all of it into memory before
+/// ever finding out it wasn't going to stop. 4 MiB is generous for any usage
+/// payload a provider has ever sent and far short of anything that hurts.
+const MAX_PROVIDER_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read `response`'s body and parse it as JSON, refusing outright — with its
+/// own message — when it is larger than [`MAX_PROVIDER_RESPONSE_BYTES`].
+///
+/// `take(MAX_PROVIDER_RESPONSE_BYTES + 1)`, not `take(MAX_PROVIDER_RESPONSE_BYTES)`:
+/// `Read::take` truncates silently, so reading exactly the cap can never tell
+/// "the body was exactly this large" from "the body was larger and got cut
+/// off here" — the one extra byte is what lets the length check below tell
+/// them apart, rather than the truncated tail failing to parse for an
+/// unrelated reason and this engine reporting a "bad response" that was
+/// actually an oversized one.
+fn read_json_body(response: ureq::Response) -> Result<Value, String> {
+    let mut buf = Vec::new();
+    response
+        .into_reader()
+        .take(MAX_PROVIDER_RESPONSE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("bad response: {e}"))?;
+    if buf.len() as u64 > MAX_PROVIDER_RESPONSE_BYTES {
+        return Err(format!(
+            "response body exceeds {MAX_PROVIDER_RESPONSE_BYTES} bytes, refusing to parse it"
+        ));
+    }
+    serde_json::from_slice(&buf).map_err(|e| format!("bad response: {e}"))
+}
+
+/// `message`, verbatim, unless it happens to quote one of this request's own
+/// header values — which would mean a credential (the bearer token, most
+/// often) ended up inside an error string this app then shows on the panel
+/// and writes to `crate::diag`. Checked against the *formatted* message
+/// rather than prevented at its source, because by this point the message
+/// can come from anywhere: some other `Display` impl this engine did not
+/// write, quoting text it was never told was sensitive.
+fn redact_header_values(message: &str, headers: &[(String, String)]) -> String {
+    let leaked = headers
+        .iter()
+        .any(|(_, v)| !v.is_empty() && message.contains(v.as_str()));
+    if leaked {
+        "a header value could not be sent".to_string()
+    } else {
+        message.to_string()
     }
 }
 
@@ -1257,7 +1578,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    use crate::plugin::manifest::{PeriodConfig, PeriodUnit, Role as ManifestRole, SourceConfig};
+    use crate::plugin::manifest::{
+        PeriodConfig, PeriodUnit, ResetsAtFormat, Role as ManifestRole, SourceConfig,
+    };
+    use crate::plugin::time::parse_iso8601;
 
     // 2026-01-01T00:00:00Z
     const NY2026: u64 = 1767225600;
@@ -1526,10 +1850,11 @@ mod tests {
     fn build_body_substitutes_the_same_placeholders_as_a_header() {
         // Not a JSON object: a body shaped like one hits the naive scanner's
         // leading-brace limitation (see `PluginManifest::validate`'s
-        // `body_swallows_a_placeholder`, which refuses that shape at load
-        // time rather than let it reach here half-substituted). This shape —
-        // no leading `{` before the first placeholder — is exactly what the
-        // scanner (shared with headers) resolves correctly.
+        // `swallowed_placeholder`, which refuses that shape at load time —
+        // now for header values and the URL too, not just the body — rather
+        // than let it reach here half-substituted). This shape — no leading
+        // `{` before the first placeholder — is exactly what the scanner
+        // (shared with headers) resolves correctly.
         let mut opts = BTreeMap::new();
         opts.insert("plugin".to_string(), true);
         let req = HttpRequestConfig {
@@ -3135,6 +3460,41 @@ mod tests {
         assert_eq!(m.account.kind, AccountType::Http);
     }
 
+    /// The caching primitive [`resolve_account`] holds a failing profile
+    /// endpoint back with — exercised on its own because `resolve_account`
+    /// itself reaches the network and this engine's tests never do. Before
+    /// this, a profile lookup that started failing was retried with the
+    /// token on *every* fetch of the main usage endpoint, however that one
+    /// was paced.
+    #[test]
+    fn account_lookup_recently_failed_holds_back_a_retry_within_the_interval() {
+        let key = "test-account-lookup-cache";
+        let min_interval = Duration::from_secs(60);
+        let t0 = Instant::now();
+
+        assert!(
+            !account_lookup_recently_failed(key, min_interval, t0),
+            "nothing has failed yet"
+        );
+        record_account_lookup_failure(key, t0);
+        assert!(
+            account_lookup_recently_failed(key, min_interval, t0 + Duration::from_secs(1)),
+            "a fresh failure holds the next attempt back"
+        );
+        assert!(
+            !account_lookup_recently_failed(key, min_interval, t0 + Duration::from_secs(61)),
+            "past the interval, an attempt is allowed again"
+        );
+
+        // A success in between clears the cool-off outright.
+        record_account_lookup_failure(key, t0);
+        record_account_lookup_success(key);
+        assert!(
+            !account_lookup_recently_failed(key, min_interval, t0 + Duration::from_secs(1)),
+            "a recorded success lifts the cool-off a failure set"
+        );
+    }
+
     #[test]
     fn account_email_is_read_via_json_path() {
         let value = json!({ "account": { "email": "user@example.com" } });
@@ -3258,6 +3618,109 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(readings[0].windows.is_empty());
+    }
+
+    /// A header value with a byte outside SP/HTAB/0x21–0x7E is refused before
+    /// any request is attempted, by a message that names the header and never
+    /// its bytes — the token this header carries, or the offending byte
+    /// itself. `\u{00A0}` (non-breaking space) is baked into the template
+    /// right after `{token}`, the shape a substitution can produce that no
+    /// static check at load time could have caught (see
+    /// `refuse_unsafe_header_values`'s doc).
+    #[test]
+    fn a_header_value_outside_visible_ascii_is_refused_by_name_never_by_its_bytes() {
+        let toml = format!(
+            r#"
+            id         = "badheader"
+            name       = "BadHeader"
+            menu_label = "Bh"
+            order      = 1
+            engine     = "http-api"
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "utilization"
+            resets_at_path    = "resets_at"
+            [http]
+            [[http.request]]
+            url = "https://api.anthropic.com/usage"
+            [http.request.headers]
+            Authorization = "Bearer {{token}}{nbsp}"
+            [[surface]]
+            id = "cli"
+            label = "CLI"
+            allowed_hosts = ["api.anthropic.com"]
+            [[surface.auth]]
+            type = "env"
+            var  = "TICKOVER_TEST_ENGINE_HTTP_BADHEADER_TOKEN"
+        "#,
+            nbsp = '\u{00A0}'
+        );
+        let m = PluginManifest::from_str(&toml).expect("valid manifest");
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(
+            "TICKOVER_TEST_ENGINE_HTTP_BADHEADER_TOKEN",
+            "top-secret-token",
+        );
+        let readings = fetch(&m, &["cli".to_string()], &no_options());
+        std::env::remove_var("TICKOVER_TEST_ENGINE_HTTP_BADHEADER_TOKEN");
+
+        assert_eq!(readings.len(), 1);
+        let err = readings[0]
+            .error
+            .as_deref()
+            .expect("must refuse, not attempt the request");
+        assert!(err.contains("Authorization"), "names the header: {err}");
+        assert!(!err.contains("top-secret-token"), "never the token: {err}");
+        assert!(
+            !err.contains('\u{00A0}'),
+            "never the offending byte itself: {err}"
+        );
+        assert!(readings[0].windows.is_empty());
+    }
+
+    /// `perform`'s own backstop for a header `ureq` refuses at send time
+    /// (`ureq` validates its own synthesized headers too, past whatever this
+    /// engine passed in — see its doc): the message is fixed, never
+    /// `ureq`'s own, which would otherwise quote the whole `"Name: value"`
+    /// line.
+    #[test]
+    fn perform_never_surfaces_ureqs_own_bad_header_message() {
+        let failure = perform(
+            "https://example.com/usage",
+            HttpMethod::Get,
+            None,
+            &[("X-Test".to_string(), "value\u{0001}".to_string())],
+            Duration::from_secs(1),
+        )
+        .expect_err("an invalid header byte must refuse, not connect");
+        assert_eq!(failure.message, BAD_HEADER_MESSAGE);
+        assert!(
+            !failure.message.contains("X-Test"),
+            "never ureq's own 'Name: value' line: {}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn redact_header_values_hides_a_leaked_header_from_an_arbitrary_message() {
+        let headers = vec![(
+            "Authorization".to_string(),
+            "Bearer secret-token".to_string(),
+        )];
+        assert_eq!(
+            redact_header_values("network error: Bearer secret-token", &headers),
+            "a header value could not be sent"
+        );
+        assert_eq!(
+            redact_header_values("network error: timed out", &headers),
+            "network error: timed out",
+            "a message that names nothing sensitive passes through unchanged"
+        );
     }
 
     #[test]
@@ -4046,6 +4509,131 @@ mod tests {
         assert_eq!(parse_usage(&unnamed, &m).expect("still readable").len(), 2);
     }
 
+    // ── for_each caps / element identity ─────────────────────────────────
+
+    /// A manifest that enumerates a bare array by name — the minimal shape
+    /// [`FOR_EACH_MAX_ELEMENTS`] and [`element_identity`]'s hash suffix need
+    /// to exercise, as opposed to claude.toml's own `limits[]` (three fixed
+    /// captions plus scoped models mixed in, which would make either test
+    /// about the filter rather than about the cap or the identity).
+    fn for_each_manifest() -> PluginManifest {
+        let toml = r#"
+            id         = "sample"
+            name       = "Sample"
+            menu_label = "Sa"
+            order      = 1
+            engine     = "http-api"
+            requires_reader = ["window-identity", "for-each-windows"]
+
+            [[windows]]
+            label = "{name}"
+            role  = "extra"
+            for_each = "items"
+            element_id_path = "name"
+            [windows.period]
+            mode    = "assumed"
+            assumed = 10080
+            [windows.source]
+            used_percent_path = "used_percent"
+            resets_at_path    = "resets_at"
+
+            [http]
+            [[http.request]]
+            url = "https://example.com/usage"
+        "#;
+        PluginManifest::from_str(toml).expect("valid manifest")
+    }
+
+    /// Elements past the cap are never scanned at all — not filtered out
+    /// after the fact — so a provider sending far more than
+    /// `FOR_EACH_MAX_ELEMENTS` elements costs this engine a fixed amount of
+    /// work rather than one proportional to whatever it sent. The truncation
+    /// itself is reported once, not once per dropped element.
+    #[test]
+    fn a_for_each_array_past_the_cap_is_truncated_and_reported_once() {
+        let m = for_each_manifest();
+        let items: Vec<Value> = (0..(FOR_EACH_MAX_ELEMENTS + 6))
+            .map(|i| json!({ "name": format!("item-{i}"), "used_percent": 1.0, "resets_at": 1 }))
+            .collect();
+        let body = json!({ "items": items });
+
+        let windows = parse_usage(&body, &m).expect("nothing here is `required`");
+        assert_eq!(
+            windows.len(),
+            FOR_EACH_MAX_ELEMENTS,
+            "only the first {FOR_EACH_MAX_ELEMENTS} elements are ever considered"
+        );
+
+        let diag = take_pending_diagnostics();
+        assert!(
+            diag.iter().any(|line| line.contains("for_each")),
+            "the truncation is reported once: {diag:?}"
+        );
+    }
+
+    /// The defect `element_identity`'s hash suffix exists to close: two
+    /// elements whose identity text agrees for the first
+    /// `PROVIDER_TEXT_MAX_CHARS` characters and only differs after it used to
+    /// truncate to one identical row key, and `build_windows`' dedup — which
+    /// has nothing else to key on — silently kept one and dropped the other.
+    #[test]
+    fn two_elements_sharing_a_long_identity_prefix_still_produce_two_rows() {
+        let m = for_each_manifest();
+        let shared_prefix = "x".repeat(crate::plugin::PROVIDER_TEXT_MAX_CHARS + 10);
+        let body = json!({ "items": [
+            { "name": format!("{shared_prefix}-A"), "used_percent": 1.0, "resets_at": 1 },
+            { "name": format!("{shared_prefix}-B"), "used_percent": 2.0, "resets_at": 1 },
+        ]});
+
+        let windows = parse_usage(&body, &m).expect("nothing here is `required`");
+        assert_eq!(
+            windows.len(),
+            2,
+            "two distinct elements must produce two rows, neither dropped by dedup"
+        );
+        assert_ne!(windows[0].key, windows[1].key);
+    }
+
+    /// The identity function itself, on the boundary the test above exercises
+    /// end to end: two names sharing a prefix longer than the cap hash apart
+    /// rather than truncating to the same text, and the result never exceeds
+    /// the cap either way.
+    #[test]
+    fn element_identity_hashes_the_tail_of_a_name_longer_than_the_cap() {
+        let cap = crate::plugin::PROVIDER_TEXT_MAX_CHARS;
+        let shared_prefix = "x".repeat(cap + 10);
+        let a = element_identity(&json!({ "name": format!("{shared_prefix}-A") }), "name")
+            .expect("resolves");
+        let b = element_identity(&json!({ "name": format!("{shared_prefix}-B") }), "name")
+            .expect("resolves");
+        assert_ne!(
+            a, b,
+            "sharing the visible prefix must not collapse the identity"
+        );
+        assert!(a.chars().count() <= cap);
+        assert!(b.chars().count() <= cap);
+
+        // A name within the cap is untouched — only a truncated one pays for
+        // the hash suffix.
+        let short = element_identity(&json!({ "name": "Fable" }), "name").expect("resolves");
+        assert_eq!(short, "Fable");
+    }
+
+    /// A template naming several placeholders can still run well past
+    /// `PROVIDER_TEXT_MAX_CHARS` once they are all concatenated, even though
+    /// each one alone was sanitised under the cap.
+    #[test]
+    fn fill_label_caps_the_whole_substituted_label_not_just_each_placeholder() {
+        let cap = crate::plugin::PROVIDER_TEXT_MAX_CHARS;
+        let element = json!({ "a": "x".repeat(50), "b": "y".repeat(50) });
+        let filled = fill_label("{a}-{b}", &element).expect("both placeholders resolve");
+        assert_eq!(
+            filled.chars().count(),
+            cap,
+            "the finished label is capped as a whole, not per placeholder"
+        );
+    }
+
     /// `reached_type` is free text from the network, and it lands in the panel
     /// and in the log. It is the one field here a provider fills in.
     #[test]
@@ -4110,6 +4698,30 @@ mod tests {
         assert_eq!(quota_for(json!("\u{200B}\u{200B}")).flatten(), None);
     }
 
+    /// `"none"`/`"null"` name no reason at all — the shape a provider that
+    /// fills this field in the *ordinary*, not-blocked case uses (Codex's own
+    /// comment on `QuotaStatus::is_blocked` names exactly this: `"type":
+    /// "none"`). A manifest declaring only `reached_type_path`, no booleans,
+    /// must not read either word as a refusal.
+    #[test]
+    fn reached_type_of_none_or_null_is_read_as_no_statement_at_all() {
+        let m = status_manifest();
+        let quota_for =
+            |v: Value| parse_quota(&json!({ "rate_limit_reached_type": { "type": v } }), &m);
+        assert_eq!(quota_for(json!("none")), None);
+        assert_eq!(quota_for(json!("null")), None);
+        // Case doesn't rescue it either.
+        assert_eq!(quota_for(json!("None")), None);
+        assert_eq!(quota_for(json!("NULL")), None);
+        // A real reason still reads through.
+        assert_eq!(
+            quota_for(json!("rate_limit_reached"))
+                .and_then(|s| s.reached_type)
+                .as_deref(),
+            Some("rate_limit_reached")
+        );
+    }
+
     // ── perform's scheme guard ────────────────────────────────────────────
     //
     // The one corner of `perform` that runs before any network I/O, so it is
@@ -4149,5 +4761,50 @@ mod tests {
         )
         .expect_err("nothing not even shaped like a URL may reach an agent");
         assert!(!err.terminal);
+    }
+
+    // ── read_json_body's byte cap ────────────────────────────────────────
+
+    #[test]
+    fn read_json_body_parses_an_ordinary_body() {
+        let response =
+            ureq::Response::new(200, "OK", r#"{"used_percent": 42}"#).expect("build a response");
+        let value = read_json_body(response).expect("an ordinary small body parses");
+        assert_eq!(value["used_percent"].as_i64(), Some(42));
+    }
+
+    #[test]
+    fn read_json_body_refuses_a_body_over_the_cap_rather_than_reading_it_all() {
+        // One byte over: `into_json()` (`ureq`'s own helper, unbounded) would
+        // have read this whole thing into memory before ever finding out it
+        // wasn't going to stop.
+        let oversized = "x".repeat(MAX_PROVIDER_RESPONSE_BYTES as usize + 1);
+        let body = format!("{{\"padding\":\"{oversized}\"}}");
+        let response = ureq::Response::new(200, "OK", &body).expect("build a response");
+        let err = read_json_body(response).expect_err("a body over the cap must be refused");
+        assert!(
+            err.contains(&MAX_PROVIDER_RESPONSE_BYTES.to_string()),
+            "the refusal should name the cap: {err}"
+        );
+    }
+
+    // ── refuse_unsafe_header_values ──────────────────────────────────────
+
+    #[test]
+    fn refuse_unsafe_header_values_names_the_header_never_the_value() {
+        let headers = vec![(
+            "Authorization".to_string(),
+            "Bearer tok\u{00A0}".to_string(),
+        )];
+        let err = refuse_unsafe_header_values(&headers).expect_err("must refuse");
+        assert!(err.contains("Authorization"));
+        assert!(!err.contains("tok"), "the value must never appear: {err}");
+
+        let ok = vec![("Authorization".to_string(), "Bearer tok-1".to_string())];
+        assert!(refuse_unsafe_header_values(&ok).is_ok());
+
+        // Tab and space are both legal inside a header value.
+        let with_space = vec![("User-Agent".to_string(), "app/1.0 (mac)".to_string())];
+        assert!(refuse_unsafe_header_values(&with_space).is_ok());
     }
 }
