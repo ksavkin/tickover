@@ -1922,10 +1922,9 @@ Shipped verbatim as `plugins/claude.toml`.
 ```toml
 # Built-in plugin manifest — Claude Code CLI + Claude desktop app.
 #
-# This is a 1:1 declarative description of the behaviour that used to live in
-# `src/claude.rs` / the `reading_from_claude` adapter in `src/main.rs`. The
-# `/api/oauth/usage` endpoint is unofficial and undocumented — if Anthropic
-# changes its shape, update this file, not Rust code.
+# Claude's quota is read from the `/api/oauth/usage` endpoint. It is
+# unofficial and undocumented — if Anthropic changes its shape, update this
+# file, not Rust code.
 
 id           = "claude"
 name         = "Claude"
@@ -1934,22 +1933,19 @@ order        = 20
 # `required` below needs a reader that knows a window can be absent rather than
 # blank — see docs/PLUGIN-ARCHITECTURE.md, "Reader capabilities".
 requires_reader = ["window-presence", "window-identity", "for-each-windows"]
-version      = "1.4.1"
+version      = "1.4.2"
 engine       = "http-api"
-# Claude is re-fetched every 60s (src/main.rs tick_timer, `n % 60`).
+# Re-fetched every 60 s.
 refresh_secs = 60
 
 # Claude reports no window lengths of its own, so the nominal periods (5h =
-# 300 min, weekly = 10080 min) are assumed here — exactly what
-# `reading_from_claude` hardcodes today (`period_minutes: Some(300)` /
-# `Some(10080)`). This is the mirror image of Codex, whose windows carry their
-# own `window_minutes`.
+# 300 min, weekly = 10080 min) are assumed here. This is the mirror image of
+# Codex, whose windows carry their own `window_minutes`.
 # Both windows are `required`: Anthropic reports both for every account, so a
 # response missing one has changed shape under us. That is worth saying out
 # loud — the alternative is a panel drawing whichever half still parsed, where
 # a missing row is indistinguishable from a quota nothing has been spent
-# against. It also replaces the reader's old guess, which called a response
-# with *nothing* in it broken and a response with half of it fine.
+# against.
 [[windows]]
 id       = "claude-5h"
 label    = "5H"
@@ -1981,11 +1977,10 @@ resets_at_format  = "iso8601"
 # field of its own — `seven_day_opus` and friends are present in the response
 # and null — but inside the `limits[]` array, as an element whose `kind` says
 # `weekly_scoped` and whose `scope.model.display_name` names the model. On the
-# account this was measured against (2026-08-22) there is one such element,
-# for Fable, and the panel had been silently omitting it while Anthropic's own
-# usage page drew it.
+# account this was measured against there is one such element, for Fable,
+# which Anthropic's own usage page draws.
 #
-# So this entry enumerates rather than points (`for_each`, stage C):
+# So this entry enumerates rather than points at a fixed path (`for_each`):
 #  * `limits[]` also carries the session and weekly-all windows — the two the
 #    fixed entries above already draw from `five_hour`/`seven_day` — so the
 #    filter is what keeps this from drawing them a second time under a
@@ -2023,9 +2018,9 @@ used_percent_path = "percent"
 resets_at_path    = "resets_at"
 resets_at_format  = "iso8601"
 
-# claude.rs `fetch_usage`: GET .../oauth/usage with the OAuth bearer token, the
-# `oauth-2025-04-20` beta header, and a `claude-code/<version>` User-Agent
-# (required — Anthropic 429s aggressively without it).
+# GET .../oauth/usage with the OAuth bearer token, the `oauth-2025-04-20` beta
+# header, and a `claude-code/<version>` User-Agent (required — Anthropic 429s
+# aggressively without it).
 [http]
 [[http.request]]
 url          = "https://api.anthropic.com/api/oauth/usage"
@@ -2035,8 +2030,8 @@ Authorization    = "Bearer {token}"
 "anthropic-beta" = "oauth-2025-04-20"
 "User-Agent"     = "claude-code/{version}"
 
-# `{version}` substitution — claude.rs `claude_code_version()`: read the
-# installed CLI's own package.json, falling back to a recent constant.
+# `{version}` substitution reads the installed CLI's own package.json,
+# falling back to a recent constant.
 #
 # The third is Windows: npm's global prefix is per-user there, under %APPDATA%
 # rather than a system directory. Spelled `~/AppData/Roaming` rather than
@@ -2054,14 +2049,14 @@ files = [
 json_path = "version"
 fallback  = "2.1.78"
 
-# Account email — claude.rs `fetch_email`: GET .../oauth/profile with the same
-# headers/auth as [http], then `account.email` in the response body.
+# Account email — GET .../oauth/profile with the same headers/auth as [http],
+# then `account.email` in the response body.
 [account]
 type      = "http"
 url       = "https://api.anthropic.com/api/oauth/profile"
 json_path = "account.email"
 
-# CLI surface — always on (claude.rs `read_all` always reads it).
+# CLI surface — always on.
 [[surface]]
 id            = "cli"
 label         = "CLI"
@@ -2069,11 +2064,11 @@ opt_in        = false
 in_menu_bar   = true
 allowed_hosts = ["api.anthropic.com"]
 
-# claude.rs `cli_token()`: plaintext credentials file first, then the OS
-# secure store per platform. Every step decodes the same JSON shape, hence the
-# same `token_json_path` fallback throughout (claude.rs `extract_access_token`:
-# nested `claudeAiOauth.accessToken`/`claudeAiOauth.access_token`, else flat
-# `accessToken`/`access_token` at the root).
+# Plaintext credentials file first, then the OS secure store per platform.
+# Every step decodes the same JSON shape, hence the same `token_json_path`
+# fallback throughout: nested
+# `claudeAiOauth.accessToken`/`claudeAiOauth.access_token`, else flat
+# `accessToken`/`access_token` at the root.
 [[surface.auth]]
 type             = "credentials-file"
 path             = "~/.claude/.credentials.json"
@@ -2090,8 +2085,7 @@ targets          = ["Claude Code-credentials", "Claude Code"]
 token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
 
 # Desktop surface — opt-in (its token needs a one-time Keychain/DPAPI grant),
-# popup-only (claude.rs module docs; `reading_from_claude`:
-# `in_menu_bar: reading.surface == claude::Surface::Cli`).
+# popup-only (`in_menu_bar = false`).
 [[surface]]
 id            = "desktop"
 label         = "Desktop"
@@ -2099,12 +2093,11 @@ opt_in        = true
 in_menu_bar   = false
 allowed_hosts = ["api.anthropic.com"]
 
-# claude.rs `desktop_token()`: `{config_dir}/Claude/config.json` →
-# `oauth:tokenCacheV2` (falling back to `oauth:tokenCache`) → an Electron Safe
-# Storage blob, decrypted via the macOS Keychain key "Claude Safe Storage" (or
-# Windows DPAPI, which needs no manifest field). The decrypted payload is the
-# same `claudeAiOauth`-wrapped shape as the CLI's, hence the same
-# `token_json_path` fallback.
+# `{config_dir}/Claude/config.json` → `oauth:tokenCacheV2` (falling back to
+# `oauth:tokenCache`) → an Electron Safe Storage blob, decrypted via the macOS
+# Keychain key "Claude Safe Storage" (or Windows DPAPI, which needs no
+# manifest field). The decrypted payload is the same `claudeAiOauth`-wrapped
+# shape as the CLI's, hence the same `token_json_path` fallback.
 [[surface.auth]]
 type               = "electron-safe-storage"
 config_path        = "{config_dir}/Claude/config.json"

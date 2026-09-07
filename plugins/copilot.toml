@@ -5,9 +5,7 @@
 # already keeps on disk. It is unofficial and undocumented — if its shape
 # changes, update this file, not Rust code. Everything below was read out of
 # the shipped Copilot language server (`copilot-agent/dist/main.js` inside the
-# JetBrains plugin) and then confirmed against a live 200; the measurements are
-# written up in the project's private provider notes, which are deliberately
-# not part of this repository.
+# JetBrains plugin) and then confirmed against a live 200.
 #
 # What this provider needs from the reader is what Grok already needed — no
 # mechanism is new here, which is the point: a fifth provider that is a
@@ -24,7 +22,7 @@ name         = "Copilot"
 menu_label   = "Cp"
 order        = 50
 requires_reader = ["reading-balances", "credentials-map"]
-version      = "1.0.0"
+version      = "1.0.1"
 engine       = "http-api"
 # A monthly counter, not a rolling window, and the number is picked rather than
 # copied from the other manifests — none of which is measuring a month.
@@ -46,7 +44,7 @@ refresh_secs = 300
 # The response carries three quota buckets — `chat`, `completions` and
 # `premium_interactions` — and only the last one is metered on a paid plan: the
 # other two arrive `unlimited = true` with `entitlement` and `remaining` both
-# zero (measured on the owner's `individual` plan). A row for them would draw a
+# zero (measured on an `individual` plan). A row for them would draw a
 # 0-of-0 that means "no ceiling", the one reading `Balance::cap` documents it
 # will never conclude. So one row here, for the bucket that has a number in it —
 # and two more at the bottom of this file for the free plan, which meters those

@@ -25,10 +25,10 @@ sha256      = "5c1a73cfc3df978684a08a6061a2a1733576159adb1bc5fb9d98ad7d25701de9"
 [[plugin]]
 id          = "claude"
 name        = "Claude"
-version     = "1.4.1"
+version     = "1.4.2"
 description = "Claude Code CLI and desktop app usage: 5h/weekly windows, per model."
 manifest    = "claude.toml"
-sha256      = "5fac28643944da153a44ee4b33df76b16ec67b5ddf43f7fd66c4613f90b1f8a8"
+sha256      = "ebe934f6649fde24ab919d3e091a55006acc3e17f993a258f7f37d66dc06469c"
 
 [[plugin]]
 id          = "grok"
@@ -41,15 +41,15 @@ sha256      = "ce23cd7fd9164aa691f7a6b61786e471f41b389b52e0b109ab259e5129523a66"
 [[plugin]]
 id          = "antigravity"
 name        = "Antigravity"
-version     = "1.1.0"
+version     = "1.1.1"
 description = "Antigravity CLI (Google Gemini Code Assist) quota."
 manifest    = "antigravity.toml"
-sha256      = "b7b23d609f859de7a01e29cec5c733026c20e656bc902c5aa5fddbfe16016832"
+sha256      = "3f6fccac2b89b41ef0db9c20ce3bb5c4420c04d45e50aaef19c3f9f5ff60f726"
 
 [[plugin]]
 id          = "copilot"
 name        = "Copilot"
-version     = "1.0.0"
+version     = "1.0.1"
 description = "GitHub Copilot quota: premium requests, chat and completions."
 manifest    = "copilot.toml"
-sha256      = "094ac70619cc6ec5e204dd3d1aa38a2cd724a2024f3e031b84dee3caf573f1cd"
+sha256      = "a18f9019849426a7396a5be96bf8cb6cc8a81068ed07e7c0f754f7d9efc42a20"

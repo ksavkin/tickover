@@ -329,8 +329,12 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "claude.toml",
         id: "claude",
-        to_version: "1.4.1",
+        to_version: "1.4.2",
         previous_sha256: &[
+            // 1.4.1 — comments only: dropped references to since-removed
+            // Rust modules and narrated history.
+            // sha256 of claude.toml as shipped at manifest version 1.4.1.
+            "5fac28643944da153a44ee4b33df76b16ec67b5ddf43f7fd66c4613f90b1f8a8",
             // 1.4.0 — the ping comment still described firing at the
             // reset instant.
             // sha256 of claude.toml as shipped at manifest version 1.4.0.
@@ -415,8 +419,12 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "antigravity.toml",
         id: "antigravity",
-        to_version: "1.1.0",
+        to_version: "1.1.1",
         previous_sha256: &[
+            // 1.1.0 — comments only: the measurements no longer point
+            // outside this repository.
+            // sha256 of antigravity.toml as shipped at manifest version 1.1.0.
+            "b7b23d609f859de7a01e29cec5c733026c20e656bc902c5aa5fddbfe16016832",
             // 1.0.0 — the literal `client_id`/`client_secret` pair typed out
             // in plain text, before `[surface.auth.client]` discovery.
             // sha256 of antigravity.toml as shipped at manifest version 1.0.0.
@@ -424,14 +432,21 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
         ],
         deliver_if_absent: true,
     },
-    // copilot.toml's first entry — new like the two above, and the same shape
-    // for the same reason: nothing on disk to recognise, and `deliver_if_absent`
-    // is what reaches an install whose plugins directory already exists.
+    // copilot.toml, updated: comments only, no shape or behaviour changed.
+    // `previous_sha256` now recognises the shipped 1.0.0 copy, so an
+    // untouched install picks up the rewording; `deliver_if_absent` stays
+    // `true`, unchanged, for an install whose plugins directory already
+    // existed before copilot.toml first shipped and so never received it.
     BuiltinUpgrade {
         file: "copilot.toml",
         id: "copilot",
-        to_version: "1.0.0",
-        previous_sha256: &[],
+        to_version: "1.0.1",
+        previous_sha256: &[
+            // 1.0.0 — comments only: the measurements no longer point
+            // outside this repository.
+            // sha256 of copilot.toml as shipped at manifest version 1.0.0.
+            "094ac70619cc6ec5e204dd3d1aa38a2cd724a2024f3e031b84dee3caf573f1cd",
+        ],
         deliver_if_absent: true,
     },
 ];
@@ -1212,7 +1227,7 @@ mod tests {
         assert_eq!(m.id, "claude");
         assert_eq!(m.engine, EngineKind::HttpApi);
         assert_eq!(
-            m.version, "1.4.1",
+            m.version, "1.4.2",
             "the version BUILTIN_UPGRADES migrates to"
         );
         assert_eq!(m.surface.len(), 2, "cli + desktop surfaces");

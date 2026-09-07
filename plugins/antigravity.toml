@@ -3,10 +3,8 @@
 # Antigravity's quota is read from the same endpoint its own CLI calls,
 # `daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`, with
 # the CLI's own OAuth access token. It is unofficial and undocumented — if its
-# shape changes, update this file, not Rust code. Measured shape and the reason
-# behind every field below:
-# the project's private provider notes, which are deliberately not part of
-# this repository.
+# shape changes, update this file, not Rust code. Every field below was
+# measured against a live account and is explained where it is set.
 #
 # What sets this provider apart, each a reader capability it declares:
 #  * POST, not GET — the endpoint follows Google's `:verb` HTTP-transcoding
@@ -28,7 +26,7 @@ name         = "Antigravity"
 menu_label   = "Ag"
 order        = 40
 requires_reader = ["http-post", "remaining-fraction", "window-identity", "keychain-expiry", "oauth-refresh", "oauth-client-discovery"]
-version      = "1.1.0"
+version      = "1.1.1"
 engine       = "http-api"
 refresh_secs = 60
 
@@ -43,8 +41,8 @@ refresh_secs = 60
 # response never carried. Marking a window `required` would call that absence a
 # changed endpoint and light up an error; leaving it absent-tolerant reads the
 # same absence as "did not say", so the row simply disappears rather than
-# claiming "spent". That is the owner's call for this provider (silence is not
-# exhaustion), and it is why the honest default here is the opposite of
+# claiming "spent". That is the deliberate choice for this provider (silence
+# is not exhaustion), and it is why the honest default here is the opposite of
 # Claude's, whose response always carries both windows.
 #
 # Gemini is the family in the menu bar; the third-party (Claude/GPT) family
