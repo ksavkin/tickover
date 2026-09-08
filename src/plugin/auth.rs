@@ -1997,7 +1997,7 @@ fn compile_scan_pattern(pattern: &str) -> Option<ScanPattern> {
 /// pattern's computed maximum cannot be a truncated prefix of a longer one
 /// no matter what follows it, so it needs no deferral regardless of `eof` —
 /// this is exactly what keeps every pattern this crate actually ships
-/// (`{12}`, `{32}`, `{28}`, all exact) behaving precisely as it did before
+/// (`{13}`, `{32}`, `{28}`, all exact) behaving precisely as it did before
 /// this whole deferral mechanism existed: an exact-length match always
 /// already equals its own maximum on the read that produces it, so it is
 /// never deferred, cutoff or no cutoff. `None` (the maximum could not be
@@ -2099,7 +2099,7 @@ fn accept_settled_match(
 /// candidates at once, and the largest known client binary, Antigravity's
 /// `agy`, is measured at about a third of
 /// [`CLIENT_DISCOVERY_MAX_SCAN_BYTES`] alone): every shipped pattern is
-/// exact-length (72 bytes for the id, 35 for the secret — see
+/// exact-length (73 bytes for the id, 35 for the secret — see
 /// [`ScanPattern::max_len`]'s own doc for what that means for
 /// `accept_settled_match`), and an exact-length pattern's `find` never
 /// returns a match short of its own full count in the first place. There is
@@ -2877,6 +2877,7 @@ fn windows_dpapi_decrypt(blob: &[u8]) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::manifest::PluginManifest;
     use super::*;
     use serde_json::json;
 
@@ -3275,20 +3276,20 @@ mod tests {
 
     #[test]
     fn scan_candidate_with_the_shipped_exact_id_pattern_does_not_swallow_a_leading_digit() {
-        // The exact motivation for shipping `{12}`/`{32}` (the counts
+        // The exact motivation for shipping `{13}`/`{32}` (the counts
         // measured against the real Antigravity binaries) instead of a
         // merely *bounded* `{1,20}`/`{1,40}`: with the bounded form, a stray
         // digit immediately before the real id in the binary extends the
         // digit run the pattern is willing to match, and `find`'s leftmost
-        // match then starts one byte too early — a 13-digit run is a
-        // *different, wrong* id, not the real 12-digit one with an extra
-        // character in front. An exact `{12}` cannot match that longer run
-        // at all: consuming its first 12 digits leaves a 13th digit where
+        // match then starts one byte too early — a 14-digit run is a
+        // *different, wrong* id, not the real 13-digit one with an extra
+        // character in front. An exact `{13}` cannot match that longer run
+        // at all: consuming its first 13 digits leaves a 14th digit where
         // the literal `-` is required, the attempt fails, and `find` retries
         // one position later — landing exactly on the real id.
         let dir = temp_dir("scan-shipped-id-pattern");
         let file = dir.join("client-binary");
-        let real_id = fake_client_id("123456789012", "abcdefghijklmnopqrstuvwxyz012345");
+        let real_id = fake_client_id("1234567890123", "abcdefghijklmnopqrstuvwxyz012345");
         let real_secret = fake_secret("shippedpatterntestsecret0123456789AB");
         let mut content = b"leading padding text ending in a digit9".to_vec();
         content.extend_from_slice(real_id.as_bytes());
@@ -3300,7 +3301,7 @@ mod tests {
         // not the loosely-bounded `synthetic_id_pattern()` every other test
         // in this module uses — that pattern is deliberately the thing
         // under test here.
-        let id_pattern = scan_pattern(r"[0-9]{12}-[a-z0-9]{32}\.apps\.googleusercontent\.com");
+        let id_pattern = scan_pattern(r"[0-9]{13}-[a-z0-9]{32}\.apps\.googleusercontent\.com");
         let secret_pattern = scan_pattern(&synthetic_secret_pattern());
         let mut budget = CLIENT_DISCOVERY_PASS_BUDGET_BYTES;
         assert_eq!(
@@ -3314,6 +3315,103 @@ mod tests {
             found(&file, &real_id, &real_secret),
             "the leading digit must not be swallowed into the match"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_shipped_antigravity_id_pattern_skips_the_twelve_digit_client_that_precedes_the_real_one()
+    {
+        // Both installed binaries this pattern is measured against carry a
+        // second, unrelated Google client id ahead of Antigravity's own — a
+        // twelve-digit project number, one digit short of the thirteen
+        // Antigravity's own client's project number carries. The patterns
+        // under test are read straight off `plugins/antigravity.toml`, not
+        // retyped here, so a manifest edit that drifted the digit count back
+        // to twelve fails this assertion before it ever reaches the second
+        // one below.
+        let manifest_text = include_str!("../../plugins/antigravity.toml");
+        let manifest =
+            PluginManifest::from_str(manifest_text).expect("plugins/antigravity.toml must parse");
+        let client = manifest
+            .surface
+            .first()
+            .expect("antigravity.toml declares one surface")
+            .auth
+            .iter()
+            .find_map(|step| step.client.as_ref())
+            .expect("an auth step with a client table");
+        let shipped_id_pattern = client
+            .id_pattern
+            .clone()
+            .expect("the oauth-refresh step's client table names an id_pattern");
+        let shipped_secret_pattern = client
+            .secret_pattern
+            .clone()
+            .expect("the oauth-refresh step's client table names a secret_pattern");
+        assert_eq!(
+            shipped_id_pattern, r"[0-9]{13}-[a-z0-9]{32}\.apps\.googleusercontent\.com",
+            "the pattern this test scans with must be the one the manifest actually ships"
+        );
+        assert_eq!(
+            shipped_secret_pattern, "GOCSPX-[A-Za-z0-9_-]{28}",
+            "the pattern this test scans with must be the one the manifest actually ships"
+        );
+
+        // filler, the foreign (twelve-digit) client id, filler, Antigravity's
+        // own (thirteen-digit) client id, filler, then two secrets — all
+        // synthetic, laid out in the same relative order the two installed
+        // binaries carry them in.
+        let foreign_id = fake_client_id("222233334444", "foreignprojectclientidzzzzzzzzz1");
+        let real_id = fake_client_id("1234567890123", "antigravityownclientidxxxxxxxxxx");
+        let first_secret = fake_secret("firstsecretbytesinthefile123");
+        let second_secret = fake_secret("secondsecretbytesinthefile12");
+        let mut content = b"binary noise before the foreign client id -- ".to_vec();
+        content.extend_from_slice(foreign_id.as_bytes());
+        content.extend_from_slice(b" -- more noise between the two client ids -- ");
+        content.extend_from_slice(real_id.as_bytes());
+        content.extend_from_slice(b" -- noise before the two secrets -- ");
+        content.extend_from_slice(first_secret.as_bytes());
+        content.extend_from_slice(b" -- ");
+        content.extend_from_slice(second_secret.as_bytes());
+        content.extend_from_slice(b" -- trailing noise");
+        let dir = temp_dir("scan-shipped-id-pattern-skips-foreign-client");
+        let file = dir.join("client-binary");
+        std::fs::write(&file, &content).unwrap();
+
+        let id_pattern = scan_pattern(&shipped_id_pattern);
+        let secret_pattern = scan_pattern(&shipped_secret_pattern);
+        let mut budget = CLIENT_DISCOVERY_PASS_BUDGET_BYTES;
+        assert_eq!(
+            scan_candidate(
+                &file,
+                &id_pattern,
+                &secret_pattern,
+                &mut budget,
+                CLIENT_DISCOVERY_MAX_SCAN_BYTES
+            ),
+            found(&file, &real_id, &first_secret),
+            "the shipped, thirteen-digit pattern must land on Antigravity's own id and \
+             the first secret, not the foreign twelve-digit id ahead of it"
+        );
+
+        // Why the digit count is pinned: the very same buffer, scanned with
+        // the old twelve-digit pattern, finds the foreign id instead — it
+        // appears first in the file, and a pattern that admits twelve digits
+        // has no way to tell it apart from the real one.
+        let old_id_pattern = scan_pattern(r"[0-9]{12}-[a-z0-9]{32}\.apps\.googleusercontent\.com");
+        let mut old_budget = CLIENT_DISCOVERY_PASS_BUDGET_BYTES;
+        assert_eq!(
+            scan_candidate(
+                &file,
+                &old_id_pattern,
+                &secret_pattern,
+                &mut old_budget,
+                CLIENT_DISCOVERY_MAX_SCAN_BYTES
+            ),
+            found(&file, &foreign_id, &first_secret),
+            "a pattern admitting twelve digits finds the foreign client id first"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3360,7 +3458,7 @@ mod tests {
         // one instead uses `GOCSPX-[A-Za-z0-9]{10,40}`: bounded (40 is a
         // finite maximum, so validation accepts it), but still
         // variable-length, unlike every pattern this crate actually ships
-        // (`{12}`, `{32}`, `{28}` — all exact). That variability is exactly
+        // (`{13}`, `{32}`, `{28}` — all exact). That variability is exactly
         // what let a chunk boundary cut the match short: an exact-length
         // pattern stops matching at its own count regardless of what chunk
         // it lands in, but this one is greedy, and greedy means "as much as

@@ -544,7 +544,7 @@ pub const SMALL_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// (`manifest::validate`, via `regex_syntax`'s parsed `maximum_len`) and
 /// enforced again defensively at scan time (`auth::scan_candidate`). A
 /// client id or secret is never remotely this long — the shipped
-/// Antigravity ones measure 72 and 35 bytes — so the bound exists to stop a
+/// Antigravity ones measure 73 and 35 bytes — so the bound exists to stop a
 /// pattern from turning "scan a file for a short id" into "read an
 /// unbounded slice of it and call the slice the client".
 pub const CLIENT_PATTERN_MAX_MATCH_BYTES: usize = 256;

@@ -1580,7 +1580,7 @@ impl PluginManifest {
                             }
                             // Bounded, not merely valid: a client id or
                             // secret is never remotely `CLIENT_PATTERN_MAX_MATCH_BYTES`
-                            // long (the shipped Antigravity ones measure 72
+                            // long (the shipped Antigravity ones measure 73
                             // and 35), so a pattern whose match has no
                             // ceiling — or one set too high — is refused
                             // here rather than left to `scan_candidate`'s own

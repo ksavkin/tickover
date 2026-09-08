@@ -41,10 +41,10 @@ sha256      = "ce23cd7fd9164aa691f7a6b61786e471f41b389b52e0b109ab259e5129523a66"
 [[plugin]]
 id          = "antigravity"
 name        = "Antigravity"
-version     = "1.1.1"
+version     = "1.1.2"
 description = "Antigravity CLI (Google Gemini Code Assist) quota."
 manifest    = "antigravity.toml"
-sha256      = "3f6fccac2b89b41ef0db9c20ce3bb5c4420c04d45e50aaef19c3f9f5ff60f726"
+sha256      = "29c98277959a3d68ec7f5bcc5453af51a6db879475a031af0fce71bb8eb11bda"
 
 [[plugin]]
 id          = "copilot"

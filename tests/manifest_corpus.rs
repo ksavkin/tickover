@@ -1631,17 +1631,21 @@ fn the_shipped_antigravity_manifest_is_accepted() {
         Some("TICKOVER_ANTIGRAVITY_CLIENT_SECRET")
     );
     // Exact, not merely bounded, the same reason `secret_pattern` below is —
-    // `{12}`/`{32}` are the digit and alnum run lengths measured against a
+    // `{13}`/`{32}` are the digit and alnum run lengths measured against a
     // real installed client, not a generous cap above them. A bounded-but-
     // not-exact count (the shape this used to be) still lets a stray digit
     // right before the real id get swallowed into a longer, wrong match;
     // an exact count cannot match that longer run at all (see
     // `scan_candidate_with_the_shipped_exact_id_pattern_does_not_swallow_a_leading_digit`
     // in `src/plugin/auth.rs`) — well short of the 256-byte ceiling
-    // `manifest::validate` enforces on both patterns either way.
+    // `manifest::validate` enforces on both patterns either way. Thirteen,
+    // not twelve, digits: both installed binaries also carry a second,
+    // unrelated Google client id whose project number is twelve digits and
+    // sits earlier in the file, so a pattern admitting twelve digits finds
+    // that one first and pairs it with Antigravity's own secret.
     assert_eq!(
         client.id_pattern.as_deref(),
-        Some(r"[0-9]{12}-[a-z0-9]{32}\.apps\.googleusercontent\.com")
+        Some(r"[0-9]{13}-[a-z0-9]{32}\.apps\.googleusercontent\.com")
     );
     // Exact, not open-ended: measured against a real installed copy of both
     // `language_server` and `agy`, the character class the format allows

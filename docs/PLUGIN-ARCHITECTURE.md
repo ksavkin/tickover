@@ -908,7 +908,7 @@ length (`maximum_len`) no greater than 256 bytes — a client id or secret is
 never remotely that long, and an unbounded pattern (`.*`, `[a-z]+`) would turn
 "scan a file for a short id" into "read an unbounded slice of it and call the
 slice the client". A *bounded-but-not-exact* pattern (`{1,20}` where the real
-value is always exactly 12 digits, say) is not itself refused, but is worth
+value is always exactly 13 digits, say) is not itself refused, but is worth
 avoiding: the same character class that lets it match the real value at all
 usually keeps matching past its actual end, so a stray byte adjacent to the
 real value in the file gets pulled into the match — a wrong, corrupted id or

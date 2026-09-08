@@ -419,8 +419,12 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "antigravity.toml",
         id: "antigravity",
-        to_version: "1.1.1",
+        to_version: "1.1.2",
         previous_sha256: &[
+            // 1.1.1 — the client id pattern admitted twelve digits, which
+            // finds the wrong client.
+            // sha256 of antigravity.toml as shipped at manifest version 1.1.1.
+            "3f6fccac2b89b41ef0db9c20ce3bb5c4420c04d45e50aaef19c3f9f5ff60f726",
             // 1.1.0 — comments only: the measurements no longer point
             // outside this repository.
             // sha256 of antigravity.toml as shipped at manifest version 1.1.0.

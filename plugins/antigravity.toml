@@ -26,7 +26,7 @@ name         = "Antigravity"
 menu_label   = "Ag"
 order        = 40
 requires_reader = ["http-post", "remaining-fraction", "window-identity", "keychain-expiry", "oauth-refresh", "oauth-client-discovery"]
-version      = "1.1.1"
+version      = "1.1.2"
 engine       = "http-api"
 refresh_secs = 60
 
@@ -169,9 +169,18 @@ expiry_json_path = "token.expiry"
 # ambiguous about which it means, so `manifest::validate` refuses the
 # combination outright rather than picking an order silently.
 #
+# Both installed binaries also carry a second Google client id, from an
+# unrelated Google project, ahead of Antigravity's own in the file — that
+# project's number is twelve digits, one short of the thirteen digits
+# Antigravity's own client's project number carries. The id pattern's
+# `{13}` pins that exact digit count for this reason: a pattern admitting
+# twelve digits as well finds the other project's id first (and could still
+# match the trailing twelve digits of Antigravity's own), pairing a foreign
+# id with Antigravity's own secret, which is the first secret in the file.
+#
 # Both patterns are exact, not merely bounded — `secret_pattern`'s count
 # (`{28}`) is Google's own fixed length for this secret shape; `id_pattern`'s
-# digit and alnum runs (`{12}`/`{32}`) are the exact counts measured against
+# digit and alnum runs (`{13}`/`{32}`) are the exact counts measured against
 # both installed binaries, not a generous cap above them. Validation still
 # refuses anything that could match more than 256 bytes either way (a client
 # id or secret is never remotely that long), but that ceiling alone is not
@@ -197,7 +206,7 @@ token_url       = "https://oauth2.googleapis.com/token"
 [surface.auth.client]
 id_env         = "TICKOVER_ANTIGRAVITY_CLIENT_ID"
 secret_env     = "TICKOVER_ANTIGRAVITY_CLIENT_SECRET"
-id_pattern     = "[0-9]{12}-[a-z0-9]{32}\\.apps\\.googleusercontent\\.com"
+id_pattern     = "[0-9]{13}-[a-z0-9]{32}\\.apps\\.googleusercontent\\.com"
 secret_pattern = "GOCSPX-[A-Za-z0-9_-]{28}"
 files = [
   "/Applications/Antigravity.app/Contents/Resources/bin/language_server",
