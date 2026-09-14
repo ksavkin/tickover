@@ -15,14 +15,14 @@ mod platform;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 use slint::{
     ComponentHandle, Model, ModelRc, PhysicalPosition, SharedString, Timer, TimerMode, VecModel,
 };
 use tickover::menubar;
-use tickover::model::{Balance, BalanceAmount, ProviderReading, Role, Window};
+use tickover::model::{Balance, BalanceAmount, ProviderReading, Role, TokenRenewal, Window};
 use tickover::plugin::auth;
 use tickover::plugin::manifest::{self, EngineKind, PluginManifest};
 use tickover::plugin::registry::{
@@ -1619,6 +1619,90 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if !plugin_ping_armed(true, config::plugin_ping(&m.id)) {
                             continue;
                         }
+                        // A lapsed token, or a bare 401, renews itself the
+                        // same way an empty window does — by running
+                        // `[ping]` — but the trigger is a surface's own
+                        // reading, not a boundary this loop would otherwise
+                        // compute. Only a surface whose auth chain declares
+                        // a token expiry (`SurfaceConfig::
+                        // declares_token_expiry`) is consulted: Claude's
+                        // `desktop` surface, say, carries its own separate
+                        // token that `[ping]`'s binary never touches, so it
+                        // is skipped here even though its plugin's `[ping]
+                        // renews_token` is true. Every eligible surface is
+                        // classified, not just the first with a signal (see
+                        // `classify_renewal_across_surfaces`'s own doc for
+                        // why one plugin can have two independently-lapsing
+                        // tokens at once) — ahead of the window ping below,
+                        // since a surface whose token has lapsed reports no
+                        // window at all while it is down (`reading.fail`
+                        // clears them), which is exactly the state
+                        // `first_surface_reading_id`/`ping_window` below
+                        // would otherwise skip silently.
+                        let renewal_wanted = m.ping.as_ref().is_some_and(|p| p.renews_token);
+                        let surfaces =
+                            m.surface
+                                .iter()
+                                .filter(|s| s.declares_token_expiry())
+                                .map(|s| {
+                                    let id = surface_reading_id(&m.id, &s.id);
+                                    let renewal = current
+                                        .iter()
+                                        .find(|r| r.id == id)
+                                        .map(|r| r.token_renewal);
+                                    (id, renewal)
+                                });
+                        // Shares `PING_MIN_INTERVAL_SECS`'s floor with the
+                        // window ping below, plus its own bound on top: at
+                        // most one ping per distinct token *per surface*
+                        // (`LAST_RENEWED_FOR` is keyed by surface reading id,
+                        // not by plugin — two renewal-eligible surfaces on
+                        // one plugin lapsing independently each get their
+                        // own once-per-token bound rather than overwriting
+                        // one another's), never one every ten minutes for as
+                        // long as a token the CLI cannot renew either stays
+                        // unrenewed. Silent when suppressed — logging it
+                        // would repeat every tick for exactly the token this
+                        // exists to stop pinging about.
+                        //
+                        // `credit_renewal` runs *before* `send_ping`, not
+                        // after: `Command::spawn`'s own failure is reported
+                        // asynchronously, on a background thread, and can
+                        // otherwise land before this thread gets around to
+                        // crediting anything — see `credit_renewal`'s own
+                        // doc for why crediting first is the one ordering
+                        // that can't lose the retry. `send_ping` returning
+                        // `false` means nothing will ever run to notice that
+                        // credit on this attempt's behalf, so the tick
+                        // undoes it itself; `continue` (skipping the
+                        // window-ping path below) only follows an actual
+                        // spawn — a renewal merely on cooldown, or one that
+                        // failed to even start, must never suppress the one
+                        // ping that plugin can still fire this tick.
+                        let due = if renewal_wanted {
+                            classify_renewal_across_surfaces(
+                                surfaces,
+                                config::plugin_pinged_at(&m.id),
+                                now,
+                                last_renewed_for,
+                            )
+                        } else {
+                            None
+                        };
+                        if let Some((surface_key, renewal)) = due {
+                            let ping = m.ping.as_ref().expect("filtered by ping.is_some() above");
+                            config::set_plugin_pinged_at(&m.id, now);
+                            credit_renewal(&surface_key, renewal);
+                            diag::line(format!(
+                                "auto-ping: {} token has lapsed, running {} to renew it",
+                                m.id, ping.bin
+                            ));
+                            let spawned = send_ping(ping, Some((surface_key.clone(), renewal)));
+                            if spawned {
+                                continue;
+                            }
+                            uncredit_renewal(&surface_key, renewal);
+                        }
                         let Some(first_id) = first_surface_reading_id(m) else {
                             continue;
                         };
@@ -1655,7 +1739,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // in which the app can be quit with the ping recorded and never
                         // sent, which on-disk state would then remember for good.
                         config::set_plugin_pinged_at(&m.id, now);
-                        send_ping(m.ping.as_ref().expect("filtered by ping.is_some() above"));
+                        send_ping(
+                            m.ping.as_ref().expect("filtered by ping.is_some() above"),
+                            None,
+                        );
                     }
                 }
             },
@@ -3568,6 +3655,230 @@ fn ping_due(
         .is_some_and(|start| pinged_at.saturating_add(PING_GRACE_SECS) < start)
 }
 
+/// Whether a renewal ping (see `[ping] renews_token`,
+/// `model::TokenRenewal`) is due — the floor it shares with [`ping_due`]
+/// ([`PING_MIN_INTERVAL_SECS`]), *and* a bound `ping_due` has no equivalent
+/// of: neither a lapsed auth chain nor a bare 401 names a window to be empty
+/// or a boundary to have passed, so left at the floor alone this would fire
+/// every ten minutes for as long as the token stayed unrenewed — forever, if
+/// the CLI cannot renew it either (its own refresh token has expired too,
+/// say, and it now needs an interactive login). `renewal` (the *current*
+/// reading's own `TokenRenewal`) and `last_renewed_for` (the reading the
+/// *last fired* renewal ping named, `main.rs`'s own in-memory memory of it —
+/// see [`LAST_RENEWED_FOR`]) answer that: due only once per distinct
+/// reading, however many ticks it keeps naming the same one. Compared as
+/// the whole `TokenRenewal` value (it is `Copy`/`Eq`) rather than an
+/// extracted `u64`, so `Lapsed { expires_at: 42 }` and
+/// `Unauthorized { token_hash: 42 }` can never be mistaken for the same
+/// key merely because the numbers inside them happen to collide.
+///
+/// `renewal == last_renewed_for` alone would wrongly treat "neither side has
+/// one" as a match — both `None`, which is not "the same token pinged
+/// again" but "nothing to dedup on". Guarded by `renewal.is_some()`, so that
+/// case falls straight through to the floor instead — defensive rather than
+/// reachable today, since every `TokenRenewal` variant this is actually
+/// called for carries a comparable value (`TokenRenewal::No` never reaches
+/// here — see [`classify_renewal`]'s own doc).
+///
+/// `pinged_at` is clamped to `now` first for the same reason `ping_due`
+/// clamps it: a `config.json` hand-edited into the future must not read as
+/// "just pinged" for longer than it takes `now` to catch up.
+fn renewal_ping_due(
+    pinged_at: u64,
+    now: u64,
+    renewal: Option<TokenRenewal>,
+    last_renewed_for: Option<TokenRenewal>,
+) -> bool {
+    if renewal.is_some() && renewal == last_renewed_for {
+        return false;
+    }
+    now.saturating_sub(pinged_at.min(now)) >= PING_MIN_INTERVAL_SECS
+}
+
+/// Per-surface memory of the `TokenRenewal` a renewal ping was last
+/// credited for — read and written only by [`renewal_ping_due`]'s caller,
+/// never by that pure function itself. Credited by [`credit_renewal`]
+/// *before* an attempt runs, not after (see that function's own doc for
+/// why), and undone by [`uncredit_renewal`] if the attempt turns out never
+/// to have actually run — so what this remembers is not quite "fired for"
+/// so much as "credited and not yet un-credited", the two being
+/// indistinguishable once an attempt has genuinely succeeded. Keyed by
+/// *surface* reading id (`main.rs::surface_reading_id`, e.g. `"claude-cli"`),
+/// not by plugin id: a plugin with two renewal-eligible surfaces can have
+/// two tokens lapsing on independent schedules, and one shared slot would
+/// let recording one surface's renewal silently overwrite — and so
+/// re-arm — the other's, even though its own token never changed. Stores
+/// the whole `TokenRenewal` value, not an extracted `u64`: `Lapsed` and
+/// `Unauthorized` are stored and compared as the distinct variants they are,
+/// so a lapsed-chain expiry and a 401's token hash can never be read as the
+/// same key merely because the numbers inside them happen to match.
+/// In-memory only, unlike `config::plugin_pinged_at`: it exists purely to
+/// stop a token that stays unrenewed from being pinged again every ten
+/// minutes forever (see [`renewal_ping_due`]'s own doc). Losing it on
+/// restart costs one extra ping, never a missing one — once the CLI does
+/// renew the token, its declared expiry (or, after a 401, the token itself)
+/// changes, and a later lapse is a different value that pings again
+/// regardless of what this remembers.
+static LAST_RENEWED_FOR: Mutex<Option<HashMap<String, TokenRenewal>>> = Mutex::new(None);
+
+/// The `TokenRenewal` [`LAST_RENEWED_FOR`] remembers a renewal ping firing
+/// for, if any, for one surface reading id — see that static's own doc.
+fn last_renewed_for(surface_key: &str) -> Option<TokenRenewal> {
+    LAST_RENEWED_FOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(surface_key).copied())
+}
+
+/// Records `renewal` in [`LAST_RENEWED_FOR`] for `surface_key` — see that
+/// static's own doc. Called *before* [`send_ping`] is even asked to attempt
+/// anything (right after `config::set_plugin_pinged_at`, at the tick's one
+/// call site that credits a renewal at all), never after: `Command::spawn`'s
+/// own failure happens asynchronously, on [`spawn_hello`]'s background
+/// thread, and can run — and call [`uncredit_renewal`] — before the tick's
+/// own thread would otherwise get around to crediting anything. Crediting
+/// first, unconditionally, and un-crediting afterward on whichever side
+/// notices the run never actually happened (the tick itself, if
+/// `send_ping` returns `false`; the background thread, if `Command::spawn`
+/// fails inside it) is the only ordering of the two that cannot lose:
+/// crediting *after* risks landing behind an uncredit that found nothing
+/// yet to undo, which leaves the credit in place over a renewal that never
+/// ran — the token is then never retried, exactly the indefinite-repeat
+/// bound this whole mechanism exists to prevent, reintroduced from the
+/// other direction.
+fn credit_renewal(surface_key: &str, renewal: TokenRenewal) {
+    LAST_RENEWED_FOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(surface_key.to_string(), renewal);
+}
+
+/// Undoes [`credit_renewal`] for `surface_key`, but only if the value
+/// recorded there is still exactly `renewal` — never an unconditional
+/// removal. Called from two places, both only after [`credit_renewal`] has
+/// already run for this exact attempt (see that function's own doc for why
+/// the ordering is guaranteed): the tick's own thread, when `send_ping`
+/// returns `false` (no working directory, `find_bin` came up empty, or the
+/// background thread itself failed to start — nothing will ever run to
+/// notice the credit on this attempt's behalf otherwise); and
+/// [`spawn_hello`]'s background thread, when `Command::spawn` fails inside
+/// it (a binary that exists but can't actually be executed — permission
+/// denied, wrong architecture). The equality check is what keeps either
+/// caller safe regardless of exactly when it runs: a later tick's own
+/// successful renewal of the *same surface* (a different `TokenRenewal`)
+/// must never be erased by a failure report about a wholly earlier attempt.
+fn uncredit_renewal(surface_key: &str, renewal: TokenRenewal) {
+    let mut guard = LAST_RENEWED_FOR.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut() {
+        if map.get(surface_key) == Some(&renewal) {
+            map.remove(surface_key);
+        }
+    }
+}
+
+/// What the tick's renewal branch should do this tick for one surface's
+/// reading, decided purely from it and this app's own memory — before any
+/// process is spawned. Pulled out of the tick loop (which lives inside a
+/// closure inside `main()` and so cannot itself be unit tested) so the
+/// decision has a name and a test, and so the loop's own `continue` can be
+/// written against it rather than against `renewal_ping_due` directly. See
+/// [`classify_renewal_across_surfaces`] for how a plugin with more than one
+/// renewal-eligible surface combines several of these into the one
+/// due-or-not decision the tick actually acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenewalOutcome {
+    /// This reading carries no renewal signal at all
+    /// (`model::TokenRenewal::No`, or no surface reading found) — nothing to
+    /// do here; the tick's window-ping path runs exactly as it would for any
+    /// other plugin.
+    NotWanted,
+    /// A renewal is wanted, but [`renewal_ping_due`] says not yet — inside
+    /// the shared floor, or already pinged for this exact reading. **Must
+    /// not** `continue` past the window-ping path below it: a plugin whose
+    /// token just lapsed is exactly the plugin whose empty-window ping
+    /// matters most, and a renewal merely being on cooldown must never
+    /// suppress that too.
+    Suppressed,
+    /// Due: the caller should [`credit_renewal`] *before* attempting
+    /// [`send_ping`], then [`uncredit_renewal`] if that attempt turns out
+    /// not to have actually run (see both functions' own docs for why that
+    /// order, not the reverse). Carried here (rather than re-derived after
+    /// the fact) since the classification already had it in hand to ask
+    /// `renewal_ping_due`.
+    Due { renewal: TokenRenewal },
+}
+
+/// [`RenewalOutcome`] for one surface's reading: `None`, or
+/// `Some(TokenRenewal::No)`, reads as [`RenewalOutcome::NotWanted`];
+/// otherwise `renewal` is compared against `last_renewed_for` through
+/// [`renewal_ping_due`] to tell [`RenewalOutcome::Suppressed`] from
+/// [`RenewalOutcome::Due`]. `TokenRenewal::No` inside `Some` cannot reach
+/// the `Suppressed`/`Due` branches through the tick's own scan (which only
+/// ever passes a surface's reading here at all when it isn't `No`), but
+/// reads as `NotWanted` all the same rather than panicking on a shape that
+/// should not occur.
+fn classify_renewal(
+    renewal: Option<TokenRenewal>,
+    pinged_at: u64,
+    now: u64,
+    last_renewed_for: Option<TokenRenewal>,
+) -> RenewalOutcome {
+    let renewal = match renewal {
+        Some(TokenRenewal::No) | None => return RenewalOutcome::NotWanted,
+        Some(renewal) => renewal,
+    };
+    if renewal_ping_due(pinged_at, now, Some(renewal), last_renewed_for) {
+        RenewalOutcome::Due { renewal }
+    } else {
+        RenewalOutcome::Suppressed
+    }
+}
+
+/// [`classify_renewal`] applied to every renewal-eligible surface a plugin
+/// reports on this tick (`surfaces`, in `m.surface` order, each paired with
+/// its own current `TokenRenewal` reading), not just the first with a
+/// signal — each looked up against its *own* [`LAST_RENEWED_FOR`] entry via
+/// `last_renewed_for` (a plain function reference in production,
+/// `main.rs::last_renewed_for`; a closure over a fixed map in tests), since
+/// two renewal-eligible surfaces on one plugin can carry two *different*
+/// `TokenRenewal` values lapsing on independent schedules, and only one of
+/// the two might already be suppressed. Stopping the scan at the first
+/// surface with any signal, suppressed or not, would let an earlier
+/// surface's cooldown silently block a later surface's own, distinct
+/// renewal — this walks every reading instead, sharing only `pinged_at`
+/// (the plugin-wide floor `renewal_ping_due` and the window ping both
+/// respect) across all of them, and returns the surface key and
+/// `TokenRenewal` of the first one [`classify_renewal`] finds
+/// [`RenewalOutcome::Due`], if any — `None` otherwise, whether because
+/// nothing was wanted or because every surface that wanted a renewal is
+/// still on cooldown (the tick's own caller treats both the same: nothing
+/// to do). At most one ping fires per tick regardless of how many surfaces
+/// are eligible, the same floor `renewal_ping_due` already enforces per
+/// surface.
+///
+/// The surface keys `surfaces` carries in are reading ids
+/// (`main.rs::surface_reading_id`), which the loaded plugin set already
+/// guarantees unique across every plugin (`dedup_plugin_ids` drops a whole
+/// manifest sooner than let two readings share one id) — so one flat
+/// `LAST_RENEWED_FOR` map keyed on them, with no plugin id folded in, can
+/// never let one plugin's surface collide with another's.
+fn classify_renewal_across_surfaces(
+    surfaces: impl IntoIterator<Item = (String, Option<TokenRenewal>)>,
+    pinged_at: u64,
+    now: u64,
+    last_renewed_for: impl Fn(&str) -> Option<TokenRenewal>,
+) -> Option<(String, TokenRenewal)> {
+    for (surface_key, renewal) in surfaces {
+        let last = last_renewed_for(&surface_key);
+        if let RenewalOutcome::Due { renewal } = classify_renewal(renewal, pinged_at, now, last) {
+            return Some((surface_key, renewal));
+        }
+    }
+    None
+}
+
 /// Whether a plugin's auto-ping may fire at all: both its master enable and
 /// its per-plugin ping toggle must be on. Asked fresh on every one-second
 /// tick, not armed once and left to fire later — there is no delay between
@@ -5410,13 +5721,37 @@ fn run_with_deadline(mut child: std::process::Child, deadline: Duration) -> (Run
 /// the whole point of the ping is a run nobody watches, and the one line that
 /// explains such a failure ("Not inside a trusted directory…") is the one that
 /// used to be thrown away with it.
-fn spawn_hello(bin: std::path::PathBuf, args: Vec<String>) {
+///
+/// Returns whether a run was actually attempted — `true` once the
+/// background thread starts, `false` for the two ways this can fail before
+/// that (no working directory, the thread itself failing to start). Not
+/// whether the command inside it successfully *starts*: `Command::spawn`
+/// itself runs on that background thread, so its own outcome is not known
+/// synchronously either — the same uncertainty [`send_ping`]'s own caller
+/// already tolerates for the window ping (`config::set_plugin_pinged_at` is
+/// recorded before a run that might not start either). For the renewal
+/// call site, which credits [`LAST_RENEWED_FOR`] *before* calling this (see
+/// [`credit_renewal`]'s own doc for why), this return is what tells it
+/// whether that credit needs undoing itself: `false` means nothing else
+/// will ever run to notice it on this attempt's behalf, so the caller must
+/// [`uncredit_renewal`] right away. For the one failure this leaves
+/// uncovered — `Command::spawn` itself failing inside the thread, an
+/// existing-but-unexecutable binary (permission denied, wrong architecture)
+/// — `on_renewal_spawn_failure`, when given, is called from inside the
+/// thread at exactly that point instead, undoing the same credit from the
+/// other side (see [`uncredit_renewal`]). `None` for the window ping, which
+/// has no renewal credit to undo.
+fn spawn_hello(
+    bin: std::path::PathBuf,
+    args: Vec<String>,
+    on_renewal_spawn_failure: Option<(String, TokenRenewal)>,
+) -> bool {
     let Some(cwd) = ping_cwd() else {
         diag::line(format!(
             "auto-ping: {} not run — no working directory available",
             bin.display()
         ));
-        return;
+        return false;
     };
     let path = cli_path_env();
     // `Builder::spawn`, not `thread::spawn`: the latter panics if the OS won't
@@ -5430,7 +5765,7 @@ fn spawn_hello(bin: std::path::PathBuf, args: Vec<String>) {
     // the one failure a moved value can't clean up after itself from — this
     // is what removes it instead of leaking one directory per failed spawn.
     let cwd_for_cleanup = cwd.clone();
-    if let Err(e) = std::thread::Builder::new().spawn(move || {
+    match std::thread::Builder::new().spawn(move || {
         let mut cmd = std::process::Command::new(&bin);
         cmd.args(&args)
             .current_dir(&cwd)
@@ -5462,6 +5797,9 @@ fn spawn_hello(bin: std::path::PathBuf, args: Vec<String>) {
                 // Fresh per run: nothing reads or writes it after this,
                 // command or no command, so it goes with the run that made it.
                 let _ = std::fs::remove_dir_all(&cwd);
+                if let Some((surface_key, renewal)) = on_renewal_spawn_failure {
+                    uncredit_renewal(&surface_key, renewal);
+                }
                 return;
             }
         };
@@ -5495,11 +5833,15 @@ fn spawn_hello(bin: std::path::PathBuf, args: Vec<String>) {
         }
         let _ = std::fs::remove_dir_all(&cwd);
     }) {
-        diag::line(format!(
-            "auto-ping: {} could not start the thread to run it: {e}",
-            bin_for_log.display()
-        ));
-        let _ = std::fs::remove_dir_all(&cwd_for_cleanup);
+        Ok(_handle) => true,
+        Err(e) => {
+            diag::line(format!(
+                "auto-ping: {} could not start the thread to run it: {e}",
+                bin_for_log.display()
+            ));
+            let _ = std::fs::remove_dir_all(&cwd_for_cleanup);
+            false
+        }
     }
 }
 
@@ -5507,10 +5849,29 @@ fn spawn_hello(bin: std::path::PathBuf, args: Vec<String>) {
 /// hello`) — fired on the tick that finds its first surface's 5-hour window
 /// empty and not yet pinged since it began (see [`ping_due`]: a state, not an
 /// edge), if the user opted in (gated by `config::plugin_ping`).
-fn send_ping(ping: &manifest::PingConfig) {
+///
+/// Returns whether a run was actually attempted — `false` when `ping.bin`
+/// cannot be found at all, otherwise [`spawn_hello`]'s own result. The
+/// window-ping call site ignores it (`config::set_plugin_pinged_at` is
+/// already recorded before this runs, by design — see that call site's own
+/// comment) and passes `on_renewal_spawn_failure = None`; the renewal call
+/// site does not ignore the return — it has already [`credit_renewal`]-ed
+/// this exact `(surface_key, renewal)` pair before calling this at all, and
+/// a `false` here means nothing else will ever run to notice that credit,
+/// so the caller undoes it itself. It also passes the same pair on as
+/// `on_renewal_spawn_failure`, so [`spawn_hello`] can undo the same credit
+/// from the other side if `Command::spawn` itself fails a moment later,
+/// inside its own thread — see that parameter's own doc.
+fn send_ping(
+    ping: &manifest::PingConfig,
+    on_renewal_spawn_failure: Option<(String, TokenRenewal)>,
+) -> bool {
     match find_bin(&ping.bin) {
-        Some(bin) => spawn_hello(bin, ping.args.clone()),
-        None => diag::line(format!("auto-ping: {} binary not found", ping.bin)),
+        Some(bin) => spawn_hello(bin, ping.args.clone(), on_renewal_spawn_failure),
+        None => {
+            diag::line(format!("auto-ping: {} binary not found", ping.bin));
+            false
+        }
     }
 }
 
@@ -6970,6 +7331,7 @@ mod title_tests {
             windows,
             balances: Vec::new(),
             error: None,
+            token_renewal: TokenRenewal::No,
             quota_status: None,
             in_menu_bar: true,
             bare_when_sole: true,
@@ -6993,6 +7355,7 @@ mod title_tests {
             windows,
             balances: Vec::new(),
             error: error.map(str::to_string),
+            token_renewal: TokenRenewal::No,
             quota_status: None,
             in_menu_bar,
             bare_when_sole: false,
@@ -7382,6 +7745,7 @@ mod title_tests {
             windows: vec![win("5H", Role::Primary, 1.0, 100, 300)],
             balances: Vec::new(),
             error: None,
+            token_renewal: TokenRenewal::No,
             quota_status: None,
             in_menu_bar: true,
             bare_when_sole: false,
@@ -7823,6 +8187,7 @@ mod title_tests {
             windows: vec![win("5H", Role::Primary, 1.0, 100, 300)],
             balances: Vec::new(),
             error: None,
+            token_renewal: TokenRenewal::No,
             quota_status: None,
             in_menu_bar: surface_id != "desktop",
             bare_when_sole: false,
@@ -8422,6 +8787,7 @@ mod title_tests {
             windows,
             balances: Vec::new(),
             error: error.map(str::to_string),
+            token_renewal: TokenRenewal::No,
             quota_status: None,
             in_menu_bar: true,
             bare_when_sole: false,
@@ -10677,6 +11043,347 @@ mod title_tests {
         assert!(!plugin_ping_armed(false, false), "neither: never pings");
     }
 
+    /// [`renewal_ping_due`]'s floor and its clamp of a `pinged_at` from the
+    /// future — the same two cases `ping_due`'s own tests pin for the
+    /// window ping — with the defensive no-value case (`renewal = None`)
+    /// threaded through both: `None == None` must never read as "the same
+    /// token pinged again", or a caller that ever passes `None` would never
+    /// see a ping due at all.
+    #[test]
+    fn renewal_ping_due_respects_the_shared_floor_and_the_future_clamp() {
+        assert!(
+            !renewal_ping_due(NOW, NOW + 599, None, None),
+            "inside the ten-minute floor: not due"
+        );
+        assert!(
+            renewal_ping_due(NOW, NOW + 600, None, None),
+            "exactly the floor, nothing to compare: due"
+        );
+        assert!(
+            renewal_ping_due(NOW, NOW + 601, None, None),
+            "past the floor: due"
+        );
+        assert!(
+            !renewal_ping_due(NOW + 10_000, NOW, None, None),
+            "a pinged_at from the future clamps to now, reading as just pinged"
+        );
+    }
+
+    /// The bound this follow-up exists for: a lapsed token that stays
+    /// lapsed must be pinged once, not once every floor forever.
+    #[test]
+    fn renewal_ping_due_fires_once_per_distinct_lapsed_expiry() {
+        let first = TokenRenewal::Lapsed {
+            expires_at: 1_700_000_000,
+        };
+        let later = TokenRenewal::Lapsed {
+            expires_at: 1_800_000_000,
+        };
+        assert!(
+            renewal_ping_due(NOW, NOW + 600, Some(first), None),
+            "a new expiry, never pinged for: due (once the floor allows it)"
+        );
+        assert!(
+            !renewal_ping_due(NOW, NOW + 600, Some(first), Some(first)),
+            "the same expiry already pinged for: not due, whatever the floor says"
+        );
+        assert!(
+            !renewal_ping_due(NOW, NOW + 60, Some(first), Some(first)),
+            "still not due even well inside the floor — the dedup is checked first"
+        );
+        assert!(
+            renewal_ping_due(NOW, NOW + 600, Some(later), Some(first)),
+            "a later, different expiry — the CLI renewed and then lapsed again: due"
+        );
+    }
+
+    /// The same bound, keyed on a 401's `TokenRenewal::Unauthorized::
+    /// token_hash` rather than a lapsed chain's declared expiry —
+    /// `renewal_ping_due` does not care which kind of value it was handed,
+    /// but this pins the 401 path by name rather than leaving it to be
+    /// inferred from the lapsed-expiry test above. Also proves the two
+    /// kinds never collide even when the numbers inside them do: `Lapsed {
+    /// expires_at: 42 }` (never seen here, but structurally in this
+    /// function's reach) and `Unauthorized { token_hash: 42 }` compare
+    /// unequal, being different variants.
+    #[test]
+    fn renewal_ping_due_fires_once_per_distinct_token_hash() {
+        let seen = TokenRenewal::Unauthorized { token_hash: 42 };
+        let different = TokenRenewal::Unauthorized { token_hash: 99 };
+        assert!(
+            renewal_ping_due(NOW, NOW + 600, Some(seen), None),
+            "a 401 never renewed for before: due (once the floor allows it)"
+        );
+        assert!(
+            !renewal_ping_due(NOW, NOW + 600, Some(seen), Some(seen)),
+            "the same token's 401 already pinged for: not due"
+        );
+        assert!(
+            renewal_ping_due(NOW, NOW + 600, Some(different), Some(seen)),
+            "a different token_hash — the credential changed: due again"
+        );
+        assert!(
+            renewal_ping_due(
+                NOW,
+                NOW + 600,
+                Some(TokenRenewal::Lapsed { expires_at: 42 }),
+                Some(seen),
+            ),
+            "a Lapsed expiry and an Unauthorized token_hash sharing the same \
+             number are not the same value — never wrongly deduped against \
+             each other"
+        );
+    }
+
+    #[test]
+    fn classify_renewal_reads_no_signal_as_not_wanted() {
+        assert_eq!(
+            classify_renewal(None, NOW, NOW + 600, None),
+            RenewalOutcome::NotWanted
+        );
+        assert_eq!(
+            classify_renewal(Some(TokenRenewal::No), NOW, NOW + 600, None),
+            RenewalOutcome::NotWanted,
+            "a TokenRenewal::No inside Some cannot reach here through the tick's \
+             own scan, but must still read as NotWanted rather than panic"
+        );
+    }
+
+    #[test]
+    fn classify_renewal_tells_suppressed_from_due_by_floor_and_key() {
+        let lapsed = TokenRenewal::Lapsed {
+            expires_at: 1_700_000_000,
+        };
+        // Inside the floor: suppressed regardless of any key. `Suppressed`
+        // rather than `NotWanted` matters to the tick's own match: only
+        // `NotWanted`/`Suppressed` fall through to the window-ping path (see
+        // `RenewalOutcome::Suppressed`'s own doc for why that distinction,
+        // not observable from this pure function alone, is the point of it).
+        assert_eq!(
+            classify_renewal(Some(lapsed), NOW, NOW + 599, None),
+            RenewalOutcome::Suppressed,
+            "still inside PING_MIN_INTERVAL_SECS: suppressed, not not-wanted"
+        );
+        // Past the floor, but already renewed for this exact expiry.
+        assert_eq!(
+            classify_renewal(Some(lapsed), NOW, NOW + 600, Some(lapsed)),
+            RenewalOutcome::Suppressed
+        );
+        // Past the floor, never renewed for this key: due, carrying it.
+        let unauthorized = TokenRenewal::Unauthorized { token_hash: 42 };
+        assert_eq!(
+            classify_renewal(Some(unauthorized), NOW, NOW + 600, None),
+            RenewalOutcome::Due {
+                renewal: unauthorized
+            }
+        );
+    }
+
+    /// The reason [`classify_renewal_across_surfaces`] exists: two
+    /// renewal-eligible surfaces on one plugin, sharing one `pinged_at` but
+    /// each with its *own* `last_renewed_for` lookup, can still carry two
+    /// different `TokenRenewal` values — surface A's already renewed for,
+    /// surface B's not. Stopping the scan at A (suppressed) would silently
+    /// starve B.
+    #[test]
+    fn classify_renewal_across_surfaces_does_not_stop_at_an_earlier_suppressed_surface() {
+        let a = TokenRenewal::Lapsed {
+            expires_at: 1_700_000_000,
+        };
+        let b = TokenRenewal::Unauthorized { token_hash: 99 };
+        let surfaces = [("a".to_string(), Some(a)), ("b".to_string(), Some(b))];
+        // A's own key is already recorded; B's key never has been.
+        let outcome = classify_renewal_across_surfaces(surfaces, NOW, NOW + 600, |key| {
+            (key == "a").then_some(a)
+        });
+        assert_eq!(
+            outcome,
+            Some(("b".to_string(), b)),
+            "A is suppressed (already renewed for, under its own key), but B is \
+             a distinct surface never renewed for under its own key: B must \
+             still ping"
+        );
+    }
+
+    #[test]
+    fn classify_renewal_across_surfaces_reads_all_suppressed_as_nothing_due() {
+        let a = TokenRenewal::Lapsed {
+            expires_at: 1_700_000_000,
+        };
+        let surfaces = [("a".to_string(), Some(a)), ("b".to_string(), None)];
+        // Keyed by surface, not a blanket answer: "b" never actually holds a
+        // renewal to look up, so its own key must not be asked to agree.
+        assert_eq!(
+            classify_renewal_across_surfaces(surfaces, NOW, NOW + 600, |key| {
+                (key == "a").then_some(a)
+            }),
+            None,
+            "every surface either carries no signal or is already renewed \
+             for: nothing due, same as if none had wanted one"
+        );
+    }
+
+    #[test]
+    fn classify_renewal_across_surfaces_with_no_signal_anywhere_is_not_due() {
+        let surfaces: [(String, Option<TokenRenewal>); 2] = [
+            ("a".to_string(), None),
+            ("b".to_string(), Some(TokenRenewal::No)),
+        ];
+        assert_eq!(
+            classify_renewal_across_surfaces(surfaces, NOW, NOW + 600, |_| None),
+            None
+        );
+    }
+
+    /// The bound [`LAST_RENEWED_FOR`]'s per-surface keying exists for: two
+    /// surfaces on one plugin lapsed at once must each get their own
+    /// "once per token" treatment rather than one overwriting the other's
+    /// record — first tick, whichever comes first in iteration order pings;
+    /// a later tick (past the shared floor again), the *other* surface is
+    /// still never-renewed-for under its own key, so it pings too. Neither
+    /// is suppressed by the other's key at any point.
+    #[test]
+    fn classify_renewal_across_surfaces_lets_two_lapsed_surfaces_each_ping_once() {
+        let a = TokenRenewal::Lapsed {
+            expires_at: 1_700_000_000,
+        };
+        let b = TokenRenewal::Unauthorized { token_hash: 7 };
+        let surfaces = || {
+            [
+                ("claude-cli".to_string(), Some(a)),
+                ("codex".to_string(), Some(b)),
+            ]
+        };
+
+        // First tick: neither surface has ever been recorded — the first in
+        // order (claude-cli) is due.
+        let first = classify_renewal_across_surfaces(surfaces(), NOW, NOW + 600, |_| None);
+        assert_eq!(first, Some(("claude-cli".to_string(), a)));
+
+        // That ping is recorded under "claude-cli" only. A later tick, past
+        // the shared floor again: "claude-cli" now reads its own key back
+        // and is suppressed, but "codex" was never recorded under *its* own
+        // key, so it is due — "claude-cli"'s record never touches it.
+        let recorded_only_for_cli = |key: &str| (key == "claude-cli").then_some(a);
+        let second =
+            classify_renewal_across_surfaces(surfaces(), NOW, NOW + 1200, recorded_only_for_cli);
+        assert_eq!(
+            second,
+            Some(("codex".to_string(), b)),
+            "codex's own key was never recorded, so claude-cli's own renewal \
+             must not suppress it"
+        );
+    }
+
+    #[test]
+    fn credit_and_uncredit_renewal_round_trip() {
+        let surface_key = format!("test-credit-roundtrip-{}", std::process::id());
+        let renewal = TokenRenewal::Lapsed { expires_at: 42 };
+        assert_eq!(last_renewed_for(&surface_key), None);
+        credit_renewal(&surface_key, renewal);
+        assert_eq!(last_renewed_for(&surface_key), Some(renewal));
+        uncredit_renewal(&surface_key, renewal);
+        assert_eq!(last_renewed_for(&surface_key), None);
+    }
+
+    #[test]
+    fn uncredit_renewal_only_clears_the_exact_value_it_was_given() {
+        let surface_key = format!("test-uncredit-exact-{}", std::process::id());
+        let renewal = TokenRenewal::Lapsed { expires_at: 42 };
+        let other = TokenRenewal::Lapsed { expires_at: 99 };
+        credit_renewal(&surface_key, renewal);
+        // A stale or unrelated uncredit report must never erase a credit it
+        // does not name — the same guard that protects a newer, genuine
+        // renewal from a late failure report about an earlier attempt.
+        uncredit_renewal(&surface_key, other);
+        assert_eq!(
+            last_renewed_for(&surface_key),
+            Some(renewal),
+            "an uncredit naming a different value must leave the real one alone"
+        );
+        uncredit_renewal(&surface_key, renewal);
+        assert_eq!(last_renewed_for(&surface_key), None);
+    }
+
+    /// The sequence the tick actually runs, one layer below the tick loop
+    /// itself: credit *before* the attempt (as production always does — see
+    /// `credit_renewal`'s own doc for why that order, not the reverse, is
+    /// the one that can't lose the retry), then uncredit once `send_ping`
+    /// reports nothing was ever attempted.
+    #[test]
+    fn a_credit_is_undone_when_send_ping_never_attempts_a_run() {
+        let surface_key = format!("test-send-ping-not-found-{}", std::process::id());
+        let renewal = TokenRenewal::Lapsed { expires_at: 1 };
+        let ping = manifest::PingConfig {
+            bin: format!("tickover-test-nonexistent-binary-{}", std::process::id()),
+            args: Vec::new(),
+            renews_token: true,
+        };
+
+        credit_renewal(&surface_key, renewal);
+        let spawned = send_ping(&ping, Some((surface_key.clone(), renewal)));
+        assert!(
+            !spawned,
+            "an unresolvable binary name must not read as spawned"
+        );
+        uncredit_renewal(&surface_key, renewal);
+        assert_eq!(
+            last_renewed_for(&surface_key),
+            None,
+            "a ping that never found its binary must not leave its credit standing"
+        );
+    }
+
+    #[test]
+    fn spawn_hello_clears_a_credited_renewal_when_command_spawn_itself_fails() {
+        // A directory path stands in for "exists but cannot actually be
+        // executed" (permission denied, wrong architecture) — every OS
+        // refuses to `exec` a directory, so `Command::spawn` fails the same
+        // way here as it would on a real unexecutable file, without needing
+        // platform-specific permission bits.
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-spawn-hello-unexecutable-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let surface_key = format!("test-spawn-hello-unexecutable-{}", std::process::id());
+        let renewal = TokenRenewal::Lapsed { expires_at: 7 };
+        // Production credits *before* calling `send_ping`/`spawn_hello` at
+        // all (see `credit_renewal`'s own doc for why) — set up directly
+        // here since this test drives `spawn_hello` itself, one layer below
+        // that call site.
+        credit_renewal(&surface_key, renewal);
+
+        let spawned = spawn_hello(
+            dir.clone(),
+            Vec::new(),
+            Some((surface_key.clone(), renewal)),
+        );
+        assert!(
+            spawned,
+            "the background thread itself starts; only Command::spawn inside it fails"
+        );
+
+        // `Command::spawn` fails, and clears the credit, on that background
+        // thread — polled rather than asserted immediately, since nothing
+        // here waits on it directly.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while last_renewed_for(&surface_key) == Some(renewal)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            last_renewed_for(&surface_key),
+            None,
+            "a process that never actually started must not leave the renewal \
+             it was credited for permanently marked as already sent"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ── plugin id dedup (fix 9) ────────────────────────────────────────────
 
     #[test]
@@ -11010,6 +11717,7 @@ mod title_tests {
         let ping = manifest::PingConfig {
             bin: "codex".to_string(),
             args: vec!["exec".to_string(), "say hello".to_string()],
+            renews_token: false,
         };
         assert_eq!(ping_command_line(&ping), "codex exec \"say hello\"");
     }
@@ -11019,6 +11727,7 @@ mod title_tests {
         let ping = manifest::PingConfig {
             bin: "codex".to_string(),
             args: vec!["exec".to_string(), "hello".to_string()],
+            renews_token: false,
         };
         assert_eq!(ping_command_line(&ping), "codex exec hello");
     }
@@ -11031,6 +11740,7 @@ mod title_tests {
         let ping = manifest::PingConfig {
             bin: "codex".to_string(),
             args: vec!["say".to_string(), "a \"quoted\" word".to_string()],
+            renews_token: false,
         };
         assert_eq!(
             ping_command_line(&ping),

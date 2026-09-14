@@ -87,7 +87,19 @@ It says two things the panel deliberately does not: that a shipped manifest
 is missing because you deleted it (which holds — *Reset plugins* restores
 it), and that a provider's row vanished because its credential is gone. A
 token that is merely no longer accepted is a different state: the row stays
-and reads "session expired — sign in again".
+and reads "session expired — sign in again" — unless the provider's own
+`[ping]` can renew it (Claude's does), in which case the row instead reads
+"token expired — renews on the next claude run". That text appears
+regardless of whether auto-ping is switched on: the next time that command
+runs, by whatever hand runs it, it renews the token as a side effect, and
+the row states that plainly either way. That rewrite applies to the CLI row
+only: Claude's Desktop row keeps "session expired — sign in again", because
+the desktop app renews its own token itself, not by way of this app's ping.
+Whether *this app* also runs that command itself, outside its usual
+schedule, is the separate question the toggle actually answers: like the
+window ping it shares a schedule with, that part is per-plugin opt-in and
+off by default — with it off, the row still names the command that renews
+the token, but nothing runs it on your behalf.
 
 ## Uninstalling
 

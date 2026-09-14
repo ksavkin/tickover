@@ -329,8 +329,11 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "claude.toml",
         id: "claude",
-        to_version: "1.4.2",
+        to_version: "1.4.3",
         previous_sha256: &[
+            // 1.4.2 — before the ping could renew a lapsed token.
+            // sha256 of claude.toml as shipped at manifest version 1.4.2.
+            "ebe934f6649fde24ab919d3e091a55006acc3e17f993a258f7f37d66dc06469c",
             // 1.4.1 — comments only: dropped references to since-removed
             // Rust modules and narrated history.
             // sha256 of claude.toml as shipped at manifest version 1.4.1.
@@ -1231,7 +1234,7 @@ mod tests {
         assert_eq!(m.id, "claude");
         assert_eq!(m.engine, EngineKind::HttpApi);
         assert_eq!(
-            m.version, "1.4.2",
+            m.version, "1.4.3",
             "the version BUILTIN_UPGRADES migrates to"
         );
         assert_eq!(m.surface.len(), 2, "cli + desktop surfaces");
@@ -1271,6 +1274,11 @@ mod tests {
         assert!(!desktop.in_menu_bar, "desktop surface is popup-only");
         assert_eq!(desktop.auth.len(), 1);
         assert_eq!(desktop.auth[0].kind, AuthType::ElectronSafeStorage);
+        assert!(
+            !desktop.declares_token_expiry(),
+            "the desktop surface's own token has no declared expiry, so it \
+             takes no part in [ping] renews_token"
+        );
 
         let cli = m
             .surface
@@ -1283,6 +1291,11 @@ mod tests {
             cli.auth.len(),
             3,
             "credentials-file -> keychain -> win-credential"
+        );
+        assert!(
+            cli.declares_token_expiry(),
+            "the cli surface's credentials-file/keychain steps both declare \
+             expiry_json_path, so it is the one this app's ping renews"
         );
 
         for w in &m.windows {

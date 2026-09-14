@@ -60,7 +60,17 @@ the README and in
   file deleted, keychain item removed) is explained in `tickover.log` at the
   moment it happens. A token that is merely no longer accepted is a
   different state: the request comes back 401 and the row stays, reading
-  "session expired — sign in again".
+  "session expired — sign in again" — unless the provider's ping can renew
+  it (`[ping] renews_token`) *and* the step that actually produced the
+  token this 401 named declares that token's expiry (a surface with its own
+  separate, undeclared credential, like Claude's Desktop below, never gets
+  the rewrite; nor does a token from an undeclared fallback step behind a
+  declared one), in which case the row reads "token expired — renews on the
+  next `<bin>` run" instead. That text appears regardless of whether
+  auto-ping is on — the next time that command runs, by whatever hand runs
+  it, it renews the token — but *this app* only runs it for you when
+  auto-ping is switched on for that plugin: per-plugin opt-in, off by
+  default.
 
 ## Claude: two surfaces
 
@@ -76,6 +86,23 @@ own.
   Safe-Storage key to itself, so the first read shows a Keychain prompt for
   `Claude Safe Storage` — *Always Allow* and the account populates. On
   Windows the same token is read through DPAPI.
+- **A lapsed CLI access token renews itself the next time the CLI runs —
+  including a run this app triggers itself, if auto-ping is on for Claude**
+  (off by default, like every plugin's ping). `claudeAiOauth.expiresAt`
+  (epoch milliseconds) is checked against both the credentials-file and
+  Keychain steps; past it, the chain reports the token lapsed rather than
+  handing back one that will 401. Because `[ping] renews_token = true`, the
+  row reads "token expired — renews on the next claude run" regardless of
+  whether auto-ping is on — that text names what the *next* `claude` run
+  does, by whoever runs it. With auto-ping on, the app also runs
+  `claude -p hello` itself, on the same ten-minute floor as the window ping,
+  so the CLI renews its own token sooner than the next window boundary would
+  otherwise trigger it.
+  **This is the CLI row's behavior only.** The Desktop row's own chain
+  (`electron-safe-storage`) declares no expiry, so a lapsed or 401'd Desktop
+  token is never rewritten and never pings — it keeps the plain "session
+  expired — sign in again", because the desktop app renews its own token
+  itself, not by way of this app's ping.
 
 The weekly bucket is reported as `seven_day` but in practice resets sooner;
 the countdown follows the reset time the provider states, not the name.

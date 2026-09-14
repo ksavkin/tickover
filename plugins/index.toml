@@ -25,10 +25,10 @@ sha256      = "5c1a73cfc3df978684a08a6061a2a1733576159adb1bc5fb9d98ad7d25701de9"
 [[plugin]]
 id          = "claude"
 name        = "Claude"
-version     = "1.4.2"
+version     = "1.4.3"
 description = "Claude Code CLI and desktop app usage: 5h/weekly windows, per model."
 manifest    = "claude.toml"
-sha256      = "ebe934f6649fde24ab919d3e091a55006acc3e17f993a258f7f37d66dc06469c"
+sha256      = "0eb73f6ba01d25da9c1d9ab3987d54adf0245628d76267fd324ff5cb8b3172c1"
 
 [[plugin]]
 id          = "grok"

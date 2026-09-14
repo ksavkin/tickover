@@ -1074,6 +1074,21 @@ fn rules() -> Vec<Rule> {
             names: "key_prefix",
         },
         Rule {
+            // `expiry_json_path` is read only by `credentials_file_step`/
+            // `keychain_step`/`win_credential_step` (`auth::token_from_blob`,
+            // shared by the three) — an `env` step never reads it at all, so
+            // setting it there would silently trip `declares_token_expiry`/
+            // `resolve_token`'s `from_expiring_step` without the field ever
+            // meaning anything a fetch actually checks.
+            says: "expiry_json_path only means something on credentials-file/keychain/win-credential",
+            broken_by: changed(
+                &http_declaring(r#"["keychain-expiry"]"#),
+                "type            = \"credentials-file\"\npath            = \"~/.sample/auth.json\"\ntoken_json_path = \"token\"",
+                "type              = \"env\"\nvar               = \"SAMPLE_TOKEN\"\nexpiry_json_path  = \"token.expiry\"",
+            ),
+            names: "expiry_json_path",
+        },
+        Rule {
             // `[surface.auth.client]` is `oauth-refresh`'s own sub-table; a
             // manifest that wrote it under a `credentials-file` step is not
             // asking for anything this app knows how to do with it.

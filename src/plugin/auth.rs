@@ -34,19 +34,57 @@ use super::manifest::{
 /// (no credentials → no section) rather than shown with an inline error.
 pub const NO_CREDENTIALS: &str = "no credentials found";
 
+/// The [`resolve_token`] error text for "every step was absent, but at least
+/// one of them found a credential whose declared expiry had already passed"
+/// — a `keychain`/`credentials-file`/`win-credential` step with an
+/// `expiry_json_path` resolves Absent on a lapsed token exactly as it would
+/// on no token at all (so a refresh step behind it still gets its turn), and
+/// without this the two were indistinguishable once the chain ran out.
+/// `plugin::engine_http` matches this literal to offer a renewal ping
+/// (`[ping] renews_token`) instead of the plain "no credentials" treatment —
+/// see its own docs for what a plugin without such a ping gets instead.
+pub const TOKEN_LAPSED: &str = "the only credential found had lapsed";
+
 /// Walk a surface's `[[surface.auth]]` chain and return the first token
-/// found. Stops (and returns an error) at the first step that is present but
-/// broken; returns [`NO_CREDENTIALS`] if every step is absent (or the chain
-/// is empty).
-pub fn resolve_token(surface: &SurfaceConfig) -> Result<String, String> {
+/// found, paired with whether the step that yielded it declares
+/// `expiry_json_path` — not whether some *other* step on this surface does
+/// (that question is `SurfaceConfig::declares_token_expiry`, asked of the
+/// surface as a whole, for the tick's own filter; this one is asked of the
+/// one step that actually produced the token in hand, for
+/// `plugin::engine_http::unauthorized_outcome`'s 401 rewrite). A two-step
+/// `cli` surface whose first step is `credentials-file` with
+/// `expiry_json_path` and whose second is a bare `env` fallback can still
+/// hand back a token from the second step — one `[ping]`'s CLI run cannot
+/// renew, since nothing about that env var's own lifetime was ever declared
+/// — and the caller needs to tell the two apart.
+///
+/// Stops (and returns an error) at the first step that is present but
+/// broken — the second element of that `Err` is always `None`, since a
+/// Present-err message names a broken store, never a lapsed token. Returns
+/// [`NO_CREDENTIALS`] (second element `None`) if every step is absent, or
+/// [`TOKEN_LAPSED`] paired with `Some(expires_at)` if every step is absent
+/// *and* at least one of them found a credential that had lapsed by its own
+/// declared expiry rather than finding none at all — a later step still gets
+/// first refusal (an `oauth-refresh` behind a lapsed `keychain` step, say),
+/// so "lapsed" only ever describes how the chain as a whole came up empty,
+/// never a token this function actually returned. `expires_at` is the Unix
+/// timestamp the credential itself declared (see [`token_expiry`]) — carried
+/// out so a caller (`plugin::engine_http`) can key a renewal ping on this one
+/// token, not on "some token, whichever it was" — see
+/// `crate::model::TokenRenewal::Lapsed`.
+pub fn resolve_token(surface: &SurfaceConfig) -> Result<(String, bool), (String, Option<u64>)> {
+    let mut lapsed_expiry: Option<u64> = None;
     for step in &surface.auth {
-        match run_step(step, &surface.allowed_hosts) {
-            Ok(Some(token)) => return Ok(token),
+        match run_step(step, &surface.allowed_hosts, &mut lapsed_expiry) {
+            Ok(Some(token)) => return Ok((token, step.expiry_json_path.is_some())),
             Ok(None) => continue,
-            Err(e) => return Err(e),
+            Err(e) => return Err((e, None)),
         }
     }
-    Err(NO_CREDENTIALS.to_string())
+    Err(match lapsed_expiry {
+        Some(expires_at) => (TOKEN_LAPSED.to_string(), Some(expires_at)),
+        None => (NO_CREDENTIALS.to_string(), None),
+    })
 }
 
 /// `allowed_hosts` is only read by `oauth-refresh` (see [`oauth_refresh_step`])
@@ -54,13 +92,29 @@ pub fn resolve_token(surface: &SurfaceConfig) -> Result<String, String> {
 /// host to check. Threaded through anyway, rather than reaching back into
 /// `surface` from inside `oauth_refresh_step`, so this function's signature
 /// says on its own which steps can reach the network.
-fn run_step(step: &AuthStep, allowed_hosts: &[String]) -> Result<Option<String>, String> {
+///
+/// `lapsed_expiry` is set — to the declared expiry, never cleared or
+/// overwritten once set — by whichever of `credentials_file_step`/
+/// `keychain_step`/`win_credential_step` is the *first* in the chain to find
+/// a credential past its own `expiry_json_path`; a later step's own lapsed
+/// finding is not this app's business once an earlier one has already named
+/// one (two stores disagreeing about the same account's expiry is not a
+/// state worth choosing between). Every other step kind leaves it exactly as
+/// it found it, which is why a single `&mut Option<u64>` threaded through the
+/// whole chain (rather than a richer per-step return type) is enough:
+/// [`resolve_token`] only ever reads it once, after the loop, and only when
+/// nothing else answered.
+fn run_step(
+    step: &AuthStep,
+    allowed_hosts: &[String],
+    lapsed_expiry: &mut Option<u64>,
+) -> Result<Option<String>, String> {
     match step.kind {
-        AuthType::CredentialsFile => credentials_file_step(step),
-        AuthType::Keychain => keychain_step(step),
+        AuthType::CredentialsFile => credentials_file_step(step, lapsed_expiry),
+        AuthType::Keychain => keychain_step(step, lapsed_expiry),
         AuthType::Env => env_step(step),
         AuthType::ElectronSafeStorage => electron_safe_storage_step(step),
-        AuthType::WinCredential => win_credential_step(step),
+        AuthType::WinCredential => win_credential_step(step, lapsed_expiry),
         AuthType::CredentialsMap => credentials_map_step(step),
         AuthType::RejectWhen => reject_when_step(step),
         AuthType::OauthRefresh => oauth_refresh_step(step, allowed_hosts),
@@ -141,7 +195,10 @@ pub fn host_allowed(allowed_hosts: &[String], url: &str) -> bool {
 
 // ── Step: credentials-file ────────────────────────────────────────────────
 
-fn credentials_file_step(step: &AuthStep) -> Result<Option<String>, String> {
+fn credentials_file_step(
+    step: &AuthStep,
+    lapsed_expiry: &mut Option<u64>,
+) -> Result<Option<String>, String> {
     let path = require_str("credentials-file", "path", step.path.as_deref())?;
     let token_json_path = require_str(
         "credentials-file",
@@ -157,14 +214,14 @@ fn credentials_file_step(step: &AuthStep) -> Result<Option<String>, String> {
     // fetch thread blocked reading a FIFO never reports back at all.
     let text = super::read_regular_file(&file, super::SMALL_FILE_MAX_BYTES)
         .ok_or_else(|| format!("{} is not a readable regular file", file.display()))?;
-    extract_token(&text, token_json_path)
-        .map(Some)
-        .ok_or_else(|| {
-            format!(
-                "not JSON, or no token at `{token_json_path}` in {}",
-                file.display()
-            )
-        })
+    token_from_blob(
+        &text,
+        token_json_path,
+        step.expiry_json_path.as_deref(),
+        now_unix(),
+        &file.display().to_string(),
+        lapsed_expiry,
+    )
 }
 
 // ── Step: credentials-map ─────────────────────────────────────────────────
@@ -233,7 +290,10 @@ fn credentials_map_step(step: &AuthStep) -> Result<Option<String>, String> {
 
 // ── Step: keychain (macOS) ────────────────────────────────────────────────
 
-fn keychain_step(step: &AuthStep) -> Result<Option<String>, String> {
+fn keychain_step(
+    step: &AuthStep,
+    lapsed_expiry: &mut Option<u64>,
+) -> Result<Option<String>, String> {
     #[cfg(target_os = "macos")]
     {
         let service = require_str("keychain", "service", step.service.as_deref())?;
@@ -245,12 +305,13 @@ fn keychain_step(step: &AuthStep) -> Result<Option<String>, String> {
         match keychain_password(service)? {
             Some(raw) => {
                 let json = unwrap_go_keyring(&raw)?;
-                keychain_token_from_blob(
+                token_from_blob(
                     &json,
                     token_json_path,
                     step.expiry_json_path.as_deref(),
                     now_unix(),
-                    service,
+                    &format!("Keychain item '{service}'"),
+                    lapsed_expiry,
                 )
             }
             None => Ok(None),
@@ -258,7 +319,7 @@ fn keychain_step(step: &AuthStep) -> Result<Option<String>, String> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = step;
+        let _ = (step, lapsed_expiry);
         Ok(None)
     }
 }
@@ -313,39 +374,66 @@ fn unwrap_go_keyring(raw: &str) -> Result<String, String> {
         .map_err(|e| format!("Keychain item's go-keyring payload was not UTF-8: {e}"))
 }
 
-/// The token-or-Absent decision for a keychain blob, split out of
-/// `keychain_step` so the expiry fall-through is tested with a fixed "now" and
-/// no real Keychain. When `expiry_json_path` is set and the token has lapsed,
-/// this resolves **Absent** (`Ok(None)`) so a refresh step behind it in the
-/// chain gets its turn — the whole reason `expiry_json_path` exists. A token
-/// with no expiry path, or one whose expiry cannot be read, is returned as
-/// before: reading the expiry wrong never turns a working credential into a
-/// missing one.
-#[cfg(any(target_os = "macos", test))]
-fn keychain_token_from_blob(
+/// The token-or-lapsed decision shared by every step whose credential store
+/// hands back one JSON blob holding both the token and (optionally) its
+/// expiry: `keychain`, `credentials-file`, and `win-credential` on Windows
+/// all parse the same shape (see each `AuthStep` field's own doc — they share
+/// `token_json_path`'s fallback grammar too), so this is written once rather
+/// than three times. Split out of `keychain_step` originally, so the expiry
+/// fall-through is tested with a fixed "now" and no real Keychain.
+///
+/// The token is extracted *first*, and the expiry checked only once one is
+/// actually in hand: a blob with a stale `expiry_json_path` but no token at
+/// `token_json_path` at all (a malformed or half-written credentials file,
+/// say) is the ordinary "not found" error below, never "lapsed" — a
+/// credential that was never present has nothing for `[ping] renews_token`
+/// to renew, and reading it as lapsed would run that ping over a blob this
+/// step never actually recognised as a credential.
+///
+/// When `expiry_json_path` is set and the extracted token has lapsed, this
+/// sets `*lapsed_expiry = Some(expires_at)` (the credential's own declared
+/// expiry, read by [`stale_expiry`]) and resolves **Absent** (`Ok(None)`)
+/// rather than handing back the stale token — so a step behind it in the
+/// chain gets its turn, and [`resolve_token`] can still say *why* the chain
+/// came up empty, and *which* token, if none does. `*lapsed_expiry` is only
+/// ever set, never cleared or overwritten: the caller starts it `None` once
+/// per surface, and the first step to find a lapsed credential is the one
+/// whose expiry survives to the end — two stores disagreeing about the same
+/// account's expiry is not a state worth choosing between (see
+/// [`resolve_token`]'s own doc). A token with no expiry path, or one whose
+/// expiry cannot be read, is returned as before: reading the expiry wrong
+/// never turns a working credential into a missing one. `context` names the
+/// store in the not-found error (`"Keychain item 'x'"`, a credentials-file's
+/// own path, `"credential"` for a Windows Credential Manager target).
+fn token_from_blob(
     json: &str,
     token_json_path: &str,
     expiry_json_path: Option<&str>,
     now: i64,
-    service: &str,
+    context: &str,
+    lapsed_expiry: &mut Option<u64>,
 ) -> Result<Option<String>, String> {
+    let Some(token) = extract_token(json, token_json_path) else {
+        return Err(format!(
+            "not JSON, or no token at `{token_json_path}` in {context}"
+        ));
+    };
     if let Some(expiry_path) = expiry_json_path {
-        if token_is_stale(json, expiry_path, now) {
+        if let Some(expires_at) = stale_expiry(json, expiry_path, now) {
+            if lapsed_expiry.is_none() {
+                *lapsed_expiry = Some(expires_at);
+            }
             return Ok(None);
         }
     }
-    extract_token(json, token_json_path)
-        .map(Some)
-        .ok_or_else(|| {
-            format!("not JSON, or no token at `{token_json_path}` in Keychain item '{service}'")
-        })
+    Ok(Some(token))
 }
 
 /// Current wall-clock time as Unix seconds, `0` on any error (the clock
 /// reads before the Unix epoch). Reserved for the one thing only the wall
 /// clock can answer — a comparison against a timestamp this process did not
-/// itself produce, e.g. an RFC3339 expiry a provider's own token carries
-/// (`token_is_stale`) — plus seeding [`cache_now`] once at its own first
+/// itself produce, e.g. an expiry a provider's own token carries
+/// (`stale_expiry`) — plus seeding [`cache_now`] once at its own first
 /// call. Every purely in-process pacing decision elsewhere in this module
 /// (the refresh cache's expiry/backoff, the client discovery caches' own
 /// backoff) reads [`cache_now`] instead, not this: see that function's own
@@ -426,25 +514,110 @@ fn cache_now() -> i64 {
     base.saturating_add(start.elapsed().as_secs() as i64)
 }
 
-/// Whether the token in `json` has lapsed, judged by an RFC3339 timestamp at
-/// `expiry_path`. A 60-second margin treats a token about to expire as already
-/// stale, so a refresh happens *before* a request would 401 on it. Pure and
-/// fail-safe: an expiry that is missing, not a string, or not RFC3339 returns
-/// `false` (not stale) — reading it wrong must never discard a token that
-/// might still work, only ever let a provably-expired one fall through.
-#[cfg(any(target_os = "macos", test))]
+/// Whether the token in `json` has lapsed, judged by the value at
+/// `expiry_path` — see [`token_expiry`] for the shapes read. Pure and
+/// fail-safe: an expiry this cannot place in time at all, or places
+/// somewhere implausible, reads as not stale — reading it wrong must never
+/// discard a token that might still work, only ever let a provably-expired
+/// one fall through.
+///
+/// `#[cfg(test)]`: [`token_from_blob`] needs the expiry itself
+/// (`crate::model::TokenRenewal::Lapsed` is keyed on it) and calls
+/// [`stale_expiry`] directly, so nothing in production asks this a plain
+/// yes/no any more — kept as the readable bool assertion the numeric/margin
+/// test surface below is written against.
+#[cfg(test)]
 fn token_is_stale(json: &str, expiry_path: &str, now: i64) -> bool {
+    stale_expiry(json, expiry_path, now).is_some()
+}
+
+/// `token_is_stale`'s decision, but naming *which* expiry made it stale
+/// rather than only answering yes/no: [`token_from_blob`] needs the number
+/// itself so a renewal ping can be keyed on this one token
+/// (`crate::model::TokenRenewal::Lapsed`), not merely told "something
+/// lapsed" — a credential that stays lapsed (its own refresh token has
+/// expired too, say, and the CLI now needs an interactive login) must be
+/// pinged once, not once every ten minutes forever.
+///
+/// `Some(expires_at)` when [`token_expiry`] reads a timestamp at or before
+/// `now` plus a 60-second margin (a token about to expire is already
+/// treated as stale, so a refresh happens *before* a request would 401 on
+/// it); `None` when it reads a later timestamp, or none at all.
+fn stale_expiry(json: &str, expiry_path: &str, now: i64) -> Option<u64> {
     const MARGIN_SECS: i64 = 60;
-    let Ok(value) = serde_json::from_str::<Value>(json) else {
-        return false;
-    };
-    let Some(expiry_str) = json_path_str(&value, expiry_path) else {
-        return false;
-    };
-    match chrono::DateTime::parse_from_rfc3339(expiry_str) {
-        Ok(dt) => dt.timestamp() <= now + MARGIN_SECS,
-        Err(_) => false,
+    let expires_at = token_expiry(json, expiry_path)?;
+    // `expires_at` came from `expiry_seconds`'s own `i64`, never negative
+    // either way it was produced (the numeric branch is bounded below by
+    // `MIN_PLAUSIBLE_EXPIRY_UNIX`, the RFC3339 branch clamps to 0), so
+    // converting it back to compare against `now` never wraps.
+    let expires_at_i64 = i64::try_from(expires_at).ok()?;
+    (expires_at_i64 <= now.saturating_add(MARGIN_SECS)).then_some(expires_at)
+}
+
+/// The value at `expiry_path` inside `json`, read as Unix seconds: an
+/// RFC3339 timestamp (Antigravity's `token.expiry`), or a JSON
+/// number/numeric string read as epoch seconds or milliseconds (Claude's
+/// `claudeAiOauth.expiresAt`) — see [`expiry_seconds`] for how the two
+/// numeric shapes are told apart. `None` when `json` doesn't parse,
+/// `expiry_path` doesn't resolve, or the value there is neither shape
+/// [`expiry_seconds`] reads.
+fn token_expiry(json: &str, expiry_path: &str) -> Option<u64> {
+    let value: Value = serde_json::from_str(json).ok()?;
+    let expiry_value = json_path_value(&value, expiry_path)?;
+    u64::try_from(expiry_seconds(expiry_value)?).ok()
+}
+
+/// The absolute floor a normalized `expiry_json_path` value's Unix seconds
+/// must clear to be trusted at all — 2000-01-01T00:00:00Z. Below it,
+/// [`expiry_seconds`] answers `None` (unreadable) rather than a timestamp: no
+/// OAuth token this app has ever seen expires before this app existed, so a
+/// number that small is a schema this manifest did not anticipate (a
+/// counter, an offset, a placeholder) rather than a real expiry — and per
+/// [`stale_expiry`]'s own fail-safe, an expiry that cannot be trusted must
+/// never mark a token stale.
+const MIN_PLAUSIBLE_EXPIRY_UNIX: i64 = 946_684_800;
+
+/// How large a normalized `expiry_json_path` number has to be before
+/// [`expiry_seconds`] reads it as epoch milliseconds rather than seconds:
+/// `1e11`. `1e11` seconds is the year 5138 — no genuine expiry states
+/// that — and `1e11` milliseconds is 1973, comfortably inside the plausible
+/// range once divided down. No real seconds-scale timestamp this app will
+/// see before the year 5138 can be misread as milliseconds by this line, and
+/// no genuine millisecond-scale one (any expiry this century) reads as
+/// anything but.
+const MS_MAGNITUDE_THRESHOLD: i64 = 100_000_000_000;
+
+/// One `expiry_json_path` value read as Unix seconds: an RFC3339 string, or —
+/// because a CLI's own credentials file is at least as likely to state an
+/// expiry as a plain epoch number (Claude's `claudeAiOauth.expiresAt` is
+/// epoch milliseconds) — a JSON number or a numeric string, read through
+/// [`crate::plugin::time::read_unix_timestamp`] and then told seconds from
+/// milliseconds by magnitude ([`MS_MAGNITUDE_THRESHOLD`]).
+///
+/// [`MIN_PLAUSIBLE_EXPIRY_UNIX`] only guards the numeric branch: a bare
+/// number below it is a schema this manifest did not anticipate (a counter,
+/// an offset), not a real expiry, so it reads as unreadable rather than
+/// stale. An RFC3339 string is not ambiguous that way — parsing it at all
+/// already says the field holds a date — so any date it names, however old,
+/// is trusted; a pre-1970 one clamps to 0 (matching
+/// [`crate::plugin::time::parse_iso8601`]'s own convention) rather than
+/// going negative or being discarded, so it reads as maximally stale
+/// instead of unreadable. `None` when `value` is neither shape, or when it
+/// is a string that parses as neither RFC3339 nor a number.
+fn expiry_seconds(value: &Value) -> Option<i64> {
+    if let Some(rfc3339) = value
+        .as_str()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+    {
+        return Some(rfc3339.timestamp().max(0));
     }
+    let unix = i64::try_from(super::time::read_unix_timestamp(value)?).ok()?;
+    let raw = if unix >= MS_MAGNITUDE_THRESHOLD {
+        unix / 1000
+    } else {
+        unix
+    };
+    (raw >= MIN_PLAUSIBLE_EXPIRY_UNIX).then_some(raw)
 }
 
 /// Decode a hex string to bytes, `None` on any non-hex byte or an odd length.
@@ -647,31 +820,41 @@ fn electron_decrypt(
 // ── Step: win-credential (Windows) ────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
-fn win_credential_step(step: &AuthStep) -> Result<Option<String>, String> {
+fn win_credential_step(
+    step: &AuthStep,
+    lapsed_expiry: &mut Option<u64>,
+) -> Result<Option<String>, String> {
     let targets = require_vec("win-credential", "targets", step.targets.as_deref())?;
     let token_json_path = require_str(
         "win-credential",
         "token_json_path",
         step.token_json_path.as_deref(),
     )?;
-    // Tolerant of any per-target failure (not found, or a blob present but
-    // without the token at `token_json_path`): try the next target name;
-    // only if every target comes up empty is the whole step Absent. A target
-    // that *is* found but doesn't yield a token moves on rather than
-    // stopping there — Claude's manifest ships two Credential Manager
-    // targets, and the first one existing with the wrong shape must not hide
-    // a token sitting in the second. The last such error is only returned if
-    // no later target produces a token either.
+    // Tolerant of any per-target failure (not found, a blob present but
+    // without the token at `token_json_path`, or one whose declared expiry
+    // has lapsed): try the next target name; only if every target comes up
+    // empty is the whole step Absent. A target that *is* found but doesn't
+    // yield a token moves on rather than stopping there — Claude's manifest
+    // ships two Credential Manager targets, and the first one existing with
+    // the wrong shape (or a lapsed token) must not hide a token sitting in
+    // the second. The last such error is only returned if no later target
+    // produces a token either — a lapsed target sets `lapsed_expiry` but
+    // leaves `last_err` alone, the same "Absent, not broken" treatment
+    // `token_from_blob` gives every other step it backs.
     let mut last_err = None;
     for target in targets {
         if let Some(raw) = win_credential(target) {
-            match extract_token(&raw, token_json_path) {
-                Some(token) => return Ok(Some(token)),
-                None => {
-                    last_err = Some(format!(
-                        "not JSON, or no token at `{token_json_path}` in credential"
-                    ));
-                }
+            match token_from_blob(
+                &raw,
+                token_json_path,
+                step.expiry_json_path.as_deref(),
+                now_unix(),
+                "credential",
+                lapsed_expiry,
+            ) {
+                Ok(Some(token)) => return Ok(Some(token)),
+                Ok(None) => {} // lapsed — `token_from_blob` already recorded it
+                Err(e) => last_err = Some(e),
             }
         }
     }
@@ -682,7 +865,10 @@ fn win_credential_step(step: &AuthStep) -> Result<Option<String>, String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn win_credential_step(_step: &AuthStep) -> Result<Option<String>, String> {
+fn win_credential_step(
+    _step: &AuthStep,
+    _lapsed_expiry: &mut Option<u64>,
+) -> Result<Option<String>, String> {
     Ok(None)
 }
 
@@ -2573,11 +2759,18 @@ fn extract_token_at(value: &Value, token_json_path: &str) -> Option<String> {
 }
 
 fn json_path_str<'v>(root: &'v Value, path: &str) -> Option<&'v str> {
+    json_path_value(root, path)?.as_str()
+}
+
+/// Resolve a `.`-separated dotted path against a JSON value, returning
+/// whatever it names — not only a string ([`json_path_str`]'s own job), so
+/// [`token_expiry`] can read an `expiry_json_path` that names a number.
+fn json_path_value<'v>(root: &'v Value, path: &str) -> Option<&'v Value> {
     let mut cur = root;
     for seg in path.split('.') {
         cur = cur.get(seg)?;
     }
-    cur.as_str()
+    Some(cur)
 }
 
 // ── Small validation helper ───────────────────────────────────────────────
@@ -5974,6 +6167,22 @@ mod tests {
     }
 
     #[test]
+    fn token_is_stale_reads_an_old_rfc3339_expiry_as_stale_regardless_of_plausibility() {
+        // `MIN_PLAUSIBLE_EXPIRY_UNIX` guards the numeric branch only: an
+        // RFC3339 string that parses at all already says the field holds a
+        // date, however old, so a pre-2000 one must still read as stale
+        // rather than unreadable.
+        let pre_2000 = r#"{"token":{"expiry":"1999-12-31T23:59:59Z"}}"#;
+        assert!(token_is_stale(pre_2000, "token.expiry", i64::MAX));
+
+        // A pre-1970 date clamps to 0 (same convention as
+        // `time::parse_iso8601`) rather than going negative or being
+        // discarded — still stale, never "unreadable".
+        let pre_1970 = r#"{"token":{"expiry":"1960-01-01T00:00:00Z"}}"#;
+        assert!(token_is_stale(pre_1970, "token.expiry", i64::MAX));
+    }
+
+    #[test]
     fn keychain_blob_falls_through_when_the_token_has_lapsed() {
         // The composed fall-through the whole hybrid rests on: a keychain step
         // with an expiry path and a lapsed token resolves Absent, so the chain
@@ -5981,46 +6190,135 @@ mod tests {
         const EXP: i64 = 1787326789;
         let blob =
             r#"{"token":{"access_token":"ya29.stale","expiry":"2026-08-21T18:39:49+03:00"}}"#;
-        // Lapsed → Absent, chain falls through.
+        // Lapsed → Absent, chain falls through, and the caller learns the
+        // declared expiry itself, not merely that one was found.
+        let mut lapsed_expiry = None;
         assert_eq!(
-            keychain_token_from_blob(
+            token_from_blob(
                 blob,
                 "token.access_token",
                 Some("token.expiry"),
                 EXP + 61,
-                "gemini"
+                "gemini",
+                &mut lapsed_expiry,
             ),
             Ok(None),
             "a lapsed keychain token must resolve Absent, not Present-ok"
         );
-        // Fresh → the token, no fall-through.
         assert_eq!(
-            keychain_token_from_blob(
+            lapsed_expiry,
+            Some(EXP as u64),
+            "the caller must be told which expiry the lapsed token declared"
+        );
+
+        // Fresh → the token, no fall-through, and the sink stays as it was.
+        let mut lapsed_expiry = None;
+        assert_eq!(
+            token_from_blob(
                 blob,
                 "token.access_token",
                 Some("token.expiry"),
                 EXP - 3600,
-                "gemini"
+                "gemini",
+                &mut lapsed_expiry,
             ),
             Ok(Some("ya29.stale".to_string()))
         );
+        assert_eq!(lapsed_expiry, None);
+
         // No expiry path → returned regardless of age, as every other manifest
         // relies on.
         assert_eq!(
-            keychain_token_from_blob(blob, "token.access_token", None, EXP + 999_999, "gemini"),
+            token_from_blob(
+                blob,
+                "token.access_token",
+                None,
+                EXP + 999_999,
+                "gemini",
+                &mut None,
+            ),
             Ok(Some("ya29.stale".to_string()))
         );
     }
 
     #[test]
+    fn token_from_blob_names_the_first_lapsed_expiry_not_the_last() {
+        // Two calls sharing one sink, as two auth steps in a chain would: the
+        // first step's own lapsed expiry is the one that survives — a second,
+        // different expiry a later step happens to find is not this app's
+        // business to choose between (see `resolve_token`'s own doc).
+        const FIRST: i64 = 1_700_000_000;
+        const SECOND: i64 = 1_800_000_000;
+        let first_blob = format!(r#"{{"token":{{"access_token":"a","expiry":{FIRST}}}}}"#);
+        let second_blob = format!(r#"{{"token":{{"access_token":"b","expiry":{SECOND}}}}}"#);
+        let mut lapsed_expiry = None;
+        assert_eq!(
+            token_from_blob(
+                &first_blob,
+                "token.access_token",
+                Some("token.expiry"),
+                i64::MAX,
+                "first",
+                &mut lapsed_expiry,
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            token_from_blob(
+                &second_blob,
+                "token.access_token",
+                Some("token.expiry"),
+                i64::MAX,
+                "second",
+                &mut lapsed_expiry,
+            ),
+            Ok(None)
+        );
+        assert_eq!(lapsed_expiry, Some(FIRST as u64));
+    }
+
+    #[test]
+    fn token_from_blob_reads_a_stale_expiry_beside_a_missing_token_as_not_found_not_lapsed() {
+        // A stale `expiresAt` with no `accessToken` at all — a malformed or
+        // half-written credentials file, not a credential this step ever
+        // actually held. Must be the ordinary "not found" error, and must
+        // never set `lapsed_expiry`: nothing here found a token to call
+        // lapsed, so `[ping] renews_token` has nothing to act on.
+        let blob = r#"{"claudeAiOauth":{"expiresAt":1577836800000}}"#; // 2020-01-01, ms
+        let mut lapsed_expiry = None;
+        let err = token_from_blob(
+            blob,
+            "claudeAiOauth.accessToken",
+            Some("claudeAiOauth.expiresAt"),
+            i64::MAX,
+            "credentials file",
+            &mut lapsed_expiry,
+        )
+        .expect_err("no token at the path is Present-err, not a lapsed Absent");
+        assert!(
+            err.contains("no token at `claudeAiOauth.accessToken`"),
+            "{err}"
+        );
+        assert_eq!(
+            lapsed_expiry, None,
+            "a token that was never found cannot also be the one that lapsed"
+        );
+    }
+
+    #[test]
     fn token_is_stale_is_false_when_the_expiry_cannot_be_read() {
-        // Missing, non-string, and non-RFC3339 all fail safe to "not stale" —
-        // a token that might still work is never discarded on a bad parse.
+        // Missing, a number too small to be a plausible expiry, non-RFC3339,
+        // and a shape that is neither a string nor a number all fail safe to
+        // "not stale" — a token that might still work is never discarded on
+        // a bad parse.
         assert!(!token_is_stale(
             r#"{"token":{"access_token":"x"}}"#,
             "token.expiry",
             i64::MAX
         ));
+        // 123 parses as a number, but as epoch seconds it names 1970 — under
+        // `MIN_PLAUSIBLE_EXPIRY_UNIX`, so this is the "implausible" case, not
+        // the "cannot parse" one; the fail-safe treats them the same.
         assert!(!token_is_stale(
             r#"{"token":{"expiry":123}}"#,
             "token.expiry",
@@ -6031,7 +6329,64 @@ mod tests {
             "token.expiry",
             i64::MAX
         ));
+        // Neither a string nor a number at all.
+        assert!(!token_is_stale(
+            r#"{"token":{"expiry":true}}"#,
+            "token.expiry",
+            i64::MAX
+        ));
         assert!(!token_is_stale("not json", "token.expiry", i64::MAX));
+    }
+
+    #[test]
+    fn token_is_stale_reads_an_epoch_number_as_seconds_or_milliseconds() {
+        // 2026-08-21T18:39:49Z == 1787329189 Unix.
+        const EXP_SECS: i64 = 1_787_329_189;
+        let seconds = format!(r#"{{"claudeAiOauth":{{"expiresAt":{EXP_SECS}}}}}"#);
+        assert!(
+            token_is_stale(&seconds, "claudeAiOauth.expiresAt", EXP_SECS + 61),
+            "a minute past an epoch-seconds expiry is stale"
+        );
+        assert!(
+            !token_is_stale(&seconds, "claudeAiOauth.expiresAt", EXP_SECS - 3600),
+            "comfortably before an epoch-seconds expiry is fresh"
+        );
+        assert!(
+            token_is_stale(&seconds, "claudeAiOauth.expiresAt", EXP_SECS - 30),
+            "inside the 60s margin counts as stale, same as the RFC3339 form"
+        );
+
+        // Claude's own shape: the same instant, in epoch milliseconds — well
+        // past `MS_MAGNITUDE_THRESHOLD`, so it is divided down rather than
+        // read as three hundred thousand centuries away.
+        let millis = format!(r#"{{"claudeAiOauth":{{"expiresAt":{}}}}}"#, EXP_SECS * 1000);
+        assert!(token_is_stale(
+            &millis,
+            "claudeAiOauth.expiresAt",
+            EXP_SECS + 61
+        ));
+        assert!(!token_is_stale(
+            &millis,
+            "claudeAiOauth.expiresAt",
+            EXP_SECS - 3600
+        ));
+
+        // A quoted number — some credential files stringify theirs — reads
+        // the same as a bare one.
+        let quoted = format!(
+            r#"{{"claudeAiOauth":{{"expiresAt":"{}"}}}}"#,
+            EXP_SECS * 1000
+        );
+        assert!(token_is_stale(
+            &quoted,
+            "claudeAiOauth.expiresAt",
+            EXP_SECS + 61
+        ));
+        assert!(!token_is_stale(
+            &quoted,
+            "claudeAiOauth.expiresAt",
+            EXP_SECS - 3600
+        ));
     }
 
     #[test]
@@ -6293,7 +6648,7 @@ mod tests {
 
         assert_eq!(
             got,
-            Err("an API key has no subscription limits".to_string())
+            Err(("an API key has no subscription limits".to_string(), None))
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -6308,7 +6663,7 @@ mod tests {
             token_json_path: Some("claudeAiOauth.accessToken|access_token".to_string()),
             ..auth_step(AuthType::CredentialsFile)
         };
-        assert_eq!(credentials_file_step(&step), Ok(None));
+        assert_eq!(credentials_file_step(&step, &mut None), Ok(None));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -6322,7 +6677,10 @@ mod tests {
             token_json_path: Some("claudeAiOauth.accessToken|access_token".to_string()),
             ..auth_step(AuthType::CredentialsFile)
         };
-        assert_eq!(credentials_file_step(&step), Ok(Some("tok-1".to_string())));
+        assert_eq!(
+            credentials_file_step(&step, &mut None),
+            Ok(Some("tok-1".to_string()))
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -6336,14 +6694,188 @@ mod tests {
             token_json_path: Some("claudeAiOauth.accessToken|access_token".to_string()),
             ..auth_step(AuthType::CredentialsFile)
         };
-        assert!(credentials_file_step(&step).is_err());
+        assert!(credentials_file_step(&step, &mut None).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn credentials_file_step_missing_required_field_is_error() {
         let step = auth_step(AuthType::CredentialsFile); // no path, no token_json_path
-        assert!(credentials_file_step(&step).is_err());
+        assert!(credentials_file_step(&step, &mut None).is_err());
+    }
+
+    #[test]
+    fn credentials_file_step_falls_through_and_marks_lapsed_when_the_token_has_expired() {
+        let dir = temp_dir("cf-lapsed");
+        let file = dir.join("creds.json");
+        std::fs::write(
+            &file,
+            r#"{"claudeAiOauth":{"accessToken":"tok-old","expiresAt":"2020-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let step = AuthStep {
+            path: Some(file.to_string_lossy().into_owned()),
+            token_json_path: Some("claudeAiOauth.accessToken".to_string()),
+            expiry_json_path: Some("claudeAiOauth.expiresAt".to_string()),
+            ..auth_step(AuthType::CredentialsFile)
+        };
+        let mut lapsed_expiry = None;
+        assert_eq!(
+            credentials_file_step(&step, &mut lapsed_expiry),
+            Ok(None),
+            "a lapsed credentials-file token resolves Absent, same as keychain's"
+        );
+        assert_eq!(
+            lapsed_expiry,
+            Some(1_577_836_800), // 2020-01-01T00:00:00Z
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── resolve_token: lapsed vs. no credentials at all ───────────────────
+
+    /// A surface named a credential, and it had lapsed — a different fact
+    /// than never finding one, and `resolve_token` must say which: nothing
+    /// downstream can renew a token it never learned had expired.
+    #[test]
+    fn resolve_token_reports_lapsed_when_the_only_credential_found_had_expired() {
+        let dir = temp_dir("resolve-lapsed-only");
+        let file = dir.join("creds.json");
+        std::fs::write(
+            &file,
+            r#"{"claudeAiOauth":{"accessToken":"tok-old","expiresAt":"2020-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let step = AuthStep {
+            path: Some(file.to_string_lossy().into_owned()),
+            token_json_path: Some("claudeAiOauth.accessToken".to_string()),
+            expiry_json_path: Some("claudeAiOauth.expiresAt".to_string()),
+            ..auth_step(AuthType::CredentialsFile)
+        };
+        assert_eq!(
+            resolve_token(&surface(vec![step])),
+            Err((TOKEN_LAPSED.to_string(), Some(1_577_836_800))) // 2020-01-01T00:00:00Z
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same lapsed step, with a working one behind it: the chain still
+    /// falls through to it, exactly as it does today — `resolve_token`
+    /// reporting *why* an empty chain came up empty must never change what
+    /// a chain that is not empty returns.
+    #[test]
+    fn resolve_token_falls_through_a_lapsed_credential_to_a_later_step() {
+        let dir = temp_dir("resolve-lapsed-fallthrough");
+        let file = dir.join("creds.json");
+        std::fs::write(
+            &file,
+            r#"{"claudeAiOauth":{"accessToken":"tok-old","expiresAt":"2020-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let lapsed_step = AuthStep {
+            path: Some(file.to_string_lossy().into_owned()),
+            token_json_path: Some("claudeAiOauth.accessToken".to_string()),
+            expiry_json_path: Some("claudeAiOauth.expiresAt".to_string()),
+            ..auth_step(AuthType::CredentialsFile)
+        };
+        let var = format!(
+            "TICKOVER_TEST_RESOLVE_LAPSED_FALLTHROUGH_{}",
+            std::process::id()
+        );
+        let env_step = AuthStep {
+            var: Some(var.clone()),
+            ..auth_step(AuthType::Env)
+        };
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(&var, "tok-fresh");
+        let got = resolve_token(&surface(vec![lapsed_step, env_step]));
+        std::env::remove_var(&var);
+        assert_eq!(
+            got,
+            Ok(("tok-fresh".to_string(), false)),
+            "the token came from the env step, which declares no expiry of its own"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The flag on a successful resolution names the *yielding* step, not
+    /// any other step on the same surface: an `env` fallback behind a lapsed
+    /// `credentials-file` step still answers `false`, because nothing about
+    /// that fallback's own lifetime was ever declared — a `[ping]` run
+    /// cannot renew an env var.
+    #[test]
+    fn resolve_token_reports_false_when_a_fresh_step_behind_a_lapsed_one_yields_the_token() {
+        let dir = temp_dir("resolve-fresh-behind-lapsed");
+        let file = dir.join("creds.json");
+        std::fs::write(
+            &file,
+            r#"{"claudeAiOauth":{"accessToken":"tok-old","expiresAt":"2020-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let lapsed_step = AuthStep {
+            path: Some(file.to_string_lossy().into_owned()),
+            token_json_path: Some("claudeAiOauth.accessToken".to_string()),
+            expiry_json_path: Some("claudeAiOauth.expiresAt".to_string()),
+            ..auth_step(AuthType::CredentialsFile)
+        };
+        let var = format!(
+            "TICKOVER_TEST_RESOLVE_STEP_FLAG_FRESH_{}",
+            std::process::id()
+        );
+        let env_step = AuthStep {
+            var: Some(var.clone()),
+            ..auth_step(AuthType::Env)
+        };
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(&var, "tok-fresh");
+        let got = resolve_token(&surface(vec![lapsed_step, env_step]));
+        std::env::remove_var(&var);
+        assert_eq!(got, Ok(("tok-fresh".to_string(), false)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same shape, but the yielding step *is* the one declaring the
+    /// expiry: the flag must read `true` here, the mirror case to the one
+    /// above.
+    #[test]
+    fn resolve_token_reports_true_when_the_expiring_step_itself_yields_the_token() {
+        let dir = temp_dir("resolve-fresh-expiring-step");
+        let file = dir.join("creds.json");
+        // 2099-01-01T00:00:00Z — comfortably unexpired.
+        std::fs::write(
+            &file,
+            r#"{"claudeAiOauth":{"accessToken":"tok-fresh","expiresAt":"2099-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let step = AuthStep {
+            path: Some(file.to_string_lossy().into_owned()),
+            token_json_path: Some("claudeAiOauth.accessToken".to_string()),
+            expiry_json_path: Some("claudeAiOauth.expiresAt".to_string()),
+            ..auth_step(AuthType::CredentialsFile)
+        };
+        assert_eq!(
+            resolve_token(&surface(vec![step])),
+            Ok(("tok-fresh".to_string(), true))
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// No credential anywhere in the chain is still the plain
+    /// [`NO_CREDENTIALS`] answer — the new sentinel exists for "found, but
+    /// lapsed", not for every empty chain.
+    #[test]
+    fn resolve_token_reports_no_credentials_when_nothing_was_ever_found() {
+        let dir = temp_dir("resolve-nothing");
+        let step = AuthStep {
+            path: Some(dir.join("absent.json").to_string_lossy().into_owned()),
+            token_json_path: Some("claudeAiOauth.accessToken".to_string()),
+            ..auth_step(AuthType::CredentialsFile)
+        };
+        assert_eq!(
+            resolve_token(&surface(vec![step])),
+            Err((NO_CREDENTIALS.to_string(), None))
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── credentials-map step ──────────────────────────────────────────────
@@ -6558,8 +7090,13 @@ mod tests {
             },
         ]);
 
-        let err = resolve_token(&s).expect_err("broken file must stop the chain, not fall through");
+        let (err, lapsed_expiry) =
+            resolve_token(&s).expect_err("broken file must stop the chain, not fall through");
         assert!(!err.contains("tok-from-env-must-not-win"));
+        assert_eq!(
+            lapsed_expiry, None,
+            "a Present-err message never carries a lapsed expiry"
+        );
 
         std::env::remove_var("TICKOVER_AUTH_TEST_CHAIN_STOP");
         std::fs::remove_dir_all(&dir).ok();
@@ -6586,7 +7123,7 @@ mod tests {
             },
         ]);
 
-        assert_eq!(resolve_token(&s), Ok("tok-from-env".to_string()));
+        assert_eq!(resolve_token(&s), Ok(("tok-from-env".to_string(), false)));
 
         std::env::remove_var("TICKOVER_AUTH_TEST_CHAIN_SKIP");
         std::fs::remove_dir_all(&dir).ok();
@@ -6613,14 +7150,20 @@ mod tests {
             },
         ]);
 
-        assert_eq!(resolve_token(&s), Err("no credentials found".to_string()));
+        assert_eq!(
+            resolve_token(&s),
+            Err(("no credentials found".to_string(), None))
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn chain_with_no_auth_steps_is_an_error() {
         let s = surface(Vec::new());
-        assert_eq!(resolve_token(&s), Err("no credentials found".to_string()));
+        assert_eq!(
+            resolve_token(&s),
+            Err(("no credentials found".to_string(), None))
+        );
     }
 
     // ── host_allowed ──────────────────────────────────────────────────────

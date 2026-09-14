@@ -9,9 +9,11 @@ name         = "Claude"
 menu_label   = "Cl"
 order        = 20
 # `required` below needs a reader that knows a window can be absent rather than
-# blank — see docs/PLUGIN-ARCHITECTURE.md, "Reader capabilities".
-requires_reader = ["window-presence", "window-identity", "for-each-windows"]
-version      = "1.4.2"
+# blank; `keychain-expiry` is what lets the auth steps below tell a stale
+# token from a working one — see docs/PLUGIN-ARCHITECTURE.md, "Reader
+# capabilities".
+requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry"]
+version      = "1.4.3"
 engine       = "http-api"
 # Re-fetched every 60 s.
 refresh_secs = 60
@@ -151,16 +153,22 @@ allowed_hosts = ["api.anthropic.com"]
 type             = "credentials-file"
 path             = "~/.claude/.credentials.json"
 token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
+# expiresAt is epoch milliseconds.
+expiry_json_path = "claudeAiOauth.expiresAt"
 
 [[surface.auth]]
 type             = "keychain"
 service          = "Claude Code-credentials"
 token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
+# expiresAt is epoch milliseconds.
+expiry_json_path = "claudeAiOauth.expiresAt"
 
 [[surface.auth]]
 type             = "win-credential"
 targets          = ["Claude Code-credentials", "Claude Code"]
 token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
+# expiresAt is epoch milliseconds.
+expiry_json_path = "claudeAiOauth.expiresAt"
 
 # Desktop surface — opt-in (its token needs a one-time Keychain/DPAPI grant),
 # popup-only (`in_menu_bar = false`).
@@ -189,3 +197,5 @@ macos_keychain_key = "Claude Safe Storage"
 [ping]
 bin  = "claude"
 args = ["-p", "hello"]
+# The CLI renews its own token only when it runs.
+renews_token = true

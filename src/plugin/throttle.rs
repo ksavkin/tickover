@@ -379,7 +379,7 @@ pub fn record_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Role;
+    use crate::model::{Role, TokenRenewal};
 
     fn limits() -> Limits {
         Limits {
@@ -407,6 +407,7 @@ mod tests {
                 period_minutes: Some(10080),
             }],
             error: None,
+            token_renewal: TokenRenewal::No,
             quota_status: None,
             in_menu_bar: true,
             bare_when_sole: false,

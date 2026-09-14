@@ -216,7 +216,7 @@ Two rules keep the key lists true:
 | `credentials-map` | **yes** | `[[surface.auth]]` `type = "credentials-map"` + `key_prefix` — a credential file that is a *map* of records keyed by a string no manifest can spell in advance |
 | `http-post` | **yes** | `[[http.request]]` `method` / `body` — an endpoint that answers only a POST, where every provider before it answered a plain GET |
 | `remaining-fraction` | **yes** | `[windows.source]` `remaining_fraction_path` — a provider that states what is *left* rather than what is spent |
-| `keychain-expiry` | **yes** | `[[surface.auth]]` `expiry_json_path` — a keychain step that resolves Absent on a lapsed token, so a step behind it can fire |
+| `keychain-expiry` | **yes** | `[[surface.auth]]` `expiry_json_path` — a `keychain`/`credentials-file`/`win-credential` step that resolves Absent on a lapsed token, so a step behind it can fire (or, with `[ping] renews_token`, a renewal ping) |
 | `oauth-refresh` | **yes** | `[[surface.auth]]` `type = "oauth-refresh"` + `token_url` — the one auth step that *spends* a credential instead of only reading one |
 | `oauth-client-discovery` | **yes** | `[surface.auth.client]` — reads an `oauth-refresh` step's installed-app client id/secret back out of the credential's own installed client at run time, instead of shipping the pair in the manifest — see [`[surface.auth.client]`](#surfaceauthclient) |
 
@@ -813,7 +813,7 @@ needs and ignores the rest.
 | `token_json_path` | string | `credentials-file`, `credentials-map`, `keychain`, `win-credential`, `oauth-refresh`; optional on `electron-safe-storage` (default `"claudeAiOauth.accessToken\|access_token"`) | `\|`-separated fallback JSON paths to the token (e.g. `"claudeAiOauth.accessToken\|access_token"` — try camelCase, then snake_case). For `credentials-map` it is read inside the *matched entry*; for `oauth-refresh` it names the **refresh** token |
 | `key_prefix` | string | `credentials-map` | prefix the entry's key in the top-level object at `path` must start with. Needs `requires_reader = ["credentials-map"]` |
 | `service` | string | `keychain` | Keychain service name to query |
-| `expiry_json_path` | string | `keychain` | JSON path to an RFC3339 expiry beside the token; a lapsed one makes the step **Absent** instead of handing back a stale token. Needs `requires_reader = ["keychain-expiry"]` |
+| `expiry_json_path` | string | `keychain`, `credentials-file`, `win-credential` — refused on any other step kind (the error names the step's own index and kind) | JSON path to an expiry beside the token — an RFC3339 string, or a JSON number/numeric string read as epoch seconds or milliseconds (told apart by magnitude); a lapsed one makes the step **Absent** instead of handing back a stale token. Needs `requires_reader = ["keychain-expiry"]` |
 | `var` | string | `env` | environment variable name holding the token |
 | `config_path` | string | `electron-safe-storage` | path to the Electron config/state file holding the encrypted blob |
 | `blob_json_path` | string | `electron-safe-storage` | `\|`-separated fallback JSON paths to the blob inside `config_path` |
@@ -1041,12 +1041,15 @@ declared twice is refused too. A manifest may declare at most 32
 ### `[ping]`
 
 Optional command run shortly after the **primary** window resets, to start a
-fresh window (consumes a little quota — opt-in per plugin/user).
+fresh window (consumes a little quota — opt-in per plugin/user). With
+`renews_token`, the same command also runs whenever a surface's token has
+lapsed — see [Renewing a lapsed token](#renewing-a-lapsed-token) below.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `bin` | string | — (required) | binary to run; a bare program name, not a path — no `/`, `\` or `:` (the last rules out a Windows prefixed-relative path like `C:evil`, which has neither of the other two) |
 | `args` | array of strings | empty | arguments; at most 32, each non-empty and at most 256 bytes — the install-time trust dialog renders the whole command line, and these bounds keep one argument from pushing its untrusted-host warning off the bottom |
+| `renews_token` | bool | `false` | whether running this command also renews the provider's token, as a side effect the provider's own CLI has and this app does not (it never spends a provider's refresh token). A surface whose auth chain ends "lapsed" (a credential found, past its `expiry_json_path`, with no working step behind it) runs this command instead of only waiting for the user to sign in again — bounded by the same ten-minute floor as the window ping above |
 
 No argument, label, hostname, message, or other manifest-supplied string
 listed in this document may contain a control character (C0, DEL) or a
@@ -1376,6 +1379,87 @@ Consequences worth knowing:
   goes out one window late costs a few tokens, while the boundary a sleeping
   Mac swallowed cost the whole window.
 
+### Renewing a lapsed token
+
+A second, independent trigger for the same command: `[ping] renews_token =
+true` means running `bin`/`args` also renews the provider's token, as a side
+effect the provider's own CLI has and this app does not — it never spends a
+provider's refresh token (see [Auth chain semantics](#auth-chain-semantics)
+and `plugin::throttle`'s module doc). Claude's CLI keeps its 8-hour access
+token current only when it itself makes a request; while the app is otherwise
+idle, that token can lapse with nothing here to renew it until the next
+window boundary happens to fire the ordinary ping — a gap of up to two hours.
+
+Only a surface whose own auth chain declares a token lifetime is even
+*consulted* by the tick — `SurfaceConfig::declares_token_expiry`, true iff
+some `[[surface.auth]]` step on it sets `expiry_json_path`. Claude's `cli`
+surface does (all three of its steps carry `expiry_json_path`); its
+`desktop` surface does not (`electron-safe-storage`, its own separate
+token, opt-in, renewed by the desktop app itself) — so a lapsed or 401'd
+`desktop` reading is never rewritten and never triggers a ping, even though
+the plugin's `[ping] renews_token` is true: that ping's binary renews the
+CLI's token, not the desktop app's, and rewriting or pinging on its behalf
+would be false.
+
+A `keychain`/`credentials-file`/`win-credential` step carrying
+`expiry_json_path` already resolves **Absent** on a lapsed token so a step
+behind it (an `oauth-refresh`, say) gets its turn. When nothing is behind it,
+the chain reports "lapsed" rather than "no credentials at all" — a fact
+distinct enough to act on — and, with `renews_token` set, the surface's row
+reads `token expired — renews on the next <bin> run` instead of "session
+expired — sign in again". The same rewrite happens on an HTTP 401 the token
+still managed to reach the network with — gated more precisely there, by
+*which step actually produced the token that 401'd*
+(`auth::resolve_token`'s own `from_expiring_step`), not by the surface as a
+whole: a surface whose chain mixes an expiry-declaring step with a plain
+fallback behind it (an `env` var behind a lapsed `credentials-file`, say)
+can still 401 on a token the fallback step produced, and that token's own
+lifetime was never declared — rewriting that 401 would promise a renewal
+`[ping]`'s binary cannot deliver. The lapsed-chain rewrite needs no
+separate check of its own here: it can only ever fire from a step
+`declares_token_expiry` already required to exist.
+
+Every tick, a plugin whose `[ping] renews_token` is true has every eligible
+surface's current reading checked — not just the first with a signal, since
+two independent surfaces can lapse on their own separate schedules — and the
+first one found due is offered the same treatment [`ping_due`] gives the
+window ping: no more than once every ten minutes
+(`PING_MIN_INTERVAL_SECS`), the floor shared with the window ping — a
+renewal spends this tick's one allowed ping, same as a window ping would.
+A renewal merely on cooldown never blocks a *later* eligible surface's own
+renewal from being checked, nor that tick's ordinary window ping — only a
+renewal that actually spawned a run skips the window ping. It is otherwise
+the same command, the same auto-ping toggle, and the same sandboxed working
+directory as the window ping below — and that toggle is what decides
+whether *this app* runs the command at all; the row text itself (above)
+appears either way, since it states what the next run of that command does,
+regardless of who starts it.
+
+**Bounded to once per token, not once per floor.** A lapsed auth chain
+carries the expiry it declared (`auth::token_expiry`, epoch seconds). A bare
+401 carries no such expiry — nothing here ever parsed the credential that
+produced it — so it is keyed on the token itself instead: a hash of the
+bearer token and the request's other credential-derived values
+(`plugin::throttle::fingerprint`, already computed for the throttle's own
+purposes and reused here rather than hashed twice; never the token itself,
+never persisted or logged). `main.rs` remembers, per *surface* (keyed by the
+same surface reading id the panel and the registry already use, e.g.
+`"claude-cli"`) and in memory only, which key the last renewal ping actually
+fired for, and a reading naming that same key again is not due again — only
+a *different* key (the CLI renewed, then the token lapsed again; or, after a
+401, the credential changed) is due. Keyed per surface rather than per
+plugin so that two renewal-eligible surfaces on one plugin, each lapsing on
+its own schedule, each get their own "once per token" bound instead of one
+surface's renewal overwriting — and so silently re-arming — the other's.
+Without this, a token the CLI cannot renew either — its own refresh token
+has expired too, say, and it now needs an interactive login — would
+otherwise be pinged every ten minutes forever, uselessly, for as long as the
+app runs. The credit is provisional until the command is actually running:
+recorded once the background thread that would run it starts, and undone if
+the OS then refuses to start the process itself (an existing but
+unexecutable binary — permission denied, wrong architecture) — a run that
+never happened must not read as "already tried".
+
 ### Where the ping's command runs
 
 Not in the home directory. These CLIs read the directory they start in —
@@ -1574,6 +1658,12 @@ script you're about to let run automatically on a timer. It's gated by the
 auto-ping toggle, off by default (see [Trust model](#trust-model) above), but
 turning that toggle on for an untrusted manifest is exactly as risky as
 running any other command that manifest could name.
+
+`renews_token` is a second trigger for the same command — a lapsed auth chain
+or an HTTP 401, not only a resting window — bounded by the same ten-minute
+floor either way (see [Renewing a lapsed
+token](#renewing-a-lapsed-token)); it names no new binary and reaches no new
+scrutiny beyond what the toggle above already covers.
 
 ### Secrets aren't persisted or logged by this app
 
@@ -1931,9 +2021,11 @@ name         = "Claude"
 menu_label   = "Cl"
 order        = 20
 # `required` below needs a reader that knows a window can be absent rather than
-# blank — see docs/PLUGIN-ARCHITECTURE.md, "Reader capabilities".
-requires_reader = ["window-presence", "window-identity", "for-each-windows"]
-version      = "1.4.2"
+# blank; `keychain-expiry` is what lets the auth steps below tell a stale
+# token from a working one — see docs/PLUGIN-ARCHITECTURE.md, "Reader
+# capabilities".
+requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry"]
+version      = "1.4.3"
 engine       = "http-api"
 # Re-fetched every 60 s.
 refresh_secs = 60
@@ -2073,16 +2165,22 @@ allowed_hosts = ["api.anthropic.com"]
 type             = "credentials-file"
 path             = "~/.claude/.credentials.json"
 token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
+# expiresAt is epoch milliseconds.
+expiry_json_path = "claudeAiOauth.expiresAt"
 
 [[surface.auth]]
 type             = "keychain"
 service          = "Claude Code-credentials"
 token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
+# expiresAt is epoch milliseconds.
+expiry_json_path = "claudeAiOauth.expiresAt"
 
 [[surface.auth]]
 type             = "win-credential"
 targets          = ["Claude Code-credentials", "Claude Code"]
 token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
+# expiresAt is epoch milliseconds.
+expiry_json_path = "claudeAiOauth.expiresAt"
 
 # Desktop surface — opt-in (its token needs a one-time Keychain/DPAPI grant),
 # popup-only (`in_menu_bar = false`).
@@ -2111,6 +2209,8 @@ macos_keychain_key = "Claude Safe Storage"
 [ping]
 bin  = "claude"
 args = ["-p", "hello"]
+# The CLI renews its own token only when it runs.
+renews_token = true
 ```
 
 ## Registry
@@ -2482,7 +2582,7 @@ written to disk, the caller runs `analyze_trust` on the parsed
 | `untrusted_hosts` | the subset of `dest_hosts` outside the caller's `trusted_hosts` set — disclosure only, see below for why it doesn't gate `requires_approval` |
 | `local_files` | every local file, or file-*shaped* source, the manifest reads: an auth step's own credential file (`credentials-file`/`credentials-map`/`reject-when`/`oauth-refresh`'s `path`), `[[http.value]] path`, `[http.version] files`, an `oauth-refresh` step's `[surface.auth.client]` discovery (`files`, `bins` labelled by name rather than a path, `id_env`/`secret_env` labelled as an environment variable, `id_pattern`/`secret_pattern` labelled and length-capped), an `electron-safe-storage` step's `config_path`, `engine = "log-file"`'s own `root`/`glob` read scope (one `"<root>/<glob>"` entry, `root` shown literally — `~` included, unexpanded — unless `root_env` is set, in which case it's `"$<root_env>"`, joined with `root_env_join` when the manifest sets one), and `[account] path` (a `jwt-file` lookup's own token file) |
 | `credential_sources` | every `env`/`keychain`/`win-credential`/`electron-safe-storage` auth step's *own* source, named specifically — `"env $VAR"`, `"keychain \"service\""`, one `"credential manager \"target\""` per target tried, `"electron safe storage <config_path> (key \"...\")"` — rather than just the step *kind* `auth_types` already carries; `credentials-file`/`credentials-map` don't repeat here since their file is already in `local_files` |
-| `ping` | the command this manifest runs after a window resets, if it declares one |
+| `ping` | the command this manifest runs after a window resets, if it declares one — with a trailing note that it also runs when its token has expired or is no longer accepted, when `renews_token` is set (see [Renewing a lapsed token](#renewing-a-lapsed-token)) |
 | `requires_approval` | see below |
 
 **Mandatory approval gate.** `requires_approval` is `true` when *any* of the

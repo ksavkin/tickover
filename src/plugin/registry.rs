@@ -1036,7 +1036,13 @@ pub struct TrustDisclosure {
     /// why this list gates on its own, unlike `auth_types`.
     pub credential_sources: Vec<String>,
     /// The command this manifest runs after a window resets (`[ping]`), if it
-    /// declares one. It is the only field in a manifest that executes
+    /// declares one — with a trailing " — also run when its token has
+    /// expired or is no longer accepted" when `renews_token` is set, since
+    /// that is a second trigger for the same command, not a fact this
+    /// disclosure can leave to the schema alone. "Expired or is no longer
+    /// accepted" names both halves of that trigger — a lapsed auth chain and
+    /// an HTTP 401 — rather than only the first, which alone would
+    /// understate it. It is the only field in a manifest that executes
     /// anything, so it is the last one that should be invisible here.
     pub ping: Option<String>,
     pub engine: EngineKind,
@@ -1420,11 +1426,21 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
     }
 
     let ping = m.ping.as_ref().map(|p| {
-        if p.args.is_empty() {
+        let mut line = if p.args.is_empty() {
             p.bin.clone()
         } else {
             format!("{} {}", p.bin, p.args.join(" "))
+        };
+        // `renews_token`'s second trigger is worth disclosing beside the
+        // command line itself: it is the one thing that makes this ping run
+        // outside the schedule the rest of this dialog already describes.
+        // Names both halves of that trigger — a lapsed auth chain and an
+        // HTTP 401 the token still managed to reach the network with — since
+        // "expired" alone would understate what can set this ping off.
+        if p.renews_token {
+            line.push_str(" — also run when its token has expired or is no longer accepted");
         }
+        line
     });
 
     let untrusted_hosts: Vec<String> = dest_hosts
@@ -2529,6 +2545,48 @@ mod tests {
         assert!(
             disclosure.untrusted_hosts.is_empty(),
             "the host is still disclosed as trusted even though approval is required regardless"
+        );
+    }
+
+    #[test]
+    fn ping_disclosure_names_the_renewal_trigger_only_when_the_manifest_declares_it() {
+        let base = r#"
+            id         = "x"
+            name       = "X"
+            menu_label = "X"
+            order      = 1
+            engine     = "log-file"
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [logfile]
+            root = "~/.x"
+            glob = "*.jsonl"
+            container_key = "rate_limits"
+            [ping]
+            bin  = "claude"
+            args = ["-p", "hello"]
+        "#;
+        let m = PluginManifest::from_str(base).expect("valid manifest");
+        assert_eq!(
+            analyze_trust(&m, TRUSTED_HOSTS).ping.as_deref(),
+            Some("claude -p hello")
+        );
+
+        let renewing = base.replace(
+            "bin  = \"claude\"",
+            "bin  = \"claude\"\n            renews_token = true",
+        );
+        let m = PluginManifest::from_str(&renewing).expect("valid manifest");
+        assert_eq!(
+            analyze_trust(&m, TRUSTED_HOSTS).ping.as_deref(),
+            Some("claude -p hello — also run when its token has expired or is no longer accepted"),
         );
     }
 

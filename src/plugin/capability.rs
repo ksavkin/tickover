@@ -253,11 +253,13 @@ pub const CAPABILITIES: &[Capability] = &[
         implemented: true,
         keys: &["windows.source.remaining_fraction_path"],
     },
-    // Antigravity's hybrid auth. A keychain step that names an expiry resolves
-    // Absent when the token has lapsed, so a refresh step behind it fires — an
-    // older build has no notion of the field and would return the stale token
-    // instead, silently defeating the fall-through. Named by the one key only
-    // this behaviour writes.
+    // Antigravity's hybrid auth. A `keychain`/`credentials-file`/
+    // `win-credential` step that names an expiry resolves Absent when the
+    // token has lapsed, so a refresh step behind it fires (or, with
+    // `[ping] renews_token`, a renewal ping) — an older build has no notion
+    // of the field and would return the stale token instead, silently
+    // defeating the fall-through. Named by the one key only this behaviour
+    // writes.
     Capability {
         name: "keychain-expiry",
         implemented: true,

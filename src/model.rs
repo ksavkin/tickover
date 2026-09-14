@@ -308,6 +308,50 @@ impl Balance {
     }
 }
 
+/// What [`ProviderReading::token_renewal`] says about renewing the token
+/// behind a reading's `error` — set only alongside `error`, by
+/// `plugin::engine_http` (the one engine that reads a token at all), and
+/// read by `main.rs`'s tick to decide whether to run a plugin's `[ping]`
+/// outside its usual empty-window schedule (`[ping] renews_token`). This app
+/// never spends a provider's refresh token itself (see
+/// `plugin::throttle`'s module doc), so this is the "someone else has to"
+/// signal — and, for both variants that carry one, a *key* naming which
+/// token lapsed, so a renewal ping fires once per distinct token rather than
+/// once per ten-minute floor forever (a token the CLI cannot renew either —
+/// its own refresh token has expired too, say, and it now needs an
+/// interactive login — must not be pinged indefinitely).
+/// [`Lapsed::expires_at`](TokenRenewal::Lapsed) and
+/// [`Unauthorized::token_hash`](TokenRenewal::Unauthorized) are both plain
+/// `u64`s, but `main.rs`'s dedup table (`LAST_RENEWED_FOR:
+/// HashMap<String, TokenRenewal>`) stores and compares the whole
+/// `TokenRenewal` value, not either number on its own — a `Lapsed { expires_at:
+/// 42 }` and an `Unauthorized { token_hash: 42 }` are different variants and
+/// so never equal, however their numbers happen to line up. `TokenRenewal`
+/// deriving `Copy`/`Eq` is what lets one table do this cheaply, keyed by
+/// surface reading id (not plugin id — a plugin can have more than one
+/// renewal-eligible surface, each lapsing on its own schedule), rather than
+/// needing two tables or a tagged key type of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenRenewal {
+    /// No renewal is wanted for this reading — the ordinary case.
+    No,
+    /// The auth chain ended with a credential past its own declared expiry
+    /// (Unix seconds) and no working step behind it (`auth::TOKEN_LAPSED`).
+    /// Named by that expiry, read from `expiry_json_path` by
+    /// `auth::token_expiry`, not just a bool.
+    Lapsed { expires_at: u64 },
+    /// An HTTP 401 arrived on a surface with no declared expiry to key a
+    /// "once per token" ping on directly, so it is keyed on the token
+    /// itself instead: `token_hash` is `plugin::throttle::fingerprint`'s
+    /// hash of the bearer token and the request's other credential-derived
+    /// values — never the token itself, never persisted or logged, the same
+    /// fingerprint the throttle already computes to notice a credential
+    /// change. A 401 with the same `token_hash` as the last renewal ping
+    /// suppresses; a different one (the CLI rotated the token some other
+    /// way, or this is the first 401 seen) pings again.
+    Unauthorized { token_hash: u64 },
+}
+
 /// One provider's snapshot in a provider-agnostic shape.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderReading {
@@ -364,6 +408,10 @@ pub struct ProviderReading {
     /// Human message when the provider couldn't be read (not installed, no
     /// usage yet, token expired, …) — shown instead of the window rows.
     pub error: Option<String>,
+    /// Whether renewing the token behind `error` is possible, and how —
+    /// see [`TokenRenewal`]. [`TokenRenewal::No`] whenever `error` is unset,
+    /// and for any other reason a surface could not be read.
+    pub token_renewal: TokenRenewal,
     /// Whether this reading participates in the menu-bar pill/title. The
     /// Claude desktop account is popup-only.
     pub in_menu_bar: bool,
@@ -431,6 +479,7 @@ mod tests {
             windows,
             balances: Vec::new(),
             error: None,
+            token_renewal: TokenRenewal::No,
             quota_status: None,
             in_menu_bar: true,
             bare_when_sole: false,

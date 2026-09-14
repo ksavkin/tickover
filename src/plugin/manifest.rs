@@ -1796,6 +1796,35 @@ impl PluginManifest {
                     }
                 }
             }
+            // `expiry_json_path` is honoured only by the three step kinds
+            // whose credential store hands back one JSON blob holding both
+            // the token and its expiry (`token_from_blob`, shared by
+            // `credentials_file_step`/`keychain_step`/`win_credential_step`)
+            // — `env`, `credentials-map`, `electron-safe-storage` and
+            // `oauth-refresh` never read the field at all. Unrefused, a
+            // manifest that set it there anyway would still trip
+            // `SurfaceConfig::declares_token_expiry` and
+            // `auth::resolve_token`'s own `from_expiring_step` flag — both
+            // just check the field's presence, not which step kind carries
+            // it — so a `renews_token = true` surface could get a false
+            // "token expired — renews on the next `<bin>` run" rewrite (and
+            // a wasted ping) for a credential this app never actually
+            // checked the age of.
+            for (i, step) in surface.auth.iter().enumerate() {
+                if step.expiry_json_path.is_some()
+                    && !matches!(
+                        step.kind,
+                        AuthType::CredentialsFile | AuthType::Keychain | AuthType::WinCredential
+                    )
+                {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `expiry_json_path`, which only \
+                         `credentials-file`, `keychain` and `win-credential` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+            }
             // `allowed_hosts` is an exact-match list — no wildcards, by design
             // (see `crate::plugin::auth::host_allowed`). A manifest writing
             // `"*"` is asking for something this app deliberately doesn't do,
@@ -3310,6 +3339,26 @@ pub struct SurfaceConfig {
     pub auth: Vec<AuthStep>,
 }
 
+impl SurfaceConfig {
+    /// Whether this surface's own credential chain states a token lifetime
+    /// at all — the manifest's own declaration that *this* surface's token
+    /// is the CLI's, renewed by the CLI running, rather than some other
+    /// credential (Claude's `desktop` surface reads Electron's
+    /// safe-storage: its own separate token, with no `expiry_json_path` on
+    /// any step, opt-in, and renewed by the desktop app itself). A plugin's
+    /// `[ping] renews_token` names one binary; only a surface this returns
+    /// `true` for is the one that binary's run actually renews, so it is
+    /// the gate both halves of `[ping] renews_token` use before treating a
+    /// surface's failure as renewable — a lapsed auth chain
+    /// (`plugin::engine_http::fetch_surface`, which can only produce
+    /// `lapsed_expiry: Some` from a step this same field governs, so it
+    /// needs no separate check) and a bare HTTP 401
+    /// (`plugin::engine_http::unauthorized_outcome`, which does).
+    pub fn declares_token_expiry(&self) -> bool {
+        self.auth.iter().any(|step| step.expiry_json_path.is_some())
+    }
+}
+
 /// One step of a `[[surface.auth]]` chain.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct AuthStep {
@@ -3326,15 +3375,25 @@ pub struct AuthStep {
     /// [`split_fallback_keys`].
     pub token_json_path: Option<String>,
 
-    /// `keychain`: optional JSON path to an RFC3339 expiry beside the token.
-    /// When set and the moment it names is in the past (with a small margin),
-    /// the step resolves **Absent** rather than handing back the stale token —
-    /// so a chain can fall through to a refresh step behind it. Without it a
-    /// keychain step returns whatever token it finds, fresh or not (the
-    /// behaviour every existing manifest relies on). Antigravity's item carries
-    /// `token.expiry`; the CLI keeps it current while it runs, and this lets a
-    /// build tell "signed in, current" from "signed in, but the token lapsed".
-    /// Needs `requires_reader = ["keychain-expiry"]`.
+    /// `keychain`, `credentials-file`, `win-credential` only — `validate`
+    /// refuses it on any other step kind, naming the step's index and kind:
+    /// those three are the only ones whose credential store hands back one
+    /// JSON blob holding both the token and its expiry
+    /// (`auth::token_from_blob`), so they are the only ones that ever read
+    /// this field at all. Optional JSON path to an expiry beside the
+    /// token — an RFC3339 string, or a JSON number (or numeric string) read
+    /// as epoch seconds or milliseconds (told apart by magnitude; see
+    /// `auth::token_expiry`). When set and the moment it names is in the
+    /// past (with a small margin), the step resolves **Absent** rather than
+    /// handing back the stale token — so a chain can fall through to a
+    /// refresh step behind it, or (with `[ping] renews_token`) let the
+    /// engine ask for a renewal. Without it a step returns whatever token it
+    /// finds, fresh or not (the behaviour every existing manifest relies
+    /// on). Antigravity's keychain item carries `token.expiry` as RFC3339;
+    /// Claude's credentials file carries `claudeAiOauth.expiresAt` as epoch
+    /// milliseconds — this lets a build tell "signed in, current" from
+    /// "signed in, but the token lapsed" from either shape. Needs
+    /// `requires_reader = ["keychain-expiry"]`.
     pub expiry_json_path: Option<String>,
 
     /// `credentials-map`: prefix an entry's key in the top-level JSON object
@@ -3719,6 +3778,19 @@ pub struct PingConfig {
     pub bin: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Whether running this command also renews the provider's token, as a
+    /// side effect the provider's own CLI has and this app does not (it never
+    /// spends a provider's refresh token — see `plugin::throttle`'s module
+    /// doc). A surface whose auth chain ends "lapsed" (see
+    /// `plugin::auth::TOKEN_LAPSED`) is a token nothing here can renew on its
+    /// own, and a lapsed token behind `renews_token = false` reads no
+    /// differently than no credential at all — the same fetch that would
+    /// otherwise wait for the user to sign in again instead runs this
+    /// command, bounded by the same ten-minute floor the window ping shares.
+    /// Default `false`: without it, this field simply does not exist for a
+    /// manifest that predates it.
+    #[serde(default)]
+    pub renews_token: bool,
 }
 
 /// [`PingConfig::args`]: how many arguments `validate` allows. A ping is a
@@ -4007,6 +4079,10 @@ mod tests {
         let ping = m.ping.as_ref().expect("[ping] section");
         assert_eq!(ping.bin, "codex");
         assert_eq!(ping.args, vec!["exec".to_string(), "hello".to_string()]);
+        assert!(
+            !ping.renews_token,
+            "a manifest that never mentions the field must not renew a token"
+        );
 
         // No [[surface]] declared → synthesized single opt-out default.
         assert_eq!(m.surface.len(), 1);
@@ -5526,6 +5602,82 @@ mod tests {
         let err = PluginManifest::from_str(&toml)
             .expect_err("using expiry_json_path without declaring the reader is refused");
         assert!(err.contains("keychain-expiry"), "{err}");
+    }
+
+    /// `expiry_json_path` is read only by `credentials_file_step`/
+    /// `keychain_step`/`win_credential_step` (`auth::token_from_blob`,
+    /// shared by all three) — every other step kind never reads it at all,
+    /// so a manifest setting it there would still trip
+    /// `SurfaceConfig::declares_token_expiry`/`auth::resolve_token`'s
+    /// `from_expiring_step` over a field the engine never actually checks.
+    #[test]
+    fn expiry_json_path_is_refused_on_a_step_kind_that_never_reads_it() {
+        // Same shape as `KEYCHAIN_EXPIRY_BASE`, `keychain-expiry` still
+        // declared, but the step itself turned into `env` — the reader
+        // capability is present, so this reaches `validate`'s own check
+        // rather than the backward-compat gate's.
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "type            = \"keychain\"\n        service         = \"gemini\"\n        token_json_path = \"token.access_token\"",
+            "type = \"env\"\n        var  = \"SAMPLE_TOKEN\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("expiry_json_path on an env step must be refused");
+        assert!(err.contains("expiry_json_path"), "{err}");
+        assert!(err.contains("env"), "{err}");
+        assert!(
+            err.contains("auth step 0"),
+            "names the step's own index: {err}"
+        );
+    }
+
+    /// The mirror of the refusal above: each of the three step kinds that
+    /// actually read `expiry_json_path` is accepted with it set —
+    /// `KEYCHAIN_EXPIRY_BASE` itself already covers `keychain`
+    /// (`parses_a_keychain_step_with_an_expiry_path`); this covers the other
+    /// two.
+    #[test]
+    fn expiry_json_path_is_accepted_on_credentials_file_and_win_credential() {
+        let credentials_file = KEYCHAIN_EXPIRY_BASE.replace(
+            "type            = \"keychain\"\n        service         = \"gemini\"\n        token_json_path = \"token.access_token\"",
+            "type             = \"credentials-file\"\n        path             = \"~/.sample/auth.json\"\n        token_json_path  = \"token.access_token\"",
+        );
+        PluginManifest::from_str(&credentials_file)
+            .expect("expiry_json_path on a credentials-file step is accepted");
+
+        let win_credential = KEYCHAIN_EXPIRY_BASE.replace(
+            "type            = \"keychain\"\n        service         = \"gemini\"\n        token_json_path = \"token.access_token\"",
+            "type             = \"win-credential\"\n        targets          = [\"Sample\"]\n        token_json_path  = \"token.access_token\"",
+        );
+        PluginManifest::from_str(&win_credential)
+            .expect("expiry_json_path on a win-credential step is accepted");
+    }
+
+    #[test]
+    fn declares_token_expiry_is_true_only_for_a_surface_whose_chain_names_one() {
+        let with_expiry = PluginManifest::from_str(KEYCHAIN_EXPIRY_BASE).expect("valid manifest");
+        assert!(
+            with_expiry.surface[0].declares_token_expiry(),
+            "a step with expiry_json_path set makes the surface eligible"
+        );
+
+        // `CLAUDE_LIKE`'s `desktop` surface, like the shipped manifest's, has
+        // no `expiry_json_path` on its one step at all.
+        let two_surfaces = PluginManifest::from_str(CLAUDE_LIKE).expect("valid manifest");
+        assert!(
+            !two_surfaces.surface[1].declares_token_expiry(),
+            "a surface whose chain never names an expiry is not renewal-eligible"
+        );
+    }
+
+    #[test]
+    fn ping_renews_token_parses_when_set() {
+        let toml = CODEX_LIKE.replace(
+            "        bin  = \"codex\"\n        args = [\"exec\", \"hello\"]\n",
+            "        bin  = \"codex\"\n        args = [\"exec\", \"hello\"]\n        renews_token = true\n",
+        );
+        let m = PluginManifest::from_str(&toml).expect("valid manifest");
+        let ping = m.ping.as_ref().expect("[ping] section");
+        assert!(ping.renews_token);
     }
 
     // ── oauth-refresh auth step ─────────────────────────────────────────

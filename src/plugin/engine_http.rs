@@ -47,12 +47,12 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::model::{ProviderReading, Window};
+use crate::model::{ProviderReading, TokenRenewal, Window};
 use crate::plugin::auth;
 use crate::plugin::manifest::{
     AccountType, AmountConfig, AmountKind, BalanceConfig, HttpMethod, HttpRequestConfig,
-    HttpValueConfig, HttpValueType, HttpVersionConfig, PeriodMode, PluginManifest, SurfaceConfig,
-    TagFrom, TagTransform, WindowConfig,
+    HttpValueConfig, HttpValueType, HttpVersionConfig, PeriodMode, PingConfig, PluginManifest,
+    SurfaceConfig, TagFrom, TagTransform, WindowConfig,
 };
 use crate::plugin::throttle;
 
@@ -109,17 +109,60 @@ fn fetch_surface(
         quota_status: None,
         balances: Vec::new(),
         error: None,
+        token_renewal: TokenRenewal::No,
         in_menu_bar: surface.in_menu_bar,
         bare_when_sole: false,
     };
 
-    let token = match auth::resolve_token(surface) {
+    let (token, from_expiring_step) = match auth::resolve_token(surface) {
         Ok(t) => t,
-        Err(e) => {
+        Err((e, lapsed_expiry)) => {
+            // A chain that ended "lapsed" (`lapsed_expiry` is `Some` — see
+            // `auth::TOKEN_LAPSED`) is a token this app cannot renew on its
+            // own — unless the manifest names a ping that can, as a side
+            // effect of running (`[ping] renews_token`). Checked before the
+            // `NO_CREDENTIALS` rewrite below, which is exactly where a
+            // plugin *without* such a ping still ends up: to it, "found but
+            // lapsed" and "never found" read as the same fact.
+            //
+            // Needs no explicit `declares_token_expiry` check of its own:
+            // `lapsed_expiry` can only be `Some` here because some step on
+            // *this* surface both found a token at its `token_json_path`
+            // *and* saw that token's own declared expiry in the past (see
+            // `auth::token_from_blob` — the expiry is checked only once a
+            // token is actually in hand, never on a blob a step never
+            // recognised as a credential at all). A step whose expiry is
+            // stale but whose token was never found produces
+            // `NO_CREDENTIALS` below instead, not this arm. So `Some` here
+            // already implies exactly what `SurfaceConfig::
+            // declares_token_expiry` asks (some step on this surface set
+            // `expiry_json_path`) — this surface is scoped by the same rule
+            // `unauthorized_outcome` below applies explicitly, not by
+            // accident.
+            if let Some(expires_at) = lapsed_expiry {
+                if let Some(ping) = m.ping.as_ref().filter(|p| p.renews_token) {
+                    reading.token_renewal = TokenRenewal::Lapsed { expires_at };
+                    reading.fail(renewal_text(&ping.bin));
+                    return reading;
+                }
+            }
             // "No credential store here at all" is the one error a surface may
             // rename: for most providers it means "not installed", and the row
             // is hidden on the strength of this exact string; for one that is
             // worth naming in that state, the manifest supplies the sentence.
+            // A lapsed credential without a renewing ping folds back into
+            // `NO_CREDENTIALS` here: a manifest with no `[ping] renews_token`
+            // gets the same hide-the-row/custom-message treatment for a
+            // lapsed credential as for no credential at all, not a second,
+            // unrecognised string. `lapsed_expiry` is `Some` only alongside
+            // `auth::TOKEN_LAPSED` (see `resolve_token`'s own doc) — a real
+            // (Present-err) failure always pairs `None`, so this never
+            // rewrites a genuine broken-store message.
+            let e = if lapsed_expiry.is_some() {
+                auth::NO_CREDENTIALS.to_string()
+            } else {
+                e
+            };
             reading.fail(
                 match (e == auth::NO_CREDENTIALS, &surface.no_credentials_message) {
                     (true, Some(message)) => message.clone(),
@@ -272,21 +315,103 @@ fn fetch_surface(
             );
         }
         Err(failure) => {
+            // A 401 is the one `Failure` this app ever rewrites — see
+            // `unauthorized_outcome`'s own doc for why. `failure.terminal`
+            // itself is untouched by the rewrite and used as `perform` set
+            // it, just below. `fingerprint` is reused as the renewal key
+            // rather than hashing anything new — it is already a hash of
+            // `(token, values)`, already documented as never persisted or
+            // logged (see `throttle::fingerprint`), and exactly what a "same
+            // token, don't ping again" dedup needs. `from_expiring_step`
+            // came back from `auth::resolve_token` above, alongside `token`
+            // itself — it names the one step that actually produced *this*
+            // token, not merely some step on this surface (that broader
+            // question, `surface.declares_token_expiry()`, is main.rs's tick
+            // scan's to ask, not this rewrite's).
+            let (message, token_renewal) = unauthorized_outcome(
+                failure.message,
+                m.ping.as_ref(),
+                from_expiring_step,
+                fingerprint,
+            );
             // Measured from when the request *finished*, not from when it was
             // sent: a request that spent ten seconds timing out has already
             // eaten ten seconds of any cool-off started at `now`.
             throttle::record_failure(
                 &throttle_key,
                 fingerprint,
-                &failure.message,
+                &message,
                 failure.terminal,
                 limits,
                 Instant::now(),
             );
-            reading.fail(failure.message);
+            reading.token_renewal = token_renewal;
+            reading.fail(message);
         }
     }
     reading
+}
+
+/// The text an engine hands back when a surface's credential has lapsed (or
+/// just 401'd) and the manifest's own `[ping]` can renew it — used for both
+/// the pre-request "lapsed, no later auth step" case ([`fetch_surface`]'s
+/// `auth::resolve_token` arm) and an HTTP 401 ([`unauthorized_outcome`]), so
+/// the two read identically to whoever is watching
+/// [`crate::model::ProviderReading::token_renewal`] for the signal. `bin` is
+/// `ping.bin` exactly as the manifest wrote it.
+fn renewal_text(bin: &str) -> String {
+    format!("token expired — renews on the next {bin} run")
+}
+
+/// The message and renewal signal [`fetch_surface`] hands back for a
+/// `perform` failure — pure, so the rewrite is tested without a network
+/// call. `UNAUTHORIZED` is `perform`'s own text for a 401 for every
+/// provider (it stays provider-neutral — it has no manifest to name a ping
+/// with); a manifest whose `[ping] renews_token` names one, when
+/// `from_expiring_step` is true, turns that same dead end into
+/// [`renewal_text`] and [`TokenRenewal::Unauthorized`] instead, since this
+/// app never spends a provider's refresh token — the run is `main.rs`'s to
+/// make, not this engine's.
+///
+/// `from_expiring_step` is `auth::resolve_token`'s own answer to "did the
+/// *step that produced this token* declare `expiry_json_path`?" — not
+/// `SurfaceConfig::declares_token_expiry`'s broader "does *some* step on
+/// this surface?" (that question is for main.rs's tick scan, gating which
+/// surfaces are consulted at all; this one gates the rewrite itself). The
+/// two disagree exactly when a surface's chain mixes step kinds: a two-step
+/// `cli` surface whose `credentials-file` step declares an expiry but whose
+/// `env` fallback does not can still 401 on a token that came from the
+/// `env` step — a token `[ping]`'s CLI run cannot renew, since nothing
+/// about that env var's own lifetime was ever declared. Rewriting that 401
+/// would be false in exactly the way a non-renewable *surface*'s 401 would
+/// be (Claude's `desktop`, its own separate credential): the ping's binary
+/// would not touch the credential that actually 401'd.
+///
+/// Unlike a lapsed auth chain, a 401 carries no declared expiry to key a
+/// "once per token" ping on — nothing here ever parsed a credential's own
+/// JSON to get one — so it is keyed on the token itself instead:
+/// `token_hash` is `throttle::fingerprint`'s hash of `(token, values)`,
+/// reused rather than recomputed, never the token itself and never
+/// persisted (see `TokenRenewal::Unauthorized`'s own doc for the dedup this
+/// enables in `main.rs`). Any other failure (`terminal` or not) passes
+/// through unchanged, [`TokenRenewal::No`] — a 429, a timeout, or a changed
+/// API shape names nothing a ping can fix. `terminal` (whether `perform`
+/// marked this failure retrying cannot fix) is untouched by this rewrite
+/// either way — that decision belongs to `perform`'s own status-code match,
+/// not to whether a ping happens to exist for it.
+fn unauthorized_outcome(
+    message: String,
+    ping: Option<&PingConfig>,
+    from_expiring_step: bool,
+    token_hash: u64,
+) -> (String, TokenRenewal) {
+    match ping.filter(|p| p.renews_token && from_expiring_step) {
+        Some(ping) if message == UNAUTHORIZED => (
+            renewal_text(&ping.bin),
+            TokenRenewal::Unauthorized { token_hash },
+        ),
+        _ => (message, TokenRenewal::No),
+    }
 }
 
 /// A surface's `[[surface]]` entry named `"default"` (the single one
@@ -1683,6 +1808,424 @@ mod tests {
         PluginManifest::from_str(toml).expect("valid test manifest")
     }
 
+    /// A single-surface, single-step manifest whose one auth step is a
+    /// `credentials-file` pointing at `dir/creds.json`, already written with
+    /// a token past `expiry_json_path` — so `auth::resolve_token` ends
+    /// "lapsed" (see `auth::TOKEN_LAPSED`) with no real filesystem surprises
+    /// and no network at all: `fetch_surface` returns before `perform` is
+    /// ever reached. `renews_token` drives whether `[ping]` names a
+    /// renewing command.
+    fn claude_like_manifest_with_a_lapsed_cli_token(
+        dir: &std::path::Path,
+        renews_token: bool,
+    ) -> PluginManifest {
+        let file = dir.join("creds.json");
+        std::fs::write(
+            &file,
+            r#"{"claudeAiOauth":{"accessToken":"tok-old","expiresAt":"2020-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let ping = if renews_token {
+            "\n            [ping]\n            bin          = \"claude\"\n            renews_token = true\n"
+        } else {
+            ""
+        };
+        let toml = format!(
+            r#"
+            id         = "claude"
+            name       = "Claude"
+            menu_label = "Cl"
+            order      = 20
+            engine     = "http-api"
+            requires_reader = ["keychain-expiry"]
+
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode    = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "five_hour.utilization"
+            resets_at_path    = "five_hour.resets_at"
+            resets_at_format  = "iso8601"
+
+            [http]
+            [[http.request]]
+            url = "https://api.anthropic.com/api/oauth/usage"
+
+            [[surface]]
+            id     = "cli"
+            label  = "CLI"
+            opt_in = false
+            allowed_hosts = ["api.anthropic.com"]
+            [[surface.auth]]
+            type             = "credentials-file"
+            path             = '{path}'
+            token_json_path  = "claudeAiOauth.accessToken"
+            expiry_json_path = "claudeAiOauth.expiresAt"
+            {ping}
+        "#,
+            path = file.to_string_lossy(),
+        );
+        PluginManifest::from_str(&toml).expect("valid test manifest")
+    }
+
+    #[test]
+    fn a_lapsed_auth_chain_with_a_renewing_ping_fails_terminally_with_the_renewal_text() {
+        let dir = temp_dir("lapsed-cli-renews");
+        let m = claude_like_manifest_with_a_lapsed_cli_token(&dir, true);
+        let readings = fetch(&m, &["cli".to_string()], &no_options());
+        assert_eq!(readings.len(), 1);
+        assert_eq!(
+            readings[0].error.as_deref(),
+            Some("token expired — renews on the next claude run")
+        );
+        assert_eq!(
+            readings[0].token_renewal,
+            TokenRenewal::Lapsed {
+                expires_at: 1_577_836_800, // 2020-01-01T00:00:00Z
+            },
+            "the declared expiry itself must reach the reading, not just a bool"
+        );
+        assert!(readings[0].windows.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_lapsed_auth_chain_without_a_renewing_ping_reads_as_no_credentials() {
+        let dir = temp_dir("lapsed-cli-no-ping");
+        let m = claude_like_manifest_with_a_lapsed_cli_token(&dir, false);
+        let readings = fetch(&m, &["cli".to_string()], &no_options());
+        assert_eq!(readings.len(), 1);
+        assert_eq!(
+            readings[0].error.as_deref(),
+            Some(auth::NO_CREDENTIALS),
+            "without a ping that can renew it, a lapsed token reads exactly like none at all"
+        );
+        assert_eq!(readings[0].token_renewal, TokenRenewal::No);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two surfaces sharing one `[ping] renews_token = true` manifest: `cli`
+    /// is `claude_like_manifest_with_a_lapsed_cli_token`'s own shape (a
+    /// `credentials-file` step with `expiry_json_path`, already lapsed);
+    /// `desktop` is an `env` step with no `expiry_json_path` at all and no
+    /// credential ever set — Claude's real `desktop` surface reads its own
+    /// separate credential the same way (a declared expiry only `cli`
+    /// states), minus the Electron-specific machinery this test has no
+    /// reason to exercise. Drives `SurfaceConfig::declares_token_expiry`
+    /// through `fetch_surface` itself, not the pure helper alone: `perform`
+    /// (the network call a real 401 would need) has no test harness in this
+    /// module by design, so this proves the surface rule the way a lapsed
+    /// chain can — a 401's own rewrite is covered separately, and only
+    /// through the pure `unauthorized_outcome` (see
+    /// `unauthorized_outcome_leaves_a_401_unchanged_on_a_surface_with_no_declared_expiry`).
+    fn claude_like_manifest_with_a_renewable_and_a_non_renewable_surface(
+        dir: &std::path::Path,
+    ) -> PluginManifest {
+        let file = dir.join("creds.json");
+        std::fs::write(
+            &file,
+            r#"{"claudeAiOauth":{"accessToken":"tok-old","expiresAt":"2020-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let toml = format!(
+            r#"
+            id         = "claude"
+            name       = "Claude"
+            menu_label = "Cl"
+            order      = 20
+            engine     = "http-api"
+            requires_reader = ["keychain-expiry"]
+
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode    = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "five_hour.utilization"
+            resets_at_path    = "five_hour.resets_at"
+            resets_at_format  = "iso8601"
+
+            [http]
+            [[http.request]]
+            url = "https://api.anthropic.com/api/oauth/usage"
+
+            [[surface]]
+            id     = "cli"
+            label  = "CLI"
+            opt_in = false
+            allowed_hosts = ["api.anthropic.com"]
+            [[surface.auth]]
+            type             = "credentials-file"
+            path             = '{path}'
+            token_json_path  = "claudeAiOauth.accessToken"
+            expiry_json_path = "claudeAiOauth.expiresAt"
+
+            [[surface]]
+            id     = "desktop"
+            label  = "Desktop"
+            opt_in = true
+            in_menu_bar = false
+            allowed_hosts = ["api.anthropic.com"]
+            [[surface.auth]]
+            type = "env"
+            var  = "TICKOVER_TEST_ENGINE_HTTP_NONRENEWABLE_DESKTOP_TOKEN"
+
+            [ping]
+            bin          = "claude"
+            renews_token = true
+        "#,
+            path = file.to_string_lossy(),
+        );
+        PluginManifest::from_str(&toml).expect("valid test manifest")
+    }
+
+    #[test]
+    fn only_the_surface_that_declares_a_token_expiry_carries_a_renewal_signal() {
+        let dir = temp_dir("renewable-and-not");
+        let m = claude_like_manifest_with_a_renewable_and_a_non_renewable_surface(&dir);
+        // The fixture is the non-renewable half of this test's own claim, so
+        // pin it directly rather than leave it implied by the desktop
+        // surface's `env` step never naming `expiry_json_path`.
+        assert!(m.surface[0].declares_token_expiry());
+        assert!(!m.surface[1].declares_token_expiry());
+
+        let readings = fetch(
+            &m,
+            &["cli".to_string(), "desktop".to_string()],
+            &no_options(),
+        );
+        assert_eq!(readings.len(), 2);
+
+        let cli = readings
+            .iter()
+            .find(|r| r.id == "claude-cli")
+            .expect("cli reading");
+        assert_eq!(
+            cli.error.as_deref(),
+            Some("token expired — renews on the next claude run")
+        );
+        assert_eq!(
+            cli.token_renewal,
+            TokenRenewal::Lapsed {
+                expires_at: 1_577_836_800, // 2020-01-01T00:00:00Z
+            },
+            "cli declares expiry_json_path, so its lapsed chain is renewal-eligible"
+        );
+
+        // Desktop's own env var is never set, so this also reaches
+        // `TokenRenewal::No` by the ordinary "no credential" path rather
+        // than through the surface-eligibility gate — the gate itself is
+        // pinned above and exercised for a 401 in
+        // `unauthorized_outcome_leaves_a_401_unchanged_on_a_surface_with_no_declared_expiry`.
+        // Asserted here anyway, alongside the concrete error text: a plugin
+        // whose `[ping] renews_token` is true must still read this surface
+        // as an ordinary missing credential, not as anything renewal-shaped.
+        let desktop = readings
+            .iter()
+            .find(|r| r.id == "claude-desktop")
+            .expect("desktop reading");
+        assert_eq!(desktop.error.as_deref(), Some(auth::NO_CREDENTIALS));
+        assert_eq!(
+            desktop.token_renewal,
+            TokenRenewal::No,
+            "desktop declares no expiry at all, so it never carries a renewal \
+             signal even under a plugin whose [ping] renews_token is true"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `perform`'s network path is the one part of this engine deliberately
+    /// left untested (see this module's own docs) — including its 401 arm,
+    /// which is why the rewrite it feeds is factored into
+    /// `unauthorized_outcome` and tested directly here, pure.
+    fn renewing_ping() -> PingConfig {
+        PingConfig {
+            bin: "claude".to_string(),
+            args: Vec::new(),
+            renews_token: true,
+        }
+    }
+
+    #[test]
+    fn unauthorized_outcome_rewrites_a_401_when_the_ping_renews_the_token() {
+        let (message, renewal) =
+            unauthorized_outcome(UNAUTHORIZED.to_string(), Some(&renewing_ping()), true, 42);
+        assert_eq!(message, "token expired — renews on the next claude run");
+        assert_eq!(renewal, TokenRenewal::Unauthorized { token_hash: 42 });
+    }
+
+    #[test]
+    fn unauthorized_outcome_leaves_a_401_unchanged_without_a_renewing_ping() {
+        let (message, renewal) = unauthorized_outcome(UNAUTHORIZED.to_string(), None, true, 42);
+        assert_eq!(message, UNAUTHORIZED);
+        assert_eq!(renewal, TokenRenewal::No);
+
+        let non_renewing = PingConfig {
+            bin: "claude".to_string(),
+            args: Vec::new(),
+            renews_token: false,
+        };
+        let (message, renewal) =
+            unauthorized_outcome(UNAUTHORIZED.to_string(), Some(&non_renewing), true, 42);
+        assert_eq!(message, UNAUTHORIZED);
+        assert_eq!(renewal, TokenRenewal::No);
+    }
+
+    #[test]
+    fn unauthorized_outcome_leaves_a_non_401_failure_unchanged_even_with_a_renewing_ping() {
+        let (message, renewal) = unauthorized_outcome(
+            "rate-limited (try later)".to_string(),
+            Some(&renewing_ping()),
+            true,
+            42,
+        );
+        assert_eq!(message, "rate-limited (try later)");
+        assert_eq!(
+            renewal,
+            TokenRenewal::No,
+            "only a 401 is a token this app cannot help but a ping might"
+        );
+    }
+
+    #[test]
+    fn unauthorized_outcome_leaves_a_401_unchanged_when_the_token_came_from_a_non_expiring_step() {
+        // Same renewing ping as `unauthorized_outcome_rewrites_a_401_...`,
+        // but `from_expiring_step = false` — the token this 401 actually
+        // named came from a step that never declared a lifetime for it (an
+        // `env` fallback, say), so the ping's CLI run has nothing it can
+        // renew. Must not be rewritten into text promising otherwise.
+        let (message, renewal) =
+            unauthorized_outcome(UNAUTHORIZED.to_string(), Some(&renewing_ping()), false, 42);
+        assert_eq!(message, UNAUTHORIZED);
+        assert_eq!(
+            renewal,
+            TokenRenewal::No,
+            "a token that never came from an expiry-declaring step is never renewal-eligible"
+        );
+    }
+
+    /// A two-step `cli` surface: `credentials-file` (declares
+    /// `expiry_json_path`) first, a bare `env` fallback behind it.
+    /// `lapsed` controls whether the file step's own credential has already
+    /// expired — lapsed, it resolves Absent and the env step's token wins
+    /// instead; fresh, it wins outright and the env step is never reached.
+    /// Exists to drive `auth::resolve_token`'s `from_expiring_step` flag
+    /// through both step kinds on one chain, into `unauthorized_outcome`,
+    /// rather than asserting the flag alone.
+    fn claude_like_two_step_cli_surface(
+        dir: &std::path::Path,
+        lapsed: bool,
+    ) -> crate::plugin::manifest::SurfaceConfig {
+        let file = dir.join("creds.json");
+        let expires_at = if lapsed {
+            "2020-01-01T00:00:00Z" // long past
+        } else {
+            "2099-01-01T00:00:00Z" // comfortably unexpired
+        };
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"tok-file","expiresAt":"{expires_at}"}}}}"#
+            ),
+        )
+        .unwrap();
+        let toml = format!(
+            r#"
+            id         = "claude"
+            name       = "Claude"
+            menu_label = "Cl"
+            order      = 20
+            engine     = "http-api"
+            requires_reader = ["keychain-expiry"]
+
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode    = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "five_hour.utilization"
+            resets_at_path    = "five_hour.resets_at"
+            resets_at_format  = "iso8601"
+
+            [http]
+            [[http.request]]
+            url = "https://api.anthropic.com/api/oauth/usage"
+
+            [[surface]]
+            id     = "cli"
+            label  = "CLI"
+            opt_in = false
+            allowed_hosts = ["api.anthropic.com"]
+            [[surface.auth]]
+            type             = "credentials-file"
+            path             = '{path}'
+            token_json_path  = "claudeAiOauth.accessToken"
+            expiry_json_path = "claudeAiOauth.expiresAt"
+            [[surface.auth]]
+            type = "env"
+            var  = "TICKOVER_TEST_ENGINE_HTTP_TWO_STEP_ENV_FALLBACK"
+        "#,
+            path = file.to_string_lossy(),
+        );
+        let m = PluginManifest::from_str(&toml).expect("valid test manifest");
+        m.surface.into_iter().next().expect("one surface")
+    }
+
+    #[test]
+    fn a_401_on_a_token_from_the_env_fallback_behind_a_lapsed_step_keeps_the_plain_text() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("two-step-lapsed-then-env");
+        let surface = claude_like_two_step_cli_surface(&dir, true);
+        std::env::set_var("TICKOVER_TEST_ENGINE_HTTP_TWO_STEP_ENV_FALLBACK", "tok-env");
+        let resolved = auth::resolve_token(&surface);
+        std::env::remove_var("TICKOVER_TEST_ENGINE_HTTP_TWO_STEP_ENV_FALLBACK");
+        let (token, from_expiring_step) =
+            resolved.expect("the env fallback must still yield a token");
+        assert_eq!(token, "tok-env");
+        assert!(
+            !from_expiring_step,
+            "the token came from the env step, which declares no expiry"
+        );
+
+        let (message, renewal) = unauthorized_outcome(
+            UNAUTHORIZED.to_string(),
+            Some(&renewing_ping()),
+            from_expiring_step,
+            42,
+        );
+        assert_eq!(message, UNAUTHORIZED);
+        assert_eq!(renewal, TokenRenewal::No);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_401_on_a_token_from_the_expiring_step_itself_is_rewritten() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("two-step-fresh-file");
+        let surface = claude_like_two_step_cli_surface(&dir, false);
+        let (token, from_expiring_step) =
+            auth::resolve_token(&surface).expect("the file step yields its own token");
+        assert_eq!(token, "tok-file");
+        assert!(from_expiring_step);
+
+        let (message, renewal) = unauthorized_outcome(
+            UNAUTHORIZED.to_string(),
+            Some(&renewing_ping()),
+            from_expiring_step,
+            42,
+        );
+        assert_eq!(message, "token expired — renews on the next claude run");
+        assert_eq!(renewal, TokenRenewal::Unauthorized { token_hash: 42 });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn win(
         role: ManifestRole,
         mode: PeriodMode,
@@ -2166,6 +2709,7 @@ mod tests {
             account: None,
             windows,
             error: None,
+            token_renewal: TokenRenewal::No,
             quota_status: None,
             balances: Vec::new(),
             in_menu_bar: true,

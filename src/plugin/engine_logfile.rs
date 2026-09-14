@@ -49,7 +49,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::Value;
 
-use crate::model::{ProviderReading, Window};
+use crate::model::{ProviderReading, TokenRenewal, Window};
 use crate::plugin::manifest::{
     AccountMatchConfig, AccountType, LogFileConfig, PeriodMode, PluginManifest, ResetsAtFormat,
     Role as ManifestRole, TagFrom, TagTransform, WindowConfig,
@@ -113,6 +113,7 @@ pub fn fetch(
                 quota_status: None,
                 balances: Vec::new(),
                 error: None,
+                token_renewal: TokenRenewal::No,
                 in_menu_bar: default_surface_in_menu_bar(m),
                 bare_when_sole: false,
             };
@@ -177,6 +178,7 @@ fn fetch_from_root(
         // balance, so nothing here can fill one.
         balances: Vec::new(),
         error: None,
+        token_renewal: TokenRenewal::No,
         in_menu_bar: default_surface_in_menu_bar(m),
         bare_when_sole: false,
     };
@@ -328,6 +330,7 @@ fn build_secondary_reading(
         windows: Vec::new(),
         balances: Vec::new(),
         error: None,
+        token_renewal: TokenRenewal::No,
         // This engine reads log lines, which carry no statement about the
         // quota as a whole — only the windows a session happened to record.
         // A manifest that declares `[status]` here is refused at validation
