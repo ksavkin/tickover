@@ -803,11 +803,23 @@ pub enum RegistryPluginState {
     /// no-lockfile-record branch of [`diff_installed`], where the file's
     /// origin is simply unknown and this is the best that can be said.
     UpToDate { locally_modified: bool },
-    /// The registry has a strictly newer version to offer, per
-    /// [`version_cmp`] — including the no-lockfile-record branch of
-    /// [`diff_installed`], which resolves `local_version`/`entry.version`
-    /// through [`update_available`] (the same strict-newer check) rather
-    /// than merely noticing the two differ.
+    /// The registry has something different to offer than what's installed.
+    ///
+    /// **Not always strictly newer.** The no-lockfile-record branch of
+    /// [`diff_installed`] does resolve `local_version`/`entry.version`
+    /// through [`update_available`] — [`version_cmp`]'s strict-newer check,
+    /// not merely noticing the two differ — but the lockfile branch (see the
+    /// decision table below, `present` / `lockfile: yes` / `local == origin`
+    /// / `index != origin`) does not: it fires on `origin_sha256`
+    /// *inequality* alone, so an `index.toml` that reverted to an older
+    /// manifest that was on offer at some earlier point reports this state
+    /// with `overwrite_safe: true` exactly as a real update would — a
+    /// downgrade offered as a safe update. Comparing versions there instead
+    /// (`update_available(origin_version, entry.version)`) trades that for a
+    /// worse problem: a byte-identical re-release published to correct
+    /// something in it, under the *same* version number, would then compare
+    /// `Equal` and never be offered at all. Refusing a downgrade is a real
+    /// decision, just a separate one, not implied by this type.
     UpdateAvailable {
         /// `true` only when a lockfile record proves the installed file
         /// still matches what was last installed — overwriting it destroys
@@ -1140,7 +1152,9 @@ fn push_dest_host(url: &str, dest_hosts: &mut Vec<String>) {
 /// otherwise make the destination vanish from this disclosure rather than
 /// merely go unresolved — the fallback below catches that by reading the
 /// authority text itself rather than trusting a real parser to make sense
-/// of it.
+/// of it; the trigger is [`https_host`] returning `None` at all, which it
+/// also does for a `substituted` URL that parses cleanly but isn't `https`,
+/// not only for one that fails to parse.
 fn push_dest_host_for_disclosure(
     url: &str,
     option_defaults: &BTreeMap<String, bool>,
@@ -1151,11 +1165,19 @@ fn push_dest_host_for_disclosure(
         push_dest_host(&substituted, dest_hosts);
         return;
     }
+    // Triggered by `https_host` returning `None` at all — an unparseable
+    // URL or one that parsed but isn't `https` — full stop, not by whether
+    // `{` is still visible in the authority. A declared option resolves to
+    // the literal text `true`/`false` above, same as an undeclared one
+    // resolves to nothing: either way the substituted URL can still fail to
+    // parse (`https://host:true/` is exactly as much an `InvalidPort` as
+    // `https://host:{option.x}/` was), and `contains('{')` only ever caught
+    // the second case — silently dropping the destination from the dialog
+    // whenever the manifest *did* declare the option.
     if let Some(authority) = raw_authority(&substituted) {
-        if authority.contains('{')
-            && !dest_hosts
-                .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(authority))
+        if !dest_hosts
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(authority))
         {
             dest_hosts.push(authority.to_string());
         }
@@ -3256,6 +3278,29 @@ mod tests {
             &mut hosts,
         );
         assert_eq!(hosts, vec!["{option.x}:{option.y}".to_string()]);
+    }
+
+    /// The declared-option counterpart to the test above: before this, the
+    /// fallback fired only when the substituted authority still literally
+    /// contained `{`, which is true only for an *undeclared* option
+    /// (`substitute_options` leaves it untouched). A *declared* one resolves
+    /// to the literal text `true`/`false`, and `https://host:true/` is
+    /// exactly as much an `InvalidPort` as the placeholder it came from —
+    /// but `contains('{')` was already false by the time this ran, so the
+    /// destination silently vanished from the trust dialog instead of being
+    /// shown as the resolved (if still nonsensical) authority.
+    #[test]
+    fn push_dest_host_for_disclosure_falls_back_when_a_declared_option_resolves_to_an_unparseable_authority(
+    ) {
+        let mut hosts = Vec::new();
+        let mut option_defaults = BTreeMap::new();
+        option_defaults.insert("port".to_string(), true);
+        push_dest_host_for_disclosure(
+            "https://evil.example:{option.port}/usage",
+            &option_defaults,
+            &mut hosts,
+        );
+        assert_eq!(hosts, vec!["evil.example:true".to_string()]);
     }
 
     #[test]

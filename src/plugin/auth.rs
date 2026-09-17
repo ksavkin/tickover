@@ -2010,19 +2010,16 @@ fn discover_client_within(
 /// mirroring `main.rs`'s `find_bin` (the same install directories that
 /// binary's own auto-ping already appends first, then the inherited `PATH`
 /// — [`super::cli_install_dirs`] is the canonical list; see its own doc for
-/// why it lives here and not beside `find_bin`). Same order both resolvers
-/// search in, so a machine with two installs of the same client on `PATH`
-/// at once has this step discover the same pair `find_bin` would have
-/// pinged — with one deliberate exception, not a parity bug: a relative (or
-/// empty) `PATH` entry is refused below, while `find_bin` still honors one.
-/// That makes the two agree everywhere a relative entry isn't in play, and
-/// disagree only in the one case where refusing it is the safer behaviour
-/// — a bare "current directory" is never where a manifest author had this
-/// app go looking for a client's binary; see `find_bin`'s own call site if
-/// it comes to filter the same way. A name not found anywhere contributes
-/// nothing, exactly like a `files` candidate that doesn't exist — discovery
-/// treats "not installed here" the same way regardless of which list named
-/// the candidate.
+/// why it lives here and not beside `find_bin`). Same order, same filters,
+/// both resolvers: a relative (or empty) `PATH` entry is refused below and
+/// by `find_bin` alike, and on unix [`super::is_executable_file`] is what
+/// both call in place of a plain `is_file()`, so a regular file without the
+/// executable bit set can't shadow the real binary in either one — a machine
+/// with two installs of the same client on `PATH` at once has this step
+/// discover the same pair `find_bin` would have pinged. A name not found
+/// anywhere contributes nothing, exactly like a `files` candidate that
+/// doesn't exist — discovery treats "not installed here" the same way
+/// regardless of which list named the candidate.
 fn bin_candidates(names: &[String]) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = super::cli_install_dirs();
     if let Some(p) = std::env::var_os("PATH") {
@@ -2058,7 +2055,10 @@ fn bin_candidates(names: &[String]) -> Vec<PathBuf> {
             })
             .find(|c| c.is_file());
         #[cfg(not(target_os = "windows"))]
-        let candidate = dirs.iter().map(|d| d.join(name)).find(|c| c.is_file());
+        let candidate = dirs
+            .iter()
+            .map(|d| d.join(name))
+            .find(|c| super::is_executable_file(c));
         if let Some(c) = candidate {
             found.push(c);
         }
@@ -2839,6 +2839,19 @@ struct DeadlineOutput {
     stderr: Vec<u8>,
 }
 
+/// Kill `child` and reap it — the same two calls at each of
+/// [`run_command_with_deadline`]'s three exits that give up on a child
+/// rather than wait for it to exit on its own, named once here so a test can
+/// point it at a real child and prove the kill directly, the same way a real
+/// `Builder::spawn` failure (the one exit that reaches this through
+/// [`pipe_drain_failure_message`] rather than a timeout or a `try_wait`
+/// error) cannot be forced on demand.
+#[cfg(any(target_os = "macos", test))]
+fn kill_and_wait(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Spawn `program` with `args`, capturing both stdout and stderr, and wait at
 /// most `deadline` for it to exit — the pattern `main.rs`'s own
 /// `run_with_deadline` established for the auto-ping subprocess (kill on
@@ -2874,8 +2887,23 @@ fn run_command_with_deadline(
         .spawn()
         .map_err(|e| format!("{program}: {e}"))?;
 
+    // Both drains have to at least be attempted before either failure is
+    // acted on, or a stdout thread the OS happily hands out would be started
+    // (and would have to be torn down again) for a stderr one it refuses.
     let stdout_buf = drain_pipe(child.stdout.take());
     let stderr_buf = drain_pipe(child.stderr.take());
+    // Whichever failed left its own end of the pipe closed under the child
+    // (see `drain_pipe`'s own doc): honest here is killing it outright and
+    // reporting why, not waiting to see what a `SIGPIPE` it never asked for
+    // does to it.
+    if let Some(msg) = pipe_drain_failure_message(program, &stdout_buf, &stderr_buf) {
+        kill_and_wait(&mut child);
+        return Err(msg);
+    }
+    let (stdout_buf, stderr_buf) = (
+        stdout_buf.expect("checked by pipe_drain_failure_message above"),
+        stderr_buf.expect("checked by pipe_drain_failure_message above"),
+    );
 
     let expiry = Instant::now() + deadline;
     let status = loop {
@@ -2888,16 +2916,14 @@ fn run_command_with_deadline(
                 if let Ok(Some(status)) = child.try_wait() {
                     break Some(status);
                 }
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_and_wait(&mut child);
                 break None;
             }
             // Polled rather than blocked on, because a blocking wait can't
             // be woken by a deadline.
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_and_wait(&mut child);
                 break None;
             }
         }
@@ -2918,32 +2944,66 @@ fn run_command_with_deadline(
 /// Drain `pipe` into a buffer on a thread of its own, handing back the other
 /// end of that same buffer rather than the thread's `JoinHandle` — see
 /// [`run_command_with_deadline`]'s own doc for why that thread is never
-/// joined. `None` (no pipe at all, or the OS refused to hand out a thread)
-/// reads back as an empty buffer, the same as a command that wrote nothing
-/// on this stream.
+/// joined. `None` (no pipe at all) reads back as an empty buffer, the same as
+/// a command that wrote nothing on this stream — but the OS refusing to hand
+/// out a thread is `Err`, not that: the closure this never runs is dropped
+/// right along with the pipe it moved, closing this process's read end, and
+/// `Command` leaves the child's `SIGPIPE` disposition at `SIG_DFL`, so the
+/// very next line it writes on this stream kills it outright. That is not
+/// "wrote nothing" — the caller has to know, and kill the rest of it.
+/// Read `source` to EOF, appending every byte into `sink` — the loop
+/// [`drain_pipe`]'s own thread runs, pulled out so a test can drive it
+/// against anything that implements `Read`, not only a real pipe.
+///
+/// A signal landing mid-read is not a failure to read the pipe — retried
+/// rather than treated as EOF, the same convention the file-scan loop above
+/// uses for the same syscall. Any other `Err` *is* treated as EOF.
+#[cfg(any(target_os = "macos", test))]
+fn drain_into(mut source: impl std::io::Read, sink: &std::sync::Mutex<Vec<u8>>) {
+    let mut chunk = [0u8; 4096];
+    loop {
+        match source.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Ok(mut kept) = sink.lock() {
+                    kept.extend_from_slice(&chunk[..n]);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn drain_pipe(
     pipe: Option<impl std::io::Read + Send + 'static>,
-) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+) -> Result<std::sync::Arc<std::sync::Mutex<Vec<u8>>>, std::io::Error> {
     let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let Some(mut pipe) = pipe else {
-        return buf;
+    let Some(pipe) = pipe else {
+        return Ok(buf);
     };
     let sink = std::sync::Arc::clone(&buf);
-    let _ = std::thread::Builder::new().spawn(move || {
-        let mut chunk = [0u8; 4096];
-        loop {
-            match pipe.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if let Ok(mut kept) = sink.lock() {
-                        kept.extend_from_slice(&chunk[..n]);
-                    }
-                }
-            }
-        }
-    });
-    buf
+    std::thread::Builder::new().spawn(move || drain_into(pipe, &sink))?;
+    Ok(buf)
+}
+
+/// Whether either [`drain_pipe`] call failed to even start, and if so, the
+/// one line [`run_command_with_deadline`] reports for it — stdout's error
+/// ahead of stderr's when, somehow, both did, since a caller staring at "no
+/// output at all" is more likely checking stdout's failure first. Pure so
+/// this policy — which of the two wins, and the exact message — is provable
+/// without an OS that will actually refuse a thread on demand.
+#[cfg(any(target_os = "macos", test))]
+fn pipe_drain_failure_message(
+    program: &str,
+    stdout: &Result<std::sync::Arc<std::sync::Mutex<Vec<u8>>>, std::io::Error>,
+    stderr: &Result<std::sync::Arc<std::sync::Mutex<Vec<u8>>>, std::io::Error>,
+) -> Option<String> {
+    let e = stdout.as_ref().err().or(stderr.as_ref().err())?;
+    Some(format!(
+        "{program}: could not start a pipe-drain thread: {e}"
+    ))
 }
 
 /// Classify the raw result of `security find-generic-password …` into the
@@ -5112,6 +5172,45 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// On unix, `is_file()` alone is not "this is the client's binary": a
+    /// regular, non-executable file satisfies it exactly as well as the real
+    /// one does, and sitting in an earlier `PATH` directory would shadow the
+    /// real install rather than be skipped over the way this proves it now
+    /// is — the same property `main.rs`'s own
+    /// `find_bin_in_skips_a_non_executable_file_for_an_executable_one_further_down`
+    /// proves for the sibling resolver.
+    #[test]
+    #[cfg(unix)]
+    fn bin_candidates_skips_a_non_executable_file_for_an_executable_one_further_down_path() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let shadowing = temp_dir("bin-candidates-non-executable");
+        let real = temp_dir("bin-candidates-real-executable");
+        let name = format!("tickover-test-bin-candidates-exec-{}", std::process::id());
+        std::fs::write(shadowing.join(&name), "not a binary, just a file").unwrap();
+        let bin = real.join(&name);
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let real_path = std::env::var_os("PATH");
+        let joined = std::env::join_paths([&shadowing, &real]).unwrap();
+        std::env::set_var("PATH", &joined);
+        let found = bin_candidates(&[name]);
+        if let Some(p) = real_path {
+            std::env::set_var("PATH", p);
+        } else {
+            std::env::remove_var("PATH");
+        }
+
+        std::fs::remove_dir_all(&shadowing).ok();
+        std::fs::remove_dir_all(&real).ok();
+        assert_eq!(
+            found,
+            vec![bin],
+            "the non-executable file in the earlier PATH directory must not win"
+        );
+    }
+
     // FIFOs, and the `mkfifo` binary that makes one, are a Unix concept —
     // `scan_candidate`'s `O_NONBLOCK` open is itself `#[cfg(unix)]`-only,
     // and there is nothing on Windows for this test to exercise.
@@ -6515,6 +6614,42 @@ mod tests {
         assert!(err.contains("Keychain access"), "unexpected error: {err}");
     }
 
+    /// The wiring `pipe_drain_failure_message_reports_whichever_drain_failed_to_start`
+    /// cannot reach on its own: that test proves *which* message a failed
+    /// drain reports, but nothing there ever touches a real child, and a
+    /// real `Builder::spawn` failure cannot be forced on demand to prove the
+    /// `if let Some(msg) = …` branch actually kills the one it names.
+    /// `kill_and_wait` is exactly what that branch (and the other two exits
+    /// that give up on a child) calls — proven directly against a real one
+    /// here instead: `kill(pid, 0)` polled until it reports the process
+    /// gone, the same technique `main.rs`'s own grandchild-kill test uses.
+    #[cfg(unix)]
+    #[test]
+    fn kill_and_wait_actually_kills_a_real_child() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("sh");
+        let pid = child.id() as libc::pid_t;
+
+        kill_and_wait(&mut child);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // SAFETY: signal `0` sends nothing — it only asks the kernel whether
+        // `pid` still exists, the standard liveness probe.
+        while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "the child must be gone once kill_and_wait returns"
+        );
+    }
+
     /// The stand-in `run_command_with_deadline`'s own doc promises: `security`
     /// needs a real Keychain, but the deadline logic itself does not — a
     /// command guaranteed to outlive the deadline proves the kill.
@@ -6559,6 +6694,84 @@ mod tests {
         .expect("a command that runs to completion, even with a non-zero exit, is not a timeout");
         assert!(!out.success);
         assert_eq!(out.stderr, b"trouble");
+    }
+
+    /// A `Read` that answers exactly the way an interrupted syscall would:
+    /// `Err(Interrupted)` once, then the real bytes, then EOF. Standing in
+    /// for a real pipe, which cannot be made to return `EINTR` on demand.
+    struct InterruptOnceThenData {
+        interrupted_yet: bool,
+        data: &'static [u8],
+        pos: usize,
+    }
+    impl std::io::Read for InterruptOnceThenData {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted_yet {
+                self.interrupted_yet = true;
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            let remaining = &self.data[self.pos..];
+            let n = remaining.len().min(buf.len());
+            buf[..n].copy_from_slice(&remaining[..n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    /// An `Err` from a read must not end the drain when it is
+    /// `Interrupted` — `EINTR` mid-read on an otherwise perfectly fine pipe
+    /// must be retried, not mistaken for the pipe's own end and lose every
+    /// byte still to come.
+    #[test]
+    fn drain_into_retries_after_an_interrupted_read_instead_of_stopping() {
+        let source = InterruptOnceThenData {
+            interrupted_yet: false,
+            data: b"hello",
+            pos: 0,
+        };
+        let sink = std::sync::Mutex::new(Vec::new());
+        drain_into(source, &sink);
+        assert_eq!(
+            *sink.lock().unwrap(),
+            b"hello",
+            "the interrupted read must not be mistaken for EOF"
+        );
+    }
+
+    /// A thread the OS refuses to hand out for either pipe must not be
+    /// swallowed the way it once was (`let _ = …spawn(…)`, no report, and the
+    /// child left to find out about the closed pipe from `SIGPIPE` on its own
+    /// next write): `run_command_with_deadline` has to see it and say so.
+    /// Pure inputs stand in for the actual `Builder::spawn` failure, which
+    /// nothing here can trigger on demand.
+    #[test]
+    fn pipe_drain_failure_message_reports_whichever_drain_failed_to_start() {
+        let ok = || Ok(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let stdout_err = Err(std::io::Error::other("boom-stdout"));
+        let stderr_err = Err(std::io::Error::other("boom-stderr"));
+
+        assert_eq!(
+            pipe_drain_failure_message("security", &ok(), &ok()),
+            None,
+            "both drains started — nothing to report"
+        );
+        assert_eq!(
+            pipe_drain_failure_message("security", &stdout_err, &ok()),
+            Some("security: could not start a pipe-drain thread: boom-stdout".to_string())
+        );
+        assert_eq!(
+            pipe_drain_failure_message("security", &ok(), &stderr_err),
+            Some("security: could not start a pipe-drain thread: boom-stderr".to_string())
+        );
+        assert_eq!(
+            pipe_drain_failure_message(
+                "security",
+                &Err(std::io::Error::other("boom-stdout")),
+                &Err(std::io::Error::other("boom-stderr"))
+            ),
+            Some("security: could not start a pipe-drain thread: boom-stdout".to_string()),
+            "stdout's failure wins when both did"
+        );
     }
 
     // ── reject-when step ──────────────────────────────────────────────────

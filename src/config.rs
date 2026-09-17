@@ -638,6 +638,18 @@ pub fn plugin_seen_window_for(plugin_id: &str, reading_id: &str, role: &str) -> 
 /// Record what the provider states about one window — both fields in a single
 /// write, so no reader can ever see the new reset beside the old length.
 pub fn set_plugin_seen_window_for(plugin_id: &str, reading_id: &str, role: &str, seen: SeenWindow) {
+    // Normalised the same way the read above normalises what it returns: an
+    // `at` of `0` never reads back as anything but `None`, so writing one here
+    // would compare unequal to that `None` forever and rewrite the file every
+    // call. The caller is expected to have filtered this already — this is
+    // only the backstop.
+    if seen.at == 0 {
+        return;
+    }
+    let seen = SeenWindow {
+        at: seen.at,
+        period_minutes: seen.period_minutes.filter(|m| *m > 0),
+    };
     if plugin_seen_window_for(plugin_id, reading_id, role) == Some(seen) {
         return;
     }
@@ -1303,6 +1315,38 @@ mod tests {
                 take_write_count(),
                 0,
                 "an unchanged entry must not touch the file"
+            );
+        });
+    }
+
+    /// A `0` boundary reads back as `None` (see `plugin_seen_window_for`
+    /// above), so writing one would never compare equal to what the next read
+    /// returns — before this guard the setter rewrote `config.json` on every
+    /// single call it was given one, forever, and never once remembered it.
+    #[test]
+    fn the_registry_setter_refuses_a_zero_boundary_instead_of_rewriting_forever() {
+        with_test_config_path(|| {
+            let zero = SeenWindow {
+                at: 0,
+                period_minutes: Some(300),
+            };
+            set_plugin_seen_window_for("acme", "acme", "primary", zero);
+            assert_eq!(
+                take_write_count(),
+                0,
+                "a zero boundary is never worth a write"
+            );
+            assert_eq!(
+                plugin_seen_window_for("acme", "acme", "primary"),
+                None,
+                "and nothing was remembered"
+            );
+
+            set_plugin_seen_window_for("acme", "acme", "primary", zero);
+            assert_eq!(
+                take_write_count(),
+                0,
+                "repeating it costs no write either — not a rewrite every call"
             );
         });
     }

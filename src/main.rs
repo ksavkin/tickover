@@ -1691,17 +1691,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         if let Some((surface_key, renewal)) = due {
                             let ping = m.ping.as_ref().expect("filtered by ping.is_some() above");
-                            config::set_plugin_pinged_at(&m.id, now);
-                            credit_renewal(&surface_key, renewal);
-                            diag::line(format!(
-                                "auto-ping: {} token has lapsed, running {} to renew it",
-                                m.id, ping.bin
-                            ));
-                            let spawned = send_ping(ping, Some((surface_key.clone(), renewal)));
-                            if spawned {
+                            if run_renewal_ping(&m.id, ping, surface_key, renewal, now) {
                                 continue;
                             }
-                            uncredit_renewal(&surface_key, renewal);
                         }
                         let Some(first_id) = first_surface_reading_id(m) else {
                             continue;
@@ -1781,7 +1773,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // the tray handler has already toggled the panel, and treating the
             // same click as a Dock reopen would toggle it straight back.
             let by_tray = activation_owned_by_tray(tray_click_at.get(), Instant::now());
-            let became_active = active && !was_active.replace(active) && !by_tray;
+            let became_active = dock_activation_edge(&was_active, active, by_tray);
             let Some(app) = weak.upgrade() else { return };
             let clicks = platform::take_reopen_requests();
             let visible = app.window().is_visible();
@@ -3258,7 +3250,15 @@ fn seen_records<'a>(
             if seen_role_key(w.role).is_none() {
                 continue;
             }
-            let Some(at) = w.resets_at else { continue };
+            // `0` is filtered here for the same reason
+            // `config::plugin_seen_window_for` filters it on the way back out:
+            // a boundary of `0` and "the provider never stated one" have to
+            // read back the same way, or a record built from it never once
+            // compares equal to what a later read returns, and the write below
+            // repeats every tick forever without ever being remembered.
+            let Some(at) = w.resets_at.filter(|at| *at > 0) else {
+                continue;
+            };
             out.push(SeenRecord {
                 manifest: m,
                 reading_id: r.id.clone(),
@@ -3271,7 +3271,8 @@ fn seen_records<'a>(
                     at,
                     period_minutes: w
                         .period_minutes
-                        .or_else(|| declared_period_minutes(m, w.role)),
+                        .or_else(|| declared_period_minutes(m, w.role))
+                        .filter(|m| *m > 0),
                 },
             });
         }
@@ -5087,6 +5088,22 @@ fn activation_owned_by_tray(tray_click_at: Option<Instant>, now: Instant) -> boo
     tray_click_at.is_some_and(|at| now.saturating_duration_since(at) < TRAY_CLICK_OWNS_ACTIVATION)
 }
 
+/// One dock-reopen tick's rising edge, folded together with the cell it reads
+/// and updates.
+///
+/// `replace` has to run on *every* call regardless of `active`, not only the
+/// ones where the rest of the expression goes on to look at `was` — an `&&`
+/// short-circuiting past it on a `false` tick leaves the cell stuck at
+/// whatever it last held, so a later `true` tick can never tell it apart from
+/// one that follows another `true`, and the edge it is meant to catch stops
+/// firing for the rest of the run. Taking `&Cell<bool>` rather than a plain
+/// `bool` in and out is what lets a test drive several ticks over the same
+/// cell the way the timer below does, and would have caught exactly that.
+fn dock_activation_edge(was_active: &Cell<bool>, active: bool, by_tray: bool) -> bool {
+    let was = was_active.replace(active);
+    active && !was && !by_tray
+}
+
 /// Whether this platform delivers the focus loss a status-item click causes
 /// *before* the click itself.
 ///
@@ -5404,7 +5421,15 @@ fn cli_dirs() -> Vec<std::path::PathBuf> {
 fn find_bin(name: &str) -> Option<std::path::PathBuf> {
     let mut dirs_to_check = cli_dirs();
     if let Some(p) = std::env::var_os("PATH") {
-        dirs_to_check.extend(std::env::split_paths(&p));
+        // An empty `PATH` entry (a leading, trailing or doubled `:`) means
+        // "the current directory" — POSIX's own convention, and never a
+        // place this app should go looking for a plugin's binary: "current
+        // directory" for a menu-bar app is wherever it happened to be
+        // launched from. `is_absolute()` refuses that and any other relative
+        // entry, matching `plugin::auth::bin_candidates`'s own filter — the
+        // two resolvers agree on what "on PATH" means, not only on the
+        // install directories they add ahead of it.
+        dirs_to_check.extend(std::env::split_paths(&p).filter(|d| d.is_absolute()));
     }
     find_bin_in(&dirs_to_check, name)
 }
@@ -5424,7 +5449,9 @@ fn find_bin_in(dirs: &[std::path::PathBuf], name: &str) -> Option<std::path::Pat
     }
     #[cfg(not(target_os = "windows"))]
     {
-        dirs.iter().map(|d| d.join(name)).find(|c| c.is_file())
+        dirs.iter()
+            .map(|d| d.join(name))
+            .find(|c| tickover::plugin::is_executable_file(c))
     }
 }
 
@@ -5470,24 +5497,45 @@ fn unique_ping_workdir_name() -> String {
     )
 }
 
-/// Create `dir` (and any missing parent) fresh — `0o700` on unix, atomically
-/// at creation rather than restricted afterwards, so there is no window in
-/// which it sits at the OS default and readable by anything else this user
-/// runs. Nothing is ever written into it today; the mode is what keeps that
-/// true if some future CLI ever does, rather than relying on it staying
-/// accidentally so.
+/// Create `dir` fresh — `0o700` on unix, atomically at creation rather than
+/// restricted afterwards, so there is no window in which it sits at the OS
+/// default and readable by anything else this user runs. Nothing is ever
+/// written into it today; the mode is what keeps that true if some future
+/// CLI ever does, rather than relying on it staying accidentally so.
+///
+/// The parent is created recursively — not because [`ping_cwd`]'s primary
+/// candidate needs it (its parent is `temp_dir()`, which always exists),
+/// but because its fallback does: `…/ping-workdir`, a sibling of the
+/// plugins directory, has no reason to exist yet on an install where the
+/// primary candidate has never once failed. `dir` itself, the leaf, is not
+/// created recursively: `DirBuilder::create` without `.recursive(true)` is
+/// `mkdir`'s own `O_EXCL` semantics, refusing outright if `dir` already
+/// exists rather than quietly succeeding on it without touching its mode or
+/// its contents. A name this function is handed twice breaks the contract
+/// `unique_ping_workdir_name`'s own doc names (a name that should never
+/// repeat) — this is what makes that loud, an `Err` right here, instead of a
+/// working directory silently shared between two runs.
 fn create_ping_workdir(dir: &std::path::Path) -> std::io::Result<()> {
+    if let Some(parent) = dir.parent() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(parent)?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
+        std::fs::DirBuilder::new().mode(0o700).create(dir)
     }
     #[cfg(not(unix))]
     {
-        std::fs::create_dir_all(dir)
+        std::fs::DirBuilder::new().create(dir)
     }
 }
 
@@ -5615,6 +5663,62 @@ fn kill_process_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+/// Remove the ping's working directory: once its run is over, or once it is
+/// clear no run will happen in it at all (`Command::spawn` or the thread
+/// meant to call it never started). A failure to remove it is logged rather
+/// than swallowed, so it is visible instead of read, by omission, as "the
+/// directory always goes away with the run".
+///
+/// Attempted the same way on every platform, but the two differ in how
+/// often that log line can actually fire. On unix, removing a directory
+/// that is still some process's current directory is allowed regardless —
+/// and on the one call site where a command did run, `kill_process_tree`
+/// reaches the whole process group it was started in (`process_group(0)`
+/// at spawn time — see that function's own doc), so there is no grandchild
+/// left holding `dir` open by the time this runs. Windows has neither: the
+/// OS refuses to remove a directory anything still has open as its cwd, and
+/// `kill_process_tree` there only ever reaches the one direct child — so a
+/// grandchild that outlived the deadline's kill can leave this failing for
+/// real.
+fn cleanup_ping_workdir(dir: &std::path::Path) {
+    if let Err(e) = std::fs::remove_dir_all(dir) {
+        diag::line(format!(
+            "auto-ping: could not remove {} after the run: {e}",
+            dir.display()
+        ));
+    }
+}
+
+/// Read `source` to EOF, appending into `sink` and keeping only the last
+/// `cap` bytes of it — the loop [`run_with_deadline`]'s own drain thread
+/// runs, pulled out so a test can drive it against anything that implements
+/// `Read`, not only a real pipe.
+///
+/// A signal landing mid-read is not a failure to read the pipe — retried
+/// rather than treated as EOF, the same convention `auth.rs`'s file-scan
+/// loop uses for the same syscall. Any other `Err` *is* treated as EOF: read
+/// to EOF even when most of what comes back is dropped, because stopping
+/// early would close this end, and the next thing the command wrote would
+/// kill it, turning "warned more than we cared to quote" into a failed ping
+/// — see [`run_with_deadline`]'s own doc for the rest of that reasoning.
+fn drain_capped(mut source: impl std::io::Read, sink: &std::sync::Mutex<Vec<u8>>, cap: usize) {
+    let mut chunk = [0u8; 4096];
+    loop {
+        match source.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Ok(mut kept) = sink.lock() {
+                    kept.extend_from_slice(&chunk[..n]);
+                    let over = kept.len().saturating_sub(cap);
+                    kept.drain(..over);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
 /// Wait for `child`, killing it (and, on unix, its whole process group — see
 /// [`kill_process_tree`]) if it outlives `deadline`. Returns how it ended,
 /// plus up to [`PING_STDERR_MAX`] bytes of the **tail** of its stderr.
@@ -5643,29 +5747,24 @@ fn run_with_deadline(mut child: std::process::Child, deadline: Duration) -> (Run
     let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     let sink = std::sync::Arc::clone(&collected);
     // `Builder::spawn`, not `thread::spawn`: the latter panics if the OS won't
-    // hand out a thread. Nothing here is left half-set-up by that failure —
-    // `stderr` is simply dropped along with the closure, same as if the
-    // command had produced none — but a diagnostic beats losing the failure
-    // reason silently.
+    // hand out a thread. This is not the harmless case the comment here used
+    // to claim: the closure — and the `ChildStderr` it moved — is dropped
+    // right along with the failed `spawn` call, which closes this process's
+    // read end of the pipe; `Command` leaves the child's `SIGPIPE`
+    // disposition at `SIG_DFL`, so the very next line the child writes to
+    // stderr kills it outright. That is not "the same as if it had produced
+    // no output" — it is a signal death nothing here reported. Killed
+    // explicitly below instead, so the run's actual fate is the one that
+    // gets logged.
     if let Err(e) = std::thread::Builder::new().spawn(move || {
-        use std::io::Read;
-        if let Some(mut stderr) = stderr {
-            let mut chunk = [0u8; 4096];
-            while let Ok(n) = stderr.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                if let Ok(mut kept) = sink.lock() {
-                    kept.extend_from_slice(&chunk[..n]);
-                    let over = kept.len().saturating_sub(PING_STDERR_MAX);
-                    kept.drain(..over);
-                }
-            }
+        if let Some(stderr) = stderr {
+            drain_capped(stderr, &sink, PING_STDERR_MAX);
         }
     }) {
         diag::line(format!(
-            "auto-ping: could not start the stderr drain thread: {e}"
+            "auto-ping: could not start the stderr drain thread: {e} — killing the run"
         ));
+        kill_process_tree(&mut child);
     }
 
     let expiry = Instant::now() + deadline;
@@ -5794,9 +5893,13 @@ fn spawn_hello(
             Ok(child) => child,
             Err(e) => {
                 diag::line(format!("auto-ping: {} did not start: {e}", bin.display()));
-                // Fresh per run: nothing reads or writes it after this,
-                // command or no command, so it goes with the run that made it.
-                let _ = std::fs::remove_dir_all(&cwd);
+                // Nothing else ever reads or writes `cwd` when the command
+                // itself never started, so there is no grandchild here to
+                // make the removal fail the way `cleanup_ping_workdir`'s own
+                // doc describes — but a removal that fails is logged, not
+                // assumed, the same way it is at every other exit from this
+                // closure.
+                cleanup_ping_workdir(&cwd);
                 if let Some((surface_key, renewal)) = on_renewal_spawn_failure {
                     uncredit_renewal(&surface_key, renewal);
                 }
@@ -5831,7 +5934,7 @@ fn spawn_hello(
                 ));
             }
         }
-        let _ = std::fs::remove_dir_all(&cwd);
+        cleanup_ping_workdir(&cwd);
     }) {
         Ok(_handle) => true,
         Err(e) => {
@@ -5839,7 +5942,11 @@ fn spawn_hello(
                 "auto-ping: {} could not start the thread to run it: {e}",
                 bin_for_log.display()
             ));
-            let _ = std::fs::remove_dir_all(&cwd_for_cleanup);
+            // Nothing else ever reads or writes `cwd_for_cleanup` when the
+            // thread that was going to run the command never started —
+            // logged rather than assumed if it fails regardless, same as
+            // every other removal in this function.
+            cleanup_ping_workdir(&cwd_for_cleanup);
             false
         }
     }
@@ -5873,6 +5980,42 @@ fn send_ping(
             false
         }
     }
+}
+
+/// One attempt at a renewal ping: credit the surface, record `now` as the
+/// plugin's last-pinged time, and ask [`send_ping`] to run its binary.
+///
+/// If the attempt never actually starts (`send_ping` returns `false`, e.g. an
+/// unresolvable binary or a thread the OS refused to hand out), both are
+/// undone — the credit via [`uncredit_renewal`], same as before, and
+/// `plugin_pinged_at` restored to whatever it held on entry. Leaving it at
+/// `now` would silence the *window* ping the tick loop tries right after
+/// this for a full `PING_MIN_INTERVAL_SECS`, over a renewal attempt that
+/// never ran anything.
+///
+/// Returns whether an attempt was made — the tick loop's own `if let` used
+/// to run this inline; pulled out so a test can drive it without a live
+/// `[ping]` process.
+fn run_renewal_ping(
+    plugin_id: &str,
+    ping: &manifest::PingConfig,
+    surface_key: String,
+    renewal: TokenRenewal,
+    now: u64,
+) -> bool {
+    let pinged_at_before = config::plugin_pinged_at(plugin_id);
+    config::set_plugin_pinged_at(plugin_id, now);
+    credit_renewal(&surface_key, renewal);
+    diag::line(format!(
+        "auto-ping: {plugin_id} token has lapsed, running {} to renew it",
+        ping.bin
+    ));
+    let spawned = send_ping(ping, Some((surface_key.clone(), renewal)));
+    if !spawned {
+        uncredit_renewal(&surface_key, renewal);
+        config::set_plugin_pinged_at(plugin_id, pinged_at_before);
+    }
+    spawned
 }
 
 // ── Registry: Check updates / Install / Update ───────────────────────────
@@ -6982,11 +7125,12 @@ fn parse_button_returned(stdout: &str) -> Option<String> {
 
 #[cfg(test)]
 mod dock_panel_tests {
+    use std::cell::Cell;
     use std::time::{Duration, Instant};
 
     use super::{
-        activation_owned_by_tray, panel_target_visibility as target, popover_moves as moves, Shown,
-        TRAY_CLICK_OWNS_ACTIVATION,
+        activation_owned_by_tray, dock_activation_edge, panel_target_visibility as target,
+        popover_moves as moves, Shown, TRAY_CLICK_OWNS_ACTIVATION,
     };
 
     // Nothing happened this tick: whatever is on screen stays.
@@ -7049,6 +7193,41 @@ mod dock_panel_tests {
         assert!(
             !activation_owned_by_tray(None, click),
             "no click, nothing to own it"
+        );
+    }
+
+    // Before this, `&&` short-circuited past the cell update whenever `active`
+    // was `false`, so a fall back to inactive was invisible to it: the cell
+    // stayed `true` from the app's own launch (`app_is_active()` is usually
+    // `true` there) for the rest of the run, and every later rising edge read
+    // `was == true` and reported no edge at all.
+    #[test]
+    fn dock_activation_edge_tracks_a_fall_back_to_inactive() {
+        let cell = Cell::new(true); // started frontmost, like `app_is_active()` usually does
+        assert!(
+            !dock_activation_edge(&cell, true, false),
+            "already active at the first tick — no edge yet"
+        );
+        assert!(
+            !dock_activation_edge(&cell, false, false),
+            "falling inactive is not itself an edge"
+        );
+        assert!(
+            dock_activation_edge(&cell, true, false),
+            "and becoming active again after that fall now reads as one"
+        );
+        assert!(
+            !dock_activation_edge(&cell, true, false),
+            "staying active on the next tick is not a second edge"
+        );
+    }
+
+    #[test]
+    fn dock_activation_edge_defers_to_the_tray() {
+        let cell = Cell::new(false);
+        assert!(
+            !dock_activation_edge(&cell, true, true),
+            "the tray already handled this activation"
         );
     }
 
@@ -7232,6 +7411,14 @@ mod title_tests {
     use tickover::model::Role;
 
     const NOW: u64 = 1_800_000_000;
+
+    /// Guards every test that reads or mutates the real `PATH` environment
+    /// variable — `cargo test`'s default threading runs test functions
+    /// concurrently, and `std::env::set_var` is process-wide, so a test that
+    /// temporarily replaces `PATH` and one that merely reads it (`find_bin`,
+    /// `cli_path_env`) would otherwise race. Same convention `plugin::auth`
+    /// already uses for its own `PATH`-mutating test.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Test-only uniform-gate resolver: every non-opt-in surface always, every
     /// opt-in one iff `opt_in_enabled`. Production's [`active_surface_ids`]
@@ -10145,6 +10332,67 @@ mod title_tests {
         assert!(seen_records(&plugins, std::slice::from_ref(&r)).is_empty());
     }
 
+    /// `resets_at: 0` from a provider is not a boundary either — reading it
+    /// back would filter it to `None` (`config::plugin_seen_window_for`), so a
+    /// record built from it would never once compare equal to what a later
+    /// read returns and the write loop would repeat every tick forever without
+    /// ever remembering anything.
+    #[test]
+    fn seen_records_skips_a_window_with_a_zero_reset_time() {
+        let plugins = vec![two_window_manifest()];
+        let zero = Window {
+            key: "w0:".to_string(),
+            label: "5H".into(),
+            role: Role::Primary,
+            used_percent: Some(3.0),
+            resets_at: Some(0),
+            period_minutes: Some(300),
+        };
+        let r = reading_with(vec![zero], None);
+        assert!(seen_records(&plugins, std::slice::from_ref(&r)).is_empty());
+    }
+
+    /// The other half of the zero filter: `period_minutes: Some(0)` reads
+    /// back as `None` on the way out of the registry exactly as `at: 0`
+    /// does (`config::plugin_seen_window_for` filters both with `.filter(|m|
+    /// *m > 0)`), so a record that carried `Some(0)` through would merge
+    /// unequal to what a later read returns, and `config.json` would rewrite
+    /// every tick the same way it does when `at` goes unfiltered. Stated as
+    /// `Some(0)` rather than left absent on purpose, so the manifest's own
+    /// declared length is *not* what ends up recorded either — the provider did say
+    /// something about this window's length, just nothing usable, and that
+    /// is different from never having said anything at all.
+    #[test]
+    fn seen_records_treats_a_zero_stated_period_as_no_period() {
+        let assumed = stub_manifest("codex", 10); // period.mode = "assumed", 300
+        let zero_period = reading_with(
+            vec![Window {
+                key: "w0:".to_string(),
+                label: "5H".into(),
+                role: Role::Primary,
+                used_percent: Some(3.0),
+                resets_at: Some(NOW + 600),
+                period_minutes: Some(0),
+            }],
+            None,
+        );
+
+        let out = seen_records(
+            std::slice::from_ref(&assumed),
+            std::slice::from_ref(&zero_period),
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "the window still has a real reset — only its stated length is thrown out"
+        );
+        assert_eq!(
+            out[0].seen.period_minutes, None,
+            "a stated zero must not read back as a zero-length window, \
+             and must not be replaced by the manifest's own declared length either"
+        );
+    }
+
     /// When the reading states no length, the manifest's own fixed one is the
     /// fallback — and for a manifest that reads its length out of the response
     /// there is nothing to fall back to, which is why the length is remembered
@@ -10735,6 +10983,59 @@ mod title_tests {
             .expect("/bin/sh")
     }
 
+    /// A `Read` that answers exactly the way an interrupted syscall would:
+    /// `Err(Interrupted)` once, then the real bytes, then EOF. Standing in
+    /// for a real pipe, which cannot be made to return `EINTR` on demand.
+    struct InterruptOnceThenData {
+        interrupted_yet: bool,
+        data: &'static [u8],
+        pos: usize,
+    }
+    impl std::io::Read for InterruptOnceThenData {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted_yet {
+                self.interrupted_yet = true;
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            let remaining = &self.data[self.pos..];
+            let n = remaining.len().min(buf.len());
+            buf[..n].copy_from_slice(&remaining[..n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    /// An `Err` from a read must not end the drain when it is
+    /// `Interrupted` — `EINTR` mid-read on an otherwise perfectly fine pipe
+    /// must be retried, not mistaken for the pipe's own end and lose every
+    /// byte still to come.
+    #[test]
+    fn drain_capped_retries_after_an_interrupted_read_instead_of_stopping() {
+        let source = InterruptOnceThenData {
+            interrupted_yet: false,
+            data: b"hello",
+            pos: 0,
+        };
+        let sink = std::sync::Mutex::new(Vec::new());
+        drain_capped(source, &sink, 4096);
+        assert_eq!(
+            *sink.lock().unwrap(),
+            b"hello",
+            "the interrupted read must not be mistaken for EOF"
+        );
+    }
+
+    /// The other half of `drain_capped`'s own contract: past `cap` bytes,
+    /// only the **tail** survives — the head is what a failing command says
+    /// least about why, and `PING_STDERR_MAX` exists to bound memory, not to
+    /// pick an arbitrary prefix to keep.
+    #[test]
+    fn drain_capped_keeps_only_the_tail_past_cap() {
+        let sink = std::sync::Mutex::new(Vec::new());
+        drain_capped(&b"abcdefghij"[..], &sink, 4);
+        assert_eq!(*sink.lock().unwrap(), b"ghij");
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_with_deadline_reports_a_command_that_ends_on_its_own() {
@@ -10813,6 +11114,33 @@ mod title_tests {
         }
     }
 
+    /// The wiring the drain-thread-spawn-failure branch relies on: a real
+    /// `Builder::spawn` failure cannot be forced on demand to prove
+    /// `kill_process_tree(&mut child)` actually runs there, so this drives
+    /// the exact function that branch calls against a real child instead —
+    /// `kill(pid, 0)` polled until it reports the process gone, once
+    /// reaped, the same technique the grandchild test just above uses for
+    /// the process-group half of the same function.
+    #[cfg(unix)]
+    #[test]
+    fn kill_process_tree_actually_kills_a_real_child() {
+        let mut child = sh("sleep 30");
+        let pid = child.id() as libc::pid_t;
+
+        kill_process_tree(&mut child);
+        let _ = child.wait(); // reap it — a killed-not-reaped pid is still "alive" to signal 0
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "the child must be gone once kill_process_tree has run and been reaped"
+        );
+    }
+
     /// A command that writes more than we keep must still run to completion:
     /// closing the pipe early would kill it, turning "warned a lot" into a
     /// failed ping. And what survives is the **tail** — a CLI that fails says
@@ -10888,6 +11216,79 @@ mod title_tests {
         let mode = std::fs::metadata(&cwd).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "got mode {mode:o}");
         std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// `DirBuilder::create` without `.recursive(true)` refuses a path that
+    /// already exists — `mkdir`'s own `O_EXCL` semantics — rather than
+    /// quietly succeeding on it without touching its mode or contents.
+    /// `create_dir_all` does the opposite: it reports success on an existing
+    /// directory and applies nothing, so a name reused by mistake would hand
+    /// back somewhere another run — or anything else on the system — had
+    /// already had a chance to write into, contradicting `ping_cwd`'s own
+    /// "nobody else has had a chance to put anything into" promise.
+    #[test]
+    fn create_ping_workdir_refuses_a_path_that_already_exists() {
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-ping-workdir-preexisting-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::create_dir_all(&dir).expect("set up a directory that is already there");
+
+        let err = create_ping_workdir(&dir)
+            .expect_err("a leaf that already exists must be refused, not silently accepted");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The one thing `create_dir_all` was still needed for: a parent that
+    /// does not exist yet (the first ping this process ever runs, before the
+    /// OS temp directory has seen `tickover-ping-…` before). Only the parent
+    /// gets that treatment now — the leaf itself is still refused if it is
+    /// already there, covered by the sibling test above.
+    #[test]
+    fn create_ping_workdir_creates_a_missing_parent() {
+        let parent = std::env::temp_dir().join(format!(
+            "tickover-ping-workdir-missing-parent-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let dir = parent.join("leaf");
+        assert!(!parent.exists(), "the parent must not already exist");
+
+        create_ping_workdir(&dir).expect("the missing parent is created along the way");
+        assert!(dir.exists());
+
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    /// A removal that fails must be logged, not silently dropped — a `let _
+    /// =` here would read, by omission, as a claim that the working
+    /// directory always goes away with the run. On Windows that claim is
+    /// false whenever a grandchild the deadline's kill never reached still
+    /// has it as its own current directory; a path that was never created at
+    /// all stands in for "removal fails" without needing a live grandchild
+    /// process to prove it.
+    #[test]
+    fn cleanup_ping_workdir_logs_a_removal_that_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-ping-workdir-cleanup-failure-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        assert!(!dir.exists(), "must not already exist — that's the failure");
+        let _ = diag::take_recorded();
+
+        cleanup_ping_workdir(&dir);
+
+        let recorded = diag::take_recorded();
+        assert!(
+            recorded
+                .iter()
+                .any(|l| l.contains("could not remove") && l.contains(&dir.display().to_string())),
+            "a failed removal must be reported, not silently dropped: {recorded:?}"
+        );
     }
 
     /// The quoted stderr of a failed ping is cut by characters, because a
@@ -10972,6 +11373,7 @@ mod title_tests {
     /// user-writable directory shadow the system tools the CLI shells out to.
     #[test]
     fn cli_path_env_appends_the_install_dirs_after_the_inherited_path() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let joined = cli_path_env().expect("no install dir contains a path separator");
         let path: Vec<std::path::PathBuf> = std::env::split_paths(&joined).collect();
         let dirs = cli_dirs();
@@ -10989,10 +11391,96 @@ mod title_tests {
     #[test]
     fn find_bin_in_matches_an_extensionless_file_on_every_platform() {
         let dir = temp_plugins_dir("find-bin-plain");
-        std::fs::write(dir.join("codex"), "#!/bin/sh\n").unwrap();
+        let bin = dir.join("codex");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        make_executable(&bin);
         let found = find_bin_in(std::slice::from_ref(&dir), "codex");
         std::fs::remove_dir_all(&dir).ok();
-        assert_eq!(found, Some(dir.join("codex")));
+        assert_eq!(found, Some(bin));
+    }
+
+    /// On unix, `is_file()` alone is not "this is the CLI": a regular,
+    /// non-executable file (a stray README, a config a package manager left
+    /// beside the real binary) satisfies it exactly as well as the binary
+    /// does, and sitting in an earlier directory would shadow the real
+    /// install rather than be skipped over the way this proves it now is.
+    #[test]
+    #[cfg(unix)]
+    fn find_bin_in_skips_a_non_executable_file_for_an_executable_one_further_down() {
+        let shadowing = temp_plugins_dir("find-bin-non-executable");
+        let real = temp_plugins_dir("find-bin-real-executable");
+        std::fs::write(shadowing.join("codex"), "not a binary, just a file").unwrap();
+        let bin = real.join("codex");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        make_executable(&bin);
+
+        let found = find_bin_in(&[shadowing.clone(), real.clone()], "codex");
+
+        std::fs::remove_dir_all(&shadowing).ok();
+        std::fs::remove_dir_all(&real).ok();
+        assert_eq!(
+            found,
+            Some(bin),
+            "the non-executable file in the earlier directory must not win"
+        );
+    }
+
+    #[cfg(unix)]
+    fn make_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod the test binary executable");
+    }
+    #[cfg(not(unix))]
+    fn make_executable(_path: &std::path::Path) {}
+
+    /// An empty or relative `PATH` entry means "the current directory" —
+    /// never where the auto-ping should go looking for a plugin's binary —
+    /// and `plugin::auth::bin_candidates` already refuses one. Before this,
+    /// `find_bin` did not: a manifest naming a `bin` that happened to match a
+    /// file relative to wherever this app was launched from would resolve to
+    /// it. Mutates the real `PATH`, so it needs the same fixture and the same
+    /// lock `plugin::auth::bin_candidates_ignores_relative_path_entries` uses
+    /// for the identical reason — see that test's own doc.
+    #[test]
+    fn find_bin_ignores_relative_path_entries() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let relative = format!("target/tickover-test-find-bin-{}", std::process::id());
+        let dir = std::env::current_dir()
+            .expect("cwd resolvable in test env")
+            .join(&relative);
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = format!("tickover-test-find-bin-{}", std::process::id());
+        let bin = dir.join(&name);
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        make_executable(&bin);
+        // If this does not hold, `relative` cannot resolve to `bin` from the
+        // test process's own cwd no matter what `find_bin` does with it, and
+        // `found == None` below would prove nothing — the exact trap
+        // `bin_candidates_ignores_relative_path_entries`'s own doc names.
+        assert!(
+            std::path::Path::new(&relative).join(&name).is_file(),
+            "the fixture must resolve relative to the cwd, or this proves nothing"
+        );
+
+        let real_path = std::env::var_os("PATH");
+        let joined =
+            std::env::join_paths([std::ffi::OsStr::new(""), std::ffi::OsStr::new(&relative)])
+                .unwrap();
+        std::env::set_var("PATH", &joined);
+        let found = find_bin(&name);
+        if let Some(p) = real_path {
+            std::env::set_var("PATH", p);
+        } else {
+            std::env::remove_var("PATH");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            found, None,
+            "a relative PATH entry (including the empty component) must never be searched, \
+             even one that would actually resolve from the crate root: {found:?}"
+        );
     }
 
     /// npm's global installer puts a `.cmd` shim beside the real Windows
@@ -11331,6 +11819,41 @@ mod title_tests {
             last_renewed_for(&surface_key),
             None,
             "a ping that never found its binary must not leave its credit standing"
+        );
+    }
+
+    /// A renewal attempt that never starts must not glue `plugin_pinged_at` to
+    /// `now`: the window ping right after it in the tick loop reads that same
+    /// key, and a stuck `now` silenced it for a full `PING_MIN_INTERVAL_SECS`
+    /// over an attempt that ran nothing at all.
+    #[test]
+    fn run_renewal_ping_restores_plugin_pinged_at_when_the_attempt_never_starts() {
+        let plugin_id = format!("test-renewal-restore-{}", std::process::id());
+        let surface_key = format!("test-renewal-restore-surface-{}", std::process::id());
+        let renewal = TokenRenewal::Lapsed { expires_at: 1 };
+        let ping = manifest::PingConfig {
+            bin: format!("tickover-test-nonexistent-binary-{}", std::process::id()),
+            args: Vec::new(),
+            renews_token: true,
+        };
+
+        let before = 1_700_000_000;
+        config::set_plugin_pinged_at(&plugin_id, before);
+
+        let spawned = run_renewal_ping(&plugin_id, &ping, surface_key.clone(), renewal, NOW);
+        assert!(
+            !spawned,
+            "an unresolvable binary name must not read as spawned"
+        );
+        assert_eq!(
+            config::plugin_pinged_at(&plugin_id),
+            before,
+            "restored to what it held before this attempt, not left at `now`"
+        );
+        assert_eq!(
+            last_renewed_for(&surface_key),
+            None,
+            "the credit is undone alongside it"
         );
     }
 

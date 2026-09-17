@@ -792,7 +792,15 @@ fn substitute(
         out.push_str(&rest[..open]);
         let after = &rest[open..];
         let Some(close) = after.find('}') else {
-            break; // an unclosed brace is literal text, not a placeholder
+            // An unclosed brace is literal text, not a placeholder — pushed
+            // once, here, rather than left for the `push_str(rest)` below to
+            // pick up: `out` already carries `rest[..open]` from the line
+            // above, and `rest` still starts at that same `{` (never
+            // advanced), so breaking without emptying it would push
+            // `rest[..open]` a second time ahead of the rest of `after`.
+            out.push_str(after);
+            rest = "";
+            break;
         };
         let name = &after[1..close];
         let replacement = match name {
@@ -2307,6 +2315,29 @@ mod tests {
         assert_eq!(
             substitute("no placeholders", "tok-1", "9.9.9", &opts, &no_values()),
             "no placeholders"
+        );
+    }
+
+    /// An unclosed `{` is literal text, once — not a placeholder, and never
+    /// duplicated: `push_str(&rest[..open])` runs ahead of the `break`, so
+    /// `rest` has to be emptied there too, or the tail `push_str(rest)`
+    /// pushes everything from `open` onward a second time on top of it.
+    #[test]
+    fn substitute_leaves_an_unclosed_brace_as_literal_text_exactly_once() {
+        let opts = no_options();
+        assert_eq!(
+            substitute("Bearer {token", "tok-1", "9.9.9", &opts, &no_values()),
+            "Bearer {token",
+            "not doubled into `Bearer Bearer {{token`"
+        );
+        assert_eq!(
+            substitute("a{bc", "tok-1", "9.9.9", &opts, &no_values()),
+            "a{bc"
+        );
+        assert_eq!(
+            substitute("{token}x{", "tok-1", "9.9.9", &opts, &no_values()),
+            "tok-1x{",
+            "a closed placeholder ahead of the unclosed brace still substitutes"
         );
     }
 

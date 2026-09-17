@@ -382,6 +382,31 @@ pub fn cli_install_dirs() -> Vec<PathBuf> {
     dirs_to_check
 }
 
+/// Whether `path` is a candidate either resolver above may actually run — a
+/// second, shared answer to the same "is this really the CLI" question
+/// [`cli_install_dirs`]'s own doc gives for *where* to look: `is_file()`
+/// alone, which is what `main.rs`'s `find_bin_in` and `auth::bin_candidates`
+/// each checked on unix on their own, is not enough — a regular,
+/// non-executable file (a stray README, a config a package manager left
+/// beside the real binary) satisfies it just as well as the binary itself
+/// does, and, sitting in an earlier `PATH` directory than the real install,
+/// would shadow it rather than be skipped over.
+///
+/// Unix only checks the executable bit; Windows resolves through `PATHEXT`
+/// suffixes instead (both callers' own doc explains why), so `is_file()`
+/// alone is already what "this suffix matched" means there.
+pub fn is_executable_file(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
 /// A declared window's key: `<entry>:<element>`.
 ///
 /// One function, called by both engines, because a key spelled differently in
@@ -707,6 +732,53 @@ mod tests {
             expand_home("{config_dir}rc"),
             PathBuf::from("{config_dir}rc")
         );
+    }
+
+    // ── is_executable_file ───────────────────────────────────────────────
+
+    fn is_executable_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-plugin-mod-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_executable_file_requires_the_executable_bit_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = is_executable_test_dir("is-executable");
+        let plain = dir.join("plain");
+        std::fs::write(&plain, "not a binary").unwrap();
+        assert!(
+            !is_executable_file(&plain),
+            "a regular file without the executable bit must not read as one"
+        );
+
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            is_executable_file(&plain),
+            "the same file, made executable, now does"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_executable_file_is_false_for_a_directory_or_a_missing_path() {
+        let dir = is_executable_test_dir("is-executable-dir");
+        assert!(
+            !is_executable_file(&dir),
+            "a directory is not a file, executable bit or not"
+        );
+        assert!(!is_executable_file(&dir.join("does-not-exist")));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── substitute_options ───────────────────────────────────────────────
