@@ -45,6 +45,54 @@ pub const NO_CREDENTIALS: &str = "no credentials found";
 /// see its own docs for what a plugin without such a ping gets instead.
 pub(crate) const TOKEN_LAPSED: &str = "the only credential found had lapsed";
 
+/// [`resolve_token`]'s chain running out — every step was absent — with
+/// which of the two reasons that is. Typed so a caller across the module
+/// boundary (`plugin::engine_http::fetch_surface`) matches this rather than
+/// comparing [`resolve_token`]'s old, single conflated error string against
+/// [`NO_CREDENTIALS`]/[`TOKEN_LAPSED`] by hand — a comparison a genuinely
+/// broken credential store's own free-text message could in principle
+/// coincide with. [`ResolveEmpty::message`] is the one place either
+/// sentinel is still produced as text, at the rendering boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveEmpty {
+    /// No step on the chain ever found a credential at all.
+    NoCredentials,
+    /// At least one step found a credential, but its own declared expiry
+    /// had already passed — carries that Unix timestamp (see
+    /// [`token_expiry`] and `crate::model::TokenRenewal::Lapsed`). A later
+    /// step still gets first refusal (an `oauth-refresh` behind a lapsed
+    /// `keychain` step, say), so this only ever describes how the chain as
+    /// a whole came up empty, never a token [`resolve_token`] actually
+    /// returned.
+    Lapsed { expires_at: u64 },
+}
+
+impl ResolveEmpty {
+    /// The user-visible text this reads as — [`NO_CREDENTIALS`] or
+    /// [`TOKEN_LAPSED`], the two sentinels this module has always exposed
+    /// publicly, produced from exactly this one place now.
+    pub fn message(self) -> &'static str {
+        match self {
+            ResolveEmpty::NoCredentials => NO_CREDENTIALS,
+            ResolveEmpty::Lapsed { .. } => TOKEN_LAPSED,
+        }
+    }
+}
+
+/// [`resolve_token`]'s failure: either a credential store that exists but
+/// is broken (`PresentErr`, the message names it — bad JSON, Keychain
+/// access denied, a wrong password, …), or the whole chain coming up empty
+/// (`Empty`, see [`ResolveEmpty`]) — kept apart here rather than sharing one
+/// `(String, Option<u64>)` shape with the `Option` `Some` only for the
+/// second case, which gave a caller no type-level way to tell which it was
+/// looking at, only the convention that a `Some` never accompanied the
+/// first. `PresentErr` here structurally cannot carry an expiry at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveError {
+    PresentErr(String),
+    Empty(ResolveEmpty),
+}
+
 /// Walk a surface's `[[surface.auth]]` chain and return the first token
 /// found, paired with whether the step that yielded it declares
 /// `expiry_json_path` — not whether some *other* step on this surface does
@@ -57,34 +105,19 @@ pub(crate) const TOKEN_LAPSED: &str = "the only credential found had lapsed";
 /// hand back a token from the second step — one `[ping]`'s CLI run cannot
 /// renew, since nothing about that env var's own lifetime was ever declared
 /// — and the caller needs to tell the two apart.
-///
-/// Stops (and returns an error) at the first step that is present but
-/// broken — the second element of that `Err` is always `None`, since a
-/// Present-err message names a broken store, never a lapsed token. Returns
-/// [`NO_CREDENTIALS`] (second element `None`) if every step is absent, or
-/// [`TOKEN_LAPSED`] paired with `Some(expires_at)` if every step is absent
-/// *and* at least one of them found a credential that had lapsed by its own
-/// declared expiry rather than finding none at all — a later step still gets
-/// first refusal (an `oauth-refresh` behind a lapsed `keychain` step, say),
-/// so "lapsed" only ever describes how the chain as a whole came up empty,
-/// never a token this function actually returned. `expires_at` is the Unix
-/// timestamp the credential itself declared (see [`token_expiry`]) — carried
-/// out so a caller (`plugin::engine_http`) can key a renewal ping on this one
-/// token, not on "some token, whichever it was" — see
-/// `crate::model::TokenRenewal::Lapsed`.
-pub fn resolve_token(surface: &SurfaceConfig) -> Result<(String, bool), (String, Option<u64>)> {
+pub fn resolve_token(surface: &SurfaceConfig) -> Result<(String, bool), ResolveError> {
     let mut lapsed_expiry: Option<u64> = None;
     for step in &surface.auth {
         match run_step(step, &surface.allowed_hosts, &mut lapsed_expiry) {
             Ok(Some(token)) => return Ok((token, step.expiry_json_path.is_some())),
             Ok(None) => continue,
-            Err(e) => return Err((e, None)),
+            Err(e) => return Err(ResolveError::PresentErr(e)),
         }
     }
-    Err(match lapsed_expiry {
-        Some(expires_at) => (TOKEN_LAPSED.to_string(), Some(expires_at)),
-        None => (NO_CREDENTIALS.to_string(), None),
-    })
+    Err(ResolveError::Empty(match lapsed_expiry {
+        Some(expires_at) => ResolveEmpty::Lapsed { expires_at },
+        None => ResolveEmpty::NoCredentials,
+    }))
 }
 
 /// `allowed_hosts` is only read by `oauth-refresh` (see [`oauth_refresh_step`])
@@ -1002,13 +1035,12 @@ static REFRESH_CACHE: std::sync::Mutex<Option<std::collections::HashMap<u64, Cac
 /// [`REFRESH_CACHE`]'s own doc for why `client_id` is not a third input here
 /// even though it once was.
 fn refresh_cache_key(token_url: &str, refresh_token: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hasher;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    // Length-prefixed so `("ab","c")` and `("a","bc")` cannot collide by
-    // concatenation.
+    // Length-prefixed, via `hash_part`, so `("ab","c")` and `("a","bc")`
+    // cannot collide by concatenation.
     for part in [token_url, refresh_token] {
-        part.len().hash(&mut hasher);
-        part.hash(&mut hasher);
+        hash_part(&mut hasher, part);
     }
     hasher.finish()
 }
@@ -1021,10 +1053,9 @@ fn refresh_cache_key(token_url: &str, refresh_token: &str) -> u64 {
 /// unchanged, but engineering one buys an attacker nothing they could not
 /// already do with the secret in hand.
 fn secret_hash(secret: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hasher;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    secret.len().hash(&mut hasher);
-    secret.hash(&mut hasher);
+    hash_part(&mut hasher, secret);
     hasher.finish()
 }
 
@@ -1699,7 +1730,8 @@ static CLIENT_DISCOVERY_LOGGED: std::sync::Mutex<Option<std::collections::HashSe
 /// hermetic and never reads config itself"). Pushed here instead of called
 /// directly, and drained by `main.rs`'s fetch loop once per pass via
 /// [`take_pending_diagnostics`].
-static PENDING_DIAGNOSTICS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static PENDING_DIAGNOSTICS: crate::plugin::diag_queue::Queue =
+    crate::plugin::diag_queue::Queue::new();
 
 /// Every diagnostic line queued since the last call, removing them — the
 /// binary's side of [`PENDING_DIAGNOSTICS`]. Meant to be drained once per
@@ -1707,15 +1739,17 @@ static PENDING_DIAGNOSTICS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::ne
 /// often (a queue not drained this tick is drained the next one, and an
 /// empty queue costs a lock).
 pub fn take_pending_diagnostics() -> Vec<String> {
-    let mut guard = PENDING_DIAGNOSTICS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    std::mem::take(&mut *guard)
+    PENDING_DIAGNOSTICS.take()
 }
 
 /// Queue `message` under `key`, the first time only — every diagnostic this
 /// module writes goes through here so "once per process" is one mechanism,
-/// not three copies of it.
+/// not three copies of it. Keyed by an arbitrary discovery-config hash
+/// rather than `(plugin_id, reason)`: nothing that calls this has a single
+/// plugin id to key by, only a client config three different plugins could
+/// legitimately share — [`crate::plugin::diag_queue::queue_diag_once`]'s
+/// shared `(plugin, reason)` dedup is `engine_logfile`'s and
+/// `engine_http`'s own rule, not this module's.
 fn queue_diag_once(key: u64, message: String) {
     let should_log = CLIENT_DISCOVERY_LOGGED
         .lock()
@@ -1723,10 +1757,7 @@ fn queue_diag_once(key: u64, message: String) {
         .get_or_insert_with(std::collections::HashSet::new)
         .insert(key);
     if should_log {
-        PENDING_DIAGNOSTICS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(message);
+        PENDING_DIAGNOSTICS.push(message);
     }
 }
 
@@ -1761,9 +1792,10 @@ fn half_set_env_diag(client: &AuthClientDiscovery) -> String {
 }
 
 /// Hash `s` into `hasher`, length-prefixed so `("ab","c")` and `("a","bc")`
-/// cannot collide by concatenation — the discipline every key function in
-/// this module (and [`refresh_cache_key`], for its own unrelated pair)
-/// hashes its parts with.
+/// cannot collide by concatenation. Every key function in this module calls
+/// through here for each part it hashes — including [`refresh_cache_key`]
+/// and [`secret_hash`], over their own unrelated inputs — rather than
+/// writing the same two-line idiom out again.
 fn hash_part(hasher: &mut std::collections::hash_map::DefaultHasher, s: &str) {
     use std::hash::Hash;
     s.len().hash(hasher);
@@ -2799,12 +2831,12 @@ fn json_path_str<'v>(root: &'v Value, path: &str) -> Option<&'v str> {
 /// Resolve a `.`-separated dotted path against a JSON value, returning
 /// whatever it names — not only a string ([`json_path_str`]'s own job), so
 /// [`token_expiry`] can read an `expiry_json_path` that names a number.
+/// Forwards to `crate::plugin::json_path_get`, the same walker
+/// `crate::plugin::engine_logfile::json_path` also forwards to, so a
+/// `[account] json_path`/`expiry_json_path` written with an array selector
+/// (`[0]`, `[field=value]`) resolves here too rather than silently missing.
 fn json_path_value<'v>(root: &'v Value, path: &str) -> Option<&'v Value> {
-    let mut cur = root;
-    for seg in path.split('.') {
-        cur = cur.get(seg)?;
-    }
-    Some(cur)
+    crate::plugin::json_path_get(root, path)
 }
 
 // ── Small validation helper ───────────────────────────────────────────────
@@ -6272,6 +6304,27 @@ mod tests {
         );
     }
 
+    /// Pins both key functions against the values the two-line `.hash()`
+    /// idiom each wrote inline, before routing through [`hash_part`],
+    /// produces for a fixed input. `DefaultHasher` is process-local and
+    /// never persisted (see [`CacheEntry`]'s own module doc), so nothing
+    /// outside this test depends on these exact numbers — this exists only
+    /// to prove that calling through `hash_part` does not change what
+    /// either function feeds its hasher.
+    #[test]
+    fn refresh_cache_key_and_secret_hash_are_unchanged_by_routing_through_hash_part() {
+        assert_eq!(
+            refresh_cache_key("https://example.com/token", "rt-fixture-value"),
+            18297797456792368918,
+            "refresh_cache_key's byte sequence into the hasher must not move"
+        );
+        assert_eq!(
+            secret_hash("secret-fixture-value"),
+            2796049795961267855,
+            "secret_hash's byte sequence into the hasher must not move"
+        );
+    }
+
     #[test]
     fn cache_now_is_never_zero_and_never_runs_backwards() {
         let a = cache_now();
@@ -7037,7 +7090,9 @@ mod tests {
 
         assert_eq!(
             got,
-            Err(("an API key has no subscription limits".to_string(), None))
+            Err(ResolveError::PresentErr(
+                "an API key has no subscription limits".to_string()
+            ))
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -7143,7 +7198,9 @@ mod tests {
         };
         assert_eq!(
             resolve_token(&surface(vec![step])),
-            Err((TOKEN_LAPSED.to_string(), Some(1_577_836_800))) // 2020-01-01T00:00:00Z
+            Err(ResolveError::Empty(ResolveEmpty::Lapsed {
+                expires_at: 1_577_836_800 // 2020-01-01T00:00:00Z
+            }))
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -7262,7 +7319,7 @@ mod tests {
         };
         assert_eq!(
             resolve_token(&surface(vec![step])),
-            Err((NO_CREDENTIALS.to_string(), None))
+            Err(ResolveError::Empty(ResolveEmpty::NoCredentials))
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -7479,13 +7536,15 @@ mod tests {
             },
         ]);
 
-        let (err, lapsed_expiry) =
-            resolve_token(&s).expect_err("broken file must stop the chain, not fall through");
-        assert!(!err.contains("tok-from-env-must-not-win"));
-        assert_eq!(
-            lapsed_expiry, None,
-            "a Present-err message never carries a lapsed expiry"
-        );
+        let err = resolve_token(&s).expect_err("broken file must stop the chain, not fall through");
+        // `PresentErr` structurally cannot carry a lapsed expiry any more —
+        // this match is exhaustive, so a future third variant would fail to
+        // compile here rather than let this assertion quietly stop meaning
+        // anything.
+        let ResolveError::PresentErr(message) = err else {
+            panic!("a broken credentials-file must be a PresentErr, got {err:?}");
+        };
+        assert!(!message.contains("tok-from-env-must-not-win"));
 
         std::env::remove_var("TICKOVER_AUTH_TEST_CHAIN_STOP");
         std::fs::remove_dir_all(&dir).ok();
@@ -7541,7 +7600,7 @@ mod tests {
 
         assert_eq!(
             resolve_token(&s),
-            Err(("no credentials found".to_string(), None))
+            Err(ResolveError::Empty(ResolveEmpty::NoCredentials))
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -7551,7 +7610,7 @@ mod tests {
         let s = surface(Vec::new());
         assert_eq!(
             resolve_token(&s),
-            Err(("no credentials found".to_string(), None))
+            Err(ResolveError::Empty(ResolveEmpty::NoCredentials))
         );
     }
 

@@ -30,11 +30,12 @@ use tickover::plugin::registry::{
 };
 use tickover::plugin::signature;
 use tickover::plugin::{
-    engine_http, engine_logfile, is_invisible_or_directional, scheduler, seed, time as plugin_time,
+    engine_http, engine_logfile, is_invisible_or_directional, push_host, scheduler, seed,
+    surface_reading_id, time as plugin_time, write_via_temp,
 };
 
 use tray_icon::{
-    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
     MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
@@ -237,6 +238,80 @@ fn menu_bar_text_label() -> &'static str {
     }
 }
 
+/// The `Rc`-backed state nearly every settings-sheet, registry and timer
+/// callback below either reads or writes. Built once in `main`, right
+/// before the first of them is wired up, so each call site opens with a
+/// single `let ctx = ctx.clone();` rather than individually pulling
+/// anywhere from three to a dozen of the same names out of `main`'s own
+/// scope. `AppWindow` itself is the one field this does *not* hold
+/// directly: every callback and timer here outlives the stack frame `main`
+/// runs on, so this carries a [`slint::Weak`], resolved the same way each
+/// call site resolves one of its own.
+#[derive(Clone)]
+struct Ctx {
+    weak: slint::Weak<AppWindow>,
+    plugins: Plugins,
+    cache: PluginCache,
+    fetching: Fetching,
+    plugin_tx: mpsc::Sender<(String, u64, Vec<ProviderReading>)>,
+    model: Providers,
+    window_models: WindowModels,
+    balance_models: BalanceModels,
+    plugin_model: PluginRows,
+    tray: TraySlot,
+    tray_key: Rc<Cell<Option<u64>>>,
+    registry_model: RegistryRows,
+    registry_index_cache: RegistryIndexCache,
+    registry_busy: RegistryBusy,
+    registry_checking: Rc<Cell<bool>>,
+    last_registry_check: Rc<Cell<Option<u64>>>,
+    registry_tx: mpsc::Sender<RegistryCheckMsg>,
+    install_tx: mpsc::Sender<(PendingKind, RegistryEntry, InstallOutcome)>,
+    anchor: Anchor,
+    shown_at: Rc<Cell<Instant>>,
+    tray_click_at: Rc<Cell<Option<Instant>>>,
+    hidden_by_focus_at: Rc<Cell<Option<Instant>>>,
+}
+
+/// The refresh triple nearly every settings-sheet callback below closes
+/// with: rebuild the plugin-manager rows, rebuild the provider rows, and
+/// let the tray icon catch up. All three only run once `ctx.weak` still
+/// resolves — one guard shared by every call site, rather than each one
+/// wrapping its own copy of this same triple in an identical check.
+fn refresh_all(ctx: &Ctx) {
+    if let Some(app) = ctx.weak.upgrade() {
+        refresh_plugins_model(&ctx.plugin_model, &ctx.plugins.borrow());
+        refresh_model(
+            &app,
+            &ctx.model,
+            &ctx.plugins.borrow(),
+            &ctx.cache,
+            &ctx.window_models,
+            &ctx.balance_models,
+        );
+        sync_tray_indicator(
+            &ctx.tray,
+            app.get_menu_bar_text(),
+            &ctx.plugins.borrow(),
+            &ctx.cache,
+            &ctx.tray_key,
+        );
+    }
+}
+
+/// The tray context menu's items and change-detection ids, threaded from
+/// [`setup_tray`] into [`run_fast_timer`] — the only other place a click on
+/// the native menu is read, or one of its two checkbox items' state is read
+/// or written.
+struct TrayMenu {
+    autostart_item: CheckMenuItem,
+    menubar_item: CheckMenuItem,
+    refresh_id: MenuId,
+    autostart_id: MenuId,
+    menubar_id: MenuId,
+    quit_id: MenuId,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Before anything else so much as looks at the config directory:
     // `platform::claim_single_instance` below, `diag::line` and
@@ -362,7 +437,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // click whose thread failed to spawn at all.
     let registry_checking: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     // Unix seconds of the last successful "Check updates" — `None` renders
-    // as Slint's own "Last checked: never" (`registry-status == 0`, never
+    // as Slint's own "Last checked: never" (`RegistryStatus::Idle`, never
     // touched here); `Some` drives the live "just now" → "Nm ago" relabeling
     // in the slow tick timer below.
     let last_registry_check: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
@@ -383,39 +458,176 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // only the network+sha256 half runs off it.
     let (install_tx, install_rx) = mpsc::channel::<(PendingKind, RegistryEntry, InstallOutcome)>();
 
-    // ── UI callbacks ────────────────────────────────────────────────────
-    {
-        let weak = app.as_weak();
-        let plugins = plugins.clone();
-        let cache = cache.clone();
-        let model = model.clone();
-        let window_models = window_models.clone();
-        let balance_models = balance_models.clone();
-        let tx = plugin_tx.clone();
-        let fetching = fetching.clone();
-        app.on_refresh(move || {
-            spawn_all_plugin_fetches(&plugins.borrow(), &tx, &fetching);
-            if let Some(app) = weak.upgrade() {
-                refresh_model(
-                    &app,
-                    &model,
-                    &plugins.borrow(),
-                    &cache,
-                    &window_models,
-                    &balance_models,
-                );
-            }
-        });
-    }
+    // Slint creates the native macOS application lazily. Deferring tray
+    // construction by one event-loop turn (`setup_tray`, below) makes the
+    // status item durable even when the popover has not been shown yet —
+    // declared here, ahead of that, so `Ctx` can carry it from the start.
+    let tray: TraySlot = Rc::new(RefCell::new(None));
+
+    let ctx = Ctx {
+        weak: app.as_weak(),
+        plugins: plugins.clone(),
+        cache: cache.clone(),
+        fetching: fetching.clone(),
+        plugin_tx: plugin_tx.clone(),
+        model: model.clone(),
+        window_models: window_models.clone(),
+        balance_models: balance_models.clone(),
+        plugin_model: plugin_model.clone(),
+        tray: tray.clone(),
+        tray_key: tray_key.clone(),
+        registry_model: registry_model.clone(),
+        registry_index_cache: registry_index_cache.clone(),
+        registry_busy: registry_busy.clone(),
+        registry_checking: registry_checking.clone(),
+        last_registry_check: last_registry_check.clone(),
+        registry_tx: registry_tx.clone(),
+        install_tx: install_tx.clone(),
+        anchor: anchor.clone(),
+        shown_at: shown_at.clone(),
+        tray_click_at: tray_click_at.clone(),
+        hidden_by_focus_at: hidden_by_focus_at.clone(),
+    };
+
+    wire_ui_callbacks(&app, &ctx);
 
     let menubar_on = config::menu_bar_text();
     app.set_menu_bar_text(menubar_on);
     app.set_menu_bar_text_label(ss(menu_bar_text_label()));
 
-    // ── Frameless popover chrome + hide-on-focus-loss ───────────────────
-    // Only platforms that draw their own edge around a frameless window want
-    // the card flush with the window bounds (macOS does, Windows does not —
-    // there the card's own border and shadow are the flyout's only chrome).
+    wire_frameless_chrome(&app, &ctx);
+
+    let (tray_menu, tray_init_timer) = setup_tray(&app, &ctx, menubar_on)?;
+
+    wire_plugin_manager_callbacks(&app, &ctx);
+
+    wire_registry_callbacks(&app, &ctx);
+
+    // ── First readings ──────────────────────────────────────────────────
+    // Read once, at start-up, and carried to both places below that ask
+    // about it — this and the `TICKOVER_SNAPSHOT_SETTINGS`/snapshot-taking
+    // block further down.
+    let snapshot_path = std::env::var_os("TICKOVER_SNAPSHOT");
+    if snapshot_path.is_some() {
+        // A screenshot needs data present synchronously, before the first
+        // render — every plugin is fetched on this thread, blocking.
+        *cache.borrow_mut() = sync_fetch_all(&plugins.borrow());
+    } else {
+        spawn_all_plugin_fetches(&plugins.borrow(), &plugin_tx, &fetching);
+    }
+    refresh_model(
+        &app,
+        &model,
+        &plugins.borrow(),
+        &cache,
+        &window_models,
+        &balance_models,
+    );
+    sync_tray_indicator(&tray, menubar_on, &plugins.borrow(), &cache, &tray_key);
+
+    if std::env::var_os("TICKOVER_SHOW_ON_START").is_some() || platform::dock_mode() {
+        present_popover(&app, &anchor, &shown_at, Shown::ByAnythingElse);
+    }
+
+    if let Some(path) = snapshot_path {
+        present_popover(&app, &anchor, &shown_at, Shown::ByAnythingElse);
+        // Snapshot the settings sheet instead of the gauges when asked.
+        if std::env::var_os("TICKOVER_SNAPSHOT_SETTINGS").is_some() {
+            app.set_settings_open(true);
+        }
+        let weak = app.as_weak();
+        Timer::single_shot(Duration::from_millis(700), move || {
+            // Not attempted on Windows. `take_snapshot` there returns a
+            // fully transparent buffer — measured on both the femtovg and
+            // the software renderer, with the window visible, sized and
+            // drawn on screen at the time — so the only thing it can produce
+            // is an empty PNG reported as a success. Worse, it sometimes
+            // does not return at all: roughly one run in ten aborts inside
+            // femtovg's `imgref` on `assertion failed: stride > 0`, taking
+            // the process down with it. The window really is drawn — every
+            // screenshot of it on this platform was captured off the screen
+            // — so that is what the message points at.
+            #[cfg(target_os = "windows")]
+            {
+                let _ = &weak;
+                eprintln!(
+                    "[tickover] TICKOVER_SNAPSHOT is not supported on Windows: the \
+                     renderer hands back an empty image for a window it has drawn correctly. \
+                     Capture the screen instead. Nothing written to {path:?}."
+                );
+            }
+            #[cfg(not(target_os = "windows"))]
+            if let Some(app) = weak.upgrade() {
+                match app.window().take_snapshot() {
+                    Ok(buf) => {
+                        let (w, h) = (buf.width(), buf.height());
+                        let bytes = buf.as_bytes().to_vec();
+                        let got = bytes.len();
+                        let want = (w as usize) * (h as usize) * 4;
+                        match image::RgbaImage::from_raw(w, h, bytes) {
+                            Some(img) => match img.save(std::path::Path::new(&path)) {
+                                Ok(()) => diag::line(format!("snapshot {w}x{h} -> {path:?}")),
+                                Err(e) => diag::line(format!(
+                                    "snapshot {w}x{h}: failed to write {path:?}: {e}"
+                                )),
+                            },
+                            None => diag::line(format!(
+                                "snapshot {w}x{h}: buffer holds {got} bytes, {want} needed \
+                                 for RGBA8 at that size, nothing written to {path:?}"
+                            )),
+                        }
+                    }
+                    Err(e) => {
+                        diag::line(format!("snapshot: take_snapshot failed: {e}"));
+                    }
+                }
+            }
+            let _ = slint::quit_event_loop();
+        });
+    }
+
+    // ── Timers ──────────────────────────────────────────────────────────
+    let _event_timer = run_fast_timer(&app, &ctx, tray_menu, plugin_rx, registry_rx, install_rx);
+    let _tick_timer = run_slow_timer(&app, &ctx);
+
+    Timer::single_shot(Duration::from_millis(60), platform::set_accessory_policy);
+
+    let _reopen_timer = run_dock_reopen_timer(&app, &ctx);
+
+    // `tray_init_timer`'s own single-shot build (`setup_tray`, above) still
+    // has to fire after the event loop starts — kept alive down here, the
+    // same as every other `Timer` in this function.
+    let _tray_init_timer = tray_init_timer;
+
+    slint::run_event_loop_until_quit()?;
+    Ok(())
+}
+
+/// The panel's own "Refresh" button: a fetch of every plugin, and — once it
+/// lands — a rebuild of the provider rows.
+fn wire_ui_callbacks(app: &AppWindow, ctx: &Ctx) {
+    let ctx = ctx.clone();
+    app.on_refresh(move || {
+        spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
+        if let Some(app) = ctx.weak.upgrade() {
+            refresh_model(
+                &app,
+                &ctx.model,
+                &ctx.plugins.borrow(),
+                &ctx.cache,
+                &ctx.window_models,
+                &ctx.balance_models,
+            );
+        }
+    });
+}
+
+/// Only platforms that draw their own edge around a frameless window want
+/// the card flush with the window bounds (macOS does, Windows does not —
+/// there the card's own border and shadow are the flyout's only chrome).
+/// Wires the hide-on-focus-loss handler and the card's own drag handle.
+fn wire_frameless_chrome(app: &AppWindow, ctx: &Ctx) {
+    use slint::winit_030::{winit::event::WindowEvent, EventResult, WinitWindowAccessor};
     app.set_system_window_edge(cfg!(target_os = "macos"));
     // Dock mode always: the panel is an ordinary window there, with no title
     // bar to grab. A tray flyout is a different matter, and the answer is not
@@ -429,10 +641,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // re-anchors it against the item regardless.
     app.set_draggable(platform::dock_mode() || cfg!(target_os = "windows"));
     {
-        use slint::winit_030::{winit::event::WindowEvent, EventResult, WinitWindowAccessor};
-        let weak = app.as_weak();
-        let shown_at = shown_at.clone();
-        let hidden_by_focus_at = hidden_by_focus_at.clone();
+        let ctx = ctx.clone();
         // Dock mode has no tray icon to re-open the panel from, so a window
         // that vanished on focus loss could never be brought back.
         let auto_hide = std::env::var_os("TICKOVER_SNAPSHOT").is_none()
@@ -440,39 +649,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             && !platform::dock_mode();
         app.window().on_winit_window_event(move |_win, event| {
             if let WindowEvent::Focused(false) = event {
-                if auto_hide && shown_at.get().elapsed() > Duration::from_millis(250) {
-                    if let Some(app) = weak.upgrade() {
+                if auto_hide && ctx.shown_at.get().elapsed() > Duration::from_millis(250) {
+                    if let Some(app) = ctx.weak.upgrade() {
                         let _ = app.window().hide();
                         // Remember *when*, so the click that took this focus
                         // away is not then read as a request to re-open.
-                        hidden_by_focus_at.set(Some(Instant::now()));
+                        ctx.hidden_by_focus_at.set(Some(Instant::now()));
                     }
                 }
             }
             EventResult::Propagate
         });
-
-        // Drag the frameless window by its own background (see the TouchArea
-        // in `app.slint`). Decorations are deliberately left off even in dock
-        // mode: a title bar would sit above a card that is flush with the
-        // window edge, which is exactly the doubled-chrome look the layout
-        // avoids.
-        {
-            let weak = app.as_weak();
-            app.on_start_drag(move || {
-                if let Some(app) = weak.upgrade() {
-                    app.window().with_winit_window(|win| {
-                        let _ = win.drag_window();
-                    });
-                }
-            });
-        }
     }
 
-    // ── Tray icon + menu ────────────────────────────────────────────────
-    // The tray context menu now carries only the app-wide toggles; per-plugin
-    // ping / opt-in-surface options moved into the settings-sheet plugin
-    // manager (their well-known ids live only in `config`'s legacy-key bridge).
+    // Drag the frameless window by its own background (see the TouchArea
+    // in `app.slint`). Decorations are deliberately left off even in dock
+    // mode: a title bar would sit above a card that is flush with the
+    // window edge, which is exactly the doubled-chrome look the layout
+    // avoids.
+    {
+        let ctx = ctx.clone();
+        app.on_start_drag(move || {
+            if let Some(app) = ctx.weak.upgrade() {
+                app.window().with_winit_window(|win| {
+                    let _ = win.drag_window();
+                });
+            }
+        });
+    }
+}
+
+/// Builds the native status-item menu, defers building the status item
+/// itself to right after the event loop starts (see the timer below), and
+/// wires the two callbacks a click on one of its own toggle items reaches
+/// (`autostart-changed`, `menu-bar-text-changed`). The tray context menu
+/// now carries only the app-wide toggles; per-plugin ping / opt-in-surface
+/// options moved into the settings-sheet plugin manager (their well-known
+/// ids live only in `config`'s legacy-key bridge).
+///
+/// Returns the menu's items and ids for [`run_fast_timer`] — the only other
+/// place a click on the native menu, or either checkbox's state, is read —
+/// and the deferred build's own [`Timer`]; `main` must keep that alive for
+/// the rest of the run, the same as every other `Timer` here.
+fn setup_tray(
+    app: &AppWindow,
+    ctx: &Ctx,
+    menubar_on: bool,
+) -> Result<(TrayMenu, Timer), Box<dyn std::error::Error>> {
     let menu = Menu::new();
     let refresh_item = MenuItem::new("Refresh now", true, None);
     let autostart_item = CheckMenuItem::new("Launch at login", true, autostart::is_enabled(), None);
@@ -491,12 +714,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let quit_id = quit_item.id().clone();
 
     {
-        let weak = app.as_weak();
+        let ctx = ctx.clone();
         let check = autostart_item.clone();
         app.on_autostart_changed(move |requested| {
             let actual = autostart::set(requested);
             check.set_checked(actual);
-            if let Some(app) = weak.upgrade() {
+            if let Some(app) = ctx.weak.upgrade() {
                 app.set_autostart(actual);
             }
         });
@@ -525,15 +748,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Slint creates the native macOS application lazily. Deferring tray
     // construction by one event-loop turn makes the status item durable even
     // when the popover has not been shown yet.
-    let tray: TraySlot = Rc::new(RefCell::new(None));
     let tray_builder = Rc::new(RefCell::new(Some(tray_builder)));
     let tray_init_timer = Timer::default();
     {
-        let tray = tray.clone();
+        let ctx = ctx.clone();
         let tray_builder = tray_builder.clone();
-        let plugins = plugins.clone();
-        let cache = cache.clone();
-        let tray_key = tray_key.clone();
         tray_init_timer.start(TimerMode::SingleShot, Duration::from_millis(1), move || {
             let Some(tray_builder) = tray_builder.borrow_mut().take() else {
                 return;
@@ -547,13 +766,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // other; `tray_click_at` below is what settles that.
             match tray_builder.build() {
                 Ok(native) => {
-                    *tray.borrow_mut() = Some(Rc::new(native));
+                    *ctx.tray.borrow_mut() = Some(Rc::new(native));
                     sync_tray_indicator(
-                        &tray,
+                        &ctx.tray,
                         config::menu_bar_text(),
-                        &plugins.borrow(),
-                        &cache,
-                        &tray_key,
+                        &ctx.plugins.borrow(),
+                        &ctx.cache,
+                        &ctx.tray_key,
                     );
                 }
                 Err(error) => {
@@ -564,100 +783,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     {
-        let weak = app.as_weak();
+        let ctx = ctx.clone();
         let check = menubar_item.clone();
-        let tray = tray.clone();
-        let plugins = plugins.clone();
-        let cache = cache.clone();
-        let tray_key = tray_key.clone();
         app.on_menu_bar_text_changed(move |enabled| {
             config::set_menu_bar_text(enabled);
             check.set_checked(enabled);
-            if let Some(app) = weak.upgrade() {
+            if let Some(app) = ctx.weak.upgrade() {
                 app.set_menu_bar_text(enabled);
             }
-            sync_tray_indicator(&tray, enabled, &plugins.borrow(), &cache, &tray_key);
+            sync_tray_indicator(
+                &ctx.tray,
+                enabled,
+                &ctx.plugins.borrow(),
+                &ctx.cache,
+                &ctx.tray_key,
+            );
         });
     }
 
-    // ── Plugin manager (settings sheet) ─────────────────────────────────
-    // Each toggle persists to `config` by plugin/surface id, then rebuilds
-    // the plugin-manager model (so sub-toggles dim with their parent) and —
-    // where the change affects what is fetched or shown — the provider list
-    // and tray. Everything stays generic over plugin ids; the well-known
-    // codex/claude bridge lives entirely in `config`.
+    Ok((
+        TrayMenu {
+            autostart_item,
+            menubar_item,
+            refresh_id,
+            autostart_id,
+            menubar_id,
+            quit_id,
+        },
+        tray_init_timer,
+    ))
+}
+
+/// The settings sheet's plugin manager. Each toggle persists to `config` by
+/// plugin/surface id, then rebuilds the plugin-manager model (so
+/// sub-toggles dim with their parent) and — where the change affects what
+/// is fetched or shown — the provider list and tray, via [`refresh_all`].
+/// Everything stays generic over plugin ids; the well-known codex/claude
+/// bridge lives entirely in `config`.
+fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
     {
-        let weak = app.as_weak();
-        let plugins = plugins.clone();
-        let cache = cache.clone();
-        let model = model.clone();
-        let window_models = window_models.clone();
-        let balance_models = balance_models.clone();
-        let plugin_model = plugin_model.clone();
-        let tx = plugin_tx.clone();
-        let fetching = fetching.clone();
-        let tray = tray.clone();
-        let tray_key = tray_key.clone();
+        let ctx = ctx.clone();
         app.on_plugin_enabled_changed(move |id, on| {
             let id = id.to_string();
             config::set_plugin_enabled(&id, on);
             if on {
                 // Re-enabled: fetch it now so its row appears without waiting
                 // for the next refresh cadence.
-                let guard = plugins.borrow();
+                let guard = ctx.plugins.borrow();
                 if let Some(m) = plugin_by_id(&guard, &id) {
-                    spawn_plugin_fetch(m, active_surface_ids(m), plugin_options(m), &tx, &fetching);
+                    spawn_plugin_fetch(
+                        m,
+                        active_surface_ids(m),
+                        plugin_options(m),
+                        &ctx.plugin_tx,
+                        &ctx.fetching,
+                    );
                 }
             } else {
                 // Disabled: drop its cached readings so it disappears at once
                 // (fetch is gated too, so nothing repopulates the slot).
-                cache.borrow_mut().remove(&id);
+                ctx.cache.borrow_mut().remove(&id);
             }
-            if let Some(app) = weak.upgrade() {
-                refresh_plugins_model(&plugin_model, &plugins.borrow());
-                refresh_model(
-                    &app,
-                    &model,
-                    &plugins.borrow(),
-                    &cache,
-                    &window_models,
-                    &balance_models,
-                );
-                sync_tray_indicator(
-                    &tray,
-                    app.get_menu_bar_text(),
-                    &plugins.borrow(),
-                    &cache,
-                    &tray_key,
-                );
-            }
+            refresh_all(&ctx);
         });
     }
     {
-        let weak = app.as_weak();
-        let plugins = plugins.clone();
-        let plugin_model = plugin_model.clone();
+        let ctx = ctx.clone();
         app.on_plugin_ping_changed(move |id, on| {
             config::set_plugin_ping(id.as_ref(), on);
             // The auto-ping gate reads config live; only the model needs a
             // refresh to keep the checkbox in sync.
-            if weak.upgrade().is_some() {
-                refresh_plugins_model(&plugin_model, &plugins.borrow());
+            if ctx.weak.upgrade().is_some() {
+                refresh_plugins_model(&ctx.plugin_model, &ctx.plugins.borrow());
             }
         });
     }
     {
-        let weak = app.as_weak();
-        let plugins = plugins.clone();
-        let cache = cache.clone();
-        let model = model.clone();
-        let window_models = window_models.clone();
-        let balance_models = balance_models.clone();
-        let plugin_model = plugin_model.clone();
-        let tx = plugin_tx.clone();
-        let fetching = fetching.clone();
-        let tray = tray.clone();
-        let tray_key = tray_key.clone();
+        let ctx = ctx.clone();
         app.on_surface_opt_in_changed(move |plugin_id, surface_id, on| {
             let plugin_id = plugin_id.to_string();
             config::set_plugin_surface_enabled(&plugin_id, surface_id.as_ref(), on);
@@ -667,9 +869,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // and risk a late reply landing the surface back in the cache before
             // the next filter, so it is skipped entirely.
             if on {
-                let guard = plugins.borrow();
+                let guard = ctx.plugins.borrow();
                 if let Some(m) = plugin_by_id(&guard, &plugin_id) {
-                    spawn_plugin_fetch(m, active_surface_ids(m), plugin_options(m), &tx, &fetching);
+                    spawn_plugin_fetch(
+                        m,
+                        active_surface_ids(m),
+                        plugin_options(m),
+                        &ctx.plugin_tx,
+                        &ctx.fetching,
+                    );
                 }
             } else {
                 // Drop what the surface last read, the way disabling a whole
@@ -680,40 +888,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // panel by a toggle and would then be announced as having
                 // "disappeared" the moment the surface is switched back on and
                 // the token turns out to be gone (`credentials_just_lost`).
-                drop_surface_reading(&cache, &plugin_id, surface_id.as_ref());
+                drop_surface_reading(&ctx.cache, &plugin_id, surface_id.as_ref());
             }
-            if let Some(app) = weak.upgrade() {
-                refresh_plugins_model(&plugin_model, &plugins.borrow());
-                refresh_model(
-                    &app,
-                    &model,
-                    &plugins.borrow(),
-                    &cache,
-                    &window_models,
-                    &balance_models,
-                );
-                sync_tray_indicator(
-                    &tray,
-                    app.get_menu_bar_text(),
-                    &plugins.borrow(),
-                    &cache,
-                    &tray_key,
-                );
-            }
+            refresh_all(&ctx);
         });
     }
     {
-        let weak = app.as_weak();
-        let plugins = plugins.clone();
-        let cache = cache.clone();
-        let model = model.clone();
-        let window_models = window_models.clone();
-        let balance_models = balance_models.clone();
-        let plugin_model = plugin_model.clone();
-        let tx = plugin_tx.clone();
-        let fetching = fetching.clone();
-        let tray = tray.clone();
-        let tray_key = tray_key.clone();
+        let ctx = ctx.clone();
         app.on_reset_plugins(move || {
             // Restore the built-in codex/claude manifests (leaving any
             // third-party manifest and every user config toggle untouched),
@@ -722,47 +903,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(e) = seed::reseed_defaults(&dir) {
                 diag::line(format!("could not reset plugins in {}: {e}", dir.display()));
             }
-            *plugins.borrow_mut() = load_plugins();
-            cache.borrow_mut().clear();
+            *ctx.plugins.borrow_mut() = load_plugins();
+            ctx.cache.borrow_mut().clear();
             // Clear in-flight markers so the fresh fetches below aren't
             // deduped away by an old worker that is still running against the
             // pre-reset manifest — otherwise its stale result would be the one
             // that lands in the (now-cleared) cache.
-            fetching.borrow_mut().clear();
-            spawn_all_plugin_fetches(&plugins.borrow(), &tx, &fetching);
-            if let Some(app) = weak.upgrade() {
-                refresh_plugins_model(&plugin_model, &plugins.borrow());
-                refresh_model(
-                    &app,
-                    &model,
-                    &plugins.borrow(),
-                    &cache,
-                    &window_models,
-                    &balance_models,
-                );
-                sync_tray_indicator(
-                    &tray,
-                    app.get_menu_bar_text(),
-                    &plugins.borrow(),
-                    &cache,
-                    &tray_key,
-                );
-            }
+            ctx.fetching.borrow_mut().clear();
+            spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
+            refresh_all(&ctx);
         });
     }
     {
-        let weak = app.as_weak();
-        let plugins = plugins.clone();
-        let cache = cache.clone();
-        let model = model.clone();
-        let window_models = window_models.clone();
-        let balance_models = balance_models.clone();
-        let plugin_model = plugin_model.clone();
-        let tx = plugin_tx.clone();
-        let fetching = fetching.clone();
-        let tray = tray.clone();
-        let tray_key = tray_key.clone();
-        let shown_at = shown_at.clone();
+        let ctx = ctx.clone();
         app.on_plugin_option_changed(move |id, key, on| {
             let id = id.to_string();
             config::set_plugin_option(&id, key.as_ref(), on);
@@ -774,33 +927,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // tick. Refetch immediately, mirroring the "enabling" branch of
             // `surface-opt-in-changed` above.
             {
-                let guard = plugins.borrow();
+                let guard = ctx.plugins.borrow();
                 if let Some(m) = plugin_by_id(&guard, &id) {
-                    spawn_plugin_fetch(m, active_surface_ids(m), plugin_options(m), &tx, &fetching);
+                    spawn_plugin_fetch(
+                        m,
+                        active_surface_ids(m),
+                        plugin_options(m),
+                        &ctx.plugin_tx,
+                        &ctx.fetching,
+                    );
                 }
             }
-            if let Some(app) = weak.upgrade() {
-                refresh_plugins_model(&plugin_model, &plugins.borrow());
-                refresh_model(
-                    &app,
-                    &model,
-                    &plugins.borrow(),
-                    &cache,
-                    &window_models,
-                    &balance_models,
-                );
-                sync_tray_indicator(
-                    &tray,
-                    app.get_menu_bar_text(),
-                    &plugins.borrow(),
-                    &cache,
-                    &tray_key,
-                );
-            }
+            refresh_all(&ctx);
             // A native dialog never opens for this callback, but keeping the
             // popover's focus-loss clock fresh here too costs nothing and
             // keeps every plugin-manager callback consistent.
-            shown_at.set(Instant::now());
+            ctx.shown_at.set(Instant::now());
         });
     }
     {
@@ -810,18 +952,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `plugin_manifest_target`'s doc comment for why the id is what
         // matters, and `find_plugin_manifest_path`'s for why the filename is
         // only ever a convention, never something later code trusts).
-        let weak = app.as_weak();
-        let plugins = plugins.clone();
-        let cache = cache.clone();
-        let model = model.clone();
-        let window_models = window_models.clone();
-        let balance_models = balance_models.clone();
-        let plugin_model = plugin_model.clone();
-        let tx = plugin_tx.clone();
-        let fetching = fetching.clone();
-        let tray = tray.clone();
-        let tray_key = tray_key.clone();
-        let shown_at = shown_at.clone();
+        let ctx = ctx.clone();
         app.on_add_plugin(move || {
             // A labeled block, not a chain of early `return`s: every exit
             // path below (Cancel, a bad file, an `id` collision, a write
@@ -916,7 +1047,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // already there) is caught below by `create_new` instead of a
                 // separate `target.exists()` check — TOCTOU-safe: nothing can
                 // create the file between a check and the write.
-                if plugins.borrow().iter().any(|m| m.id == manifest.id) {
+                if ctx.plugins.borrow().iter().any(|m| m.id == manifest.id) {
                     diag::line(format!(
                         "add-plugin: \"{}\" is already loaded, refusing the import",
                         manifest.id
@@ -951,22 +1082,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     break 'import;
                 }
-                reload_and_fetch(&plugins, &fetching, &plugin_model, &tx);
-                if let Some(app) = weak.upgrade() {
+                // `reload_and_fetch` already rebuilds the plugin-manager
+                // model on its own (`reload_manifests_only`, inside it), so
+                // only the provider rows and the tray still need a refresh
+                // here — this pair, not `refresh_all`, or the plugin-manager
+                // rows would be rebuilt from the same data twice.
+                reload_and_fetch(
+                    &ctx.plugins,
+                    &ctx.fetching,
+                    &ctx.plugin_model,
+                    &ctx.plugin_tx,
+                );
+                if let Some(app) = ctx.weak.upgrade() {
                     refresh_model(
                         &app,
-                        &model,
-                        &plugins.borrow(),
-                        &cache,
-                        &window_models,
-                        &balance_models,
+                        &ctx.model,
+                        &ctx.plugins.borrow(),
+                        &ctx.cache,
+                        &ctx.window_models,
+                        &ctx.balance_models,
                     );
                     sync_tray_indicator(
-                        &tray,
+                        &ctx.tray,
                         app.get_menu_bar_text(),
-                        &plugins.borrow(),
-                        &cache,
-                        &tray_key,
+                        &ctx.plugins.borrow(),
+                        &ctx.cache,
+                        &ctx.tray_key,
                     );
                 }
             }
@@ -978,7 +1119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // resetting the clock here (not before the dialog) is what
             // actually keeps the sheet from hiding right after the reload
             // above finally lands.
-            shown_at.set(Instant::now());
+            ctx.shown_at.set(Instant::now());
         });
     }
     {
@@ -987,9 +1128,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // -t` returns immediately), so there is no reload here — the settings
         // sheet re-reads every manifest from disk the next time it is opened
         // (see the `settings-open` rising-edge check in the fast timer below).
-        let shown_at = shown_at.clone();
+        let ctx = ctx.clone();
         app.on_edit_plugin(move |id| {
-            shown_at.set(Instant::now()); // the editor window steals focus
+            ctx.shown_at.set(Instant::now()); // the editor window steals focus
             let dir = seed::plugins_dir();
             match find_plugin_manifest_path(&dir, id.as_ref()) {
                 Some(path) => open_in_text_editor(&path),
@@ -1000,18 +1141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
-        let weak = app.as_weak();
-        let plugins = plugins.clone();
-        let cache = cache.clone();
-        let model = model.clone();
-        let window_models = window_models.clone();
-        let balance_models = balance_models.clone();
-        let plugin_model = plugin_model.clone();
-        let tx = plugin_tx.clone();
-        let fetching = fetching.clone();
-        let tray = tray.clone();
-        let tray_key = tray_key.clone();
-        let shown_at = shown_at.clone();
+        let ctx = ctx.clone();
         app.on_remove_plugin(move |id| {
             let id = id.to_string();
             let confirmed = confirm_remove_plugin(&id);
@@ -1020,7 +1150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // so a `Focused(false)` queued while it had focus (processed
             // only once this callback returns control to the event loop)
             // doesn't hide the sheet on the very next tick.
-            shown_at.set(Instant::now());
+            ctx.shown_at.set(Instant::now());
             if !confirmed {
                 return; // Cancel, closed, or no dialog at all — never destructive by default
             }
@@ -1048,66 +1178,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // happens to reuse this id. Never touches the well-known
             // codex/claude bridge keys — see `config::remove_plugin_keys`.
             config::remove_plugin_keys(&id);
-            cache.borrow_mut().remove(&id);
-            fetching.borrow_mut().remove(&id);
-            reload_and_fetch(&plugins, &fetching, &plugin_model, &tx);
-            if let Some(app) = weak.upgrade() {
+            ctx.cache.borrow_mut().remove(&id);
+            ctx.fetching.borrow_mut().remove(&id);
+            // `reload_and_fetch` already refreshed the plugin-manager rows —
+            // see `on_add_plugin`'s identical comment above.
+            reload_and_fetch(
+                &ctx.plugins,
+                &ctx.fetching,
+                &ctx.plugin_model,
+                &ctx.plugin_tx,
+            );
+            if let Some(app) = ctx.weak.upgrade() {
                 refresh_model(
                     &app,
-                    &model,
-                    &plugins.borrow(),
-                    &cache,
-                    &window_models,
-                    &balance_models,
+                    &ctx.model,
+                    &ctx.plugins.borrow(),
+                    &ctx.cache,
+                    &ctx.window_models,
+                    &ctx.balance_models,
                 );
                 sync_tray_indicator(
-                    &tray,
+                    &ctx.tray,
                     app.get_menu_bar_text(),
-                    &plugins.borrow(),
-                    &cache,
-                    &tray_key,
+                    &ctx.plugins.borrow(),
+                    &ctx.cache,
+                    &ctx.tray_key,
                 );
             }
         });
     }
     {
-        let shown_at = shown_at.clone();
+        let ctx = ctx.clone();
         app.on_open_plugins_folder(move || {
-            shown_at.set(Instant::now()); // Finder/the file manager steals focus
+            ctx.shown_at.set(Instant::now()); // Finder/the file manager steals focus
             open_in_file_manager(&seed::plugins_dir());
         });
     }
+}
 
-    // ── Registry (Check updates / Install / Update) ─────────────────────
-    // "Check updates" is a manual, user-triggered action (never on a timer
-    // or at launch — see `docs/PLUGIN-ARCHITECTURE.md`'s Transport section);
-    // the network fetch runs on a background thread so it can never freeze
-    // the popover, and its result is drained on the UI thread in the fast
-    // event timer below (`apply_registry_check`), the same idiom as
-    // `plugin_rx`.
+/// "Check updates" (manual, user-triggered — never on a timer or at launch,
+/// see `docs/PLUGIN-ARCHITECTURE.md`'s Transport section), Install, and
+/// Update. Every network fetch runs on a background thread so it can never
+/// freeze the popover, and its result is drained on the UI thread in
+/// [`run_fast_timer`] (`apply_registry_check`, `handle_install_outcome`),
+/// the same idiom [`wire_ui_callbacks`]'s own plugin-fetch channel uses.
+fn wire_registry_callbacks(app: &AppWindow, ctx: &Ctx) {
     {
-        let weak = app.as_weak();
-        let tx = registry_tx.clone();
-        let registry_checking = registry_checking.clone();
-        let plugins = plugins.clone();
+        let ctx = ctx.clone();
         app.on_check_updates(move || {
             // A check already running answers for this click too — its
             // result is on the way regardless of how many more times the
             // button is pressed before it arrives.
-            if registry_checking.replace(true) {
+            if ctx.registry_checking.replace(true) {
                 return;
             }
-            if let Some(app) = weak.upgrade() {
-                app.set_registry_status(1); // checking — flips the button to "Checking…"
+            if let Some(app) = ctx.weak.upgrade() {
+                app.set_registry_status(RegistryStatus::Checking); // flips the button to "Checking…"
             }
-            let tx = tx.clone();
+            let tx = ctx.registry_tx.clone();
             // Snapshotted here, on the UI thread, rather than handing the
             // worker thread `plugins` itself: `Rc<RefCell<…>>` is not `Send`,
             // and reading it from another thread would race whatever else
             // touches it on this one. Only `(id, version)` — the file read
             // and sha256 that turn this into `hash_installed_manifests`'s
             // full triples happen entirely on the worker thread below.
-            let installed: Vec<(String, String)> = plugins
+            let installed: Vec<(String, String)> = ctx
+                .plugins
                 .borrow()
                 .iter()
                 .map(|m| (m.id.clone(), m.version.clone()))
@@ -1124,9 +1260,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // No thread means no result will ever arrive on `registry_rx`
                 // to clear the flag below — clear it here instead, or every
                 // click after this one would be refused for good.
-                registry_checking.set(false);
-                if let Some(app) = weak.upgrade() {
-                    app.set_registry_status(2);
+                ctx.registry_checking.set(false);
+                if let Some(app) = ctx.weak.upgrade() {
+                    app.set_registry_status(RegistryStatus::ErrNetwork);
                     app.set_registry_error(ss("Could not start the update check"));
                 }
             }
@@ -1138,13 +1274,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // successful "Check updates" — an install click with no cached index
         // (or for an id that check no longer lists) is a no-op, since there
         // is nothing to fetch a manifest from.
-        let registry_index_cache = registry_index_cache.clone();
-        let registry_model = registry_model.clone();
-        let registry_busy = registry_busy.clone();
-        let tx = install_tx.clone();
+        let ctx = ctx.clone();
         app.on_install_plugin(move |id| {
             let id = id.to_string();
-            let Some(entry) = registry_index_cache
+            let Some(entry) = ctx
+                .registry_index_cache
                 .borrow()
                 .as_ref()
                 .and_then(|idx| idx.plugins.iter().find(|e| e.id == id).cloned())
@@ -1155,11 +1289,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ));
                 return;
             };
-            if !registry_busy.borrow_mut().insert(id.clone()) {
+            if !ctx.registry_busy.borrow_mut().insert(id.clone()) {
                 return; // an install/update for this id is already in flight
             }
-            set_registry_row_status(&registry_model, &id, 1, ""); // installing…
-            let tx = tx.clone();
+            set_registry_row_status(&ctx.registry_model, &id, InstallStatus::Installing, "");
+            let tx = ctx.install_tx.clone();
             // `Builder::spawn`, not `thread::spawn`: the latter panics if the OS
             // won't hand out a thread, landing here after `registry_busy` and the
             // row's status both went up and before anything exists to take
@@ -1175,8 +1309,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 guard.finish(outcome);
             });
             if spawned.is_err() {
-                registry_busy.borrow_mut().remove(&id);
-                set_registry_row_status(&registry_model, &id, 2, "could not start the install");
+                ctx.registry_busy.borrow_mut().remove(&id);
+                set_registry_row_status(
+                    &ctx.registry_model,
+                    &id,
+                    InstallStatus::Failed,
+                    "could not start the install",
+                );
             }
         });
     }
@@ -1184,14 +1323,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Update an already-installed plugin (its id is `PluginRow.id`,
         // whatever the plugin's *installed* id is — the entry that produced
         // it is looked up by that same id in the cached index).
-        let plugins = plugins.clone();
-        let plugin_model = plugin_model.clone();
-        let registry_index_cache = registry_index_cache.clone();
-        let registry_busy = registry_busy.clone();
-        let tx = install_tx.clone();
+        let ctx = ctx.clone();
         app.on_update_plugin(move |id| {
             let id = id.to_string();
-            let Some(entry) = registry_index_cache
+            let Some(entry) = ctx
+                .registry_index_cache
                 .borrow()
                 .as_ref()
                 .and_then(|idx| idx.plugins.iter().find(|e| e.id == id).cloned())
@@ -1202,11 +1338,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ));
                 return;
             };
-            if !registry_busy.borrow_mut().insert(id.clone()) {
+            if !ctx.registry_busy.borrow_mut().insert(id.clone()) {
                 return; // an install/update for this id is already in flight
             }
-            set_plugin_update_status(&plugin_model, &plugins, &id, 1, ""); // updating…
-            let tx = tx.clone();
+            set_plugin_update_status(
+                &ctx.plugin_model,
+                &ctx.plugins,
+                &id,
+                UpdateStatus::Updating,
+                "",
+            );
+            let tx = ctx.install_tx.clone();
             // `Builder::spawn`, not `thread::spawn` — see the identical comment
             // on the Install side above.
             let spawned = std::thread::Builder::new().spawn(move || {
@@ -1219,649 +1361,544 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 guard.finish(outcome);
             });
             if spawned.is_err() {
-                registry_busy.borrow_mut().remove(&id);
+                ctx.registry_busy.borrow_mut().remove(&id);
                 set_plugin_update_status(
-                    &plugin_model,
-                    &plugins,
+                    &ctx.plugin_model,
+                    &ctx.plugins,
                     &id,
-                    2,
+                    UpdateStatus::Failed,
                     "could not start the update",
                 );
             }
         });
     }
+}
 
-    // ── First readings ──────────────────────────────────────────────────
-    // Read once, at start-up, and carried to both places below that ask
-    // about it — this and the `TICKOVER_SNAPSHOT_SETTINGS`/snapshot-taking
-    // block further down.
-    let snapshot_path = std::env::var_os("TICKOVER_SNAPSHOT");
-    if snapshot_path.is_some() {
-        // A screenshot needs data present synchronously, before the first
-        // render — every plugin is fetched on this thread, blocking.
-        *cache.borrow_mut() = sync_fetch_all(&plugins.borrow());
-    } else {
-        spawn_all_plugin_fetches(&plugins.borrow(), &plugin_tx, &fetching);
-    }
-    refresh_model(
-        &app,
-        &model,
-        &plugins.borrow(),
-        &cache,
-        &window_models,
-        &balance_models,
-    );
-    sync_tray_indicator(&tray, menubar_on, &plugins.borrow(), &cache, &tray_key);
-
-    if std::env::var_os("TICKOVER_SHOW_ON_START").is_some() || platform::dock_mode() {
-        present_popover(&app, &anchor, &shown_at, Shown::ByAnythingElse);
-    }
-
-    if let Some(path) = snapshot_path {
-        present_popover(&app, &anchor, &shown_at, Shown::ByAnythingElse);
-        // Snapshot the settings sheet instead of the gauges when asked.
-        if std::env::var_os("TICKOVER_SNAPSHOT_SETTINGS").is_some() {
-            app.set_settings_open(true);
-        }
-        let weak = app.as_weak();
-        Timer::single_shot(Duration::from_millis(700), move || {
-            // Not attempted on Windows. `take_snapshot` there returns a
-            // fully transparent buffer — measured on both the femtovg and
-            // the software renderer, with the window visible, sized and
-            // drawn on screen at the time — so the only thing it can produce
-            // is an empty PNG reported as a success. Worse, it sometimes
-            // does not return at all: roughly one run in ten aborts inside
-            // femtovg's `imgref` on `assertion failed: stride > 0`, taking
-            // the process down with it. The window really is drawn — every
-            // screenshot of it on this platform was captured off the screen
-            // — so that is what the message points at.
-            #[cfg(target_os = "windows")]
-            {
-                let _ = &weak;
-                eprintln!(
-                    "[tickover] TICKOVER_SNAPSHOT is not supported on Windows: the \
-                     renderer hands back an empty image for a window it has drawn correctly. \
-                     Capture the screen instead. Nothing written to {path:?}."
-                );
-            }
-            #[cfg(not(target_os = "windows"))]
-            if let Some(app) = weak.upgrade() {
-                match app.window().take_snapshot() {
-                    Ok(buf) => {
-                        let (w, h) = (buf.width(), buf.height());
-                        let bytes = buf.as_bytes().to_vec();
-                        let got = bytes.len();
-                        let want = (w as usize) * (h as usize) * 4;
-                        match image::RgbaImage::from_raw(w, h, bytes) {
-                            Some(img) => match img.save(std::path::Path::new(&path)) {
-                                Ok(()) => diag::line(format!("snapshot {w}x{h} -> {path:?}")),
-                                Err(e) => diag::line(format!(
-                                    "snapshot {w}x{h}: failed to write {path:?}: {e}"
-                                )),
-                            },
-                            None => diag::line(format!(
-                                "snapshot {w}x{h}: buffer holds {got} bytes, {want} needed \
-                                 for RGBA8 at that size, nothing written to {path:?}"
-                            )),
-                        }
-                    }
-                    Err(e) => {
-                        diag::line(format!("snapshot: take_snapshot failed: {e}"));
-                    }
-                }
-            }
-            let _ = slint::quit_event_loop();
-        });
-    }
-
-    // ── Timers ──────────────────────────────────────────────────────────
-    // Fast: drain tray/menu events + collect finished plugin fetches.
+/// Fast: drain tray/menu events + collect finished plugin fetches, every
+/// 80ms. Takes the three receivers this app only ever has one of each of
+/// (an `mpsc::Receiver` is not `Clone`) and the tray menu [`setup_tray`]
+/// built, since this is the only other place either is read from. `main`
+/// must keep the returned [`Timer`] alive for the rest of the run.
+fn run_fast_timer(
+    app: &AppWindow,
+    ctx: &Ctx,
+    tray_menu: TrayMenu,
+    plugin_rx: mpsc::Receiver<(String, u64, Vec<ProviderReading>)>,
+    registry_rx: mpsc::Receiver<RegistryCheckMsg>,
+    install_rx: mpsc::Receiver<(PendingKind, RegistryEntry, InstallOutcome)>,
+) -> Timer {
     let event_timer = Timer::default();
-    {
-        let weak = app.as_weak();
-        let plugins = plugins.clone();
-        let cache = cache.clone();
-        let model = model.clone();
-        let window_models = window_models.clone();
-        let balance_models = balance_models.clone();
-        let plugin_model = plugin_model.clone();
-        let anchor = anchor.clone();
-        let shown_at = shown_at.clone();
-        let check = autostart_item.clone();
-        let menubar_check = menubar_item.clone();
-        let tray = tray.clone();
-        let tray_key = tray_key.clone();
-        let fetching = fetching.clone();
-        let tx = plugin_tx.clone();
-        let tray_click_at = tray_click_at.clone();
-        let hidden_by_focus_at = hidden_by_focus_at.clone();
-        let registry_model = registry_model.clone();
-        let registry_index_cache = registry_index_cache.clone();
-        let registry_busy = registry_busy.clone();
-        let registry_checking = registry_checking.clone();
-        let last_registry_check = last_registry_check.clone();
-        // Rising-edge state for the "settings sheet just opened" reload
-        // below — a plain `Cell`, mirroring `tick_timer`'s own `ticks` Cell.
-        let settings_open_prev = Cell::new(false);
-        event_timer.start(TimerMode::Repeated, Duration::from_millis(80), move || {
-            let Some(app) = weak.upgrade() else { return };
+    let weak = app.as_weak();
+    let ctx = ctx.clone();
+    // Rising-edge state for the "settings sheet just opened" reload
+    // below — a plain `Cell`, mirroring `tick_timer`'s own `ticks` Cell.
+    let settings_open_prev = Cell::new(false);
+    event_timer.start(TimerMode::Repeated, Duration::from_millis(80), move || {
+        let Some(app) = weak.upgrade() else { return };
 
-            // The settings sheet has no Rust-side "opened" callback (frozen
-            // Slint contract: `settings-open` is a plain `in-out` property
-            // toggled directly by the gear/Close buttons — see
-            // `ui/app.slint`). Polling it here and reacting to the
-            // false→true edge is what picks up a manifest edited in the
-            // external `edit-plugin` text editor (or dropped by hand into
-            // the plugins folder) without needing that process to notify
-            // this one. Manifests-only, deliberately no fetch — see
-            // `reload_manifests_only`'s docs.
-            let settings_open_now = app.get_settings_open();
-            if settings_open_now && !settings_open_prev.get() {
-                reload_manifests_only(&plugins, &plugin_model);
+        // The settings sheet has no Rust-side "opened" callback (frozen
+        // Slint contract: `settings-open` is a plain `in-out` property
+        // toggled directly by the gear/Close buttons — see
+        // `ui/app.slint`). Polling it here and reacting to the
+        // false→true edge is what picks up a manifest edited in the
+        // external `edit-plugin` text editor (or dropped by hand into
+        // the plugins folder) without needing that process to notify
+        // this one. Manifests-only, deliberately no fetch — see
+        // `reload_manifests_only`'s docs.
+        let settings_open_now = app.get_settings_open();
+        if settings_open_now && !settings_open_prev.get() {
+            reload_manifests_only(&ctx.plugins, &ctx.plugin_model);
+        }
+        settings_open_prev.set(settings_open_now);
+
+        // Plugin fetch results.
+        let mut got = false;
+        while let Ok((id, generation, plugin_readings)) = plugin_rx.try_recv() {
+            // A result whose generation no longer matches what `fetching`
+            // has on record for this id: past `FETCH_PATIENCE` this app
+            // now waits rather than replaces (`Admission::Stalled`),
+            // so a live entry's generation never actually changes out
+            // from under an outstanding fetch any more — this is instead
+            // the plugin having been removed (or removed and reinstalled)
+            // while an old fetch for it was still running. Dropping it
+            // keeps that late arrival from clearing the in-flight mark of
+            // whatever fetch is current now, and from overwriting a newer
+            // reading with an older one.
+            if !result_is_current(ctx.fetching.borrow().get(&id).copied(), generation) {
+                continue;
             }
-            settings_open_prev.set(settings_open_now);
-
-            // Plugin fetch results.
-            let mut got = false;
-            while let Ok((id, generation, plugin_readings)) = plugin_rx.try_recv() {
-                // A result whose generation no longer matches what `fetching`
-                // has on record for this id: past `FETCH_PATIENCE` this app
-                // now waits rather than replaces (`Admission::Stalled`),
-                // so a live entry's generation never actually changes out
-                // from under an outstanding fetch any more — this is instead
-                // the plugin having been removed (or removed and reinstalled)
-                // while an old fetch for it was still running. Dropping it
-                // keeps that late arrival from clearing the in-flight mark of
-                // whatever fetch is current now, and from overwriting a newer
-                // reading with an older one.
-                if !result_is_current(fetching.borrow().get(&id).copied(), generation) {
-                    continue;
-                }
-                fetching.borrow_mut().remove(&id);
-                // Drop a result for a plugin disabled (or removed) while its
-                // fetch was in flight, so a late landing can't resurface it.
-                // `is_some_and` over the borrowed `find` rather than
-                // `.cloned()` first: the temporary `Ref` still lives to the
-                // end of this expression, so nothing here needs to deep-clone
-                // a whole `PluginManifest` just to read one `bool` out of it.
-                let keep = plugins
-                    .borrow()
-                    .iter()
-                    .find(|m| m.id == id)
-                    .is_some_and(plugin_enabled);
-                if keep {
-                    // Before the insert, while the previous reading is still
-                    // there to compare against — see `credentials_just_lost`.
-                    for r in credentials_just_lost(
-                        cache
-                            .borrow()
-                            .get(&id)
-                            .map(Vec::as_slice)
-                            .unwrap_or_default(),
-                        &plugin_readings,
-                    ) {
-                        diag::line(format!(
-                            "{} ({}) was on screen a moment ago and is hidden now: its \
-                             credential chain came up empty. The row returns when a \
-                             credential does.",
-                            r.name, r.id
-                        ));
-                    }
-                    cache.borrow_mut().insert(id, plugin_readings);
-                    got = true;
-                }
-            }
-
-            // "Check updates" results.
-            while let Ok(msg) = registry_rx.try_recv() {
-                // This reply is what the guard in `on_check_updates` was
-                // waiting for — cleared before `apply_registry_check` so a
-                // status callback it triggers can turn straight around into
-                // another check rather than finding one still "in flight".
-                registry_checking.set(false);
-                apply_registry_check(
-                    &app,
-                    msg,
-                    &plugins,
-                    &plugin_model,
-                    &registry_model,
-                    &registry_index_cache,
-                    &last_registry_check,
-                );
-            }
-
-            // Install/Update fetch+verify results. The trust dialog (when
-            // required) and the actual disk write both happen here, on the
-            // UI thread — same idiom as `confirm_remove_plugin` blocking this
-            // thread on a native dialog.
-            while let Ok((kind, entry, outcome)) = install_rx.try_recv() {
-                registry_busy.borrow_mut().remove(&entry.id);
-                if handle_install_outcome(
-                    kind,
-                    entry,
-                    outcome,
-                    &plugins,
-                    &plugin_model,
-                    &registry_model,
+            ctx.fetching.borrow_mut().remove(&id);
+            // Drop a result for a plugin disabled (or removed) while its
+            // fetch was in flight, so a late landing can't resurface it.
+            // `is_some_and` over the borrowed `find` rather than
+            // `.cloned()` first: the temporary `Ref` still lives to the
+            // end of this expression, so nothing here needs to deep-clone
+            // a whole `PluginManifest` just to read one `bool` out of it.
+            let keep = ctx
+                .plugins
+                .borrow()
+                .iter()
+                .find(|m| m.id == id)
+                .is_some_and(plugin_enabled);
+            if keep {
+                // Before the insert, while the previous reading is still
+                // there to compare against — see `credentials_just_lost`.
+                for r in credentials_just_lost(
+                    ctx.cache
+                        .borrow()
+                        .get(&id)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                    &plugin_readings,
                 ) {
-                    reload_and_fetch(&plugins, &fetching, &plugin_model, &tx);
-                    got = true;
+                    diag::line(format!(
+                        "{} ({}) was on screen a moment ago and is hidden now: its \
+                         credential chain came up empty. The row returns when a \
+                         credential does.",
+                        r.name, r.id
+                    ));
                 }
-                // Every path through `handle_install_outcome` may have shown
-                // a native dialog (trust confirmation) that stole focus —
-                // reset unconditionally, mirroring
-                // `plugin-option-changed`'s own "costs nothing" comment.
-                shown_at.set(Instant::now());
+                ctx.cache.borrow_mut().insert(id, plugin_readings);
+                got = true;
             }
+        }
 
-            if got {
+        // "Check updates" results.
+        while let Ok(msg) = registry_rx.try_recv() {
+            // This reply is what the guard in `on_check_updates` was
+            // waiting for — cleared before `apply_registry_check` so a
+            // status callback it triggers can turn straight around into
+            // another check rather than finding one still "in flight".
+            ctx.registry_checking.set(false);
+            apply_registry_check(
+                &app,
+                msg,
+                &ctx.plugins,
+                &ctx.plugin_model,
+                &ctx.registry_model,
+                &ctx.registry_index_cache,
+                &ctx.last_registry_check,
+            );
+        }
+
+        // Install/Update fetch+verify results. The trust dialog (when
+        // required) and the actual disk write both happen here, on the
+        // UI thread — same idiom as `confirm_remove_plugin` blocking this
+        // thread on a native dialog.
+        while let Ok((kind, entry, outcome)) = install_rx.try_recv() {
+            ctx.registry_busy.borrow_mut().remove(&entry.id);
+            if handle_install_outcome(
+                kind,
+                entry,
+                outcome,
+                &ctx.plugins,
+                &ctx.plugin_model,
+                &ctx.registry_model,
+            ) {
+                reload_and_fetch(
+                    &ctx.plugins,
+                    &ctx.fetching,
+                    &ctx.plugin_model,
+                    &ctx.plugin_tx,
+                );
+                got = true;
+            }
+            // Every path through `handle_install_outcome` may have shown
+            // a native dialog (trust confirmation) that stole focus —
+            // reset unconditionally, mirroring
+            // `plugin-option-changed`'s own "costs nothing" comment.
+            ctx.shown_at.set(Instant::now());
+        }
+
+        if got {
+            refresh_model(
+                &app,
+                &ctx.model,
+                &ctx.plugins.borrow(),
+                &ctx.cache,
+                &ctx.window_models,
+                &ctx.balance_models,
+            );
+            sync_tray_indicator(
+                &ctx.tray,
+                app.get_menu_bar_text(),
+                &ctx.plugins.borrow(),
+                &ctx.cache,
+                &ctx.tray_key,
+            );
+        }
+
+        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                rect,
+                ..
+            } = event
+            {
+                *ctx.anchor.borrow_mut() = Some((
+                    rect.position.x,
+                    rect.position.y,
+                    rect.size.width as f64,
+                    rect.size.height as f64,
+                ));
+                // This click owns whatever activation it causes.
+                let now = Instant::now();
+                ctx.tray_click_at.set(Some(now));
+                // Taken whatever the platform, so the mark cannot go
+                // stale and answer for a much later click.
+                let hidden_at = ctx.hidden_by_focus_at.take();
+                let dismissed = TRAY_CLICK_CAN_ARRIVE_AFTER_ITS_OWN_DISMISSAL
+                    && tray_click_dismissed_panel(hidden_at, now);
+                if app.window().is_visible() {
+                    let _ = app.window().hide();
+                } else if !dismissed {
+                    spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
+                    if should_refresh_panel(app.window().is_visible(), true) {
+                        refresh_model(
+                            &app,
+                            &ctx.model,
+                            &ctx.plugins.borrow(),
+                            &ctx.cache,
+                            &ctx.window_models,
+                            &ctx.balance_models,
+                        );
+                    }
+                    present_popover(&app, &ctx.anchor, &ctx.shown_at, Shown::ByTrayClick);
+                }
+            }
+        }
+
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            if event.id == tray_menu.refresh_id {
+                spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
                 refresh_model(
                     &app,
-                    &model,
-                    &plugins.borrow(),
-                    &cache,
-                    &window_models,
-                    &balance_models,
+                    &ctx.model,
+                    &ctx.plugins.borrow(),
+                    &ctx.cache,
+                    &ctx.window_models,
+                    &ctx.balance_models,
                 );
                 sync_tray_indicator(
-                    &tray,
+                    &ctx.tray,
                     app.get_menu_bar_text(),
-                    &plugins.borrow(),
-                    &cache,
-                    &tray_key,
+                    &ctx.plugins.borrow(),
+                    &ctx.cache,
+                    &ctx.tray_key,
+                );
+            } else if event.id == tray_menu.autostart_id {
+                let actual = autostart::set(tray_menu.autostart_item.is_checked());
+                tray_menu.autostart_item.set_checked(actual);
+                app.set_autostart(actual);
+            } else if event.id == tray_menu.menubar_id {
+                let enabled = tray_menu.menubar_item.is_checked();
+                config::set_menu_bar_text(enabled);
+                app.set_menu_bar_text(enabled);
+                sync_tray_indicator(
+                    &ctx.tray,
+                    enabled,
+                    &ctx.plugins.borrow(),
+                    &ctx.cache,
+                    &ctx.tray_key,
+                );
+            } else if event.id == tray_menu.quit_id {
+                let _ = slint::quit_event_loop();
+            }
+        }
+    });
+    event_timer
+}
+
+/// Slow: tick the countdowns every second; re-fetch each plugin on its own
+/// `refresh_secs` cadence, and auto-ping shortly after a 5-hour window
+/// resets. `main` must keep the returned [`Timer`] alive for the rest of
+/// the run.
+fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
+    let tick_timer = Timer::default();
+    let weak = app.as_weak();
+    let ctx = ctx.clone();
+    let ticks = Cell::new(0u32);
+    tick_timer.start(
+        TimerMode::Repeated,
+        Duration::from_millis(1000),
+        move || {
+            let Some(app) = weak.upgrade() else { return };
+            let n = ticks.get().wrapping_add(1);
+            ticks.set(n);
+
+            // Bumped every tick, whether or not this one actually spawns
+            // a fetch — see its own doc for why a shared, continuously
+            // rotating pass rather than a bump only where a spawn is
+            // decided below is both simpler and sufficient: a
+            // tray-click-triggered fetch between ticks still reads
+            // whatever pass the last tick set, and that changes every
+            // second regardless.
+            auth::begin_fetch_pass();
+
+            for m in ctx.plugins.borrow().iter() {
+                if scheduler::due(n, m.refresh_secs) {
+                    spawn_plugin_fetch(
+                        m,
+                        active_surface_ids(m),
+                        plugin_options(m),
+                        &ctx.plugin_tx,
+                        &ctx.fetching,
+                    );
+                }
+            }
+
+            // Built once and threaded through the rest of this tick —
+            // `refresh_model_from`, `sync_tray_indicator_from`, and the
+            // ping loop below all read the same `current` rather than
+            // each rebuilding it from `cache` for itself.
+            let current = readings(&ctx.plugins.borrow(), &ctx.cache.borrow());
+
+            // Rebuilding the Slint model is skipped while the popover is
+            // not on screen — the common case for a menu-bar app — since
+            // nothing can see the result until it is shown again, and
+            // that path (below, and every explicit open elsewhere in this
+            // file) already calls `refresh_model`/`refresh_model_from`
+            // itself right before showing it. Everything else in this
+            // tick — the tray icon, the seen-window registry, the auto-
+            // ping loop — runs unconditionally: they are either always on
+            // screen (the tray) or work whether or not anyone is looking
+            // at the panel right now (the headline feature of this app is
+            // pinging a window while the popover stays closed).
+            if should_refresh_panel(app.window().is_visible(), false) {
+                refresh_model_from(
+                    &app,
+                    &ctx.model,
+                    &ctx.plugins.borrow(),
+                    &current,
+                    &ctx.window_models,
+                    &ctx.balance_models,
                 );
             }
+            // Cheap no-op unless data, theme, or the toggle actually changed.
+            sync_tray_indicator_from(&ctx.tray, app.get_menu_bar_text(), &current, &ctx.tray_key);
 
-            while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-                if let TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    button_state: MouseButtonState::Up,
-                    rect,
-                    ..
-                } = event
-                {
-                    *anchor.borrow_mut() = Some((
-                        rect.position.x,
-                        rect.position.y,
-                        rect.size.width as f64,
-                        rect.size.height as f64,
-                    ));
-                    // This click owns whatever activation it causes.
-                    let now = Instant::now();
-                    tray_click_at.set(Some(now));
-                    // Taken whatever the platform, so the mark cannot go
-                    // stale and answer for a much later click.
-                    let hidden_at = hidden_by_focus_at.take();
-                    let dismissed = TRAY_CLICK_CAN_ARRIVE_AFTER_ITS_OWN_DISMISSAL
-                        && tray_click_dismissed_panel(hidden_at, now);
-                    if app.window().is_visible() {
-                        let _ = app.window().hide();
-                    } else if !dismissed {
-                        spawn_all_plugin_fetches(&plugins.borrow(), &tx, &fetching);
-                        if should_refresh_panel(app.window().is_visible(), true) {
-                            refresh_model(
-                                &app,
-                                &model,
-                                &plugins.borrow(),
-                                &cache,
-                                &window_models,
-                                &balance_models,
-                            );
-                        }
-                        present_popover(&app, &anchor, &shown_at, Shown::ByTrayClick);
-                    }
-                }
-            }
+            let now = now_unix();
 
-            while let Ok(event) = MenuEvent::receiver().try_recv() {
-                if event.id == refresh_id {
-                    spawn_all_plugin_fetches(&plugins.borrow(), &tx, &fetching);
-                    refresh_model(
-                        &app,
-                        &model,
-                        &plugins.borrow(),
-                        &cache,
-                        &window_models,
-                        &balance_models,
-                    );
-                    sync_tray_indicator(
-                        &tray,
-                        app.get_menu_bar_text(),
-                        &plugins.borrow(),
-                        &cache,
-                        &tray_key,
-                    );
-                } else if event.id == autostart_id {
-                    let actual = autostart::set(check.is_checked());
-                    check.set_checked(actual);
-                    app.set_autostart(actual);
-                } else if event.id == menubar_id {
-                    let enabled = menubar_check.is_checked();
-                    config::set_menu_bar_text(enabled);
-                    app.set_menu_bar_text(enabled);
-                    sync_tray_indicator(&tray, enabled, &plugins.borrow(), &cache, &tray_key);
-                } else if event.id == quit_id {
-                    let _ = slint::quit_event_loop();
-                }
-            }
-        });
-    }
-
-    // Slow: tick the countdowns every second; re-fetch each plugin on its own
-    // `refresh_secs` cadence, and auto-ping shortly after a 5-hour window
-    // resets.
-    let tick_timer = Timer::default();
-    {
-        let weak = app.as_weak();
-        let plugins = plugins.clone();
-        let cache = cache.clone();
-        let model = model.clone();
-        let window_models = window_models.clone();
-        let balance_models = balance_models.clone();
-        let tray = tray.clone();
-        let tray_key = tray_key.clone();
-        let fetching = fetching.clone();
-        let tx = plugin_tx.clone();
-        let last_registry_check = last_registry_check.clone();
-        let anchor = anchor.clone();
-        let shown_at = shown_at.clone();
-        let ticks = Cell::new(0u32);
-        tick_timer.start(
-            TimerMode::Repeated,
-            Duration::from_millis(1000),
-            move || {
-                let Some(app) = weak.upgrade() else { return };
-                let n = ticks.get().wrapping_add(1);
-                ticks.set(n);
-
-                // Bumped every tick, whether or not this one actually spawns
-                // a fetch — see its own doc for why a shared, continuously
-                // rotating pass rather than a bump only where a spawn is
-                // decided below is both simpler and sufficient: a
-                // tray-click-triggered fetch between ticks still reads
-                // whatever pass the last tick set, and that changes every
-                // second regardless.
-                auth::begin_fetch_pass();
-
-                for m in plugins.borrow().iter() {
-                    if scheduler::due(n, m.refresh_secs) {
-                        spawn_plugin_fetch(
-                            m,
-                            active_surface_ids(m),
-                            plugin_options(m),
-                            &tx,
-                            &fetching,
-                        );
-                    }
-                }
-
-                // Built once and threaded through the rest of this tick —
-                // `refresh_model_from`, `sync_tray_indicator_from`, and the
-                // ping loop below all read the same `current` rather than
-                // each rebuilding it from `cache` for itself.
-                let current = readings(&plugins.borrow(), &cache.borrow());
-
-                // Rebuilding the Slint model is skipped while the popover is
-                // not on screen — the common case for a menu-bar app — since
-                // nothing can see the result until it is shown again, and
-                // that path (below, and every explicit open elsewhere in this
-                // file) already calls `refresh_model`/`refresh_model_from`
-                // itself right before showing it. Everything else in this
-                // tick — the tray icon, the seen-window registry, the auto-
-                // ping loop — runs unconditionally: they are either always on
-                // screen (the tray) or work whether or not anyone is looking
-                // at the panel right now (the headline feature of this app is
-                // pinging a window while the popover stays closed).
-                if should_refresh_panel(app.window().is_visible(), false) {
+            // A second launch can't put a window on screen — it exits before
+            // it has one — so it leaves a note instead, and this instance
+            // answers the click that started it. Without this, launching the
+            // app while it is already running does nothing whatsoever, which
+            // looks exactly like an app that failed to start.
+            if platform::take_show_request() && !app.window().is_visible() {
+                // The gate above skipped `refresh_model_from` for exactly
+                // this window (hidden when this tick started) — force it
+                // now, with the same `current`, so the popover this is
+                // about to show is not a tick behind.
+                if should_refresh_panel(app.window().is_visible(), true) {
                     refresh_model_from(
                         &app,
-                        &model,
-                        &plugins.borrow(),
+                        &ctx.model,
+                        &ctx.plugins.borrow(),
                         &current,
-                        &window_models,
-                        &balance_models,
+                        &ctx.window_models,
+                        &ctx.balance_models,
                     );
                 }
-                // Cheap no-op unless data, theme, or the toggle actually changed.
-                sync_tray_indicator_from(&tray, app.get_menu_bar_text(), &current, &tray_key);
+                present_popover(&app, &ctx.anchor, &ctx.shown_at, Shown::ByAnythingElse);
+            }
 
-                let now = now_unix();
-
-                // A second launch can't put a window on screen — it exits before
-                // it has one — so it leaves a note instead, and this instance
-                // answers the click that started it. Without this, launching the
-                // app while it is already running does nothing whatsoever, which
-                // looks exactly like an app that failed to start.
-                if platform::take_show_request() && !app.window().is_visible() {
-                    // The gate above skipped `refresh_model_from` for exactly
-                    // this window (hidden when this tick started) — force it
-                    // now, with the same `current`, so the popover this is
-                    // about to show is not a tick behind.
-                    if should_refresh_panel(app.window().is_visible(), true) {
-                        refresh_model_from(
-                            &app,
-                            &model,
-                            &plugins.borrow(),
-                            &current,
-                            &window_models,
-                            &balance_models,
-                        );
-                    }
-                    present_popover(&app, &anchor, &shown_at, Shown::ByAnythingElse);
+            // Keep "· checked <registry-checked-at>" live (Slint only ever
+            // sees whatever string Rust last set — see the property's own
+            // doc comment in `ui/app.slint`) — only meaningful once a check
+            // has actually completed (`RegistryStatus::UpToDate` or
+            // `::Results`; idle/checking/error render their own line
+            // instead).
+            if let Some(checked) = ctx.last_registry_check.get() {
+                let status = app.get_registry_status();
+                if matches!(status, RegistryStatus::UpToDate | RegistryStatus::Results) {
+                    app.set_registry_checked_at(ss(relative_checked_at(
+                        now.saturating_sub(checked),
+                    )));
                 }
+            }
 
-                // Keep "· checked <registry-checked-at>" live (Slint only ever
-                // sees whatever string Rust last set — see the property's own
-                // doc comment in `ui/app.slint`) — only meaningful once a check
-                // has actually completed (`registry-status` 4 "up to date" or 5
-                // "results"; idle/checking/error render their own line instead).
-                if let Some(checked) = last_registry_check.get() {
-                    let status = app.get_registry_status();
-                    if status == 4 || status == 5 {
-                        app.set_registry_checked_at(ss(relative_checked_at(
-                            now.saturating_sub(checked),
-                        )));
+            // Auto-ping a plugin's first-surface 5-hour window while it sits
+            // empty (opt-in per plugin, one ping per window — see
+            // [`ping_due`] for why this is a state and not an edge). Only
+            // an enabled plugin arms it — a disabled one is skipped even if it
+            // still declares `[ping]`.
+            //
+            // Remember the newest reset every provider states, while it is
+            // still stating one: once a window empties, a provider like Codex
+            // reports it not at all, and the registry is then the only record
+            // of where its boundary was. Runs before the ping loop below and
+            // outside its `[ping]` filter, so the boundary is there for the
+            // panel's hysteresis and for a ping toggle switched on later —
+            // under that filter, a manifest without a `[ping]` section (every
+            // third-party one) recorded nothing at all.
+            //
+            // Scoped because the borrow is held across a loop rather than for a
+            // single statement. Nothing else in this tick takes the manifest
+            // set mutably today; a reload added later (`*plugins.borrow_mut() =
+            // load_plugins()`, as the settings sheet does) would panic rather
+            // than fail to compile, so the block keeps the region it could
+            // happen in as small as the loop that needs it.
+            {
+                let ps = ctx.plugins.borrow();
+                let written = record_seen_windows(&ps, &current, now);
+                for m in ps.iter().filter(|m| m.ping.is_some() && plugin_enabled(m)) {
+                    // The filter above already established `plugin_enabled(m)`;
+                    // passed as `true` rather than asked a second time. Checked
+                    // before either lookup below so a plugin whose ping toggle
+                    // is off never pays for `seen_window_for`/`ping_window`.
+                    if !plugin_ping_armed(true, config::plugin_ping(&m.id)) {
+                        continue;
                     }
-                }
-
-                // Auto-ping a plugin's first-surface 5-hour window while it sits
-                // empty (opt-in per plugin, one ping per window — see
-                // [`ping_due`] for why this is a state and not an edge). Only
-                // an enabled plugin arms it — a disabled one is skipped even if it
-                // still declares `[ping]`.
-                //
-                // Remember the newest reset every provider states, while it is
-                // still stating one: once a window empties, a provider like Codex
-                // reports it not at all, and the registry is then the only record
-                // of where its boundary was. Runs before the ping loop below and
-                // outside its `[ping]` filter, so the boundary is there for the
-                // panel's hysteresis and for a ping toggle switched on later —
-                // under that filter, a manifest without a `[ping]` section (every
-                // third-party one) recorded nothing at all.
-                //
-                // Scoped because the borrow is held across a loop rather than for a
-                // single statement. Nothing else in this tick takes the manifest
-                // set mutably today; a reload added later (`*plugins.borrow_mut() =
-                // load_plugins()`, as the settings sheet does) would panic rather
-                // than fail to compile, so the block keeps the region it could
-                // happen in as small as the loop that needs it.
-                {
-                    let ps = plugins.borrow();
-                    let written = record_seen_windows(&ps, &current, now);
-                    for m in ps.iter().filter(|m| m.ping.is_some() && plugin_enabled(m)) {
-                        // The filter above already established `plugin_enabled(m)`;
-                        // passed as `true` rather than asked a second time. Checked
-                        // before either lookup below so a plugin whose ping toggle
-                        // is off never pays for `seen_window_for`/`ping_window`.
-                        if !plugin_ping_armed(true, config::plugin_ping(&m.id)) {
+                    // A lapsed token, or a bare 401, renews itself the
+                    // same way an empty window does — by running
+                    // `[ping]` — but the trigger is a surface's own
+                    // reading, not a boundary this loop would otherwise
+                    // compute. Only a surface whose auth chain declares
+                    // a token expiry (`SurfaceConfig::
+                    // declares_token_expiry`) is consulted: Claude's
+                    // `desktop` surface, say, carries its own separate
+                    // token that `[ping]`'s binary never touches, so it
+                    // is skipped here even though its plugin's `[ping]
+                    // renews_token` is true. Every eligible surface is
+                    // classified, not just the first with a signal (see
+                    // `classify_renewal_across_surfaces`'s own doc for
+                    // why one plugin can have two independently-lapsing
+                    // tokens at once) — ahead of the window ping below,
+                    // since a surface whose token has lapsed reports no
+                    // window at all while it is down (`reading.fail`
+                    // clears them), which is exactly the state
+                    // `first_surface_reading_id`/`ping_window` below
+                    // would otherwise skip silently.
+                    let renewal_wanted = m.ping.as_ref().is_some_and(|p| p.renews_token);
+                    let surfaces =
+                        m.surface
+                            .iter()
+                            .filter(|s| s.declares_token_expiry())
+                            .map(|s| {
+                                let id = surface_reading_id(&m.id, &s.id);
+                                let renewal =
+                                    current.iter().find(|r| r.id == id).map(|r| r.token_renewal);
+                                (id, renewal)
+                            });
+                    // Shares `PING_MIN_INTERVAL_SECS`'s floor with the
+                    // window ping below, plus its own bound on top: at
+                    // most one ping per distinct token *per surface*
+                    // (`LAST_RENEWED_FOR` is keyed by surface reading id,
+                    // not by plugin — two renewal-eligible surfaces on
+                    // one plugin lapsing independently each get their
+                    // own once-per-token bound rather than overwriting
+                    // one another's), never one every ten minutes for as
+                    // long as a token the CLI cannot renew either stays
+                    // unrenewed. Silent when suppressed — logging it
+                    // would repeat every tick for exactly the token this
+                    // exists to stop pinging about.
+                    //
+                    // `credit_renewal` runs *before* `send_ping`, not
+                    // after: `Command::spawn`'s own failure is reported
+                    // asynchronously, on a background thread, and can
+                    // otherwise land before this thread gets around to
+                    // crediting anything — see `credit_renewal`'s own
+                    // doc for why crediting first is the one ordering
+                    // that can't lose the retry. `send_ping` returning
+                    // `false` means nothing will ever run to notice that
+                    // credit on this attempt's behalf, so the tick
+                    // undoes it itself; `continue` (skipping the
+                    // window-ping path below) only follows an actual
+                    // spawn — a renewal merely on cooldown, or one that
+                    // failed to even start, must never suppress the one
+                    // ping that plugin can still fire this tick.
+                    // Read once for this whole iteration, not once per use
+                    // below: nothing between here and `set_plugin_pinged_at`
+                    // moves it, and `config`'s own cache makes a second ask
+                    // cheap but not free.
+                    let pinged_at = config::plugin_pinged_at(&m.id);
+                    let due = if renewal_wanted {
+                        classify_renewal_across_surfaces(surfaces, pinged_at, now, last_renewed_for)
+                    } else {
+                        None
+                    };
+                    if let Some((surface_key, renewal)) = due {
+                        let ping = m.ping.as_ref().expect("filtered by ping.is_some() above");
+                        if run_renewal_ping(&m.id, ping, surface_key, renewal, now) {
                             continue;
                         }
-                        // A lapsed token, or a bare 401, renews itself the
-                        // same way an empty window does — by running
-                        // `[ping]` — but the trigger is a surface's own
-                        // reading, not a boundary this loop would otherwise
-                        // compute. Only a surface whose auth chain declares
-                        // a token expiry (`SurfaceConfig::
-                        // declares_token_expiry`) is consulted: Claude's
-                        // `desktop` surface, say, carries its own separate
-                        // token that `[ping]`'s binary never touches, so it
-                        // is skipped here even though its plugin's `[ping]
-                        // renews_token` is true. Every eligible surface is
-                        // classified, not just the first with a signal (see
-                        // `classify_renewal_across_surfaces`'s own doc for
-                        // why one plugin can have two independently-lapsing
-                        // tokens at once) — ahead of the window ping below,
-                        // since a surface whose token has lapsed reports no
-                        // window at all while it is down (`reading.fail`
-                        // clears them), which is exactly the state
-                        // `first_surface_reading_id`/`ping_window` below
-                        // would otherwise skip silently.
-                        let renewal_wanted = m.ping.as_ref().is_some_and(|p| p.renews_token);
-                        let surfaces =
-                            m.surface
-                                .iter()
-                                .filter(|s| s.declares_token_expiry())
-                                .map(|s| {
-                                    let id = surface_reading_id(&m.id, &s.id);
-                                    let renewal = current
-                                        .iter()
-                                        .find(|r| r.id == id)
-                                        .map(|r| r.token_renewal);
-                                    (id, renewal)
-                                });
-                        // Shares `PING_MIN_INTERVAL_SECS`'s floor with the
-                        // window ping below, plus its own bound on top: at
-                        // most one ping per distinct token *per surface*
-                        // (`LAST_RENEWED_FOR` is keyed by surface reading id,
-                        // not by plugin — two renewal-eligible surfaces on
-                        // one plugin lapsing independently each get their
-                        // own once-per-token bound rather than overwriting
-                        // one another's), never one every ten minutes for as
-                        // long as a token the CLI cannot renew either stays
-                        // unrenewed. Silent when suppressed — logging it
-                        // would repeat every tick for exactly the token this
-                        // exists to stop pinging about.
-                        //
-                        // `credit_renewal` runs *before* `send_ping`, not
-                        // after: `Command::spawn`'s own failure is reported
-                        // asynchronously, on a background thread, and can
-                        // otherwise land before this thread gets around to
-                        // crediting anything — see `credit_renewal`'s own
-                        // doc for why crediting first is the one ordering
-                        // that can't lose the retry. `send_ping` returning
-                        // `false` means nothing will ever run to notice that
-                        // credit on this attempt's behalf, so the tick
-                        // undoes it itself; `continue` (skipping the
-                        // window-ping path below) only follows an actual
-                        // spawn — a renewal merely on cooldown, or one that
-                        // failed to even start, must never suppress the one
-                        // ping that plugin can still fire this tick.
-                        // Read once for this whole iteration, not once per use
-                        // below: nothing between here and `set_plugin_pinged_at`
-                        // moves it, and `config`'s own cache makes a second ask
-                        // cheap but not free.
-                        let pinged_at = config::plugin_pinged_at(&m.id);
-                        let due = if renewal_wanted {
-                            classify_renewal_across_surfaces(
-                                surfaces,
-                                pinged_at,
-                                now,
-                                last_renewed_for,
-                            )
-                        } else {
-                            None
-                        };
-                        if let Some((surface_key, renewal)) = due {
-                            let ping = m.ping.as_ref().expect("filtered by ping.is_some() above");
-                            if run_renewal_ping(&m.id, ping, surface_key, renewal, now) {
-                                continue;
-                            }
-                        }
-                        let Some(first_id) = first_surface_reading_id(m) else {
-                            continue;
-                        };
-                        // `written` first — `record_seen_windows` just above may have
-                        // recorded exactly this window on this very tick, and
-                        // `seen_window_for` would otherwise reread and reparse
-                        // `config.json` to learn what this loop's own caller already
-                        // knows (that write is what invalidated `config`'s cache in
-                        // the first place). Falling back to `seen_window_for`, not
-                        // `seen_window_of`: this loop already holds the manifest, and
-                        // the registry key is namespaced by the *owner's* id, so
-                        // asking with `m` reads exactly the key `record_seen_windows`
-                        // wrote for it. Going back through the reading id would run
-                        // the inverse again only to have it answer `None` for a
-                        // reading id two manifests both claim — costing this provider
-                        // its auto-ping over a collision the panel is right to be
-                        // cautious about and the ping need not be.
-                        let seen_window = written
-                            .get(&(m.id.clone(), first_id.clone(), Role::Primary))
-                            .copied()
-                            .or_else(|| seen_window_for(m, &first_id, Role::Primary));
-                        let Some(window) = ping_window(
-                            m,
-                            current.iter().find(|r| r.id == first_id),
-                            seen_window.as_ref().and_then(|s| s.period_minutes),
-                        ) else {
-                            continue;
-                        };
-                        let seen = seen_window.map_or(0, |s| s.at);
-                        if !ping_due(
-                            window.used_percent,
-                            window.resets_at,
-                            window.period_minutes,
-                            seen,
-                            pinged_at,
-                            now,
-                        ) {
-                            continue;
-                        }
-                        // Recorded first, and the command run on this same tick. There
-                        // is deliberately no delay between the two: a gap is a window
-                        // in which the app can be quit with the ping recorded and never
-                        // sent, which on-disk state would then remember for good.
-                        config::set_plugin_pinged_at(&m.id, now);
-                        send_ping(
-                            m.ping.as_ref().expect("filtered by ping.is_some() above"),
-                            None,
-                        );
                     }
+                    let Some(first_id) = first_surface_reading_id(m) else {
+                        continue;
+                    };
+                    // `written` first — `record_seen_windows` just above may have
+                    // recorded exactly this window on this very tick, and
+                    // `seen_window_for` would otherwise reread and reparse
+                    // `config.json` to learn what this loop's own caller already
+                    // knows (that write is what invalidated `config`'s cache in
+                    // the first place). Falling back to `seen_window_for`, not
+                    // `seen_window_of`: this loop already holds the manifest, and
+                    // the registry key is namespaced by the *owner's* id, so
+                    // asking with `m` reads exactly the key `record_seen_windows`
+                    // wrote for it. Going back through the reading id would run
+                    // the inverse again only to have it answer `None` for a
+                    // reading id two manifests both claim — costing this provider
+                    // its auto-ping over a collision the panel is right to be
+                    // cautious about and the ping need not be.
+                    let seen_window = written
+                        .get(&(m.id.clone(), first_id.clone(), Role::Primary))
+                        .copied()
+                        .or_else(|| seen_window_for(m, &first_id, Role::Primary));
+                    let Some(window) = ping_window(
+                        m,
+                        current.iter().find(|r| r.id == first_id),
+                        seen_window.as_ref().and_then(|s| s.period_minutes),
+                    ) else {
+                        continue;
+                    };
+                    let seen = seen_window.map_or(0, |s| s.at);
+                    if !ping_due(
+                        window.used_percent,
+                        window.resets_at,
+                        window.period_minutes,
+                        seen,
+                        pinged_at,
+                        now,
+                    ) {
+                        continue;
+                    }
+                    // Recorded first, and the command run on this same tick. There
+                    // is deliberately no delay between the two: a gap is a window
+                    // in which the app can be quit with the ping recorded and never
+                    // sent, which on-disk state would then remember for good.
+                    config::set_plugin_pinged_at(&m.id, now);
+                    send_ping(
+                        m.ping.as_ref().expect("filtered by ping.is_some() above"),
+                        None,
+                    );
                 }
-            },
-        );
-    }
+            }
+        },
+    );
+    tick_timer
+}
 
-    Timer::single_shot(Duration::from_millis(60), platform::set_accessory_policy);
-
-    // Dock mode: clicking the Dock icon of a running app is an app-level
-    // reopen that never reaches the winit event loop, so a hidden panel would
-    // stay hidden with no way back. Watch the activation flag's rising edge
-    // instead — an edge, not the level, so hiding the window while the app is
-    // still frontmost doesn't immediately re-present it.
-    //
-    // `panel_target_visibility` resolves each tick to a single target state
-    // rather than reacting per event, because several clicks can land inside
-    // one interval and their order is not recoverable afterwards.
+/// Dock mode: clicking the Dock icon of a running app is an app-level
+/// reopen that never reaches the winit event loop, so a hidden panel would
+/// stay hidden with no way back. Watch the activation flag's rising edge
+/// instead — an edge, not the level, so hiding the window while the app is
+/// still frontmost doesn't immediately re-present it.
+///
+/// `panel_target_visibility` resolves each tick to a single target state
+/// rather than reacting per event, because several clicks can land inside
+/// one interval and their order is not recoverable afterwards.
+///
+/// Outside dock mode the returned [`Timer`] is simply never started — cheap
+/// to always build, so `main` can hold one `Timer` binding for it
+/// unconditionally, the same as every other timer here.
+fn run_dock_reopen_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
     let reopen_timer = Timer::default();
     if platform::dock_mode() {
         let weak = app.as_weak();
-        let anchor = anchor.clone();
-        let shown_at = shown_at.clone();
+        let ctx = ctx.clone();
         let was_active = Cell::new(platform::app_is_active());
         let handler_ready = Cell::new(false);
-        let tray_click_at = tray_click_at.clone();
-        // Cloned only to force one refresh right before a reopen makes the
-        // panel visible again — see the comment at that call below. The
-        // one-second tick's own `refresh_model_from` skips exactly this
-        // window (hidden) while it is hidden, so nothing else keeps the
-        // model current until this fires.
-        let plugins = plugins.clone();
-        let cache = cache.clone();
-        let model = model.clone();
-        let window_models = window_models.clone();
-        let balance_models = balance_models.clone();
-        // Short enough that a Dock click feels immediate; the tick is one
-        // atomic read plus one `isActive` message, so it costs nothing.
         reopen_timer.start(TimerMode::Repeated, Duration::from_millis(120), move || {
             // winit sets the delegate once the loop is running, so keep trying
             // until it exists.
@@ -1872,7 +1909,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // An activation the status item caused is that click's business:
             // the tray handler has already toggled the panel, and treating the
             // same click as a Dock reopen would toggle it straight back.
-            let by_tray = activation_owned_by_tray(tray_click_at.get(), Instant::now());
+            let by_tray = activation_owned_by_tray(ctx.tray_click_at.get(), Instant::now());
             let became_active = dock_activation_edge(&was_active, active, by_tray);
             let Some(app) = weak.upgrade() else { return };
             let clicks = platform::take_reopen_requests();
@@ -1888,22 +1925,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if should_refresh_panel(visible, true) {
                     refresh_model(
                         &app,
-                        &model,
-                        &plugins.borrow(),
-                        &cache,
-                        &window_models,
-                        &balance_models,
+                        &ctx.model,
+                        &ctx.plugins.borrow(),
+                        &ctx.cache,
+                        &ctx.window_models,
+                        &ctx.balance_models,
                     );
                 }
-                present_popover(&app, &anchor, &shown_at, Shown::ByAnythingElse);
+                present_popover(&app, &ctx.anchor, &ctx.shown_at, Shown::ByAnythingElse);
             } else if !want_visible && visible {
                 let _ = app.window().hide();
             }
         });
     }
-
-    slint::run_event_loop_until_quit()?;
-    Ok(())
+    reopen_timer
 }
 
 // ── Plugin loading ────────────────────────────────────────────────────────
@@ -2985,19 +3020,13 @@ fn now_unix() -> u64 {
 }
 
 // ── Provider readings (universal model) ─────────────────────────────────────
-
-/// The reading id a given surface of a plugin appears under. Mirrors
-/// `engine_http::surface_reading_id`'s naming scheme so this always matches a
-/// real reading id in the merged list: the synthesized "default" surface
-/// reads under the plugin id verbatim, any other surface under
-/// "{plugin_id}-{surface_id}".
-fn surface_reading_id(plugin_id: &str, surface_id: &str) -> String {
-    if surface_id == "default" {
-        plugin_id.to_string()
-    } else {
-        format!("{plugin_id}-{surface_id}")
-    }
-}
+//
+// [`surface_reading_id`] (imported from `tickover::plugin`, the one
+// definition `engine_http` also forwards to) is the reading id a given
+// surface of a plugin appears under: the synthesized "default" surface
+// reads under the plugin id verbatim, any other surface under
+// "{plugin_id}-{surface_id}" — used throughout this section to always match
+// a real reading id in the merged list.
 
 /// Whether a reading id belongs to an active surface. A plain reading id must
 /// itself be active (`"claude-desktop"` stays gated by the desktop surface's
@@ -4296,7 +4325,7 @@ fn provider_data_from_reading(
             tag,
             account,
             live: true,
-            status: 0,
+            status: ProviderStatus::Rows,
             windows,
             balances,
             notice: ss(&notice),
@@ -4307,7 +4336,7 @@ fn provider_data_from_reading(
             tag,
             account,
             live: true,
-            status: 1,
+            status: ProviderStatus::Message,
             message: ss("no usage reported yet"),
             ..Default::default()
         },
@@ -4316,7 +4345,7 @@ fn provider_data_from_reading(
             tag,
             account,
             live: true,
-            status: 0,
+            status: ProviderStatus::Rows,
             windows,
             balances,
             notice: ss(&notice),
@@ -4332,7 +4361,7 @@ fn provider_data_from_reading(
             name,
             tag,
             account,
-            status: 1,
+            status: ProviderStatus::Message,
             message: ss(tickover::plugin::sanitize_provider_text(msg)),
             ..Default::default()
         },
@@ -4593,6 +4622,7 @@ fn not_started_row(label: &str, role: Role, period_minutes: u64) -> WindowData {
         // count to. The clock the provider will state once it does is not ours
         // to guess.
         reset_rel: ss(""),
+        reset_rel_kind: ResetRelKind::Unknown,
         reset_at: ss(""),
         tooltip: ss(""),
     }
@@ -4624,13 +4654,14 @@ fn window_data(now: u64, w: &Window, used: f64) -> WindowData {
         .period_minutes
         .map_or(w.role == Role::Secondary, |m| m > 720);
     let name = window_title(w);
-    let (rel, at, tooltip, _, _) =
+    let (kind, rel, at, tooltip, _, _) =
         window_view(now, used, w.resets_at, w.period_minutes, weekly, &name);
     WindowData {
         label: ss(&name),
         pct: used as f32,
         not_started: false,
         reset_rel: ss(rel),
+        reset_rel_kind: kind,
         reset_at: ss(at),
         tooltip: ss(tooltip),
     }
@@ -4926,7 +4957,7 @@ fn plugin_row(m: &PluginManifest) -> PluginRow {
         current_version: ss(&m.version),
         available_version: ss(""),
         has_local_edits: false,
-        update_status: 0,
+        update_status: UpdateStatus::Idle,
         update_error: ss(""),
     }
 }
@@ -4940,9 +4971,15 @@ fn engine_label(kind: EngineKind) -> &'static str {
     }
 }
 
-/// Build (reset-rel, reset-at, tooltip, time-progress, time-known) for one
-/// window. `reset-rel` is the compact countdown ("6d 2h"); `reset-at` the
-/// absolute clock ("19 Jul 22:18" for weekly, "22:10" for 5h).
+/// Build (reset-rel-kind, reset-rel, reset-at, tooltip, time-progress,
+/// time-known) for one window. `reset-rel` is the compact countdown
+/// ("6d 2h"), non-empty only when `reset-rel-kind` is `Known` — the other
+/// two states, which a string sentinel (`"unknown"`/`"due"`) would
+/// otherwise have to overload `reset-rel` itself with, are `ResetRelKind`
+/// variants instead, constructed here rather than left for
+/// `ui/widgets.slint`'s `LimitBlock` to recover by string comparison.
+/// `reset-at` is the absolute clock ("19 Jul 22:18" for weekly, "22:10" for
+/// 5h).
 fn window_view(
     now: u64,
     used_percent: f64,
@@ -4950,7 +4987,7 @@ fn window_view(
     window_minutes: Option<u64>,
     weekly: bool,
     name: &str,
-) -> (String, String, String, f32, bool) {
+) -> (ResetRelKind, String, String, String, f32, bool) {
     use chrono::{Local, TimeZone};
 
     // Round once and derive the complement — matching `LimitBlock`'s caption,
@@ -4962,7 +4999,14 @@ fn window_view(
 
     let Some(mut target) = resets_at else {
         let tip = format!("{name}\n{used:.0}% used · {left:.0}% left\nno reset time reported");
-        return ("unknown".to_string(), String::new(), tip, 0.0, false);
+        return (
+            ResetRelKind::Unknown,
+            String::new(),
+            String::new(),
+            tip,
+            0.0,
+            false,
+        );
     };
 
     let period = window_minutes
@@ -4973,6 +5017,14 @@ fn window_view(
     }
     let secs = (target as i64 - now as i64).max(0);
 
+    // `rel` still carries "due" into the tooltip text below whichever way
+    // this comes out — only the *structured* `reset-rel` field returned at
+    // the bottom is emptied for anything that isn't `Known`.
+    let kind = if secs == 0 {
+        ResetRelKind::Due
+    } else {
+        ResetRelKind::Known
+    };
     let rel = if secs == 0 {
         "due".to_string()
     } else {
@@ -5019,7 +5071,11 @@ fn window_view(
             used - progress as f64 * 100.0
         ));
     }
-    (rel, clock, tooltip, progress, time_known)
+    let reset_rel = match kind {
+        ResetRelKind::Known => rel,
+        ResetRelKind::Due | ResetRelKind::Unknown => String::new(),
+    };
+    (kind, reset_rel, clock, tooltip, progress, time_known)
 }
 
 // ── Menu-bar title (plain-text fallback) ─────────────────────────────────────
@@ -6402,7 +6458,7 @@ fn fetch_registry_index(url: &str, installed: Vec<(String, String, String)>) -> 
             // honest registry look corrupt.
             let signature = match registry::fetch_text(&signature_url(url)) {
                 Ok(text) => Some(text),
-                Err(e) if e.starts_with("HTTP 404") => None,
+                Err(e) if e.is_not_found() => None,
                 Err(e) => {
                     if signature::REGISTRY_PUBLIC_KEY.is_some() {
                         diag::line(format!(
@@ -6501,9 +6557,9 @@ fn fold_registry_diff(
     diff
 }
 
-/// One not-yet-installed registry entry as a `registry-new` row: `status =
-/// 0` (available) with no error — [`set_registry_row_status`] is what moves
-/// it to installing/failed once the user actually clicks Install.
+/// One not-yet-installed registry entry as a `registry-new` row:
+/// `InstallStatus::Available` with no error — [`set_registry_row_status`] is
+/// what moves it to installing/failed once the user actually clicks Install.
 ///
 /// `name`/`description` come from `index.toml` on whatever host serves this
 /// registry, not from the manifest being installed — the same untrusted class
@@ -6518,7 +6574,7 @@ fn registry_entry_row(entry: &RegistryEntry) -> RegistryPluginRow {
         description: ss(tickover::plugin::sanitize_provider_text(
             entry.description.as_deref().unwrap_or_default(),
         )),
-        status: 0,
+        status: InstallStatus::Available,
         error: ss(""),
     }
 }
@@ -6572,11 +6628,11 @@ fn apply_registry_check(
 ) {
     match msg {
         RegistryCheckMsg::NetworkError => {
-            app.set_registry_status(2);
+            app.set_registry_status(RegistryStatus::ErrNetwork);
             app.set_registry_error(ss("Registry unreachable — check your connection"));
         }
         RegistryCheckMsg::Malformed => {
-            app.set_registry_status(3);
+            app.set_registry_status(RegistryStatus::ErrMalformed);
             // Three different failures collapse into this one variant — a
             // signature this build refuses, bytes that are not UTF-8, and an
             // `index.toml` that doesn't parse — and none of them says which
@@ -6621,16 +6677,16 @@ fn apply_registry_check(
             app.set_registry_checked_at(ss(relative_checked_at(0)));
 
             if update_count == 0 && new_count == 0 {
-                app.set_registry_status(4);
+                app.set_registry_status(RegistryStatus::UpToDate);
             } else {
                 app.set_registry_summary(ss(registry_summary(update_count, new_count)));
-                app.set_registry_status(5);
+                app.set_registry_status(RegistryStatus::Results);
             }
         }
     }
 }
 
-/// The `registry-summary` text for `registry-status == 5` — the fixed
+/// The `registry-summary` text for `RegistryStatus::Results` — the fixed
 /// template `"N update, M new"`, omitting whichever half is zero. `"update"`
 /// deliberately never pluralizes: the template is literal — `"N update"` for
 /// any N, and `"N new"` — with no plural form, rather than guessing one.
@@ -6662,10 +6718,10 @@ fn relative_checked_at(elapsed_secs: u64) -> String {
 }
 
 /// Find and update one `registry-new` row's `status`/`error` by id — used to
-/// move a row through available (0) → installing (1) → failed (2), or back
-/// to available on a user Cancel. A no-op if `id` isn't (or is no longer) in
+/// move a row through `Available` → `Installing` → `Failed`, or back to
+/// `Available` on a user Cancel. A no-op if `id` isn't (or is no longer) in
 /// the list, e.g. a stale message landing after the row was already removed.
-fn set_registry_row_status(model: &RegistryRows, id: &str, status: i32, error: &str) {
+fn set_registry_row_status(model: &RegistryRows, id: &str, status: InstallStatus, error: &str) {
     for i in 0..model.row_count() {
         let Some(mut row) = model.row_data(i) else {
             continue;
@@ -6703,7 +6759,7 @@ fn set_plugin_update_status(
     plugin_model: &PluginRows,
     plugins: &Plugins,
     id: &str,
-    status: i32,
+    status: UpdateStatus,
     error: &str,
 ) {
     let Some(i) = plugins.borrow().iter().position(|m| m.id == id) else {
@@ -6833,7 +6889,7 @@ fn fetch_and_verify_manifest(base_url: &str, entry: &RegistryEntry) -> InstallOu
     };
     let raw_bytes = match registry::fetch_bytes(&manifest_url) {
         Ok(b) => b,
-        Err(e) => return InstallOutcome::Failed(e),
+        Err(e) => return InstallOutcome::Failed(e.to_string()),
     };
     match registry::verify_and_prepare(&raw_bytes, &entry.sha256) {
         Ok((manifest, sha_hex)) => match verify_manifest_id_matches_entry(&manifest, entry) {
@@ -6887,11 +6943,10 @@ fn verify_manifest_id_matches_entry(
 /// — this is what ends up on disk and is what every later reload/diff
 /// addresses the plugin by.
 ///
-/// Writes to a sibling temp file first, `create_new` (never a bare
-/// `open().create_new()` on `target` itself, which this used to be) — a
-/// disk-full or a crash partway through `write_all` used to leave a
-/// truncated manifest sitting at `target`, and `create_new` on a *second*
-/// attempt would then refuse to touch it: a bad write got permanently stuck
+/// Writes through [`write_via_temp`] — never a bare `open().create_new()` on
+/// `target` itself, which would leave a disk-full or a crash partway through
+/// `write_all` sitting on a truncated manifest that a *second* attempt's own
+/// `create_new` would then refuse to touch: a bad write permanently stuck
 /// rather than retried. The temp file is renamed over `target` only once it
 /// holds every byte, and only when nothing is there already — the same
 /// existence check `add-plugin`'s own inline write leans on `create_new` for
@@ -6908,32 +6963,16 @@ fn verify_manifest_id_matches_entry(
 fn install_write(dir: &std::path::Path, id: &str, raw_bytes: &[u8]) -> Result<(), String> {
     let target = plugin_manifest_target(dir, id)
         .ok_or_else(|| format!("plugin id \"{id}\" is not a valid filename"))?;
-    let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(format!(".tmp{}", std::process::id()));
-    let tmp = target.with_file_name(tmp_name);
-    // Same predictable-temp-path reasoning as `update_write`: whatever is
-    // already sitting at `tmp` goes first, then `create_new` is what actually
-    // makes the file, so a symlink planted there is removed rather than
-    // followed and overwritten.
-    let _ = std::fs::remove_file(&tmp);
-    let result = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, raw_bytes))
-        .and_then(|_| {
-            if target.symlink_metadata().is_ok() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    format!("{} already exists", target.display()),
-                ));
-            }
-            std::fs::rename(&tmp, &target)
-        });
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp); // best-effort cleanup of a half-written temp file
-    }
-    result.map_err(|e| e.to_string())
+    write_via_temp(&target, raw_bytes, |target| {
+        if target.symlink_metadata().is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{} already exists", target.display()),
+            ));
+        }
+        Ok(())
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Overwrite an already-installed plugin's manifest with a freshly-verified
@@ -6944,35 +6983,20 @@ fn install_write(dir: &std::path::Path, id: &str, raw_bytes: &[u8]) -> Result<()
 /// agree by the time this is called): this function still never trusts the
 /// downloaded manifest's id to name the file it's replacing, so a future
 /// regression that weakens that guarantee can't silently overwrite the
-/// wrong file. Writes to a sibling temp file first (an extension other than
+/// wrong file. Writes through [`write_via_temp`] (an extension other than
 /// `.toml`, so `manifest::load_dir`'s glob can never pick up a half-written
 /// file) then atomically renames it over the target — never a direct
 /// in-place write, which a reload racing this write could observe
-/// half-written.
+/// half-written. `create_new`, like `install_write` — never
+/// `create().truncate()`, which would follow a symlink planted on the
+/// predictable temp path and overwrite whatever is on the other end, outside
+/// this directory entirely (see [`write_via_temp`]'s own doc). No check
+/// before the rename — unlike `install_write`, this means to overwrite
+/// whatever is at `target`.
 fn update_write(dir: &std::path::Path, id: &str, raw_bytes: &[u8]) -> Result<(), String> {
     let target = find_plugin_manifest_path(dir, id)
         .ok_or_else(|| format!("no installed manifest file found for id \"{id}\""))?;
-    let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(format!(".tmp{}", std::process::id()));
-    let tmp = target.with_file_name(tmp_name);
-    // `create_new`, like `install_write` — never `create().truncate()`. The
-    // temp path is predictable, and anything running as this user can leave a
-    // symlink sitting on it; `create().truncate()` follows that link and
-    // overwrites whatever is on the other end, outside this directory
-    // entirely. Whatever is already at the path goes first (removing a
-    // symlink removes the link, not its target), and then the create must be
-    // the one that makes the file.
-    let _ = std::fs::remove_file(&tmp);
-    let result = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, raw_bytes))
-        .and_then(|_| std::fs::rename(&tmp, &target));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp); // best-effort cleanup of a half-written temp file
-    }
-    result.map_err(|e| e.to_string())
+    write_via_temp(&target, raw_bytes, |_| Ok(())).map_err(|e| e.to_string())
 }
 
 /// Whether it is still safe for [`handle_install_outcome`] to run
@@ -7015,10 +7039,16 @@ fn handle_install_outcome(
         InstallOutcome::Failed(err) => {
             diag::line(format!("{kind:?} \"{}\": {err}", entry.id));
             match kind {
-                PendingKind::Install => set_registry_row_status(registry_model, &entry.id, 2, &err),
-                PendingKind::Update => {
-                    set_plugin_update_status(plugin_model, plugins, &entry.id, 2, &err)
+                PendingKind::Install => {
+                    set_registry_row_status(registry_model, &entry.id, InstallStatus::Failed, &err)
                 }
+                PendingKind::Update => set_plugin_update_status(
+                    plugin_model,
+                    plugins,
+                    &entry.id,
+                    UpdateStatus::Failed,
+                    &err,
+                ),
             }
             return false;
         }
@@ -7036,9 +7066,11 @@ fn handle_install_outcome(
         || show_trust_dialog(&manifest.id, &disclosure, &allowed_hosts);
     if !approved {
         match kind {
-            PendingKind::Install => set_registry_row_status(registry_model, &entry.id, 0, ""),
+            PendingKind::Install => {
+                set_registry_row_status(registry_model, &entry.id, InstallStatus::Available, "")
+            }
             PendingKind::Update => {
-                set_plugin_update_status(plugin_model, plugins, &entry.id, 0, "")
+                set_plugin_update_status(plugin_model, plugins, &entry.id, UpdateStatus::Idle, "")
             }
         }
         return false;
@@ -7065,7 +7097,13 @@ fn handle_install_outcome(
             if !update_target_unchanged(recorded, &current_sha256) {
                 let msg = "the installed file changed since the last check — not overwriting it";
                 diag::line(format!("{kind:?} \"{}\": {msg}", entry.id));
-                set_plugin_update_status(plugin_model, plugins, &entry.id, 2, msg);
+                set_plugin_update_status(
+                    plugin_model,
+                    plugins,
+                    &entry.id,
+                    UpdateStatus::Failed,
+                    msg,
+                );
                 return false;
             }
         }
@@ -7084,9 +7122,11 @@ fn handle_install_outcome(
             entry.id
         ));
         match kind {
-            PendingKind::Install => set_registry_row_status(registry_model, &entry.id, 2, &e),
+            PendingKind::Install => {
+                set_registry_row_status(registry_model, &entry.id, InstallStatus::Failed, &e)
+            }
             PendingKind::Update => {
-                set_plugin_update_status(plugin_model, plugins, &entry.id, 2, &e)
+                set_plugin_update_status(plugin_model, plugins, &entry.id, UpdateStatus::Failed, &e)
             }
         }
         return false;
@@ -7138,12 +7178,7 @@ fn all_allowed_hosts(m: &PluginManifest) -> Vec<String> {
     let mut hosts: Vec<String> = Vec::new();
     for s in &m.surface {
         for h in &s.allowed_hosts {
-            if !hosts
-                .iter()
-                .any(|existing: &String| existing.eq_ignore_ascii_case(h))
-            {
-                hosts.push(h.clone());
-            }
+            push_host(&mut hosts, h);
         }
     }
     hosts
@@ -8248,9 +8283,10 @@ mod title_tests {
 
     #[test]
     fn window_without_reset_time_marks_pace_unknown() {
-        let (rel, at, _tooltip, progress, time_known) =
+        let (kind, rel, at, _tooltip, progress, time_known) =
             window_view(NOW, 42.0, None, Some(300), false, "5-hour limit");
-        assert_eq!(rel, "unknown");
+        assert_eq!(kind, ResetRelKind::Unknown);
+        assert_eq!(rel, "", "structured field is empty for anything but Known");
         assert_eq!(at, "");
         assert_eq!(progress, 0.0);
         assert!(!time_known);
@@ -8258,7 +8294,7 @@ mod title_tests {
 
     #[test]
     fn fresh_window_keeps_a_visible_time_marker() {
-        let (rel, _at, _tooltip, progress, time_known) = window_view(
+        let (kind, rel, _at, _tooltip, progress, time_known) = window_view(
             NOW,
             0.0,
             Some(NOW + 300 * 60),
@@ -8266,6 +8302,7 @@ mod title_tests {
             false,
             "5-hour limit",
         );
+        assert_eq!(kind, ResetRelKind::Known);
         assert_eq!(rel, "5h 0m");
         assert_eq!(progress, 0.0);
         assert!(time_known);
@@ -8273,7 +8310,7 @@ mod title_tests {
 
     #[test]
     fn reset_timestamp_without_window_length_marks_pace_unknown() {
-        let (_rel, _at, tooltip, progress, time_known) =
+        let (_kind, _rel, _at, tooltip, progress, time_known) =
             window_view(NOW, 42.0, Some(NOW + 3600), None, false, "5-hour limit");
         assert_eq!(progress, 0.0);
         assert!(!time_known);
@@ -9670,7 +9707,11 @@ mod title_tests {
         let windows = reconcile_window_model(&mut models, "codex", rows);
         let data = provider_data_from_reading(&reading, windows, ModelRc::default());
 
-        assert_eq!(data.status, 0, "there are rows, so the section draws them");
+        assert_eq!(
+            data.status,
+            ProviderStatus::Rows,
+            "there are rows, so the section draws them"
+        );
         assert!(
             data.notice.contains("limit reached"),
             "with the refusal above them rather than instead of them: {}",
@@ -9723,7 +9764,8 @@ mod title_tests {
         let data = provider_data_from_reading(&reading, ModelRc::default(), balances);
 
         assert_eq!(
-            data.status, 0,
+            data.status,
+            ProviderStatus::Rows,
             "there is a balance row, so the section draws it"
         );
         assert_ne!(
@@ -11209,6 +11251,7 @@ mod title_tests {
                     pct,
                     not_started: false,
                     reset_rel: ss(""),
+                    reset_rel_kind: ResetRelKind::Unknown,
                     reset_at: ss(""),
                     tooltip: ss(""),
                 },
@@ -12761,7 +12804,7 @@ mod title_tests {
         );
         assert_eq!(row.available_version.as_str(), "");
         assert!(!row.has_local_edits);
-        assert_eq!(row.update_status, 0);
+        assert_eq!(row.update_status, UpdateStatus::Idle);
         assert_eq!(row.update_error.as_str(), "");
     }
 
@@ -12872,7 +12915,7 @@ mod title_tests {
             diff.new_rows[0].description.as_str(),
             "Brand New description"
         );
-        assert_eq!(diff.new_rows[0].status, 0);
+        assert_eq!(diff.new_rows[0].status, InstallStatus::Available);
         assert_eq!(diff.new_rows[0].error.as_str(), "");
     }
 

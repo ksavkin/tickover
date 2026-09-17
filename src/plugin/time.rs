@@ -23,9 +23,9 @@
 
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::plugin::diag_queue::Queue;
 use crate::plugin::manifest::ResetsAtFormat;
 
 /// Parse an RFC3339 / ISO-8601 timestamp to Unix seconds. Negative
@@ -103,8 +103,9 @@ pub fn resets_at(v: &Value, format: ResetsAtFormat) -> Option<u64> {
 /// (see `crate::plugin::auth`'s own `PENDING_DIAGNOSTICS` for the identical
 /// split, and its own doc for why this crate does not reach into either
 /// directly). Queued here, meant to be drained once per fetch pass by
-/// `main.rs` via [`take_pending_diagnostics`], the same shape as `auth`'s.
-static PENDING_DIAGNOSTICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// `main.rs` via [`take_pending_diagnostics`], the same
+/// [`crate::plugin::diag_queue::Queue`] `auth`'s own uses.
+static PENDING_DIAGNOSTICS: Queue = Queue::new();
 
 /// Whether the one diagnostic this module ever queues has already gone out,
 /// this process. A single flag rather than a per-value key on purpose,
@@ -118,23 +119,17 @@ static IMPLAUSIBLE_RESETS_AT_LOGGED: AtomicBool = AtomicBool::new(false);
 
 fn queue_implausible_resets_at_diag() {
     if !IMPLAUSIBLE_RESETS_AT_LOGGED.swap(true, Ordering::SeqCst) {
-        PENDING_DIAGNOSTICS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(
-                "a resets_at value more than ten years from now was treated as absent \
-                 (seconds vs. milliseconds?)"
-                    .to_string(),
-            );
+        PENDING_DIAGNOSTICS.push(
+            "a resets_at value more than ten years from now was treated as absent \
+             (seconds vs. milliseconds?)"
+                .to_string(),
+        );
     }
 }
 
 /// Every diagnostic line queued since the last call, removing them.
 pub fn take_pending_diagnostics() -> Vec<String> {
-    let mut guard = PENDING_DIAGNOSTICS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    std::mem::take(&mut *guard)
+    PENDING_DIAGNOSTICS.take()
 }
 
 #[cfg(test)]

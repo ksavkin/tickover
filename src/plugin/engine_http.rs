@@ -40,7 +40,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read as _;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -49,12 +48,17 @@ use sha2::{Digest, Sha256};
 
 use crate::model::{ProviderReading, TokenRenewal, Window};
 use crate::plugin::auth;
+use crate::plugin::json_path_get;
 use crate::plugin::manifest::{
     AccountType, AmountConfig, AmountKind, BalanceConfig, HttpMethod, HttpRequestConfig,
     HttpValueConfig, HttpValueType, HttpVersionConfig, PeriodMode, PingConfig, PluginManifest,
-    SurfaceConfig, TagFrom, TagTransform, WindowConfig,
+    SurfaceConfig, WindowConfig,
 };
 use crate::plugin::throttle;
+// Only this module's own tests still call `segments` directly (production
+// code here reaches it only indirectly, through `json_path_get`).
+#[cfg(test)]
+use crate::plugin::segments;
 
 /// The reading error for HTTP 401 — a token this engine may not renew (see
 /// the comment on [`perform`]'s 401 match arm for why no provider's refresh
@@ -116,30 +120,37 @@ fn fetch_surface(
 
     let (token, from_expiring_step) = match auth::resolve_token(surface) {
         Ok(t) => t,
-        Err((e, lapsed_expiry)) => {
-            // A chain that ended "lapsed" (`lapsed_expiry` is `Some` — see
-            // `auth::TOKEN_LAPSED`) is a token this app cannot renew on its
-            // own — unless the manifest names a ping that can, as a side
-            // effect of running (`[ping] renews_token`). Checked before the
-            // `NO_CREDENTIALS` rewrite below, which is exactly where a
-            // plugin *without* such a ping still ends up: to it, "found but
-            // lapsed" and "never found" read as the same fact.
+        // A genuinely broken credential store — the message names it — is
+        // never eligible for the `NO_CREDENTIALS` rewrite below: unlike the
+        // old single conflated error string, `PresentErr` here structurally
+        // cannot be mistaken for either `Empty` case.
+        Err(auth::ResolveError::PresentErr(e)) => {
+            reading.fail(e);
+            return reading;
+        }
+        Err(auth::ResolveError::Empty(empty)) => {
+            // A chain that ended `Lapsed` is a token this app cannot renew
+            // on its own — unless the manifest names a ping that can, as a
+            // side effect of running (`[ping] renews_token`). Checked
+            // before the `NO_CREDENTIALS` rewrite below, which is exactly
+            // where a plugin *without* such a ping still ends up: to it,
+            // "found but lapsed" and "never found" read as the same fact.
             //
             // Needs no explicit `declares_token_expiry` check of its own:
-            // `lapsed_expiry` can only be `Some` here because some step on
+            // `Lapsed` can only be produced here because some step on
             // *this* surface both found a token at its `token_json_path`
             // *and* saw that token's own declared expiry in the past (see
             // `auth::token_from_blob` — the expiry is checked only once a
             // token is actually in hand, never on a blob a step never
             // recognised as a credential at all). A step whose expiry is
             // stale but whose token was never found produces
-            // `NO_CREDENTIALS` below instead, not this arm. So `Some` here
+            // `NoCredentials` below instead, not this arm. So `Lapsed` here
             // already implies exactly what `SurfaceConfig::
             // declares_token_expiry` asks (some step on this surface set
             // `expiry_json_path`) — this surface is scoped by the same rule
             // `unauthorized_outcome` below applies explicitly, not by
             // accident.
-            if let Some(expires_at) = lapsed_expiry {
+            if let auth::ResolveEmpty::Lapsed { expires_at } = empty {
                 if let Some(ping) = m.ping.as_ref().filter(|p| p.renews_token) {
                     reading.token_renewal = TokenRenewal::Lapsed { expires_at };
                     reading.fail(renewal_text(&ping.bin));
@@ -154,21 +165,12 @@ fn fetch_surface(
             // `NO_CREDENTIALS` here: a manifest with no `[ping] renews_token`
             // gets the same hide-the-row/custom-message treatment for a
             // lapsed credential as for no credential at all, not a second,
-            // unrecognised string. `lapsed_expiry` is `Some` only alongside
-            // `auth::TOKEN_LAPSED` (see `resolve_token`'s own doc) — a real
-            // (Present-err) failure always pairs `None`, so this never
-            // rewrites a genuine broken-store message.
-            let e = if lapsed_expiry.is_some() {
-                auth::NO_CREDENTIALS.to_string()
-            } else {
-                e
-            };
-            reading.fail(
-                match (e == auth::NO_CREDENTIALS, &surface.no_credentials_message) {
-                    (true, Some(message)) => message.clone(),
-                    _ => e,
-                },
-            );
+            // unrecognised string — both `empty` variants render the same
+            // text from this point on, whichever one it was.
+            reading.fail(match &surface.no_credentials_message {
+                Some(message) => message.clone(),
+                None => auth::NO_CREDENTIALS.to_string(),
+            });
             return reading;
         }
     };
@@ -417,17 +419,11 @@ fn unauthorized_outcome(
     }
 }
 
-/// A surface's `[[surface]]` entry named `"default"` (the single one
-/// `PluginManifest::apply_defaults` synthesizes for a manifest that omits
-/// `[[surface]]` entirely) reads under the plugin's own id; any other,
-/// explicitly-named surface reads under `"{id}-{surface}"` — e.g. Claude's
-/// `"cli"`/`"desktop"` surfaces become `"claude-cli"`/`"claude-desktop"`.
+/// [`crate::plugin::surface_reading_id`], over the two fields this engine's
+/// own callers already have in hand rather than the bare id strings that
+/// function takes.
 fn surface_reading_id(m: &PluginManifest, surface: &SurfaceConfig) -> String {
-    if surface.id == "default" {
-        m.id.clone()
-    } else {
-        format!("{}-{}", m.id, surface.id)
-    }
+    crate::plugin::surface_reading_id(&m.id, &surface.id)
 }
 
 // ── Tag / account (manifest-driven) ──────────────────────────────────────
@@ -457,28 +453,12 @@ fn resolve_tag(
     if has_explicit_surfaces(m) {
         // `manifest::validate` already refuses a blank `[[surface]] label`
         // at load — this filter is a second, cheap belt under that first
-        // one, the same "blank reads as none" rule the `[tag] from =
-        // "field"` branch below already applies to its own text.
+        // one, the same "blank reads as none" rule
+        // [`crate::plugin::resolve_tag_from`]'s own `[tag] from = "field"`
+        // branch already applies to its own text.
         return Some(surface.label.clone()).filter(|s| !s.is_empty());
     }
-    let raw = match m.tag.from {
-        TagFrom::Static => m.tag.value.clone(),
-        // The manifest names the field, but the *value* in it is the
-        // provider's own answer (Codex's `plan_type`, live) — sanitised like
-        // any other response-supplied text before it reaches the tag chip.
-        TagFrom::Field => {
-            let path = m.tag.path.as_deref()?;
-            json_path_get(value?, path)?
-                .as_str()
-                .map(crate::plugin::sanitize_provider_text)
-                .filter(|s| !s.is_empty())
-        }
-        TagFrom::None => None,
-    }?;
-    Some(match m.tag.transform {
-        TagTransform::None => raw,
-        TagTransform::Uppercase => raw.to_uppercase(),
-    })
+    crate::plugin::resolve_tag_from(&m.tag, value)
 }
 
 /// The four values every header substitution needs, bundled only so
@@ -877,7 +857,7 @@ fn resolve_version(v: &HttpVersionConfig) -> String {
 /// [`crate::plugin::collect_windows`], which is where the rule lives so that
 /// both engines keep the same one.
 fn parse_usage(value: &Value, m: &PluginManifest) -> Result<Vec<Window>, String> {
-    crate::plugin::collect_windows(m, "response", |i, w| build_windows(i, w, value))
+    crate::plugin::collect_windows(m, "response", |i, w| build_windows(i, w, value, &m.id))
 }
 
 /// How many elements of a `for_each` array [`build_windows`] will ever look
@@ -894,32 +874,37 @@ const FOR_EACH_MAX_ELEMENTS: usize = 64;
 /// `main.rs`'s binary crate, not this library one), kept as this engine's own
 /// queue rather than borrowed from `time`'s: what gets queued here is about a
 /// `for_each` array, not a timestamp.
-static PENDING_DIAGNOSTICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static PENDING_DIAGNOSTICS: crate::plugin::diag_queue::Queue =
+    crate::plugin::diag_queue::Queue::new();
 
-/// Whether the one diagnostic this queue ever carries has already gone out,
-/// this process. A single flag, not a per-label key: a manifest whose
-/// `for_each` array is oversized says so on the first window it happens to,
-/// and does not need a second line to say the same thing about a second one.
-static FOR_EACH_TRUNCATED_LOGGED: AtomicBool = AtomicBool::new(false);
+/// Every `(plugin id, reason)` pair this process has already logged this
+/// diagnostic for — keyed per plugin, not one process-wide flag: a manifest
+/// whose `for_each` array is oversized says so on the first window it
+/// happens to and does not need a second line about a second one *on that
+/// plugin*, but a different plugin's own oversized array is a different
+/// fact, and a single shared flag would let whichever plugin tripped it
+/// first silence every other plugin's line for the rest of the process.
+static FOR_EACH_TRUNCATED_LOGGED: Mutex<Option<std::collections::HashSet<String>>> =
+    Mutex::new(None);
 
-fn queue_for_each_truncated_diag(label: &str) {
-    if !FOR_EACH_TRUNCATED_LOGGED.swap(true, Ordering::SeqCst) {
-        PENDING_DIAGNOSTICS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(format!(
-                "a `for_each` array for \"{label}\" carried more than \
+fn queue_for_each_truncated_diag(plugin_id: &str, label: &str) {
+    crate::plugin::diag_queue::queue_diag_once(
+        &PENDING_DIAGNOSTICS,
+        &FOR_EACH_TRUNCATED_LOGGED,
+        plugin_id,
+        "for-each-truncated",
+        || {
+            format!(
+                "{plugin_id}: a `for_each` array for \"{label}\" carried more than \
                  {FOR_EACH_MAX_ELEMENTS} elements; the rest were not considered"
-            ));
-    }
+            )
+        },
+    );
 }
 
 /// Every diagnostic line queued since the last call, removing them.
 pub fn take_pending_diagnostics() -> Vec<String> {
-    let mut guard = PENDING_DIAGNOSTICS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    std::mem::take(&mut *guard)
+    PENDING_DIAGNOSTICS.take()
 }
 
 /// The rows one `[[windows]]` entry produces: exactly one, as it always was,
@@ -942,7 +927,7 @@ pub fn take_pending_diagnostics() -> Vec<String> {
 /// nothing here has ever been observed to — and the elements past the cap
 /// are silently unreachable rather than reported one by one; the truncation
 /// itself is reported once, not each one it drops.
-fn build_windows(index: usize, w: &WindowConfig, value: &Value) -> Vec<Window> {
+fn build_windows(index: usize, w: &WindowConfig, value: &Value, plugin_id: &str) -> Vec<Window> {
     let Some(path) = w
         .for_each
         .as_deref()
@@ -959,7 +944,7 @@ fn build_windows(index: usize, w: &WindowConfig, value: &Value) -> Vec<Window> {
         return Vec::new();
     };
     if elements.len() > FOR_EACH_MAX_ELEMENTS {
-        queue_for_each_truncated_diag(&w.label);
+        queue_for_each_truncated_diag(plugin_id, &w.label);
     }
     let mut produced: Vec<Window> = elements
         .iter()
@@ -1004,17 +989,21 @@ fn element_matches(element: &Value, filter: Option<&str>) -> bool {
 /// as it prints — because a manifest is TOML and everything in a path or a
 /// filter is a string by the time it gets here. Both `field` and `wanted` are
 /// taken as given: trimming, if the caller's manifest syntax needs it, is the
-/// caller's job ([`pick`] and [`element_matches`] both do it before calling
-/// in). One function for both callers on purpose: a path selector
-/// (`limits[kind=weekly_scoped]`, one element) and an enumeration filter
-/// (`for_each_where`, every element) differ in how many elements they keep
-/// and in nothing else, and two copies of this would be two chances for that
-/// to stop being true.
+/// caller's job ([`crate::plugin::pick`] and [`element_matches`] both do it
+/// before calling in). One function for both callers on purpose: a path
+/// selector (`limits[kind=weekly_scoped]`, one element) and an enumeration
+/// filter (`for_each_where`, every element) differ in how many elements
+/// they keep and in nothing else, and two copies of this would be two
+/// chances for that to stop being true.
+///
+/// `pub(super)`, not private: [`crate::plugin::pick`] moved to `plugin/mod.rs`
+/// so `engine_logfile` and `auth` could share it (see that function's own
+/// docs), and it still needs this one.
 // `cmp_owned` says to compare the `Value` directly, and that is wrong here:
 // `Value == &str` is true only for a `Value::String`, so every number and every
 // boolean would stop matching — the case the line below exists for.
 #[allow(clippy::cmp_owned)]
-fn field_says(item: &Value, field: &str, wanted: &str) -> bool {
+pub(super) fn field_says(item: &Value, field: &str, wanted: &str) -> bool {
     item.get(field).is_some_and(|v| match v.as_str() {
         Some(text) => text == wanted,
         None => v.to_string() == wanted,
@@ -1472,92 +1461,6 @@ fn read_amount(value: &Value, cfg: &AmountConfig) -> Option<crate::model::Balanc
     }
 }
 
-/// Resolve a dotted JSON path (`"a.b.c"`) against an arbitrary value — plus
-/// the array-selector segments (`[0]`, `[field=value]`) [`pick`] below
-/// implements. `crate::plugin::auth::json_path_str` and
-/// `engine_logfile::json_path` walk the same dotted-key syntax but stop
-/// there, with no selector support of their own — this is the superset, not
-/// a mirror of either.
-fn json_path_get<'v>(root: &'v Value, path: &str) -> Option<&'v Value> {
-    let mut cur = root;
-    for seg in segments(path) {
-        // A selector is a segment that both opens and closes one — and when
-        // reading it that way finds nothing, the segment is tried again whole,
-        // as a key. A provider is entitled to a field called `counts[daily]`,
-        // and a syntax added beside the existing paths must not take names
-        // away from them. Only a real array with a matching element beats a
-        // real key of that exact name, and no provider has both.
-        let stepped = match seg.strip_suffix(']').and_then(|open| open.split_once('[')) {
-            Some((key, selector)) => {
-                let container = if key.is_empty() {
-                    Some(cur)
-                } else {
-                    cur.get(key)
-                };
-                container.and_then(|c| pick(c, selector))
-            }
-            None => None,
-        };
-        cur = match stepped {
-            Some(found) => found,
-            None => cur.get(seg)?,
-        };
-    }
-    Some(cur)
-}
-
-/// Split a path on `.`, except inside `[...]`. A selector's value is arbitrary
-/// text a provider chose — `GPT-5.3-Codex-Spark` has two dots in it — and
-/// splitting through one would leave a path nothing could ever match, in the
-/// most confusing way possible: silently, as a missing field.
-///
-/// The sequence `].` inside a value is what this grammar cannot express: the
-/// `]` closes the selector and the `.` then splits the path, so the selector
-/// ends up shorter than it was written. A plain `]` is fine (the closing one
-/// is the last), and so is any number of dots. No escape is offered rather
-/// than invented — a manifest is meant to be read — and the boundary is
-/// pinned by a test rather than left to be discovered.
-fn segments(path: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let (mut start, mut depth) = (0usize, 0u32);
-    for (i, c) in path.char_indices() {
-        match c {
-            '[' => depth += 1,
-            ']' => depth = depth.saturating_sub(1),
-            '.' if depth == 0 => {
-                out.push(&path[start..i]);
-                start = i + c.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    out.push(&path[start..]);
-    out
-}
-
-/// One element of an array, chosen the way the manifest asked: by position
-/// (`[0]`) or by a field of its own (`[limit_name=GPT-5.3-Codex-Spark]`).
-///
-/// The second form is what a list of quotas needs. A provider that answers
-/// with an array of per-model allowances puts them in no fixed order and adds
-/// to them over time, so "the second one" is not a thing a manifest can mean;
-/// "the one that calls itself this" is. The comparison is against the field's
-/// text — a number or a boolean compares as it prints — because a manifest is
-/// TOML and everything in a path is a string by the time it gets here. Both
-/// halves are trimmed before the comparison, the same reason
-/// [`element_matches`] trims `for_each_where`'s: `limits[kind = weekly_scoped]`
-/// is the natural way to align a manifest's `=` signs, and comparing the
-/// field's text against `" weekly_scoped"` would match nothing forever.
-fn pick<'v>(container: &'v Value, selector: &str) -> Option<&'v Value> {
-    let array = container.as_array()?;
-    match selector.split_once('=') {
-        None => array.get(selector.parse::<usize>().ok()?),
-        Some((field, wanted)) => array
-            .iter()
-            .find(|item| field_says(item, field.trim(), wanted.trim())),
-    }
-}
-
 // ── Network (the only part that isn't unit-tested) ───────────────────────
 
 /// GET or POST `url` (per `method`), with `headers` attached, `body`
@@ -1803,6 +1706,17 @@ mod tests {
     /// this module, since env var mutation only races within one test
     /// binary's shared state either way).
     static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Guards every test that calls [`take_pending_diagnostics`] —
+    /// `PENDING_DIAGNOSTICS` is one process-wide queue shared by every test
+    /// in this module, not one per plugin id. A test's own unique plugin id
+    /// stops it from *misreading* another test's line, but does nothing to
+    /// stop a drain from *stealing* one: two tests racing
+    /// `take_pending_diagnostics()` at once can each walk away with half of
+    /// what was queued. Same poison-safety discipline as `ENV_TEST_LOCK`:
+    /// `.unwrap_or_else(|e| e.into_inner())`, never `.unwrap()` — mirrors
+    /// `auth.rs`'s own, distinct `DIAG_TEST_LOCK`.
+    static DIAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A Claude-like manifest: `engine = "http-api"`, two explicit surfaces,
     /// each with an `env`-backed auth step so tests never touch the real
@@ -5195,8 +5109,11 @@ mod tests {
     /// [`FOR_EACH_MAX_ELEMENTS`] and [`element_identity`]'s hash suffix need
     /// to exercise, as opposed to claude.toml's own `limits[]` (three fixed
     /// captions plus scoped models mixed in, which would make either test
-    /// about the filter rather than about the cap or the identity).
-    fn for_each_manifest() -> PluginManifest {
+    /// about the filter rather than about the cap or the identity). `id` is
+    /// a parameter, not always `"sample"`, so a test proving two *different*
+    /// plugins each get their own truncation diagnostic can build two of
+    /// these that do not share a manifest id.
+    fn for_each_manifest(id: &str) -> PluginManifest {
         let toml = r#"
             id         = "sample"
             name       = "Sample"
@@ -5220,8 +5137,9 @@ mod tests {
             [http]
             [[http.request]]
             url = "https://example.com/usage"
-        "#;
-        PluginManifest::from_str(toml).expect("valid manifest")
+        "#
+        .replace("id         = \"sample\"", &format!("id         = \"{id}\""));
+        PluginManifest::from_str(&toml).expect("valid manifest")
     }
 
     /// Elements past the cap are never scanned at all — not filtered out
@@ -5231,7 +5149,8 @@ mod tests {
     /// itself is reported once, not once per dropped element.
     #[test]
     fn a_for_each_array_past_the_cap_is_truncated_and_reported_once() {
-        let m = for_each_manifest();
+        let _diag_guard = DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let m = for_each_manifest("sample");
         let items: Vec<Value> = (0..(FOR_EACH_MAX_ELEMENTS + 6))
             .map(|i| json!({ "name": format!("item-{i}"), "used_percent": 1.0, "resets_at": 1 }))
             .collect();
@@ -5251,6 +5170,39 @@ mod tests {
         );
     }
 
+    /// The dedup this diagnostic queues under is `(plugin id, reason)`, not
+    /// one process-wide flag: before that, whichever plugin's `for_each`
+    /// array overflowed first silenced every other plugin's own truncation
+    /// line for the rest of the process, and the one line that did print
+    /// carried only the first plugin's own label. Two different plugins
+    /// both overflowing must each still get a line, and each line must name
+    /// its own plugin.
+    #[test]
+    fn two_different_plugins_each_overflowing_for_each_both_get_their_own_line() {
+        let _diag_guard = DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let over_cap: Vec<Value> = (0..(FOR_EACH_MAX_ELEMENTS + 6))
+            .map(|i| json!({ "name": format!("item-{i}"), "used_percent": 1.0, "resets_at": 1 }))
+            .collect();
+        let body = json!({ "items": over_cap });
+
+        let first = for_each_manifest("for-each-overflow-a");
+        parse_usage(&body, &first).expect("nothing here is `required`");
+        let second = for_each_manifest("for-each-overflow-b");
+        parse_usage(&body, &second).expect("nothing here is `required`");
+
+        let diag = take_pending_diagnostics();
+        assert!(
+            diag.iter()
+                .any(|line| line.starts_with("for-each-overflow-a: ")),
+            "the first plugin's own overflow is reported: {diag:?}"
+        );
+        assert!(
+            diag.iter()
+                .any(|line| line.starts_with("for-each-overflow-b: ")),
+            "the second plugin's own overflow is reported too, not silenced by the first: {diag:?}"
+        );
+    }
+
     /// The defect `element_identity`'s hash suffix exists to close: two
     /// elements whose identity text agrees for the first
     /// `PROVIDER_TEXT_MAX_CHARS` characters and only differs after it used to
@@ -5258,7 +5210,7 @@ mod tests {
     /// has nothing else to key on — silently kept one and dropped the other.
     #[test]
     fn two_elements_sharing_a_long_identity_prefix_still_produce_two_rows() {
-        let m = for_each_manifest();
+        let m = for_each_manifest("sample");
         let shared_prefix = "x".repeat(crate::plugin::PROVIDER_TEXT_MAX_CHARS + 10);
         let body = json!({ "items": [
             { "name": format!("{shared_prefix}-A"), "used_percent": 1.0, "resets_at": 1 },

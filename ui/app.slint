@@ -1,6 +1,38 @@
 // Limits — the popover window.
 import { Theme, Icons } from "theme.slint";
-import { LimitBlock, ToggleRow, GhostButton, InfoDot, MiniIconButton, BarTip } from "widgets.slint";
+import { LimitBlock, ToggleRow, GhostButton, InfoDot, IconButton, BarTip, ResetRelKind } from "widgets.slint";
+
+// Whether a `ProviderData` draws its `windows`/`balances` rows or its
+// `message` line instead — see `ProviderData.status`.
+export enum ProviderStatus {
+    rows,
+    message,
+}
+
+// An already-installed plugin's own update, from `PluginRow.update-status`.
+export enum UpdateStatus {
+    idle,     // show the Update button
+    updating,
+    failed,   // show `update-error` and a Retry button
+}
+
+// A not-yet-installed registry plugin's own install, from
+// `RegistryPluginRow.status`.
+export enum InstallStatus {
+    available,  // show the Install button
+    installing,
+    failed,     // show `error` and a Retry button
+}
+
+// The settings sheet's "Check updates" line — `AppWindow.registry-status`.
+export enum RegistryStatus {
+    idle,          // never checked
+    checking,
+    err-network,
+    err-malformed,
+    up-to-date,    // checked, nothing new
+    results,       // updates and/or new plugins found — see registry-summary
+}
 
 // One quota window (a single console row). A provider now carries a dynamic
 // list of these instead of two fixed slots, so a plugin can declare any number
@@ -8,7 +40,9 @@ import { LimitBlock, ToggleRow, GhostButton, InfoDot, MiniIconButton, BarTip } f
 export struct WindowData {
     label: string,        // "5H" / "WK"
     pct: float,           // used %
-    reset-rel: string,    // "6d 2h" / "2h 4m"
+    // "6d 2h" / "2h 4m" when `reset-rel-kind` is `known`; empty otherwise.
+    reset-rel: string,
+    reset-rel-kind: ResetRelKind,
     reset-at: string,     // "19 Jul 22:18" / "22:10" / ""
     tooltip: string,
     // A window the provider has stopped reporting because nothing has been
@@ -51,7 +85,7 @@ export struct ProviderData {
     tag: string,         // plan or surface: "PROLITE" / "CLI" / "Desktop"
     account: string,     // account email (faint), "" hides it
     live: bool,          // green status dot
-    status: int,         // 0 = show rows, 1 = show `message`
+    status: ProviderStatus,
     message: string,     // empty / error / not-installed text
     windows: [WindowData],
     // Balance rows, drawn under the windows above — see `BalanceData`. Empty
@@ -95,8 +129,8 @@ export struct PluginRow {
     current-version: string,   // installed version, e.g. "1.0.0"
     available-version: string, // "" = no update available; else e.g. "1.2.0"
     has-local-edits: bool,     // installed file's hash has diverged from the origin manifest
-    update-status: int,        // 0 idle (show Update button) / 1 updating / 2 failed
-    update-error: string,      // update-status == 2: error text (e.g. "sha256 mismatch")
+    update-status: UpdateStatus,
+    update-error: string,      // update-status == failed: error text (e.g. "sha256 mismatch")
 }
 
 // One `[[plugin]]` entry from the registry's index.toml that isn't installed
@@ -107,8 +141,8 @@ export struct RegistryPluginRow {
     name: string,        // display name
     version: string,     // publisher-declared version, e.g. "0.3.0"
     description: string, // one-line description shown before install
-    status: int,          // 0 available (show Install) / 1 installing / 2 failed
-    error: string,        // status == 2: error text (e.g. "sha256 mismatch")
+    status: InstallStatus,
+    error: string,        // status == failed: error text (e.g. "sha256 mismatch")
 }
 
 // small rounded chip (plan / surface badge / version badge)
@@ -140,39 +174,10 @@ component Chip inherits Rectangle {
     }
 }
 
-// Small square icon button for the header (refresh / settings).
-component IconButton inherits Rectangle {
-    // An `Icons` path on a 24×24 grid. The icon is sized from the button, so
-    // both buttons match each other whatever they draw.
-    in property <string> icon;
-    in property <length> icon-size: 17px;
-    in property <color> tint: Theme.text-dim;
-    callback clicked;
-
-    width: 26px;
-    height: 26px;
-    border-radius: 7px;
-    background: ta.has-hover ? Theme.surface : transparent;
-    animate background { duration: 120ms; }
-
-    ta := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
-    }
-    Path {
-        width: root.icon-size;
-        height: root.icon-size;
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-        viewbox-width: 24;
-        viewbox-height: 24;
-        commands: root.icon;
-        fill: transparent;
-        stroke: ta.has-hover ? Theme.text : root.tint;
-        // Matches the weight of the text it sits beside.
-        stroke-width: 1.7px;
-    }
-}
+// The header's own refresh/settings buttons are the larger of `IconButton`'s
+// two shapes (see its own doc, in `widgets.slint`) — every call site here
+// overrides `button-size`/`icon-size`/`radius`/`hover-bg`/`tint` to match
+// what this file drew inline before the two components merged.
 
 // One balance row, drawn under a provider's quota windows. Simpler than
 // `LimitBlock` by design: a stated percentage is not always there, so there
@@ -293,7 +298,7 @@ component ProviderCard inherits VerticalLayout {
             wrap: word-wrap;
         }
     }
-    if data.status == 0 : VerticalLayout {
+    if data.status == ProviderStatus.rows : VerticalLayout {
         padding-top: 10px;
         padding-bottom: 4px;
         // Blocks are three lines tall, so they need real air between them or
@@ -301,7 +306,8 @@ component ProviderCard inherits VerticalLayout {
         spacing: 18px;
         for w[i] in data.windows : LimitBlock {
             win-label: w.label; pct: w.pct;
-            reset-rel: w.reset-rel; reset-at: w.reset-at; tooltip: w.tooltip;
+            reset-rel: w.reset-rel; reset-rel-kind: w.reset-rel-kind;
+            reset-at: w.reset-at; tooltip: w.tooltip;
             not-started: w.not-started;
             // Where the bar is, not what it is called: two windows can be
             // captioned alike and two cards can be named alike, while no two
@@ -321,7 +327,7 @@ component ProviderCard inherits VerticalLayout {
             notice: b.notice;
         }
     }
-    if data.status != 0 : HorizontalLayout {
+    if data.status != ProviderStatus.rows : HorizontalLayout {
         padding-top: 6px;
         padding-bottom: 8px;
         Text {
@@ -407,18 +413,16 @@ export component AppWindow inherits Window {
     // ── Registry (Check updates / Available from registry) ──────────────
     // Not-yet-installed plugins the last successful index fetch turned up.
     in property <[RegistryPluginRow]> registry-new;
-    // 0 idle (never checked) / 1 checking / 2 err-network / 3 err-malformed
-    // / 4 up-to-date (checked, nothing new) / 5 results (updates and/or new
-    // plugins found — see registry-summary + the per-row state below).
-    in property <int> registry-status;
-    // registry-status == 2 or 3: the full user-facing sentence (Rust picks
-    // the wording; Slint just renders it verbatim, same idiom as
-    // ProviderData.message).
+    in property <RegistryStatus> registry-status;
+    // registry-status == err-network or err-malformed: the full
+    // user-facing sentence (Rust picks the wording; Slint just renders it
+    // verbatim, same idiom as ProviderData.message).
     in property <string> registry-error;
-    // registry-status == 5: the short summary, e.g. "1 update, 2 new".
+    // registry-status == results: the short summary, e.g. "1 update, 2 new".
     in property <string> registry-summary;
-    // registry-status == 4 or 5: just the relative time — "2m ago" / "just
-    // now" — rendered by Slint as "· checked <registry-checked-at>".
+    // registry-status == up-to-date or results: just the relative time —
+    // "2m ago" / "just now" — rendered by Slint as "· checked
+    // <registry-checked-at>".
     in property <string> registry-checked-at;
 
     callback autostart-changed(bool);
@@ -474,7 +478,7 @@ export component AppWindow inherits Window {
             // no system edge they are the flyout's only chrome.
             border-width: root.system-window-edge ? 0px : 1px;
             border-color: Theme.hairline;
-            drop-shadow-color: #000000b0;
+            drop-shadow-color: Theme.shadow.with-alpha(0.6901961);
             drop-shadow-blur: root.system-window-edge ? 0px : 22px;
             drop-shadow-offset-y: root.system-window-edge ? 0px : 7px;
 
@@ -542,6 +546,10 @@ export component AppWindow inherits Window {
                         alignment: center;
                         IconButton {
                             icon: Icons.refresh;
+                            button-size: 26px;
+                            icon-size: 17px;
+                            radius: 7px;
+                            hover-bg: Theme.surface;
                             tint: Theme.accent;
                             clicked => { root.refresh(); }
                         }
@@ -550,6 +558,11 @@ export component AppWindow inherits Window {
                         alignment: center;
                         IconButton {
                             icon: Icons.gear;
+                            button-size: 26px;
+                            icon-size: 17px;
+                            radius: 7px;
+                            hover-bg: Theme.surface;
+                            tint: Theme.text-dim;
                             clicked => { root.settings-open = true; }
                         }
                     }
@@ -625,10 +638,10 @@ export component AppWindow inherits Window {
                 width: parent.width - 16px;
                 height: parent.height - 16px;
                 border-radius: 8px;
-                background: #151a22;
+                background: Theme.sheet;
                 border-width: 1px;
                 border-color: Theme.hairline-strong;
-                drop-shadow-color: #000000cc;
+                drop-shadow-color: Theme.shadow.with-alpha(0.8);
                 drop-shadow-blur: 20px;
                 drop-shadow-offset-y: 8px;
 
@@ -749,11 +762,11 @@ export component AppWindow inherits Window {
                                             VerticalLayout {
                                                 alignment: center;
                                                 GhostButton {
-                                                    icon: root.registry-status == 1 ? "⋯" : "⇣";
-                                                    label: root.registry-status == 1 ? "Checking…" : "Check updates";
-                                                    tint: root.registry-status == 1 ? Theme.text-faint : Theme.accent;
+                                                    icon: root.registry-status == RegistryStatus.checking ? "⋯" : "⇣";
+                                                    label: root.registry-status == RegistryStatus.checking ? "Checking…" : "Check updates";
+                                                    tint: root.registry-status == RegistryStatus.checking ? Theme.text-faint : Theme.accent;
                                                     clicked => {
-                                                        if (root.registry-status != 1) {
+                                                        if (root.registry-status != RegistryStatus.checking) {
                                                             root.check-updates();
                                                         }
                                                     }
@@ -789,12 +802,12 @@ export component AppWindow inherits Window {
                                     }
 
                                     // ── Check-updates status line ────────────────────
-                                    if root.registry-status == 0 : Text {
+                                    if root.registry-status == RegistryStatus.idle : Text {
                                         text: "Last checked: never";
                                         font-size: 10.5px;
                                         color: Theme.text-faint;
                                     }
-                                    if root.registry-status == 1 : HorizontalLayout {
+                                    if root.registry-status == RegistryStatus.checking : HorizontalLayout {
                                         spacing: 6px;
                                         Text { text: "⋯"; font-size: 10px; color: Theme.text-faint; vertical-alignment: center; }
                                         Text {
@@ -805,7 +818,7 @@ export component AppWindow inherits Window {
                                         }
                                         Rectangle { horizontal-stretch: 1; }
                                     }
-                                    if root.registry-status == 2 || root.registry-status == 3 : HorizontalLayout {
+                                    if root.registry-status == RegistryStatus.err-network || root.registry-status == RegistryStatus.err-malformed : HorizontalLayout {
                                         spacing: 6px;
                                         Text { text: "⚠"; font-size: 10px; color: Theme.warn; vertical-alignment: center; }
                                         Text {
@@ -817,7 +830,7 @@ export component AppWindow inherits Window {
                                             horizontal-stretch: 1;
                                         }
                                     }
-                                    if root.registry-status == 4 : HorizontalLayout {
+                                    if root.registry-status == RegistryStatus.up-to-date : HorizontalLayout {
                                         spacing: 6px;
                                         Text { text: "✓"; font-size: 10px; color: Theme.ok; vertical-alignment: center; }
                                         Text { text: "Up to date"; font-size: 10.5px; color: Theme.ok; vertical-alignment: center; }
@@ -829,7 +842,7 @@ export component AppWindow inherits Window {
                                         }
                                         Rectangle { horizontal-stretch: 1; }
                                     }
-                                    if root.registry-status == 5 : HorizontalLayout {
+                                    if root.registry-status == RegistryStatus.results : HorizontalLayout {
                                         spacing: 6px;
                                         Text { text: "⇣"; font-size: 10px; color: Theme.warn; vertical-alignment: center; }
                                         Text {
@@ -885,14 +898,14 @@ export component AppWindow inherits Window {
                                             Rectangle { horizontal-stretch: 1; }
                                             VerticalLayout {
                                                 alignment: center;
-                                                MiniIconButton {
+                                                IconButton {
                                                     icon: Icons.pencil;
                                                     clicked => { root.edit-plugin(p.id); }
                                                 }
                                             }
                                             VerticalLayout {
                                                 alignment: center;
-                                                MiniIconButton {
+                                                IconButton {
                                                     icon: Icons.close;
                                                     clicked => { root.remove-plugin(p.id); }
                                                 }
@@ -904,23 +917,23 @@ export component AppWindow inherits Window {
                                         // indented idiom as the ping/surface sub-toggles below.
                                         if p.available-version != "" : VerticalLayout {
                                             spacing: 3px;
-                                            if p.update-status != 1 : HorizontalLayout {
+                                            if p.update-status != UpdateStatus.updating : HorizontalLayout {
                                                 padding-left: 30px;
                                                 spacing: 7px;
                                                 height: 24px;
                                                 Text {
                                                     text: "⇣";
                                                     font-size: 11px;
-                                                    color: p.update-status == 2 ? Theme.crit : Theme.warn;
+                                                    color: p.update-status == UpdateStatus.failed ? Theme.crit : Theme.warn;
                                                     vertical-alignment: center;
                                                 }
                                                 Text {
-                                                    text: p.update-status == 2 ? p.update-error : "Update available";
+                                                    text: p.update-status == UpdateStatus.failed ? p.update-error : "Update available";
                                                     font-size: 10.5px;
-                                                    color: p.update-status == 2 ? Theme.crit : Theme.text-dim;
+                                                    color: p.update-status == UpdateStatus.failed ? Theme.crit : Theme.text-dim;
                                                     vertical-alignment: center;
                                                 }
-                                                if p.update-status != 2 : VerticalLayout {
+                                                if p.update-status != UpdateStatus.failed : VerticalLayout {
                                                     alignment: center;
                                                     Chip {
                                                         text: "\{p.current-version} → \{p.available-version}";
@@ -932,13 +945,13 @@ export component AppWindow inherits Window {
                                                 }
                                                 Rectangle { horizontal-stretch: 1; }
                                                 GhostButton {
-                                                    label: p.update-status == 2 ? "Retry" : "Update";
-                                                    tint: p.update-status == 2 ? Theme.crit : Theme.warn;
+                                                    label: p.update-status == UpdateStatus.failed ? "Retry" : "Update";
+                                                    tint: p.update-status == UpdateStatus.failed ? Theme.crit : Theme.warn;
                                                     button-height: 22px;
                                                     clicked => { root.update-plugin(p.id); }
                                                 }
                                             }
-                                            if p.update-status == 1 : HorizontalLayout {
+                                            if p.update-status == UpdateStatus.updating : HorizontalLayout {
                                                 padding-left: 30px;
                                                 spacing: 7px;
                                                 height: 24px;
@@ -950,7 +963,7 @@ export component AppWindow inherits Window {
                                                     vertical-alignment: center;
                                                 }
                                             }
-                                            if p.has-local-edits && p.update-status != 1 : HorizontalLayout {
+                                            if p.has-local-edits && p.update-status != UpdateStatus.updating : HorizontalLayout {
                                                 padding-left: 30px;
                                                 Text {
                                                     text: "⚠ locally modified — Update will overwrite your changes";
@@ -1035,19 +1048,19 @@ export component AppWindow inherits Window {
                                                     Chip { text: "v\{r.version}"; tracking: 0.4px; }
                                                 }
                                                 Rectangle { horizontal-stretch: 1; }
-                                                if r.status == 0 : GhostButton {
+                                                if r.status == InstallStatus.available : GhostButton {
                                                     label: "Install";
                                                     tint: Theme.accent;
                                                     button-height: 22px;
                                                     clicked => { root.install-plugin(r.id); }
                                                 }
-                                                if r.status == 1 : Text {
+                                                if r.status == InstallStatus.installing : Text {
                                                     text: "Installing…";
                                                     font-size: 10.5px;
                                                     color: Theme.text-faint;
                                                     vertical-alignment: center;
                                                 }
-                                                if r.status == 2 : GhostButton {
+                                                if r.status == InstallStatus.failed : GhostButton {
                                                     label: "Retry";
                                                     tint: Theme.crit;
                                                     button-height: 22px;
@@ -1060,19 +1073,19 @@ export component AppWindow inherits Window {
                                                 color: Theme.text-dim;
                                                 wrap: word-wrap;
                                             }
-                                            if r.status == 0 : Text {
+                                            if r.status == InstallStatus.available : Text {
                                                 text: "verified against the index's sha256 after download, before install";
                                                 font-size: 9px;
                                                 color: Theme.text-faint;
                                                 wrap: word-wrap;
                                             }
-                                            if r.status == 1 : Text {
+                                            if r.status == InstallStatus.installing : Text {
                                                 text: "Downloading manifest, verifying sha256…";
                                                 font-size: 9.5px;
                                                 color: Theme.text-faint;
                                                 wrap: word-wrap;
                                             }
-                                            if r.status == 2 : Text {
+                                            if r.status == InstallStatus.failed : Text {
                                                 text: "✕ \{r.error}";
                                                 font-size: 9.5px;
                                                 color: Theme.crit;
@@ -1151,11 +1164,11 @@ export component AppWindow inherits Window {
                 y: self.bar-y > self.height + 12px
                     ? self.bar-y - self.height - 8px
                     : self.bar-y + root.tip.h + 8px;
-                background: #05070a;
+                background: Theme.tooltip-bg;
                 border-radius: 8px;
                 border-width: 1px;
                 border-color: Theme.hairline-strong;
-                drop-shadow-color: #000000aa;
+                drop-shadow-color: Theme.shadow.with-alpha(0.6666667);
                 drop-shadow-blur: 18px;
                 drop-shadow-offset-y: 6px;
                 tip-text := Text {

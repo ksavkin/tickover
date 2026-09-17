@@ -284,10 +284,14 @@ impl PluginManifest {
         crate::plugin::capability::check(&raw)?;
         // Parsed a second time, now into this struct. The two passes are the
         // same parser over the same bytes, so they cannot disagree about the
-        // document; what differs is that this one keeps only the fields this
-        // build knows, which is exactly what the check above had to see past.
-        let mut manifest: PluginManifest =
-            toml::from_str(input).map_err(|e| format!("invalid manifest TOML: {e}"))?;
+        // document being valid TOML; what the first pass cannot see is
+        // whether the document's *shape* matches this struct — a field
+        // holding a table where a string is expected, say — so a failure
+        // here gets its own message rather than the syntax one above, which
+        // would tell an author to look for a typo a syntax checker would
+        // have caught, when what actually needs fixing is a field's type.
+        let mut manifest: PluginManifest = toml::from_str(input)
+            .map_err(|e| format!("manifest TOML has a field of the wrong shape or type: {e}"))?;
         manifest.apply_defaults();
         manifest.validate()?;
         Ok(manifest)
@@ -326,6 +330,30 @@ impl PluginManifest {
     /// and one assembled in memory has not. Anything that starts accepting
     /// manifests by some other route has to call that check itself.
     pub fn validate(&self) -> Result<(), String> {
+        // Each `validate_*` fn below covers one contiguous run of checks, in
+        // the exact order they run in here — none of them reorders a single
+        // check, so which error a given manifest gets back stays fixed
+        // purely by this sequence. A few names cover more than their
+        // label alone (`validate_windows` closes with `[status]`, since that
+        // section sits between two runs of window checks in the original text;
+        // `[tag]` sits between two runs of window-period checks and gets its
+        // own fn rather than stretching either neighbour's name to cover it).
+        self.validate_identity()?;
+        self.validate_engine_sections()?;
+        self.validate_windows()?;
+        self.validate_balances()?;
+        self.validate_window_period_mode()?;
+        self.validate_tag()?;
+        self.validate_window_period_bounds()?;
+        self.validate_account_and_surface_auth()?;
+        self.validate_http()?;
+        self.validate_auth()?;
+        self.validate_account_ping_options()?;
+        self.validate_templates()?;
+        Ok(())
+    }
+
+    fn validate_identity(&self) -> Result<(), String> {
         if self.id.trim().is_empty() {
             return Err("`id` must not be empty".to_string());
         }
@@ -481,7 +509,10 @@ impl PluginManifest {
                 self.refresh_secs
             ));
         }
+        Ok(())
+    }
 
+    fn validate_engine_sections(&self) -> Result<(), String> {
         match self.engine {
             EngineKind::LogFile if self.logfile.is_none() => {
                 return Err("engine = \"log-file\" requires a [logfile] section".to_string());
@@ -580,12 +611,11 @@ impl PluginManifest {
         }
         // Same for the one endpoint an http manifest calls: an empty URL is a
         // request that cannot be sent, and `allowed_hosts` has no host to
-        // check it against either.
-        if let Some(http) = &self.http {
-            if http.request.iter().any(|r| r.url.trim().is_empty()) {
-                return Err("`[[http.request]] url` must not be empty".to_string());
-            }
-        }
+        // check it against either. Merged with the two checks below — all
+        // three read `self.http` and nothing sits between them that does
+        // not — rather than three separate `if let Some(http)`s over the
+        // same reference.
+        //
         // A GET has nowhere to put a body — `perform` only ever attaches one
         // to a POST — so `body` under the default `method = "get"` is a
         // request that cannot be sent as written, not a body silently
@@ -594,19 +624,7 @@ impl PluginManifest {
         // the URL and the credentials in its headers) — exactly what
         // Antigravity's `:retrieveUserQuotaSummary` needs — so it is legal
         // rather than required to spell out `body = ""`.
-        if let Some(http) = &self.http {
-            if http
-                .request
-                .iter()
-                .any(|r| r.body.is_some() && r.method != HttpMethod::Post)
-            {
-                return Err(
-                    "`[[http.request]] body` requires `method = \"post\"` — a GET request has \
-                     nowhere to put a body"
-                        .to_string(),
-                );
-            }
-        }
+        //
         // A `{` earlier in a template than a real placeholder — most commonly
         // a JSON object's own opening brace in an http body, but nothing
         // about the shape is body-specific, or even http-specific: a header
@@ -627,6 +645,20 @@ impl PluginManifest {
         // control-character and `..` sweeps below.
         let mut option_templates: Vec<(String, &str)> = Vec::new();
         if let Some(http) = &self.http {
+            if http.request.iter().any(|r| r.url.trim().is_empty()) {
+                return Err("`[[http.request]] url` must not be empty".to_string());
+            }
+            if http
+                .request
+                .iter()
+                .any(|r| r.body.is_some() && r.method != HttpMethod::Post)
+            {
+                return Err(
+                    "`[[http.request]] body` requires `method = \"post\"` — a GET request has \
+                     nowhere to put a body"
+                        .to_string(),
+                );
+            }
             for req in &http.request {
                 option_templates.push(("`[[http.request]] url`".to_string(), req.url.as_str()));
                 for (header, value) in &req.headers {
@@ -662,7 +694,10 @@ impl PluginManifest {
                  written"
             ));
         }
+        Ok(())
+    }
 
+    fn validate_windows(&self) -> Result<(), String> {
         // A provider has to report *something*. Windows were the only shape
         // this could take until Grok, whose response carries no window key at
         // all — only a monthly billing period — so "at least one [[windows]]"
@@ -730,20 +765,7 @@ impl PluginManifest {
             if w.id.is_empty() {
                 continue;
             }
-            let ok = w.id.len() <= WINDOW_ID_MAX_BYTES
-                && w.id
-                    .starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
-                && w.id
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-            if !ok {
-                return Err(format!(
-                    "windows[label = \"{}\"]: `id = \"{}\"` must be at most {WINDOW_ID_MAX_BYTES} \
-                     bytes of lowercase ASCII letters, digits and hyphens, starting with a letter \
-                     or digit",
-                    w.label, w.id
-                ));
-            }
+            check_entry_id(&w.id, &w.label, "windows")?;
         }
         // Two entries sharing an identity share a registry entry, a row in the
         // reconciler and a target for the ping. Compared on the *resolved*
@@ -997,7 +1019,10 @@ impl PluginManifest {
                 ));
             }
         }
+        Ok(())
+    }
 
+    fn validate_balances(&self) -> Result<(), String> {
         // Only the HTTP engine reads balances, for the reason `[status]` is
         // http-only: a log line records the windows one session saw, and this
         // app's log reader has nowhere to take a balance from. Accepting the
@@ -1029,20 +1054,7 @@ impl PluginManifest {
             // Same charset and cap as `[[windows]] id`, and for the same
             // reason: it becomes a segment of a dotted key on disk.
             if !b.id.is_empty() {
-                let ok = b.id.len() <= WINDOW_ID_MAX_BYTES
-                    && b.id
-                        .starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
-                    && b.id
-                        .chars()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-                if !ok {
-                    return Err(format!(
-                        "balances[label = \"{}\"]: `id = \"{}\"` must be at most \
-                         {WINDOW_ID_MAX_BYTES} bytes of lowercase ASCII letters, digits and \
-                         hyphens, starting with a letter or digit",
-                        b.label, b.id
-                    ));
-                }
+                check_entry_id(&b.id, &b.label, "balances")?;
             }
             // An entry that names no source is a caption beside empty space.
             if b.reads_nothing() {
@@ -1202,7 +1214,10 @@ impl PluginManifest {
                 ));
             }
         }
+        Ok(())
+    }
 
+    fn validate_window_period_mode(&self) -> Result<(), String> {
         for w in &self.windows {
             match w.period.mode {
                 PeriodMode::Assumed if w.period.assumed.is_none() => {
@@ -1220,7 +1235,10 @@ impl PluginManifest {
                 _ => {}
             }
         }
+        Ok(())
+    }
 
+    fn validate_tag(&self) -> Result<(), String> {
         // The same `mode`/field cross-check as `[windows.period]` just
         // above, for `[tag]`: `resolve_tag` (`engine_http`/`engine_logfile`,
         // identically) reads `value` only on `from = "static"` and `path`
@@ -1236,6 +1254,10 @@ impl PluginManifest {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    fn validate_window_period_bounds(&self) -> Result<(), String> {
         // A window this short turns `main.rs`'s `ping_due` arithmetic —
         // `pinged_at + PING_GRACE_SECS < start` with `start = reset − period`
         // — into something that can fire on every one-second tick: a
@@ -1334,7 +1356,10 @@ impl PluginManifest {
                 }
             }
         }
+        Ok(())
+    }
 
+    fn validate_account_and_surface_auth(&self) -> Result<(), String> {
         // `[account] url`'s two checks used to sit inside `if let Some(http)`
         // below, which was never the right gate for them: `[account] type =
         // "http"` sends its own request whatever `self.engine` is (the
@@ -1380,7 +1405,10 @@ impl PluginManifest {
                 ));
             }
         }
+        Ok(())
+    }
 
+    fn validate_http(&self) -> Result<(), String> {
         if let Some(http) = &self.http {
             // `{token}`, `{version}` and `{value.<name>}` are header-only, by
             // design: a URL is where a credential is most easily logged by
@@ -1585,7 +1613,10 @@ impl PluginManifest {
                 }
             }
         }
+        Ok(())
+    }
 
+    fn validate_auth(&self) -> Result<(), String> {
         // Every auth step, checked against what its own type needs. Without
         // this a manifest missing, say, a `credentials-file`'s `path` loads
         // fine and then fails on every single fetch, with an error about a
@@ -1833,7 +1864,7 @@ impl PluginManifest {
                             // defensive `debug_assert` at scan time, which
                             // exists for a manifest that got past this check
                             // some other way, not as the primary guard.
-                            let max_len = regex_max_match_len(pattern);
+                            let (max_len, min_len) = regex_len_bounds(pattern);
                             if !matches!(max_len, Some(len) if len <= super::CLIENT_PATTERN_MAX_MATCH_BYTES)
                             {
                                 // `None` is not always "unbounded": `regex_syntax`'s
@@ -1878,13 +1909,13 @@ impl PluginManifest {
                             // `>= 1` fails on a value is for it to be zero);
                             // the other failing case is `None`, which is not
                             // the same claim, let alone a softer one —
-                            // `regex_min_match_len` returns it exactly when
-                            // the pattern can never match anything at all
-                            // (an empty intersection like `[a&&b]`), so it
-                            // is named separately rather than folded into a
-                            // message that would call a pattern matching
-                            // nothing "the empty string" too.
-                            let min_len = regex_min_match_len(pattern);
+                            // the minimum half of `regex_len_bounds` returns
+                            // it exactly when the pattern can never match
+                            // anything at all (an empty intersection like
+                            // `[a&&b]`), so it is named separately rather
+                            // than folded into a message that would call a
+                            // pattern matching nothing "the empty string"
+                            // too.
                             if !matches!(min_len, Some(len) if len >= 1) {
                                 let why = match min_len {
                                     None => {
@@ -2110,7 +2141,10 @@ impl PluginManifest {
                 ));
             }
         }
+        Ok(())
+    }
 
+    fn validate_account_ping_options(&self) -> Result<(), String> {
         // `[account]`, checked the same way and for the same reason.
         let account_missing: &[(&str, bool)] = match self.account.kind {
             AccountType::None => &[],
@@ -2225,7 +2259,10 @@ impl PluginManifest {
                 ));
             }
         }
+        Ok(())
+    }
 
+    fn validate_templates(&self) -> Result<(), String> {
         // A control character or a bidirectional override in any manifest
         // string reaches somewhere it can do real damage before this app
         // gets a chance to sanitise it for display: `[ping] args` and
@@ -2259,6 +2296,8 @@ impl PluginManifest {
         // Whichever class, one shared check
         // ([`control_char_field_is_disruptive`]) over every field named
         // above, rather than a copy of the same lines at each site.
+        let seen_option_keys: std::collections::HashSet<&str> =
+            self.option.iter().map(|o| o.key.as_str()).collect();
         let mut control_char_fields: Vec<(String, &str, CharClass)> = vec![
             ("`name`".to_string(), self.name.as_str(), CharClass::Narrow),
             (
@@ -2761,7 +2800,6 @@ impl PluginManifest {
                 }
             }
         }
-
         Ok(())
     }
 }
@@ -2840,18 +2878,30 @@ fn placeholders(template: &str) -> Vec<&str> {
 /// correctly a few characters later (the case that found this: `{token}`
 /// resolved fine while `{option.plugin}` earlier in the same string did
 /// not).
+/// The three placeholder markers checked in both [`swallowed_placeholder`]
+/// and [`url_placeholder`] — everywhere a `{token}`/`{version}`/`{value.…}`
+/// swallowed by an earlier, structural `{` gets caught. `{option.` is
+/// deliberately not a fourth entry here: a `[plugin.<id>].option.<key>`
+/// value substitutes fine anywhere in a URL, including its query string, so
+/// [`url_placeholder`] leaves it out on purpose, not by omission —
+/// [`swallowed_placeholder`] still checks it, on its own, after this list,
+/// since a swallowed brace inside `{option.<key>}` breaks the same way
+/// whichever text it lands in.
+const HEADER_ONLY: [&str; 3] = ["{token}", "{version}", "{value."];
+
 fn swallowed_placeholder(text: &str) -> Option<&'static str> {
     let names = placeholders(text);
     let raw = |marker: &str| text.matches(marker).count();
     let recognized_exact = |name: &str| names.iter().filter(|n| **n == name).count();
     let recognized_prefix = |prefix: &str| names.iter().filter(|n| n.starts_with(prefix)).count();
-    if raw("{token}") > recognized_exact("token") {
+    let [token_marker, version_marker, value_marker] = HEADER_ONLY;
+    if raw(token_marker) > recognized_exact("token") {
         return Some("{token}");
     }
-    if raw("{version}") > recognized_exact("version") {
+    if raw(version_marker) > recognized_exact("version") {
         return Some("{version}");
     }
-    if raw("{value.") > recognized_prefix("value.") {
+    if raw(value_marker) > recognized_prefix("value.") {
         return Some("{value.<name>}");
     }
     if raw("{option.") > recognized_prefix("option.") {
@@ -3116,6 +3166,30 @@ fn template_complaint(label: &str) -> Option<&'static str> {
 /// `main.rs`'s `seen_role_key`). Capped here rather than left open, because a
 /// manifest that already shipped with a 4 KB id would have to keep working.
 pub(crate) const WINDOW_ID_MAX_BYTES: usize = 64;
+
+/// The charset, length cap and "starts with a letter or digit" rule shared
+/// by `[[windows]] id` and `[[balances]] id` — the same rule for the same
+/// reason (see [`WINDOW_ID_MAX_BYTES`]'s own doc), written out identically
+/// down to the message shape, with only the section name (`"windows"` or
+/// `"balances"`) and the entry's own `label` differing. Callers still guard
+/// an empty `id` themselves — an unset one falls back to the entry's
+/// position, which this has nothing to say about — so an empty string never
+/// reaches here.
+fn check_entry_id(id: &str, label: &str, section: &str) -> Result<(), String> {
+    let ok = id.len() <= WINDOW_ID_MAX_BYTES
+        && id.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !ok {
+        return Err(format!(
+            "{section}[label = \"{label}\"]: `id = \"{id}\"` must be at most \
+             {WINDOW_ID_MAX_BYTES} bytes of lowercase ASCII letters, digits and hyphens, \
+             starting with a letter or digit"
+        ));
+    }
+    Ok(())
+}
 
 impl WindowConfig {
     /// The `<entry>` half of this window's key: the declared `id`, or the
@@ -4154,19 +4228,39 @@ fn control_char_field_is_disruptive(text: &str, class: CharClass) -> bool {
     }
 }
 
-/// The most bytes any match of `pattern` could ever return — `None` when
-/// there is no such maximum (an unbounded repeat, e.g. `.*` or `[a-z]+`), and
-/// also, less obviously, when `regex_syntax` simply has no byte-length answer
-/// for the pattern at all rather than a genuinely infinite one — its own
-/// `Properties::maximum_len` does not distinguish the two, so neither does
-/// this. `validate`'s call site treats both alike (a ceiling it cannot
-/// compute is refused exactly like no ceiling), and says so rather than
-/// calling every `None` "unbounded".
+/// The bounds on how many bytes any match of `pattern` could ever return —
+/// `.0` the most (`None` for an unbounded repeat like `.*`/`[a-z]+`, and
+/// also, less obviously, whenever `regex_syntax` simply has no byte-length
+/// answer for the pattern at all rather than a genuinely infinite one — its
+/// own `Properties::maximum_len` does not distinguish the two, so neither
+/// does this), `.1` the fewest (`0` for a pattern that can match the empty
+/// string, e.g. `a*` or `(foo)?`; `None` when the parse fails —
+/// unreachable at the one call site, which only ever runs a pattern
+/// `regex::bytes::Regex::new` already compiled — or when `regex_syntax`
+/// says the pattern can never match anything at all, an empty intersection
+/// like `[a&&b]`, not merely an unmeasured minimum). `PluginManifest::validate`'s
+/// call site needs both for the same pattern and names the two `None`s
+/// differently in the messages it returns, so they stay separate `Option`s
+/// rather than folding into one meaning — a ceiling this cannot compute is
+/// refused like no ceiling, but a floor of `None` is not the same claim as a
+/// floor of `Some(0)`, and only the latter is actually "matches the empty
+/// string".
 ///
-/// Parsed by `regex_syntax` directly rather than derived from a compiled
-/// `regex::bytes::Regex` (which does not expose this): the same grammar
-/// `regex::bytes::Regex` compiles, so a pattern this measures as unbounded is
-/// exactly one that engine would have matched as unboundedly long.
+/// One `regex_syntax` parse for both, rather than two independent ones each
+/// computing its own half: parsed directly rather than derived from a
+/// compiled `regex::bytes::Regex` (which exposes neither), the same grammar
+/// `regex::bytes::Regex` compiles, so a pattern this measures as unbounded
+/// is exactly one that engine would have matched as unboundedly long.
+fn regex_len_bounds(pattern: &str) -> (Option<usize>, Option<usize>) {
+    let Ok(hir) = regex_syntax::Parser::new().parse(pattern) else {
+        return (None, None);
+    };
+    let props = hir.properties();
+    (props.maximum_len(), props.minimum_len())
+}
+
+/// The most bytes any match of `pattern` could ever return — see
+/// [`regex_len_bounds`] for what `None` means here.
 ///
 /// `pub(crate)`, not private: `auth::compile_scan_pattern` reads this same
 /// figure to decide whether a discovery pattern's match has already reached
@@ -4176,34 +4270,7 @@ fn control_char_field_is_disruptive(text: &str, class: CharClass) -> bool {
 /// requirement and the scanner's deferral rule can never disagree about
 /// what a given pattern's maximum actually is.
 pub(crate) fn regex_max_match_len(pattern: &str) -> Option<usize> {
-    regex_syntax::Parser::new()
-        .parse(pattern)
-        .ok()?
-        .properties()
-        .maximum_len()
-}
-
-/// The fewest bytes any match of `pattern` could ever return — `0` for a
-/// pattern that can match the empty string (e.g. `a*` or `(foo)?`), `None`
-/// when the parse fails (unreachable at the one call site, which only ever
-/// runs on a pattern `regex::bytes::Regex::new` already compiled) or when
-/// `regex_syntax` says the pattern can never match anything at all — an
-/// empty intersection like `[a&&b]`, not merely an unmeasured minimum.
-/// `PluginManifest::validate`'s own call site treats both `Some(0)` and
-/// `None` as "not safely at least one byte", but names them separately in
-/// the message it returns: only `Some(0)` is actually "matches the empty
-/// string", and calling "matches nothing" by that name would be wrong, not
-/// just imprecise. Paired with [`regex_max_match_len`] against the same
-/// parse: an `id_pattern`/`secret_pattern` that can match nothing is not
-/// "bounded", it is a manifest bug that `discover_client` would otherwise
-/// turn into a client id of `""` — a credential the OAuth exchange would
-/// then fail on with a message naming no field a user wrote.
-fn regex_min_match_len(pattern: &str) -> Option<usize> {
-    regex_syntax::Parser::new()
-        .parse(pattern)
-        .ok()?
-        .properties()
-        .minimum_len()
+    regex_len_bounds(pattern).0
 }
 
 /// A `[[surface.auth]].type` in its manifest spelling, for error messages.
@@ -4223,13 +4290,14 @@ fn auth_type_name(kind: AuthType) -> &'static str {
 /// The first header-only placeholder found in a URL, if any — see the
 /// validation that uses it.
 fn url_placeholder(url: &str) -> Option<&'static str> {
-    if url.contains("{token}") {
+    let [token_marker, version_marker, value_marker] = HEADER_ONLY;
+    if url.contains(token_marker) {
         return Some("`{token}`");
     }
-    if url.contains("{version}") {
+    if url.contains(version_marker) {
         return Some("`{version}`");
     }
-    if url.contains("{value.") {
+    if url.contains(value_marker) {
         return Some("`{value.<name>}`");
     }
     None
@@ -6870,7 +6938,7 @@ mod tests {
         // Bounded above (`{0,5}` is a finite, 5-byte match) is not bounded
         // below: it can also match zero bytes, which `auth::discover_client`
         // would otherwise hand to the OAuth exchange as a client id of `""`.
-        // `regex_min_match_len`'s own doc names `a*` and `(foo)?` as the
+        // `regex_len_bounds`'s own doc names `a*` and `(foo)?` as the
         // canonical empty-matching shapes; `?` is exercised here too, on top
         // of `{0,N}` — a bare `*` is not, on purpose: any `*`/`+` submatch
         // makes the pattern's *maximum* length unmeasurable as well as its

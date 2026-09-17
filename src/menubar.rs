@@ -20,7 +20,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use ab_glyph::{point, Font, FontVec, PxScale, ScaleFont};
+use ab_glyph::{point, Font, FontVec, GlyphId, PxScale, ScaleFont};
 use image::RgbaImage;
 
 /// One quota window as shown in the widget.
@@ -224,19 +224,33 @@ fn capped_label(label: &str) -> String {
     }
 }
 
-fn text_width(f: &FontVec, px: f32, s: &str) -> f32 {
+/// Per-glyph horizontal advances for `s` at `px`: each item's `f32` is that
+/// glyph's own `h_advance` plus the kerning against whichever glyph follows
+/// it (`0.0` extra for the last glyph, which has no next one to pair with).
+/// Folding the *following* kern into each glyph's own advance, rather than
+/// the *preceding* one — which is how [`text_width`] and [`draw_text`] each
+/// walked this same pair of calls on their own — means a running sum of
+/// these values lands a cursor at exactly the positions either one placed a
+/// glyph at: [`text_width`] sums them all for the total width, [`draw_text`]
+/// places each glyph at the cursor *before* adding its item and steps the
+/// cursor by it *after* — the two are the same walk over the same glyphs, so
+/// one iterator now does both, and a change to kerning or fallback-glyph
+/// behaviour can no longer land in one without the other.
+fn advances<'f>(f: &'f FontVec, px: f32, s: &str) -> impl Iterator<Item = (GlyphId, f32)> + 'f {
     let scaled = f.as_scaled(PxScale::from(px));
-    let mut w = 0.0;
-    let mut prev = None;
-    for ch in s.chars() {
-        let id = f.glyph_id(ch);
-        if let Some(p) = prev {
-            w += scaled.kern(p, id);
+    let ids: Vec<GlyphId> = s.chars().map(|ch| f.glyph_id(ch)).collect();
+    (0..ids.len()).map(move |i| {
+        let id = ids[i];
+        let mut advance = scaled.h_advance(id);
+        if let Some(&next) = ids.get(i + 1) {
+            advance += scaled.kern(id, next);
         }
-        w += scaled.h_advance(id);
-        prev = Some(id);
-    }
-    w
+        (id, advance)
+    })
+}
+
+fn text_width(f: &FontVec, px: f32, s: &str) -> f32 {
+    advances(f, px, s).map(|(_, advance)| advance).sum()
 }
 
 fn draw_text(
@@ -248,14 +262,8 @@ fn draw_text(
     s: &str,
     c: [u8; 4],
 ) {
-    let scaled = f.as_scaled(PxScale::from(px));
     let mut cursor = x;
-    let mut prev = None;
-    for ch in s.chars() {
-        let id = f.glyph_id(ch);
-        if let Some(p) = prev {
-            cursor += scaled.kern(p, id);
-        }
+    for (id, advance) in advances(f, px, s) {
         let glyph = id.with_scale_and_position(PxScale::from(px), point(cursor, baseline));
         if let Some(og) = f.outline_glyph(glyph) {
             let b = og.px_bounds();
@@ -269,8 +277,7 @@ fn draw_text(
                 );
             });
         }
-        cursor += scaled.h_advance(id);
-        prev = Some(id);
+        cursor += advance;
     }
 }
 
@@ -426,6 +433,99 @@ struct RenderRow<'a> {
     weekly_num: String,
 }
 
+/// The scale-derived constants [`layout_rows`] needs, bundled so passing
+/// them costs one parameter rather than five — `render` still keeps its own
+/// copies too, since its drawing loop (the bars in particular) reads them
+/// directly rather than through a row's layout.
+struct Metrics {
+    label_px: f32,
+    val_px: f32,
+    gap: f32,
+    bar_w: f32,
+    /// The gap on each side of the `·` separator between two rows.
+    sep_gap: f32,
+    sep_w: f32,
+    slash_w: f32,
+}
+
+/// One row's x-offsets within the pill, relative to its left edge —
+/// everywhere [`render`]'s drawing loop places something. Computed once by
+/// [`layout_rows`] and read by both that loop and the allocation-sizing code
+/// just above it — sharing one walk rather than each calling [`text_width`]
+/// over the same rows on its own, which would keep the two in sync only for
+/// as long as that agreement held, exactly the kind of drift a change to
+/// either walk alone could introduce without either one failing to compile.
+struct RowLayout {
+    /// Where the `·` separator before this row starts — `None` for the
+    /// first row, which has none.
+    sep_x: Option<f32>,
+    label_x: f32,
+    bars_x: f32,
+    /// Where the "91/68"-shaped percentage pair starts — the bold
+    /// five-hour number.
+    pair_x: f32,
+    /// Where the `/` separator starts: `pair_x` plus the five-hour
+    /// number's measured width plus the same bold-overstrike offset
+    /// [`draw_text_bold`] itself draws its second stroke at, so the slash
+    /// clears that second stroke instead of starting under it.
+    slash_x: f32,
+    /// Where the bold weekly number starts — `slash_x` plus the slash's
+    /// own width.
+    weekly_x: f32,
+    /// Where this row ends. The pill's own width is the last row's `end_x`
+    /// plus `pad`; the next row's own `sep_x`, if any, starts `m.sep_gap`
+    /// past this.
+    end_x: f32,
+}
+
+/// Lay out every row from `start_x` onward: for each, where its separator
+/// (if any), label, bar pair and percentage pair each start, and where it
+/// ends. One walk over `rows`, in drawing order, producing every offset
+/// [`render`] needs — both to size its own allocation (the last row's
+/// `end_x`) and to draw each row's pieces without recomputing any of their
+/// widths a second time.
+fn layout_rows(f: &FontVec, rows: &[RenderRow], start_x: f32, m: &Metrics) -> Vec<RowLayout> {
+    let mut x = start_x;
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, rt) in rows.iter().enumerate() {
+        let sep_x = if i > 0 {
+            x += m.sep_gap;
+            let at = x;
+            x += m.sep_w + m.sep_gap;
+            Some(at)
+        } else {
+            None
+        };
+        let label_x = x;
+        x += text_width(f, m.label_px, &rt.label) + m.label_px * 0.05 + m.gap;
+        let bars_x = x;
+        x += m.bar_w + m.gap;
+        let pair_x = x;
+        let five_w = text_width(f, m.val_px, &rt.five_hour_num);
+        // The five-hour number draws bold, which is `draw_text_bold`
+        // itself drawing a second, `val_px * 0.05`-offset stroke on top of
+        // the first — the slash has to start past that second stroke, not
+        // past the glyphs' own measured width alone, or it lands under it.
+        let slash_x = pair_x + (five_w + m.val_px * 0.05);
+        let weekly_x = slash_x + m.slash_w;
+        // The weekly number draws bold too, so the same offset carries
+        // this row's end past its own second stroke — matching the total
+        // `val_px * 0.1` (one offset before the slash, one after the
+        // weekly number) the un-laid-out width math already priced in.
+        x = weekly_x + (text_width(f, m.val_px, &rt.weekly_num) + m.val_px * 0.05);
+        out.push(RowLayout {
+            sep_x,
+            label_x,
+            bars_x,
+            pair_x,
+            slash_x,
+            weekly_x,
+            end_x: x,
+        });
+    }
+    out
+}
+
 /// Render the widget: a single-line pill
 /// `⌾ Cx ▂▂ 91/68 · Cl ▂▂ 6/77` — per provider: label, two stacked mini
 /// bars (5-hour on top, weekly below; fill = used, tick = elapsed time) and
@@ -478,25 +578,23 @@ pub fn render(rows: &[ProviderRow], dark: bool, scale: f32) -> Option<RgbaImage>
     let bar_h = 2.6 * s;
     let bar_gap = 1.8 * s;
     let gap = 3.0 * s;
-    let sep_w = text_width(f, label_px, "·");
-    let slash_w = text_width(f, val_px, "/");
-
-    let val_pair_w = |five: &str, weekly: &str| -> f32 {
-        text_width(f, val_px, five) + slash_w + text_width(f, val_px, weekly) + val_px * 0.1
+    let m = Metrics {
+        label_px,
+        val_px,
+        gap,
+        bar_w,
+        sep_gap: 4.0 * s,
+        sep_w: text_width(f, label_px, "·"),
+        slash_w: text_width(f, val_px, "/"),
     };
-    let group_w = |rt: &RenderRow| -> f32 {
-        let label_w = text_width(f, label_px, &rt.label) + label_px * 0.05;
-        label_w + gap + bar_w + gap + val_pair_w(&rt.five_hour_num, &rt.weekly_num)
-    };
 
-    let mut w = pad + icon + 4.0 * s;
-    for (i, rt) in rows.iter().enumerate() {
-        if i > 0 {
-            w += 4.0 * s + sep_w + 4.0 * s;
-        }
-        w += group_w(rt);
-    }
-    w += pad;
+    let start_x = pad + icon + 4.0 * s;
+    let laid_out = layout_rows(f, &rows, start_x, &m);
+    let w = laid_out
+        .last()
+        .expect("`rows` was checked non-empty above")
+        .end_x
+        + pad;
 
     let mut img = RgbaImage::new(w.ceil() as u32, h.ceil() as u32);
 
@@ -508,7 +606,6 @@ pub fn render(rows: &[ProviderRow], dark: bool, scale: f32) -> Option<RgbaImage>
 
     let cy = h / 2.0;
     let baseline = cy + label_px * 0.36;
-    let mut x = pad + icon + 4.0 * s;
 
     // One mini bar (track, used fill, elapsed-time tick) centred on `bcy`.
     let draw_bar = |img: &mut RgbaImage, x: f32, bcy: f32, stat: &Option<WindowStat>| {
@@ -545,37 +642,43 @@ pub fn render(rows: &[ProviderRow], dark: bool, scale: f32) -> Option<RgbaImage>
         }
     };
 
-    for (i, rt) in rows.iter().enumerate() {
-        if i > 0 {
-            x += 4.0 * s;
-            draw_text(&mut img, f, label_px, x, baseline, "·", p.faint);
-            x += sep_w + 4.0 * s;
+    for (rt, rl) in rows.iter().zip(laid_out.iter()) {
+        if let Some(sep_x) = rl.sep_x {
+            draw_text(&mut img, f, label_px, sep_x, baseline, "·", p.faint);
         }
 
-        draw_text_bold(&mut img, f, label_px, x, baseline, &rt.label, p.ink);
-        x += text_width(f, label_px, &rt.label) + label_px * 0.05 + gap;
+        draw_text_bold(
+            &mut img, f, label_px, rl.label_x, baseline, &rt.label, p.ink,
+        );
 
         // Stacked bars: 5-hour above, weekly below.
-        draw_bar(&mut img, x, cy - (bar_h + bar_gap) / 2.0, &rt.row.five_hour);
-        draw_bar(&mut img, x, cy + (bar_h + bar_gap) / 2.0, &rt.row.weekly);
-        x += bar_w + gap;
+        draw_bar(
+            &mut img,
+            rl.bars_x,
+            cy - (bar_h + bar_gap) / 2.0,
+            &rt.row.five_hour,
+        );
+        draw_bar(
+            &mut img,
+            rl.bars_x,
+            cy + (bar_h + bar_gap) / 2.0,
+            &rt.row.weekly,
+        );
 
         // Left-% pair "91/68", each half in its own severity colour.
         let pair = [
-            (&rt.row.five_hour, &rt.five_hour_num),
-            (&rt.row.weekly, &rt.weekly_num),
+            (&rt.row.five_hour, &rt.five_hour_num, rl.pair_x),
+            (&rt.row.weekly, &rt.weekly_num, rl.weekly_x),
         ];
-        for (idx, (stat, text)) in pair.into_iter().enumerate() {
+        for (idx, (stat, text, x)) in pair.into_iter().enumerate() {
             if idx > 0 {
-                draw_text(&mut img, f, val_px, x, baseline, "/", p.faint);
-                x += slash_w;
+                draw_text(&mut img, f, val_px, rl.slash_x, baseline, "/", p.faint);
             }
             let color = match stat {
                 Some(st) => p.sev(used_fraction(st) as f64 * 100.0),
                 None => p.faint,
             };
             draw_text_bold(&mut img, f, val_px, x, baseline, text, color);
-            x += text_width(f, val_px, text) + val_px * 0.05;
         }
     }
 
@@ -1046,6 +1149,85 @@ mod tests {
                     img.width() < 10_000,
                     "scale {scale} produced {}px of width",
                     img.width()
+                );
+            }
+        }
+    }
+
+    /// Checks [`layout_rows`]'s percentage-pair offsets against the
+    /// arithmetic that positioned that pair before `layout_rows` existed,
+    /// at both scales `render` actually asks for. The expected `slash_x`/
+    /// `weekly_x`/`end_x` below are derived from [`text_width`] with that
+    /// same arithmetic, not pinned as literals, so the comparison holds
+    /// under whatever font [`font`] actually resolves to on the machine
+    /// running this test, not only the one it was written against. A gap
+    /// here means the slash or the second half of a "91/68" pair has moved
+    /// off the pixel the old arithmetic placed it on — `render`'s own
+    /// drawing loop reads these three fields with no further arithmetic of
+    /// its own, so this is the whole positioning contract for that pair.
+    #[test]
+    fn pair_offsets_match_the_arithmetic_that_predates_layout_rows() {
+        let f = font().expect("system font present");
+        // (five-hour %, weekly %) → the exact digits `used_num` draws for
+        // each — chosen, like the rest of this module's fixtures, so the two
+        // numbers have different widths ("9" vs "32", "94" vs "23").
+        let cases: [(f64, f64); 2] = [(9.0, 32.0), (94.0, 23.0)];
+        for s in [1.0f32, 2.0f32] {
+            let val_px = 8.0 * s;
+            let slash_w = text_width(f, val_px, "/");
+            let m = Metrics {
+                label_px: 0.0,
+                val_px,
+                gap: 0.0,
+                bar_w: 0.0,
+                sep_gap: 0.0,
+                sep_w: 0.0,
+                slash_w,
+            };
+            for (five_pct, weekly_pct) in cases {
+                let row = ProviderRow {
+                    label: String::new(),
+                    five_hour: Some(WindowStat {
+                        used_percent: five_pct,
+                        time_progress: None,
+                    }),
+                    weekly: Some(WindowStat {
+                        used_percent: weekly_pct,
+                        time_progress: None,
+                    }),
+                };
+                let rt = RenderRow {
+                    row: &row,
+                    label: String::new(),
+                    five_hour_num: used_num(&row.five_hour),
+                    weekly_num: used_num(&row.weekly),
+                };
+                // `pair_x` at 0.0, matching `layout_rows`' own below (every
+                // other `Metrics` field is zeroed too) — only the deltas
+                // from `pair_x` are being checked here, so the label/bar
+                // layout ahead of the pair, unrelated to the pair layout
+                // itself, is left at zero rather than reproduced.
+                let pair_x = 0.0f32;
+                let five_w = text_width(f, val_px, &rt.five_hour_num);
+                // The bold-overstrike offset before the slash, and again
+                // before the end of the row — the addition grouping matters
+                // here, not just the operands: floating-point addition is
+                // not associative, so `pair_x + (five_w + val_px * 0.05)`
+                // is not bit-identical to `(pair_x + five_w) + val_px *
+                // 0.05`.
+                let expected_slash_x = pair_x + (five_w + val_px * 0.05);
+                let expected_weekly_x = expected_slash_x + slash_w;
+                let expected_end_x =
+                    expected_weekly_x + (text_width(f, val_px, &rt.weekly_num) + val_px * 0.05);
+
+                let laid_out = layout_rows(f, std::slice::from_ref(&rt), pair_x, &m);
+                let rl = &laid_out[0];
+                assert_eq!(
+                    (rl.slash_x, rl.weekly_x, rl.end_x),
+                    (expected_slash_x, expected_weekly_x, expected_end_x),
+                    "scale {s}, {}/{} pair",
+                    rt.five_hour_num,
+                    rt.weekly_num
                 );
             }
         }

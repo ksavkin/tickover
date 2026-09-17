@@ -1133,12 +1133,7 @@ pub struct TrustDisclosure {
 /// disclosure list simply says nothing about it rather than guess.
 fn push_dest_host(url: &str, dest_hosts: &mut Vec<String>) {
     if let Some(h) = https_host(url) {
-        if !dest_hosts
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(&h))
-        {
-            dest_hosts.push(h);
-        }
+        crate::plugin::push_host(dest_hosts, &h);
     }
 }
 
@@ -1190,12 +1185,7 @@ fn push_dest_host_for_disclosure(
     // the second case — silently dropping the destination from the dialog
     // whenever the manifest *did* declare the option.
     if let Some(authority) = raw_authority(&substituted) {
-        if !dest_hosts
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(authority))
-        {
-            dest_hosts.push(authority.to_string());
-        }
+        crate::plugin::push_host(dest_hosts, authority);
     }
 }
 
@@ -1575,13 +1565,105 @@ fn is_https(url: &str) -> bool {
     https_host(url).is_some()
 }
 
-/// GET `url` and return the raw response body as text. HTTPS-only (a
+/// [`fetch_text`]/[`fetch_bytes`]'s failure, typed rather than a single
+/// conflated `String` — a caller that only wants to
+/// show the message still gets exactly the same text back (see the
+/// [`std::fmt::Display`] impl below), but one that needs to tell "the
+/// registry doesn't publish this" (a 404) apart from "this request didn't
+/// land" now matches [`FetchError::is_not_found`] instead of comparing
+/// against a literal that a *different* error shape here
+/// (`RedirectBlocked`'s own "(redirect blocked)" suffix) already
+/// demonstrates is not guaranteed to stay stable text a caller can safely
+/// `starts_with` — `fetch_registry_index`'s own comment on the call site
+/// that motivated this explains the stakes: misreading a dropped request as
+/// "not published" would blame an honest registry for a reader's bad
+/// minute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchError {
+    /// `url` itself wasn't `https://` — refused before any connection.
+    NonHttps(String),
+    /// A 3xx response, with the redirect not followed (`redirects(0)`).
+    RedirectBlocked(u16),
+    /// The response body could not be read to completion, or (for
+    /// [`fetch_text`] only) read completely but was not valid UTF-8.
+    BadResponse(String),
+    /// The response was larger than the caller's own cap allows. Names the
+    /// caller (`"fetch_text"`/`"fetch_bytes"`), the same way the old
+    /// message did.
+    TooBig(String),
+    /// The server answered with an error status (`>= 400`).
+    HttpStatus(u16),
+    /// `ureq` itself failed below the HTTP layer (DNS, connection, TLS, …).
+    Network(String),
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::NonHttps(url) => write!(f, "refusing non-https URL: {url}"),
+            FetchError::RedirectBlocked(status) => write!(f, "HTTP {status} (redirect blocked)"),
+            FetchError::BadResponse(e) => write!(f, "bad response: {e}"),
+            FetchError::TooBig(what) => write!(f, "response too big for {what}"),
+            FetchError::HttpStatus(code) => write!(f, "HTTP {code}"),
+            FetchError::Network(e) => write!(f, "network error: {e}"),
+        }
+    }
+}
+
+impl FetchError {
+    /// Whether the server itself said "not found" (404) — as opposed to a
+    /// redirect, a size cap, a malformed body, or any other status/network
+    /// failure, every one of which is a *different* fact about the request,
+    /// not evidence the resource doesn't exist. The one caller this exists
+    /// for is `fetch_registry_index`'s minisig lookup: a missing signature
+    /// file is a registry choosing not to publish one, nothing else here
+    /// means that.
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, FetchError::HttpStatus(404))
+    }
+}
+
+/// Shared GET body for [`fetch_text`]/[`fetch_bytes`]: HTTPS-only (a
 /// plain-`http://` URL is refused before any connection is attempted — the
 /// registry's whole trust story rests on verified integrity *and* a
-/// non-tampered transport). Built like `crate::plugin::engine_http::perform`:
-/// `redirects(0)` (so a compromised/misconfigured CDN can't silently hand
+/// non-tampered transport), built like `crate::plugin::engine_http::perform`
+/// — `redirects(0)` (so a compromised/misconfigured CDN can't silently hand
 /// back content from a different host — the caller's own URL is all that was
-/// ever vetted) and an ~8s timeout.
+/// ever vetted) and an ~8s timeout — and capped at `max_bytes`, read through
+/// `into_reader()` rather than trusting `into_string()`'s own unbounded-by-
+/// comparison 10 MiB `INTO_STRING_LIMIT`. Without that cap, a hostile or
+/// misbehaving server could make a caller buffer an unbounded response into
+/// memory before whichever check downstream (a signature, a sha256) ever
+/// gets a chance to reject it. `what` names the caller in the "too big"
+/// error only, so `fetch_text`'s and `fetch_bytes`' own messages stay
+/// exactly what each already read.
+///
+/// Not exercised by any test in this module — see the module docs.
+fn fetch_raw(url: &str, max_bytes: u64, what: &str) -> Result<Vec<u8>, FetchError> {
+    if !is_https(url) {
+        return Err(FetchError::NonHttps(url.to_string()));
+    }
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let req = agent.get(url).timeout(Duration::from_secs(8));
+    match req.call() {
+        Ok(r) if (300..400).contains(&r.status()) => Err(FetchError::RedirectBlocked(r.status())),
+        Ok(r) => {
+            let mut buf = Vec::new();
+            r.into_reader()
+                .take(max_bytes + 1)
+                .read_to_end(&mut buf)
+                .map_err(|e| FetchError::BadResponse(e.to_string()))?;
+            if buf.len() as u64 > max_bytes {
+                return Err(FetchError::TooBig(what.to_string()));
+            }
+            Ok(buf)
+        }
+        Err(ureq::Error::Status(code, _)) => Err(FetchError::HttpStatus(code)),
+        Err(e) => Err(FetchError::Network(e.to_string())),
+    }
+}
+
+/// GET `url` and return the raw response body as text, via [`fetch_raw`].
 ///
 /// Used only for the index's `.minisig` signature file — a short block of
 /// base64 that `signature::verify_index` parses once and never hashes or
@@ -1589,43 +1671,17 @@ fn is_https(url: &str) -> bool {
 /// `index.toml` itself, and a manifest file, both go through [`fetch_bytes`]
 /// instead — see that function's own docs for why.
 ///
-/// Capped at [`MAX_MINISIG_BYTES`], read through `into_reader()` rather than
-/// `into_string()`'s own unbounded-by-comparison 10 MiB `INTO_STRING_LIMIT`:
-/// a minisig block is a handful of lines of base64, nowhere near either
-/// ceiling, so there is no reason for this function's one caller to ever
-/// buffer megabytes of "signature" from a hostile or misbehaving server
-/// before `signature::verify_index` gets a chance to reject it — the same
-/// reasoning [`fetch_bytes`]'s own cap already gives, sized to what this
-/// function is actually ever asked to fetch instead. Reading through
-/// `into_reader()` for the cap's sake is also why the UTF-8 decode below is
-/// a manual `String::from_utf8` on the buffer it filled, not a call to
-/// `into_string()`: the two are different methods on the response, and only
-/// one of them lets this function bound the read itself. Not exercised by
-/// any test in this module — see the module docs.
-pub fn fetch_text(url: &str) -> Result<String, String> {
-    if !is_https(url) {
-        return Err(format!("refusing non-https URL: {url}"));
-    }
-    let agent = ureq::AgentBuilder::new().redirects(0).build();
-    let req = agent.get(url).timeout(Duration::from_secs(8));
-    match req.call() {
-        Ok(r) if (300..400).contains(&r.status()) => {
-            Err(format!("HTTP {} (redirect blocked)", r.status()))
-        }
-        Ok(r) => {
-            let mut buf = Vec::new();
-            r.into_reader()
-                .take(MAX_MINISIG_BYTES + 1)
-                .read_to_end(&mut buf)
-                .map_err(|e| format!("bad response: {e}"))?;
-            if buf.len() as u64 > MAX_MINISIG_BYTES {
-                return Err("response too big for fetch_text".to_string());
-            }
-            String::from_utf8(buf).map_err(|e| format!("bad response: {e}"))
-        }
-        Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
-        Err(e) => Err(format!("network error: {e}")),
-    }
+/// Capped at [`MAX_MINISIG_BYTES`]: a minisig block is a handful of lines of
+/// base64, nowhere near either that or [`fetch_bytes`]'s much larger cap, so
+/// there is no reason for this function's one caller to ever buffer
+/// megabytes of "signature" from a hostile or misbehaving server before
+/// `signature::verify_index` gets a chance to reject it. Decoding through a
+/// manual `String::from_utf8` on [`fetch_raw`]'s buffer, not ureq's own
+/// `into_string()`, is what lets [`fetch_raw`] bound the read itself in the
+/// first place — the two are different methods on the response.
+pub fn fetch_text(url: &str) -> Result<String, FetchError> {
+    let buf = fetch_raw(url, MAX_MINISIG_BYTES, "fetch_text")?;
+    String::from_utf8(buf).map_err(|e| FetchError::BadResponse(e.to_string()))
 }
 
 /// [`fetch_text`]'s response-size cap — see its own doc comment for why 8
@@ -1633,60 +1689,24 @@ pub fn fetch_text(url: &str) -> Result<String, String> {
 /// than borrowing [`fetch_bytes`]'s much larger one.
 const MAX_MINISIG_BYTES: u64 = 8 * 1024;
 
-/// GET `url` and return the raw response body as bytes, **undecoded** —
-/// unlike [`fetch_text`], which still UTF-8-decodes the body first (via
-/// `String::from_utf8`, not ureq's own `into_string()` — see that function's
-/// own doc for why). Used for anything a later step verifies against the
-/// exact bytes the server sent: `index.toml` itself (`signature::
-/// verify_index` checks its ed25519 signature over these bytes, not over a
-/// UTF-8 round-trip of them) and a manifest file ([`verify_and_prepare`]'s
-/// sha256 check is equally only meaningful against the exact bytes). Either
-/// one that isn't UTF-8-clean, or that round-trips through decode/re-encode
-/// with different line endings or a BOM, would then verify against something
-/// other than what was actually published — a false mismatch, or worse, a
-/// false match against bytes that were never actually served. Same
-/// HTTPS-only gate, `redirects(0)` and ~8s timeout as [`fetch_text`] — see
-/// its own docs for the rationale, which applies here unchanged; the
-/// response-size cap below mirrors the one [`fetch_text`] writes out for
-/// itself (`MAX_MINISIG_BYTES`, through the same `into_reader().take(…)`
-/// pattern), just sized for a whole manifest rather than a signature block —
-/// `into_reader()` enforces no limit of its own, unlike `into_string()`'s
-/// internal 10MB `INTO_STRING_LIMIT`, so any function reading a response
-/// through it has to impose its own ceiling by hand, and both of these do.
-/// Without it, a hostile or misbehaving registry could make this function
-/// buffer an unbounded response into memory, and it would do so *before*
-/// whichever check downstream (a signature, a sha256) ever gets a chance to
-/// reject it.
+/// GET `url` and return the raw response body as bytes, **undecoded**, via
+/// [`fetch_raw`] — unlike [`fetch_text`], which still UTF-8-decodes the body
+/// first. Used for anything a later step verifies against the exact bytes
+/// the server sent: `index.toml` itself (`signature::verify_index` checks
+/// its ed25519 signature over these bytes, not over a UTF-8 round-trip of
+/// them) and a manifest file ([`verify_and_prepare`]'s sha256 check is
+/// equally only meaningful against the exact bytes). Either one that isn't
+/// UTF-8-clean, or that round-trips through decode/re-encode with different
+/// line endings or a BOM, would then verify against something other than
+/// what was actually published — a false mismatch, or worse, a false match
+/// against bytes that were never actually served.
 ///
-/// Not exercised by any test in this module — see the module docs.
-pub fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
-    if !is_https(url) {
-        return Err(format!("refusing non-https URL: {url}"));
-    }
-    // Mirrors ureq's own private `Response::INTO_STRING_LIMIT` — see this
-    // function's own doc comment for why `into_reader()` needs the same cap
-    // re-imposed by hand.
+/// Capped at `MAX_RESPONSE_BYTES` below, which mirrors ureq's own private
+/// `Response::INTO_STRING_LIMIT` — see [`fetch_raw`]'s own doc comment for
+/// why `into_reader()` needs that cap re-imposed by hand.
+pub fn fetch_bytes(url: &str) -> Result<Vec<u8>, FetchError> {
     const MAX_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
-    let agent = ureq::AgentBuilder::new().redirects(0).build();
-    let req = agent.get(url).timeout(Duration::from_secs(8));
-    match req.call() {
-        Ok(r) if (300..400).contains(&r.status()) => {
-            Err(format!("HTTP {} (redirect blocked)", r.status()))
-        }
-        Ok(r) => {
-            let mut buf = Vec::new();
-            r.into_reader()
-                .take(MAX_RESPONSE_BYTES + 1)
-                .read_to_end(&mut buf)
-                .map_err(|e| format!("bad response: {e}"))?;
-            if buf.len() as u64 > MAX_RESPONSE_BYTES {
-                return Err("response too big for fetch_bytes".to_string());
-            }
-            Ok(buf)
-        }
-        Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
-        Err(e) => Err(format!("network error: {e}")),
-    }
+    fetch_raw(url, MAX_RESPONSE_BYTES, "fetch_bytes")
 }
 
 // ── Tests (hermetic: no network — fetch_text/fetch_bytes never called) ───

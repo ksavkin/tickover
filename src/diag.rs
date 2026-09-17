@@ -16,6 +16,10 @@
 //! module, and the app never logs one anywhere (see the security section of
 //! `docs/PLUGIN-ARCHITECTURE.md`).
 
+// Only `append_to_log` needs `Write::write_all` now that `trim_if_large`
+// goes through `write_via_temp` instead — and that fn is compiled out
+// under `cargo test` (see its own doc), so this import would be too.
+#[cfg(not(test))]
 use std::io::Write;
 
 /// Size at which the log is trimmed.
@@ -153,9 +157,10 @@ fn append_to_log(message: &str) {
 /// the whole file — so even that one line never pays for the whole
 /// (ever-growing) file.
 ///
-/// Written through a temporary neighbour and renamed, the same way
-/// [`crate::config`] writes: a truncate-in-place interrupted half-way would
-/// leave the log unreadable, which is the one thing a log must not become.
+/// Written through `tickover::plugin::write_via_temp`, the same shared
+/// temp-then-rename [`crate::config`]'s own writes go through: a
+/// truncate-in-place interrupted half-way would leave the log unreadable,
+/// which is the one thing a log must not become.
 fn trim_if_large(path: &std::path::Path) {
     use std::io::{Read, Seek};
     let Ok(meta) = std::fs::metadata(path) else {
@@ -186,20 +191,10 @@ fn trim_if_large(path: &std::path::Path) {
     // for good, since nothing about a line-less tail ever changes that on
     // its own.
     let start = tail.iter().position(|b| *b == b'\n').map_or(0, |i| i + 1);
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .and_then(|mut f| f.write_all(&tail[start..]));
-    if written.is_ok() {
-        if std::fs::rename(&tmp, path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    // Best-effort, like every other write in this module (see the module
+    // doc): a trim that fails half-way is worth leaving the oversized file
+    // in place for, not worth failing an app launch over.
+    let _ = tickover::plugin::write_via_temp(path, &tail[start..], |_| Ok(()));
 }
 
 #[cfg(test)]

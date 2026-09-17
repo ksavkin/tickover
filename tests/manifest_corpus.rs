@@ -2318,15 +2318,118 @@ fn the_corpus_has_a_line_for_every_rule_the_validator_enforces() {
             .sum()
     };
 
-    let enforced = refusals_in(
-        include_str!("../src/plugin/manifest.rs"),
+    // `validate` itself only chains `self.validate_*()?;` calls now — each
+    // section of the schema got its own fn, in the same order the checks
+    // always ran in, so a literal `"\n        Ok(())\n    }\n}"` marker no
+    // longer picks out one function: every one of these closes the same way,
+    // at the same indent, inside the same `impl`. Brace-matched from the
+    // signature to its own closing `}` instead, so it finds exactly the body
+    // that signature owns regardless of how many siblings close identically.
+    let refusals_in_fn = |source: &str, signature: &str| -> usize {
+        let start = source.find(signature).unwrap_or_else(|| {
+            panic!("`{signature}` was renamed — point this at whatever refuses manifests now")
+        });
+        let open = source[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("`{signature}` has no body — update the locator"))
+            + start;
+        // A plain `{`/`}` count over the raw text is thrown off by every
+        // brace that isn't actually a brace: a `'{'` char literal
+        // (`validate_windows` has one — a label checked for a stray
+        // placeholder, the same reason `template_complaint` has one too),
+        // and every `{` this file's own comments write when they quote a
+        // placeholder like `{option.<key>}`. Skipped explicitly rather than
+        // trusted to balance by accident: a `//` comment runs to the next
+        // newline, a string or char literal runs to its own unescaped
+        // closing quote, and only what is left after both is counted as
+        // real Rust syntax. `'` never opens a lifetime here — nothing this
+        // deep inside a `validate_*` body's ordinary expressions is one.
+        let bytes = &source.as_bytes()[open..];
+        let mut depth = 0i32;
+        let mut i = 0usize;
+        let mut end = open;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                    i += 1;
+                }
+                b'\'' => {
+                    i += 1;
+                    i += if bytes.get(i) == Some(&b'\\') { 2 } else { 1 };
+                    if bytes.get(i) == Some(&b'\'') {
+                        i += 1;
+                    }
+                }
+                b'{' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b'}' => {
+                    depth -= 1;
+                    i += 1;
+                    if depth == 0 {
+                        end = open + i - 1;
+                        break;
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+        assert!(
+            end > open,
+            "`{signature}`'s opening brace never closes — update the locator"
+        );
+        source[start..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(|line| line.matches("return Err(").count())
+            .sum()
+    };
+
+    let manifest_src = include_str!("../src/plugin/manifest.rs");
+    let validate_fns = [
         "pub fn validate(&self)",
-        "\n        Ok(())\n    }\n}",
-    ) + refusals_in(
-        include_str!("../src/plugin/capability.rs"),
-        "pub(crate) fn check_against(",
-        "\n    Ok(())\n}",
-    );
+        "fn validate_identity(&self)",
+        "fn validate_engine_sections(&self)",
+        "fn validate_windows(&self)",
+        "fn validate_balances(&self)",
+        "fn validate_window_period_mode(&self)",
+        "fn validate_tag(&self)",
+        "fn validate_window_period_bounds(&self)",
+        "fn validate_account_and_surface_auth(&self)",
+        "fn validate_http(&self)",
+        "fn validate_auth(&self)",
+        "fn validate_account_ping_options(&self)",
+        "fn validate_templates(&self)",
+    ];
+    // `check_entry_id` is one refusal shared by `validate_windows` and
+    // `validate_balances` (the `id` charset/length rule, identical for both
+    // — see its own doc) rather than the same `return Err(` written out
+    // twice. A single `fn check_entry_id(` signature in `validate_fns` above
+    // would count it once no matter how many rules call it, undercounting
+    // the corpus by one row for every section past the first that shares it
+    // — so it is counted by call site instead, once per place that actually
+    // backs a distinct corpus row.
+    let shared_entry_id_rule_sites = manifest_src.matches("check_entry_id(&").count();
+    let enforced = validate_fns
+        .iter()
+        .map(|signature| refusals_in_fn(manifest_src, signature))
+        .sum::<usize>()
+        + shared_entry_id_rule_sites
+        + refusals_in(
+            include_str!("../src/plugin/capability.rs"),
+            "pub(crate) fn check_against(",
+            "\n    Ok(())\n}",
+        );
 
     assert_eq!(
         rules().len(),

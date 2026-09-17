@@ -52,7 +52,7 @@ use serde_json::Value;
 use crate::model::{ProviderReading, TokenRenewal, Window};
 use crate::plugin::manifest::{
     AccountMatchConfig, AccountType, LogFileConfig, LogFileFormat, LogFileSelect, PeriodMode,
-    PluginManifest, ResetsAtFormat, Role as ManifestRole, TagFrom, TagTransform, WindowConfig,
+    PluginManifest, ResetsAtFormat, Role as ManifestRole, WindowConfig,
 };
 use crate::plugin::time::parse_iso8601;
 
@@ -927,7 +927,8 @@ fn tail_cost(len: u64) -> u64 {
 /// this crate does not reach into either directly). Queued here, meant to be
 /// drained once per fetch pass by `main.rs` via
 /// [`take_pending_diagnostics`].
-static PENDING_DIAGNOSTICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static PENDING_DIAGNOSTICS: crate::plugin::diag_queue::Queue =
+    crate::plugin::diag_queue::Queue::new();
 
 /// Every `(plugin id, reason)` pair this process has already logged once —
 /// shared by both diagnostics this module queues, so a session tree that
@@ -936,29 +937,22 @@ static PENDING_DIAGNOSTICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static ALREADY_LOGGED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
 
 /// Queue `build_message()`'s result under `(plugin_id, reason)`, the first
-/// time only. `build_message` is a closure rather than a plain `String` so
-/// the (trivial) formatting cost is paid only when this is actually the
-/// first time — not on every refresh a cap keeps tripping on.
+/// time only — [`crate::plugin::diag_queue::queue_diag_once`], the same
+/// `(plugin, reason)` dedup `engine_http`'s own `for_each`-truncation
+/// diagnostic now shares.
 fn queue_diag_once(plugin_id: &str, reason: &str, build_message: impl FnOnce() -> String) {
-    let should_log = ALREADY_LOGGED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(std::collections::HashSet::new)
-        .insert(format!("{plugin_id}\u{1}{reason}"));
-    if should_log {
-        PENDING_DIAGNOSTICS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(build_message());
-    }
+    crate::plugin::diag_queue::queue_diag_once(
+        &PENDING_DIAGNOSTICS,
+        &ALREADY_LOGGED,
+        plugin_id,
+        reason,
+        build_message,
+    );
 }
 
 /// Every diagnostic line queued since the last call, removing them.
 pub fn take_pending_diagnostics() -> Vec<String> {
-    let mut guard = PENDING_DIAGNOSTICS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    std::mem::take(&mut *guard)
+    PENDING_DIAGNOSTICS.take()
 }
 
 /// Whether `name` (a bare file name, no directories) matches `glob`. Only the
@@ -1191,38 +1185,22 @@ fn first_u64(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u64>
 // ── Tag / account (manifest-driven, not engine-hardcoded) ───────────────
 
 /// Resolve a dotted JSON path (`"a.b.c"`) against an arbitrary value —
-/// object keys only, mirrors `crate::plugin::auth::json_path_str`.
+/// forwards to `crate::plugin::json_path_get`, the same walker
+/// `crate::plugin::auth::json_path_value` also forwards to, so a
+/// `container_key`/`tag.path` written with an array selector (`[0]`,
+/// `[field=value]`) resolves here too rather than silently missing.
 fn json_path<'v>(root: &'v Value, path: &str) -> Option<&'v Value> {
-    let mut cur = root;
-    for seg in path.split('.') {
-        cur = cur.get(seg)?;
-    }
-    Some(cur)
+    crate::plugin::json_path_get(root, path)
 }
 
 /// `[tag]` resolution. `from = "field"` reads `tag.path` out of the
 /// container that produced this reading (e.g. Codex's `plan_type`, which
-/// lives alongside `primary`/`secondary` in the same object).
+/// lives alongside `primary`/`secondary` in the same object) — this engine
+/// has no surfaces of its own, so it calls straight through to
+/// [`crate::plugin::resolve_tag_from`], unlike `engine_http::resolve_tag`,
+/// which layers an explicit `[[surface]]` label on top of the same call.
 fn resolve_tag(m: &PluginManifest, container: Option<&Value>) -> Option<String> {
-    let raw = match m.tag.from {
-        TagFrom::Static => m.tag.value.clone(),
-        // The manifest names the field, but the *value* in it is the
-        // provider's own answer (Codex's `plan_type`, live) — sanitised like
-        // any other response-supplied text before it reaches the tag chip.
-        TagFrom::Field => {
-            let path = m.tag.path.as_deref()?;
-            let value = json_path(container?, path)?;
-            value
-                .as_str()
-                .map(crate::plugin::sanitize_provider_text)
-                .filter(|s| !s.is_empty())
-        }
-        TagFrom::None => None,
-    }?;
-    Some(match m.tag.transform {
-        TagTransform::None => raw,
-        TagTransform::Uppercase => raw.to_uppercase(),
-    })
+    crate::plugin::resolve_tag_from(&m.tag, container)
 }
 
 /// `[account]` resolution. Only `type = "jwt-file"` is wired here: read

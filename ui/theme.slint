@@ -15,6 +15,14 @@ export global Theme {
     out property <color> track: #20252e;          // meter track
     out property <color> hairline: #262b34;       // 1px borders
     out property <color> hairline-strong: #333a45;
+    // Darker than `panel`: the settings sheet sits as a modal *on top of*
+    // the popover card, and reads as its own surface only because it is
+    // darker than the card behind it.
+    out property <color> sheet: #151a22;
+    // Darker still: the tooltip bubble sits above both, at the top of the
+    // stack, and needs the same visual separation from whichever surface —
+    // card or sheet — happens to be behind it.
+    out property <color> tooltip-bg: #05070a;
 
     // ── Ink ─────────────────────────────────────────────────────────────
     out property <color> text: #e7eaf0;
@@ -26,6 +34,22 @@ export global Theme {
     out property <color> warn: #f4b740;          // 70–90%  amber
     out property <color> crit: #f26d6d;          // ≥ 90%   soft red
     out property <color> accent: #3ddc97;        // brand / live dot
+
+    // ── Interaction / elevation ────────────────────────────────────────
+    // A faint white wash over a dark surface — the hover fill every small
+    // icon button and the info dot use. One token, not three call sites
+    // each writing their own `#ffffff0N` by hand, where a `0d` beside two
+    // `0f`s can drift by a pixel with nothing to catch it.
+    out property <color> hover-wash: #ffffff0f;
+    // Ink drawn on top of an accent-filled control (the checkmark inside a
+    // checked `ToggleRow` box) — dark enough to read against `accent`,
+    // which every other text colour in this palette is not.
+    out property <color> on-accent: #0b0d10;
+    // Base colour for a `drop-shadow-color` — each site still picks its own
+    // depth with `.with-alpha(…)` rather than sharing one opacity, since a
+    // modal sheet, the popover card and a tooltip bubble sit at three
+    // different elevations and read wrong if they all cast the same shadow.
+    out property <color> shadow: #000000;
 
     // ── Type ────────────────────────────────────────────────────────────
     // `AppWindow`'s own `default-font-family` sets the window to its

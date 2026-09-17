@@ -1,6 +1,22 @@
 // Reusable, hand-styled components for the Limits popover.
 import { Theme, Icons } from "theme.slint";
 
+// Which of the three shapes a window's reset countdown takes — Rust
+// constructs one of these rather than overloading `WindowData.reset-rel`
+// with the sentinel strings `"unknown"`/`"due"` alongside a real countdown
+// like `"6d 2h"`, where a typo in a string comparison on either side falls
+// through to `LimitBlock`'s own `else` branch in silence ("resets in
+// unknown"); a typo in an enum variant is a compile error on whichever side
+// made it.
+export enum ResetRelKind {
+    // `reset-rel` holds the actual countdown text, e.g. "6d 2h".
+    known,
+    // No reset time was reported at all — `reset-rel` is empty.
+    unknown,
+    // The window's reset has already passed — `reset-rel` is empty.
+    due,
+}
+
 // A bar asking for its hover tooltip to be drawn — see `LimitBlock`'s
 // `tip-changed`. The bubble cannot be drawn where it is asked for: Slint has no
 // z-index, so painting order is declaration order, and a tooltip that lives
@@ -37,7 +53,9 @@ export struct BarTip {
 export component LimitBlock inherits VerticalLayout {
     in property <string> win-label;      // "5H" / "WK"
     in property <float> pct;             // used %
-    in property <string> reset-rel;      // "6d 2h" / "2h 4m"
+    // "6d 2h" / "2h 4m" when `reset-rel-kind` is `known`; empty otherwise.
+    in property <string> reset-rel;
+    in property <ResetRelKind> reset-rel-kind: ResetRelKind.known;
     in property <string> reset-at;       // "19 Jul 22:18" / "22:10" / ""
     in property <string> tooltip;
     // Identity of this block among all the blocks on the panel, so the one
@@ -138,12 +156,14 @@ export component LimitBlock inherits VerticalLayout {
     if !root.not-started : HorizontalLayout {
         spacing: 4px;
         Text {
-            // "resets in" only fits an actual countdown. `window_view` also
-            // emits two sentinels: "unknown" (usage reported without a
-            // resets_at) and "due" (reset passed, window period unknown, so
-            // the next boundary can't be projected).
-            text: root.reset-rel == "unknown" ? "next reset unknown"
-                : root.reset-rel == "due" ? "reset due"
+            // "resets in" only fits an actual countdown — `reset-rel-kind`
+            // is `unknown` for a window with usage reported but no
+            // `resets_at`, `due` for a window whose reset has already
+            // passed (its period unknown, so the next boundary can't be
+            // projected), and `known` for the ordinary case, where
+            // `reset-rel` carries the countdown text itself.
+            text: root.reset-rel-kind == ResetRelKind.unknown ? "next reset unknown"
+                : root.reset-rel-kind == ResetRelKind.due ? "reset due"
                 : "resets in \{root.reset-rel}";
             font-size: 11px;
             color: Theme.text-dim;
@@ -206,7 +226,7 @@ export component ToggleRow inherits Rectangle {
                     visible: root.checked;
                     font-size: 12px;
                     font-weight: 700;
-                    color: #0b0d10;
+                    color: Theme.on-accent;
                     horizontal-alignment: center;
                     vertical-alignment: center;
                 }
@@ -217,7 +237,13 @@ export component ToggleRow inherits Rectangle {
             text: root.label;
             font-size: Theme.fs-body;
             font-weight: 400;
-            color: root.hot ? Theme.text : #e7eaf0;
+            // `Theme.text` here and `#e7eaf0` there were the same colour —
+            // the label never actually changed shade on hover, and the
+            // `animate color` below animated a value that never moved.
+            // `text-dim` at rest, brightening to `text` on hover, is the
+            // same relationship `border-color` above already states for
+            // the box (`hairline` → `hairline-strong`).
+            color: root.hot ? Theme.text : Theme.text-dim;
             vertical-alignment: center;
             // A caller may constrain the row (the plugin manager does, so a
             // third-party manifest's long name cannot shove the edit/remove
@@ -243,7 +269,7 @@ export component GhostButton inherits Rectangle {
     callback clicked;
 
     border-radius: 7px;
-    background: ta.has-hover ? #ffffff0f : transparent;
+    background: ta.has-hover ? Theme.hover-wash : transparent;
     animate background { duration: 120ms; }
     height: root.button-height;
     horizontal-stretch: 0;
@@ -275,20 +301,28 @@ export component GhostButton inherits Rectangle {
     }
 }
 
-// ── Tiny inline icon button (per-row actions: edit / remove…) ─────────────
-// Same idea as the header's IconButton, but compact enough to sit inline in
-// a plugin's master row without crowding the toggle/chip/engine cluster.
-export component MiniIconButton inherits Rectangle {
+// ── Icon-only button (header actions, per-row actions: edit / remove…) ────
+// One component at two sizes, not two that could drift apart on their own —
+// the header's shape (`refresh`/`gear`) and the smaller per-row shape share
+// one `background`/`stroke` animation and one hover-fill token, rather than
+// each call site choosing its own by hand with no agreement enforcing it. A
+// caller that wants the header's look sets `button-size`/`icon-size`/
+// `radius`/`hover-bg`/`tint` to match; the defaults below are the smaller,
+// per-row shape, since that is where most of the callers are.
+export component IconButton inherits Rectangle {
     // An `Icons` path on a 24×24 grid — see the note beside `Icons`.
     in property <string> icon;
+    in property <length> button-size: 20px;
     in property <length> icon-size: 13px;
+    in property <length> radius: 6px;
     in property <color> tint: Theme.text-faint;
+    in property <color> hover-bg: Theme.hover-wash;
     callback clicked;
 
-    width: 20px;
-    height: 20px;
-    border-radius: 6px;
-    background: ta.has-hover ? #ffffff0f : transparent;
+    width: root.button-size;
+    height: root.button-size;
+    border-radius: root.radius;
+    background: ta.has-hover ? root.hover-bg : transparent;
     animate background { duration: 120ms; }
 
     ta := TouchArea {
@@ -330,7 +364,7 @@ export component InfoDot inherits Rectangle {
         border-radius: 10px;
         border-width: 1.2px;
         border-color: ta.has-hover ? Theme.text-dim : Theme.text-faint;
-        background: ta.has-hover ? #ffffff0d : transparent;
+        background: ta.has-hover ? Theme.hover-wash : transparent;
         animate border-color, background { duration: 120ms; }
         Text {
             text: "i";

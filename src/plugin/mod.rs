@@ -10,6 +10,10 @@
 //!   the reader to do, checked in both directions so neither an old app nor an
 //!   undeclared new field ends in a confidently wrong number.
 //! * [`auth`] — the ordered credential-lookup chain (`[[surface.auth]]`).
+//! * [`diag_queue`] — the `Queue` type [`auth`], [`engine_http`],
+//!   [`engine_logfile`] and [`time`] each keep one static of, for a
+//!   diagnostic line produced here but only writable from `main.rs`'s
+//!   binary crate.
 //! * [`engine_logfile`] — the `engine = "log-file"` reader (Codex-style).
 //! * [`engine_http`] — the `engine = "http-api"` reader (Claude-style).
 //! * [`time`] — timestamp parsing shared by [`engine_logfile`] and
@@ -36,6 +40,7 @@
 
 pub mod auth;
 pub mod capability;
+pub(crate) mod diag_queue;
 pub mod engine_http;
 pub mod engine_logfile;
 pub mod manifest;
@@ -48,6 +53,8 @@ pub mod time;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+use serde_json::Value;
 
 use crate::model::Window;
 use manifest::{PluginManifest, WindowConfig};
@@ -313,6 +320,90 @@ pub fn read_regular_file(path: &std::path::Path, max_bytes: u64) -> Option<Strin
     let mut text = String::new();
     file.take(max_bytes).read_to_string(&mut text).ok()?;
     Some(text)
+}
+
+/// Write `bytes` to `target` without ever leaving a half-written file at
+/// that path: created at a predictable sibling temp path first, then renamed
+/// over `target` once every byte has landed — atomic on every filesystem
+/// this app runs on, so a crash, an app quit or a full disk mid-write leaves
+/// either the old file or the new one, never a truncated one in between.
+/// `main.rs`'s `install_write` and `update_write`, `config`'s
+/// `write_atomically`, and `diag`'s `trim_if_large` all call through this
+/// one function rather than each repeating the same sequence and the same
+/// TOCTOU reasoning on its own.
+///
+/// The temp path is predictable — `target`'s own file name with
+/// `.tmp<pid>` appended — and anything running as this user could plant a
+/// symlink there between one call and the next; `remove_file` before
+/// `create_new` removes the link itself, never what it points at, and
+/// `create_new` is what actually makes the file, so a symlink already
+/// sitting on the path is discarded rather than followed and written
+/// through.
+///
+/// `pre_rename` runs once the temp file holds every byte, immediately
+/// before the rename that puts it at `target` — not any earlier, since a
+/// caller checking `target` before this call's own write finishes would
+/// race a file created in between. `install_write` passes its own
+/// `symlink_metadata` check (refusing to clobber an existing file);
+/// `update_write`, `write_atomically` and `trim_if_large`, which each mean
+/// to overwrite whatever is there, pass a no-op. An `Err` from it is
+/// treated exactly like a write or rename failure: the temp file is
+/// removed and the error returned, without ever having touched `target`.
+pub fn write_via_temp(
+    target: &std::path::Path,
+    bytes: &[u8],
+    pre_rename: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp{}", std::process::id()));
+    let tmp = target.with_file_name(tmp_name);
+    let _ = std::fs::remove_file(&tmp);
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, bytes))
+        .and_then(|_| pre_rename(target))
+        .and_then(|_| std::fs::rename(&tmp, target));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp); // best-effort cleanup of a half-written temp file
+    }
+    result
+}
+
+/// Push `h` onto `hosts` if it isn't already there, compared
+/// case-insensitively — the de-duplication idiom `registry::push_dest_host`,
+/// its own `push_dest_host_for_disclosure` authority fallback, and
+/// `main.rs`'s `all_allowed_hosts` each wrote out by hand. A `HashSet` would
+/// be the obvious alternative and the wrong one here: it allocates a
+/// lowercased copy of every host pushed, for lists that hold one to three
+/// entries and are built once per install-time trust dialog or Add-Host
+/// click, where `eq_ignore_ascii_case`'s zero-allocation scan is strictly
+/// cheaper.
+pub fn push_host(hosts: &mut Vec<String>, h: &str) {
+    if !hosts
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(h))
+    {
+        hosts.push(h.to_string());
+    }
+}
+
+/// The reading id a given surface of a plugin appears under: the
+/// synthesized `"default"` surface (the one `PluginManifest::apply_defaults`
+/// creates for a manifest that omits `[[surface]]` entirely) reads under the
+/// plugin id verbatim; any other, explicitly-named surface reads under
+/// `"{plugin_id}-{surface_id}"` — e.g. Claude's `"cli"`/`"desktop"` surfaces
+/// become `"claude-cli"`/`"claude-desktop"`. `engine_http`'s own resolver and
+/// `main.rs`'s reading-id bookkeeping both need this exact mapping to agree
+/// on a real reading id, so both forward to this one definition rather than
+/// each keeping its own copy of it.
+pub fn surface_reading_id(plugin_id: &str, surface_id: &str) -> String {
+    if surface_id == "default" {
+        plugin_id.to_string()
+    } else {
+        format!("{plugin_id}-{surface_id}")
+    }
 }
 
 /// This app's own directory under the OS config dir
@@ -630,6 +721,127 @@ pub fn substitute_options(template: &str, options: &BTreeMap<String, bool>) -> S
         out = out.replace(&placeholder, if *value { "true" } else { "false" });
     }
     out
+}
+
+/// Resolve a dotted JSON path (`"a.b.c"`) against an arbitrary value — plus
+/// the array-selector segments (`[0]`, `[field=value]`) [`pick`] below
+/// implements. `engine_logfile::json_path` and `auth::json_path_value` both
+/// forward to this one function rather than each walking the plain
+/// dotted-key subset of this same syntax on their own, the way they once
+/// did — so a `container_key`, `tag.path`, `[account] json_path` or
+/// `expiry_json_path` written with a selector now resolves the same way
+/// through either of them as it already did through `http-api`'s own
+/// `[[windows]]`/`[balance]` paths. Strictly more permissive than either of
+/// their old walkers: a field literally named `counts[daily]` still
+/// resolves, via the same whole-segment fallback [`engine_http`]'s own
+/// version already relied on.
+pub(crate) fn json_path_get<'v>(root: &'v Value, path: &str) -> Option<&'v Value> {
+    let mut cur = root;
+    for seg in segments(path) {
+        // A selector is a segment that both opens and closes one — and when
+        // reading it that way finds nothing, the segment is tried again whole,
+        // as a key. A provider is entitled to a field called `counts[daily]`,
+        // and a syntax added beside the existing paths must not take names
+        // away from them. Only a real array with a matching element beats a
+        // real key of that exact name, and no provider has both.
+        let stepped = match seg.strip_suffix(']').and_then(|open| open.split_once('[')) {
+            Some((key, selector)) => {
+                let container = if key.is_empty() {
+                    Some(cur)
+                } else {
+                    cur.get(key)
+                };
+                container.and_then(|c| pick(c, selector))
+            }
+            None => None,
+        };
+        cur = match stepped {
+            Some(found) => found,
+            None => cur.get(seg)?,
+        };
+    }
+    Some(cur)
+}
+
+/// Split a path on `.`, except inside `[...]`. A selector's value is arbitrary
+/// text a provider chose — `GPT-5.3-Codex-Spark` has two dots in it — and
+/// splitting through one would leave a path nothing could ever match, in the
+/// most confusing way possible: silently, as a missing field.
+///
+/// The sequence `].` inside a value is what this grammar cannot express: the
+/// `]` closes the selector and the `.` then splits the path, so the selector
+/// ends up shorter than it was written. A plain `]` is fine (the closing one
+/// is the last), and so is any number of dots. No escape is offered rather
+/// than invented — a manifest is meant to be read — and the boundary is
+/// pinned by a test rather than left to be discovered.
+pub(crate) fn segments(path: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut depth) = (0usize, 0u32);
+    for (i, c) in path.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            '.' if depth == 0 => {
+                out.push(&path[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(&path[start..]);
+    out
+}
+
+/// One element of an array, chosen the way the manifest asked: by position
+/// (`[0]`) or by a field of its own (`[limit_name=GPT-5.3-Codex-Spark]`).
+///
+/// The second form is what a list of quotas needs. A provider that answers
+/// with an array of per-model allowances puts them in no fixed order and adds
+/// to them over time, so "the second one" is not a thing a manifest can mean;
+/// "the one that calls itself this" is. The comparison is against the field's
+/// text — a number or a boolean compares as it prints — because a manifest is
+/// TOML and everything in a path is a string by the time it gets here. Both
+/// halves are trimmed before the comparison, the same reason
+/// `engine_http::element_matches` trims `for_each_where`'s:
+/// `limits[kind = weekly_scoped]` is the natural way to align a manifest's
+/// `=` signs, and comparing the field's text against `" weekly_scoped"`
+/// would match nothing forever.
+pub(crate) fn pick<'v>(container: &'v Value, selector: &str) -> Option<&'v Value> {
+    let array = container.as_array()?;
+    match selector.split_once('=') {
+        None => array.get(selector.parse::<usize>().ok()?),
+        Some((field, wanted)) => array
+            .iter()
+            .find(|item| engine_http::field_says(item, field.trim(), wanted.trim())),
+    }
+}
+
+/// `[tag]` resolution's shared tail: `"static"` (`tag.value` verbatim),
+/// `"field"` (`tag.path` read out of `value` via [`json_path_get`] — the
+/// provider's own answer, sanitised like any other response-supplied text
+/// before it reaches the tag chip — hence `None` until a response is
+/// available), or `"none"` (no tag). Byte-identical in both engines once
+/// [`json_path_get`] became their shared walker — `engine_http::resolve_tag`
+/// layers one more rule on top, ahead of ever falling back to this: when the
+/// manifest declares explicit `[[surface]]` entries, that surface's own
+/// label always wins. `engine_logfile::resolve_tag` has no surfaces of its
+/// own and calls straight through.
+pub(crate) fn resolve_tag_from(tag: &manifest::TagConfig, value: Option<&Value>) -> Option<String> {
+    let raw = match tag.from {
+        manifest::TagFrom::Static => tag.value.clone(),
+        manifest::TagFrom::Field => {
+            let path = tag.path.as_deref()?;
+            json_path_get(value?, path)?
+                .as_str()
+                .map(sanitize_provider_text)
+                .filter(|s| !s.is_empty())
+        }
+        manifest::TagFrom::None => None,
+    }?;
+    Some(match tag.transform {
+        manifest::TagTransform::None => raw,
+        manifest::TagTransform::Uppercase => raw.to_uppercase(),
+    })
 }
 
 #[cfg(test)]

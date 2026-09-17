@@ -320,12 +320,16 @@ fn take_write_count() -> u64 {
     WRITE_COUNT.with(|c| c.replace(0))
 }
 
-/// Write `text` to `path` without ever leaving a half-written file behind:
-/// into a temporary neighbour first, then a rename over the target, which is
-/// atomic on every filesystem this app runs on. A plain write truncates first,
-/// so an app quit (or a crash, or a full disk) in the middle of one leaves
-/// settings that no longer parse — and this file's reader treats unparsable
-/// as empty, which is every preference in it, silently gone.
+/// Write `text` to `path` without ever leaving a half-written file behind —
+/// through [`tickover::plugin::write_via_temp`], the same temp-neighbour-
+/// then-rename sequence `main.rs`'s `install_write`/`update_write` use for a
+/// plugin manifest, atomic on every filesystem this app runs on. A plain
+/// write truncates first, so an app quit (or a crash, or a full disk) in the
+/// middle of one leaves settings that no longer parse — and this file's
+/// reader treats unparsable as empty, which is every preference in it,
+/// silently gone. No check before the rename (a no-op `pre_rename`): unlike
+/// `install_write`'s new-file case, every setter here means to overwrite
+/// whatever is already at `path`.
 ///
 /// Backs up a corrupt `path` (see [`backup_if_corrupt`]) before ever touching
 /// it — every setter routes through here, so this is the one place that can
@@ -343,24 +347,7 @@ fn write_atomically(path: &std::path::Path, text: &str) {
     // failure branch costs more reasoning than one avoidable reparse the next
     // time something reads it.
     invalidate_config_cache();
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    // Created, not written into whatever is already there: the temp path is
-    // predictable, and a symlink left on it by anything running as this user
-    // would otherwise be followed and its target overwritten. Clearing the
-    // path first removes the link itself, never what it points at.
-    let _ = std::fs::remove_file(&tmp);
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return;
-    }
-    if std::fs::rename(&tmp, path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    } else {
+    if tickover::plugin::write_via_temp(path, text.as_bytes(), |_| Ok(())).is_ok() {
         #[cfg(test)]
         WRITE_COUNT.with(|c| c.set(c.get() + 1));
     }
