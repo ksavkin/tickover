@@ -19,7 +19,7 @@
 /// pill, the compact tray title, the auto-ping's reset time) goes through
 /// them. The one place a model quota appeared in the main row cost this
 /// project a panel reading 0% while the real weekly window sat at 69%.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Role {
     Primary,
     Secondary,
@@ -232,29 +232,6 @@ pub enum BalanceAmount {
     Text(String),
 }
 
-impl BalanceAmount {
-    /// A tag identifying what this figure is measured in.
-    ///
-    /// Two figures may be shown as a pair ("12 / 100") only when their tags
-    /// match: pairing dollars with credits, or minor units at different scales,
-    /// would render a comparison the provider never made.
-    pub fn unit_tag(&self) -> Option<String> {
-        match self {
-            BalanceAmount::Money {
-                currency, exponent, ..
-            } => Some(format!("money:{currency}:{exponent}")),
-            BalanceAmount::Number { unit, .. } => {
-                Some(format!("number:{}", unit.as_deref().unwrap_or("")))
-            }
-            // Never pairable. Two provider sentences ("$5.00", "Pro tier")
-            // have no common unit to compare in — reading them as a pair
-            // would render `used $5.00 / cap Pro tier`, a ratio between two
-            // things that are not quantities of the same kind.
-            BalanceAmount::Text(_) => None,
-        }
-    }
-}
-
 impl Balance {
     /// Whether the provider stated anything at all worth a row.
     pub fn is_stated(&self) -> bool {
@@ -295,14 +272,39 @@ impl Balance {
     }
 
     /// Two figures are a pair only if both are there and both count the same
-    /// thing. A figure with no unit to compare in (a provider's own sentence)
-    /// never pairs.
+    /// thing: `Money` by equal `currency` and `exponent` (the scale a minor
+    /// unit is stated in — pairing cents with a different scale's minor units
+    /// would render a ratio between two different amounts of money), `Number`
+    /// by equal `unit` (`None` pairs with `None`: two unitless numbers, the
+    /// shape a free Copilot plan ships, still count the same thing when the
+    /// row label already names it). `Text` never pairs — a provider's own
+    /// sentence ("$5.00", "Pro tier") has no unit to compare in, so reading
+    /// two of them as a pair would render `used $5.00 / cap Pro tier`, a
+    /// ratio between two things that are not quantities of the same kind.
+    ///
+    /// Matches the variants directly rather than building a `String` tag from
+    /// each side and comparing those: this runs on every balance row, on
+    /// every one-second tick, and the two amounts being compared already
+    /// carry everything this needs to look at without allocating anything to
+    /// hold it.
     fn same_unit(a: Option<&BalanceAmount>, b: Option<&BalanceAmount>) -> bool {
         match (a, b) {
-            (Some(a), Some(b)) => match (a.unit_tag(), b.unit_tag()) {
-                (Some(x), Some(y)) => x == y,
-                _ => false,
-            },
+            (
+                Some(BalanceAmount::Money {
+                    currency: cx,
+                    exponent: ex,
+                    ..
+                }),
+                Some(BalanceAmount::Money {
+                    currency: cy,
+                    exponent: ey,
+                    ..
+                }),
+            ) => cx == cy && ex == ey,
+            (
+                Some(BalanceAmount::Number { unit: ux, .. }),
+                Some(BalanceAmount::Number { unit: uy, .. }),
+            ) => ux == uy,
             _ => false,
         }
     }
@@ -625,7 +627,6 @@ mod tests {
         b.used = Some(BalanceAmount::Text("$5.00".into()));
         b.cap = Some(BalanceAmount::Text("Pro tier".into()));
         assert!(!b.pair_is_comparable());
-        assert_eq!(BalanceAmount::Text("$5.00".into()).unit_tag(), None);
     }
 
     #[test]

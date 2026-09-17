@@ -15,7 +15,7 @@ mod platform;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use slint::{
@@ -330,7 +330,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the click that caused it — see `TRAY_CLICK_DISMISS_WINDOW`.
     let hidden_by_focus_at: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
     // Change-detection key for the tray indicator (avoids icon churn).
-    let tray_key = Rc::new(RefCell::new(String::new()));
+    // `sync_tray_indicator_from` treats an unchanged key as "nothing to draw"
+    // and returns before ever setting the icon or tooltip — `None` here means
+    // nothing has been drawn yet, so the very first `tray_indicator_key` this
+    // process computes, whatever value it happens to be, is always a change.
+    let tray_key: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
 
     let model: Providers = Rc::new(VecModel::from(Vec::<ProviderData>::new()));
     app.set_providers(ModelRc::from(model.clone()));
@@ -1090,6 +1094,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let weak = app.as_weak();
         let tx = registry_tx.clone();
         let registry_checking = registry_checking.clone();
+        let plugins = plugins.clone();
         app.on_check_updates(move || {
             // A check already running answers for this click too — its
             // result is on the way regardless of how many more times the
@@ -1101,12 +1106,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.set_registry_status(1); // checking — flips the button to "Checking…"
             }
             let tx = tx.clone();
+            // Snapshotted here, on the UI thread, rather than handing the
+            // worker thread `plugins` itself: `Rc<RefCell<…>>` is not `Send`,
+            // and reading it from another thread would race whatever else
+            // touches it on this one. Only `(id, version)` — the file read
+            // and sha256 that turn this into `hash_installed_manifests`'s
+            // full triples happen entirely on the worker thread below.
+            let installed: Vec<(String, String)> = plugins
+                .borrow()
+                .iter()
+                .map(|m| (m.id.clone(), m.version.clone()))
+                .collect();
             // `Builder::spawn`, not `thread::spawn`: the latter panics if the OS
             // won't hand out a thread, and by then `registry-status` is already
             // "checking…" with nothing left to ever move it off that — the same
             // failure mode `spawn_plugin_fetch`'s own doc comment describes.
             let spawned = std::thread::Builder::new().spawn(move || {
-                let _ = tx.send(fetch_registry_index(DEFAULT_REGISTRY_URL));
+                let hashed = hash_installed_manifests(&seed::plugins_dir(), &installed);
+                let _ = tx.send(fetch_registry_index(DEFAULT_REGISTRY_URL, hashed));
             });
             if spawned.is_err() {
                 // No thread means no result will ever arrive on `registry_rx`
@@ -1348,8 +1365,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fetching.borrow_mut().remove(&id);
                 // Drop a result for a plugin disabled (or removed) while its
                 // fetch was in flight, so a late landing can't resurface it.
-                let manifest = plugins.borrow().iter().find(|m| m.id == id).cloned();
-                let keep = manifest.as_ref().is_some_and(plugin_enabled);
+                // `is_some_and` over the borrowed `find` rather than
+                // `.cloned()` first: the temporary `Ref` still lives to the
+                // end of this expression, so nothing here needs to deep-clone
+                // a whole `PluginManifest` just to read one `bool` out of it.
+                let keep = plugins
+                    .borrow()
+                    .iter()
+                    .find(|m| m.id == id)
+                    .is_some_and(plugin_enabled);
                 if keep {
                     // Before the insert, while the previous reading is still
                     // there to compare against — see `credentials_just_lost`.
@@ -1459,14 +1483,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = app.window().hide();
                     } else if !dismissed {
                         spawn_all_plugin_fetches(&plugins.borrow(), &tx, &fetching);
-                        refresh_model(
-                            &app,
-                            &model,
-                            &plugins.borrow(),
-                            &cache,
-                            &window_models,
-                            &balance_models,
-                        );
+                        if should_refresh_panel(app.window().is_visible(), true) {
+                            refresh_model(
+                                &app,
+                                &model,
+                                &plugins.borrow(),
+                                &cache,
+                                &window_models,
+                                &balance_models,
+                            );
+                        }
                         present_popover(&app, &anchor, &shown_at, Shown::ByTrayClick);
                     }
                 }
@@ -1533,6 +1559,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let n = ticks.get().wrapping_add(1);
                 ticks.set(n);
 
+                // Bumped every tick, whether or not this one actually spawns
+                // a fetch — see its own doc for why a shared, continuously
+                // rotating pass rather than a bump only where a spawn is
+                // decided below is both simpler and sufficient: a
+                // tray-click-triggered fetch between ticks still reads
+                // whatever pass the last tick set, and that changes every
+                // second regardless.
+                auth::begin_fetch_pass();
+
                 for m in plugins.borrow().iter() {
                     if scheduler::due(n, m.refresh_secs) {
                         spawn_plugin_fetch(
@@ -1545,22 +1580,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                refresh_model(
-                    &app,
-                    &model,
-                    &plugins.borrow(),
-                    &cache,
-                    &window_models,
-                    &balance_models,
-                );
+                // Built once and threaded through the rest of this tick —
+                // `refresh_model_from`, `sync_tray_indicator_from`, and the
+                // ping loop below all read the same `current` rather than
+                // each rebuilding it from `cache` for itself.
+                let current = readings(&plugins.borrow(), &cache.borrow());
+
+                // Rebuilding the Slint model is skipped while the popover is
+                // not on screen — the common case for a menu-bar app — since
+                // nothing can see the result until it is shown again, and
+                // that path (below, and every explicit open elsewhere in this
+                // file) already calls `refresh_model`/`refresh_model_from`
+                // itself right before showing it. Everything else in this
+                // tick — the tray icon, the seen-window registry, the auto-
+                // ping loop — runs unconditionally: they are either always on
+                // screen (the tray) or work whether or not anyone is looking
+                // at the panel right now (the headline feature of this app is
+                // pinging a window while the popover stays closed).
+                if should_refresh_panel(app.window().is_visible(), false) {
+                    refresh_model_from(
+                        &app,
+                        &model,
+                        &plugins.borrow(),
+                        &current,
+                        &window_models,
+                        &balance_models,
+                    );
+                }
                 // Cheap no-op unless data, theme, or the toggle actually changed.
-                sync_tray_indicator(
-                    &tray,
-                    app.get_menu_bar_text(),
-                    &plugins.borrow(),
-                    &cache,
-                    &tray_key,
-                );
+                sync_tray_indicator_from(&tray, app.get_menu_bar_text(), &current, &tray_key);
 
                 let now = now_unix();
 
@@ -1570,6 +1618,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // app while it is already running does nothing whatsoever, which
                 // looks exactly like an app that failed to start.
                 if platform::take_show_request() && !app.window().is_visible() {
+                    // The gate above skipped `refresh_model_from` for exactly
+                    // this window (hidden when this tick started) — force it
+                    // now, with the same `current`, so the popover this is
+                    // about to show is not a tick behind.
+                    if should_refresh_panel(app.window().is_visible(), true) {
+                        refresh_model_from(
+                            &app,
+                            &model,
+                            &plugins.borrow(),
+                            &current,
+                            &window_models,
+                            &balance_models,
+                        );
+                    }
                     present_popover(&app, &anchor, &shown_at, Shown::ByAnythingElse);
                 }
 
@@ -1592,7 +1654,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // [`ping_due`] for why this is a state and not an edge). Only
                 // an enabled plugin arms it — a disabled one is skipped even if it
                 // still declares `[ping]`.
-                let current = readings(&plugins.borrow(), &cache.borrow());
+                //
                 // Remember the newest reset every provider states, while it is
                 // still stating one: once a window empties, a provider like Codex
                 // reports it not at all, and the registry is then the only record
@@ -1610,7 +1672,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // happen in as small as the loop that needs it.
                 {
                     let ps = plugins.borrow();
-                    record_seen_windows(&ps, &current, now);
+                    let written = record_seen_windows(&ps, &current, now);
                     for m in ps.iter().filter(|m| m.ping.is_some() && plugin_enabled(m)) {
                         // The filter above already established `plugin_enabled(m)`;
                         // passed as `true` rather than asked a second time. Checked
@@ -1679,10 +1741,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // spawn — a renewal merely on cooldown, or one that
                         // failed to even start, must never suppress the one
                         // ping that plugin can still fire this tick.
+                        // Read once for this whole iteration, not once per use
+                        // below: nothing between here and `set_plugin_pinged_at`
+                        // moves it, and `config`'s own cache makes a second ask
+                        // cheap but not free.
+                        let pinged_at = config::plugin_pinged_at(&m.id);
                         let due = if renewal_wanted {
                             classify_renewal_across_surfaces(
                                 surfaces,
-                                config::plugin_pinged_at(&m.id),
+                                pinged_at,
                                 now,
                                 last_renewed_for,
                             )
@@ -1698,16 +1765,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let Some(first_id) = first_surface_reading_id(m) else {
                             continue;
                         };
-                        // `seen_window_for`, not `seen_window_of`: this loop already
-                        // holds the manifest, and the registry key is namespaced by
-                        // the *owner's* id, so asking with `m` reads exactly the key
-                        // `record_seen_windows` wrote for it. Going back through the
-                        // reading id would run the inverse again only to have it
-                        // answer `None` for a reading id two manifests both claim —
-                        // costing this provider its auto-ping over a collision the
-                        // panel is right to be cautious about and the ping need not
-                        // be.
-                        let seen_window = seen_window_for(m, &first_id, Role::Primary);
+                        // `written` first — `record_seen_windows` just above may have
+                        // recorded exactly this window on this very tick, and
+                        // `seen_window_for` would otherwise reread and reparse
+                        // `config.json` to learn what this loop's own caller already
+                        // knows (that write is what invalidated `config`'s cache in
+                        // the first place). Falling back to `seen_window_for`, not
+                        // `seen_window_of`: this loop already holds the manifest, and
+                        // the registry key is namespaced by the *owner's* id, so
+                        // asking with `m` reads exactly the key `record_seen_windows`
+                        // wrote for it. Going back through the reading id would run
+                        // the inverse again only to have it answer `None` for a
+                        // reading id two manifests both claim — costing this provider
+                        // its auto-ping over a collision the panel is right to be
+                        // cautious about and the ping need not be.
+                        let seen_window = written
+                            .get(&(m.id.clone(), first_id.clone(), Role::Primary))
+                            .copied()
+                            .or_else(|| seen_window_for(m, &first_id, Role::Primary));
                         let Some(window) = ping_window(
                             m,
                             current.iter().find(|r| r.id == first_id),
@@ -1721,7 +1796,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             window.resets_at,
                             window.period_minutes,
                             seen,
-                            config::plugin_pinged_at(&m.id),
+                            pinged_at,
                             now,
                         ) {
                             continue;
@@ -1760,6 +1835,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let was_active = Cell::new(platform::app_is_active());
         let handler_ready = Cell::new(false);
         let tray_click_at = tray_click_at.clone();
+        // Cloned only to force one refresh right before a reopen makes the
+        // panel visible again — see the comment at that call below. The
+        // one-second tick's own `refresh_model_from` skips exactly this
+        // window (hidden) while it is hidden, so nothing else keeps the
+        // model current until this fires.
+        let plugins = plugins.clone();
+        let cache = cache.clone();
+        let model = model.clone();
+        let window_models = window_models.clone();
+        let balance_models = balance_models.clone();
         // Short enough that a Dock click feels immediate; the tick is one
         // atomic read plus one `isActive` message, so it costs nothing.
         reopen_timer.start(TimerMode::Repeated, Duration::from_millis(120), move || {
@@ -1780,6 +1865,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let want_visible = panel_target_visibility(became_active, clicks, visible);
             if want_visible && !visible {
+                // The panel was hidden — the tick timer's own gate has been
+                // skipping `refresh_model_from` for it — so it must be forced
+                // fresh here, the same `should_refresh_panel` idiom as every
+                // other `present_popover` call site in this file, rather than
+                // showing whatever the model last held.
+                if should_refresh_panel(visible, true) {
+                    refresh_model(
+                        &app,
+                        &model,
+                        &plugins.borrow(),
+                        &cache,
+                        &window_models,
+                        &balance_models,
+                    );
+                }
                 present_popover(&app, &anchor, &shown_at, Shown::ByAnythingElse);
             } else if !want_visible && visible {
                 let _ = app.window().hide();
@@ -2037,20 +2137,6 @@ fn absent_note(upgrade: &seed::BuiltinUpgrade) -> String {
 /// is merely skipped at fetch ([`spawn_plugin_fetch`]/[`sync_fetch_all`]) and
 /// hidden from [`readings`] because its cache slot stays empty.
 fn load_plugins_from(dir: &std::path::Path) -> Vec<PluginManifest> {
-    diag::line(format!(
-        "loading plugin manifests from {} ({})",
-        dir.display(),
-        std::fs::read_dir(dir)
-            .map(|entries| {
-                let mut names: Vec<String> = entries
-                    .filter_map(Result::ok)
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect();
-                names.sort();
-                names.join(", ")
-            })
-            .unwrap_or_else(|e| format!("unreadable: {e}"))
-    ));
     let manifests: Vec<PluginManifest> = manifest::load_dir(dir)
         .into_iter()
         .filter_map(|result| match result {
@@ -2064,6 +2150,17 @@ fn load_plugins_from(dir: &std::path::Path) -> Vec<PluginManifest> {
             }
         })
         .collect();
+    // `manifest::load_dir` above already scanned `dir` once — this logs what
+    // it found there rather than scanning it a second time (with its own
+    // sort and name-join) purely to describe what the first scan was about
+    // to do. `manifests.len()` is every manifest that parsed, `dir.display()`
+    // is where they came from; a broken `.toml` already logged its own line,
+    // above, by id.
+    diag::line(format!(
+        "loaded {} plugin manifest(s) from {}",
+        manifests.len(),
+        dir.display()
+    ));
     let manifests = dedup_plugin_ids(manifests);
     // A backstop, not the primary defence any more: `dedup_plugin_ids` above
     // already drops the later of any two manifests claiming one reading id,
@@ -3058,11 +3155,14 @@ fn readings_with(
 /// kind of detail that goes wrong silently — it would simply clear nothing.
 fn drop_surface_reading(cache: &PluginCache, plugin_id: &str, surface_id: &str) {
     let base = surface_reading_id(plugin_id, surface_id);
+    // Built once, not once per element `retain` below visits: a plugin can
+    // report several accounts under one surface.
+    let sub_account_prefix = format!("{base}#");
     if let Some(readings) = cache.borrow_mut().get_mut(plugin_id) {
         // `surface_id_active`'s rule, applied to one surface: the id itself,
         // plus the `"<id>#<account>"` sub-account rows a log-file engine can
         // emit under it. Dropping only the exact id would leave those behind.
-        readings.retain(|r| r.id != base && !r.id.starts_with(&format!("{base}#")));
+        readings.retain(|r| r.id != base && !r.id.starts_with(&sub_account_prefix));
     }
 }
 
@@ -3444,13 +3544,34 @@ fn seen_window_of(
 /// same tick's `now_unix()` the auto-ping loop right after this one uses, so a
 /// reading judged implausible-far-out by [`seen_at_is_plausible`] cannot
 /// disagree with itself between the two calls.
-fn record_seen_windows(plugins: &[PluginManifest], readings: &[ProviderReading], now: u64) {
+///
+/// Returns exactly what it just wrote, keyed the same way the registry
+/// itself is (`plugin id`, `reading id`, `role`) — the auto-ping loop right
+/// after this call asks [`seen_window_for`] about a window this call may have
+/// *just* recorded, and `config`'s own cache (see `config::with_config`) only
+/// remembers one parsed copy of the whole file: the write above already threw
+/// it out, so asking again would reread and reparse `config.json` a second
+/// time in the same tick for an answer this call already has in hand. Handing
+/// it back is what lets that second ask be a map lookup instead — see the
+/// call site's own comment for why a *stale* map would be worse than no map
+/// at all.
+fn record_seen_windows(
+    plugins: &[PluginManifest],
+    readings: &[ProviderReading],
+    now: u64,
+) -> HashMap<(String, String, Role), config::SeenWindow> {
+    let mut written = HashMap::new();
     for rec in seen_writes(seen_records(plugins, readings), seen_window_for, now) {
         let Some(key) = seen_role_key(rec.role) else {
             continue;
         };
         config::set_plugin_seen_window_for(&rec.manifest.id, &rec.reading_id, key, rec.seen);
+        written.insert(
+            (rec.manifest.id.clone(), rec.reading_id.clone(), rec.role),
+            rec.seen,
+        );
     }
+    written
 }
 
 /// Which of the stated windows are actually worth writing, given what the
@@ -3891,6 +4012,20 @@ fn plugin_ping_armed(enabled: bool, ping_on: bool) -> bool {
 
 // ── Provider model building ──────────────────────────────────────────────────
 
+/// Whether rebuilding the Slint model is worth doing right now: `visible` —
+/// the popover is on screen and could otherwise show a tick-old number — or
+/// `forced` — it is about to be shown and would open on a tick-old number the
+/// instant it appeared, whether or not it happened to already be on screen.
+/// The tick's own gate and every `present_popover` call site but one — the
+/// unconditional refresh right after startup, which runs whether or not a
+/// popover is ever about to follow it — go through this same predicate, so
+/// "does a refresh belong here" has one answer for the tick and for showing
+/// the panel again later, rather than a hidden agreement between several
+/// `if`s that happen to match today.
+fn should_refresh_panel(visible: bool, forced: bool) -> bool {
+    visible || forced
+}
+
 /// Rebuild the provider list from the cache. Two nested reconciles keep the UI
 /// stable across the one-second tick:
 ///   * the outer list reuses each `ProviderData` slot in place (`set_row_data`
@@ -3911,8 +4046,31 @@ fn refresh_model(
     window_models: &WindowModels,
     balance_models: &BalanceModels,
 ) {
-    let now = now_unix();
     let readings = readings(plugins, &cache.borrow());
+    refresh_model_from(
+        app,
+        model,
+        plugins,
+        &readings,
+        window_models,
+        balance_models,
+    );
+}
+
+/// [`refresh_model`]'s body, taking readings already built rather than
+/// building its own. `tick_timer`'s one-second callback computes
+/// `readings()` once and reuses it here, in `sync_tray_indicator_from`, and
+/// in its own ping loop — calling through here instead of `refresh_model` is
+/// what keeps that computation to once per tick instead of three times.
+fn refresh_model_from(
+    app: &AppWindow,
+    model: &Providers,
+    plugins: &[PluginManifest],
+    readings: &[ProviderReading],
+    window_models: &WindowModels,
+    balance_models: &BalanceModels,
+) {
+    let now = now_unix();
 
     let mut win_models = window_models.borrow_mut();
     let mut bal_models = balance_models.borrow_mut();
@@ -4052,8 +4210,19 @@ fn header_status(has_live_provider: bool, has_provider_reading: bool) -> (&'stat
 /// in as. It only rewrites the label: the reading itself, and the token it was
 /// resolved from, are untouched.
 fn display_account(account: &str) -> String {
-    match std::env::var("TICKOVER_DEMO_ACCOUNT") {
-        Ok(demo) if !demo.is_empty() && !account.is_empty() => demo,
+    // Resolved once per process, not once per provider per tick: a
+    // screenshot stand's environment cannot change while it runs, and
+    // `refresh_model`'s `.map` over every reading calls this once per
+    // provider every time it runs, `std::env::var` lock and allocation
+    // included.
+    static DEMO_ACCOUNT: OnceLock<Option<String>> = OnceLock::new();
+    let demo = DEMO_ACCOUNT.get_or_init(|| {
+        std::env::var("TICKOVER_DEMO_ACCOUNT")
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
+    match demo {
+        Some(demo) if !account.is_empty() => demo.clone(),
         _ => account.to_string(),
     }
 }
@@ -4420,7 +4589,7 @@ fn window_data(now: u64, w: &Window, used: f64) -> WindowData {
     let (rel, at, tooltip, _, _) =
         window_view(now, used, w.resets_at, w.period_minutes, weekly, &name);
     WindowData {
-        label: ss(window_title(w)),
+        label: ss(&name),
         pct: used as f32,
         not_started: false,
         reset_rel: ss(rel),
@@ -4936,15 +5105,70 @@ fn widget_rows(now: u64, readings: &[ProviderReading]) -> Vec<menubar::ProviderR
 
 /// Menu-bar theme: `TICKOVER_THEME=light|dark` overrides (screenshots),
 /// otherwise the system appearance.
+/// How long [`menu_theme_dark`] trusts its last poll of
+/// `platform::system_dark_theme` before asking the OS again. Bounded
+/// staleness rather than a permanent cache (unlike `TICKOVER_THEME`/
+/// `TICKOVER_DEMO_ACCOUNT` below, resolved once for the whole process): a
+/// switch in System Settings can happen at any moment during a real run, and
+/// the tray still has to notice it, just not on every single tick.
+const THEME_POLL_TTL: Duration = Duration::from_secs(5);
+
+/// Reuse `poll`'s last answer until `ttl` has elapsed since it was called,
+/// then call it again — `menu_theme_dark`'s use below wraps a real
+/// ObjC/Win32 call that `sync_tray_indicator` would otherwise pay for once a
+/// second, on every tick, regardless of whether the OS answer has moved.
+/// `now` is taken rather than read internally so a test can drive the clock
+/// without waiting on a real one or replacing `platform::system_dark_theme`.
+fn ttl_cached<T: Copy>(
+    cache: &Cell<Option<(Instant, T)>>,
+    ttl: Duration,
+    now: Instant,
+    poll: impl FnOnce() -> T,
+) -> T {
+    if let Some((at, value)) = cache.get() {
+        if now.saturating_duration_since(at) < ttl {
+            return value;
+        }
+    }
+    let value = poll();
+    cache.set(Some((now, value)));
+    value
+}
+
 fn menu_theme_dark() -> bool {
-    match std::env::var("TICKOVER_THEME").ok().as_deref() {
-        Some("light") => false,
-        Some("dark") => true,
-        _ => platform::system_dark_theme(),
+    // Resolved once per process: a screenshot stand's environment cannot
+    // change while it runs, so unlike the OS poll below this never needs a
+    // second look.
+    static THEME_OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
+    let override_dark =
+        *THEME_OVERRIDE.get_or_init(|| match std::env::var("TICKOVER_THEME").ok().as_deref() {
+            Some("light") => Some(false),
+            Some("dark") => Some(true),
+            _ => None,
+        });
+    match override_dark {
+        Some(dark) => dark,
+        None => {
+            thread_local! {
+                static POLLED: Cell<Option<(Instant, bool)>> = const { Cell::new(None) };
+            }
+            POLLED.with(|c| {
+                ttl_cached(
+                    c,
+                    THEME_POLL_TTL,
+                    Instant::now(),
+                    platform::system_dark_theme,
+                )
+            })
+        }
     }
 }
 
-/// The tooltip shown on hovering the tray icon.
+/// The tooltip shown on hovering the tray icon, built from `figures` —
+/// [`menu_bar_title`]'s own answer — rather than reading `readings` and
+/// calling it again: [`sync_tray_indicator_from`] already has it computed by
+/// the time this runs, and needs it again itself for the text-title fallback
+/// right after.
 ///
 /// Windows has no title beside a notification-area icon, so the compact
 /// figures the menu-bar pill carries in its own image have nowhere to go
@@ -4952,8 +5176,7 @@ fn menu_theme_dark() -> bool {
 /// more than its 16 pixels can. macOS gets the same string for the same
 /// reason it is worth having at all: the pill states used-% and nothing else,
 /// and the tooltip is the one place the app's own name still appears.
-fn tray_tooltip(readings: &[ProviderReading]) -> String {
-    let figures = menu_bar_title(readings);
+fn tray_tooltip(figures: &str) -> String {
     // `menu_bar_title`'s own "nothing to report" answer. Repeating it after
     // the name would read as a second, emptier label.
     if figures == "Limits" {
@@ -4971,16 +5194,28 @@ fn sync_tray_indicator(
     enabled: bool,
     plugins: &[PluginManifest],
     cache: &PluginCache,
-    last_key: &Rc<RefCell<String>>,
+    last_key: &Rc<Cell<Option<u64>>>,
+) {
+    let readings = readings(plugins, &cache.borrow());
+    sync_tray_indicator_from(tray, enabled, &readings, last_key);
+}
+
+/// [`sync_tray_indicator`]'s body, taking readings already built. See
+/// [`refresh_model_from`]'s own doc — the one-second tick shares one
+/// `readings()` between this, that, and its ping loop.
+fn sync_tray_indicator_from(
+    tray: &TraySlot,
+    enabled: bool,
+    readings: &[ProviderReading],
+    last_key: &Rc<Cell<Option<u64>>>,
 ) {
     let Some(tray) = tray.borrow().as_ref().cloned() else {
         return;
     };
     let now = now_unix();
-    let readings = readings(plugins, &cache.borrow());
 
     let widget = if enabled {
-        let rows = widget_rows(now, &readings);
+        let rows = widget_rows(now, readings);
         if rows.is_empty() {
             None
         } else {
@@ -4991,13 +5226,10 @@ fn sync_tray_indicator(
         None
     };
 
-    let tooltip = tray_tooltip(&readings);
-    let key = match &widget {
-        Some((rows, dark)) => format!("{}|{tooltip}", menubar::cache_key(rows, *dark)),
-        None if enabled => format!("empty|{tooltip}"),
-        None => format!("off|{tooltip}"),
-    };
-    if *last_key.borrow() == key {
+    let figures = menu_bar_title(readings);
+    let tooltip = tray_tooltip(&figures);
+    let key = tray_indicator_key(&widget, enabled, &tooltip);
+    if last_key.get() == Some(key) {
         return;
     }
     // The figures move once a minute even when the widget's own rounded
@@ -5022,7 +5254,7 @@ fn sync_tray_indicator(
                 let _ = tray.set_icon(Some(icon));
                 tray.set_icon_as_template(false);
                 tray.set_title(Some(""));
-                *last_key.borrow_mut() = key;
+                last_key.set(Some(key));
                 return;
             }
         }
@@ -5033,8 +5265,8 @@ fn sync_tray_indicator(
             let _ = tray.set_icon(Some(icon));
         }
         tray.set_icon_as_template(cfg!(target_os = "macos"));
-        tray.set_title(Some(menu_bar_title(&readings)));
-        *last_key.borrow_mut() = key;
+        tray.set_title(Some(figures));
+        last_key.set(Some(key));
         return;
     }
 
@@ -5044,7 +5276,33 @@ fn sync_tray_indicator(
     }
     tray.set_icon_as_template(cfg!(target_os = "macos"));
     tray.set_title(Some(""));
-    *last_key.borrow_mut() = key;
+    last_key.set(Some(key));
+}
+
+/// [`sync_tray_indicator_from`]'s own change-detection key, folded into a
+/// single `u64` rather than a `String`: a leading discriminant, mirroring
+/// what a derived `Hash` impl on an enum would produce, tells the
+/// disabled/empty/rendered shapes apart before [`menubar::cache_key`]'s own
+/// bits (only present for the rendered shape) get mixed in, then the
+/// tooltip — which changes on its own cadence (once a minute) independent of
+/// the widget.
+fn tray_indicator_key(
+    widget: &Option<(Vec<menubar::ProviderRow>, bool)>,
+    enabled: bool,
+    tooltip: &str,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match widget {
+        Some((rows, dark)) => {
+            0u8.hash(&mut h);
+            menubar::cache_key(rows, *dark).hash(&mut h);
+        }
+        None if enabled => 1u8.hash(&mut h),
+        None => 2u8.hash(&mut h),
+    }
+    tooltip.hash(&mut h);
+    h.finish()
 }
 
 /// Edge, in real pixels, of the badge handed to the notification area.
@@ -6046,7 +6304,14 @@ fn run_renewal_ping(
 enum RegistryCheckMsg {
     NetworkError,
     Malformed,
-    Success(RegistryIndex),
+    /// The parsed index, paired with every installed manifest's on-disk
+    /// sha256 — `(id, sha256, version)`, [`hash_installed_manifests`]'s own
+    /// shape — computed on the same background thread as the fetch itself,
+    /// not by [`apply_registry_check`] once this lands back on the UI
+    /// thread: reading and hashing every installed manifest is exactly the
+    /// filesystem work `fetch_registry_index`'s own doc promises never runs
+    /// there.
+    Success(RegistryIndex, Vec<(String, String, String)>),
 }
 
 /// The signature file that goes with an index, by minisign's convention:
@@ -6056,8 +6321,11 @@ fn signature_url(index_url: &str) -> String {
 }
 
 /// Fetch `url` and parse it as an `index.toml` — the whole background-thread
-/// body of `check-updates`. Never touches the UI or the filesystem; safe to
-/// run off the calling thread.
+/// body of `check-updates`. Never touches the UI or the filesystem itself;
+/// safe to run off the calling thread. `installed` is carried straight
+/// through to [`RegistryCheckMsg::Success`] unexamined — the caller has
+/// already computed it, on this same background thread, with
+/// [`hash_installed_manifests`], before calling this.
 ///
 /// The signature is checked **before** the index is parsed, once a key is
 /// pinned: an index this app will not vouch for will never be read for what
@@ -6068,7 +6336,7 @@ fn signature_url(index_url: &str) -> String {
 /// this still parses it — logged, not refused, on every single check (see the
 /// `Unverifiable` arm below). Everything downstream is unchanged either way;
 /// the check is a gate in front of them, never a substitute for one.
-fn fetch_registry_index(url: &str) -> RegistryCheckMsg {
+fn fetch_registry_index(url: &str, installed: Vec<(String, String, String)>) -> RegistryCheckMsg {
     // Fetched as bytes rather than text, because a signature is over the
     // bytes a server sent and nothing else. Decoding first and verifying the
     // decoded form would check a signature over something the publisher never
@@ -6121,7 +6389,7 @@ fn fetch_registry_index(url: &str) -> RegistryCheckMsg {
                 }
             };
             match RegistryIndex::from_str(&text) {
-                Ok(index) => RegistryCheckMsg::Success(index),
+                Ok(index) => RegistryCheckMsg::Success(index, installed),
                 Err(e) => {
                     diag::line(format!(
                         "check-updates: index.toml failed to parse ({url}): {e}"
@@ -6205,16 +6473,44 @@ fn registry_entry_row(entry: &RegistryEntry) -> RegistryPluginRow {
     }
 }
 
+/// Read and sha256-hash every installed manifest in `dir` that `installed`
+/// (an `(id, version)` pair per plugin — `apply_registry_check`'s caller
+/// snapshots this off `plugins` before spawning) names — the file I/O
+/// [`fold_registry_diff`] needs its byte-exact hash for ([`registry::
+/// diff_installed`]'s own doc comment: never a re-serialization), pulled out
+/// so it can run entirely on the "Check updates" worker thread rather than on
+/// the UI thread once the result lands back on it.
+fn hash_installed_manifests(
+    dir: &std::path::Path,
+    installed: &[(String, String)],
+) -> Vec<(String, String, String)> {
+    installed
+        .iter()
+        .filter_map(|(id, version)| {
+            let path = find_plugin_manifest_path(dir, id)?;
+            // Bounded and FIFO-safe, the same as every other manifest read:
+            // this path came out of the plugins folder, exactly as reachable
+            // by another program as any third-party manifest is.
+            let text =
+                tickover::plugin::read_regular_file(&path, tickover::plugin::SMALL_FILE_MAX_BYTES)?;
+            Some((
+                id.clone(),
+                registry::sha256_hex(text.as_bytes()),
+                version.clone(),
+            ))
+        })
+        .collect()
+}
+
 /// Apply a "Check updates" background result to the UI. The two error
 /// statuses render a fixed sentence (`registry-error`); a successful fetch
-/// re-reads every installed manifest's on-disk sha256 ([`fold_registry_diff`]
-/// requires the byte-exact hash, never a re-serialization — see
-/// `registry::diff_installed`'s own doc comment), diffs against the index,
-/// then rebuilds the plugin manager's update badges and the "available from
-/// registry" list. A network/parse failure deliberately leaves a
-/// previously-cached [`RegistryIndex`] in `registry_index_cache` alone,
-/// rather than throwing away an otherwise-still-valid install/update target
-/// over a transient blip.
+/// diffs the installed-manifest hashes [`hash_installed_manifests`] already
+/// computed, off this thread, against the index, then rebuilds the plugin
+/// manager's update badges and the "available from registry" list. A
+/// network/parse failure deliberately leaves whatever [`RegistryIndex`] is
+/// already sitting in `registry_index_cache` alone, rather than throwing
+/// away an otherwise-still-valid install/update target over a transient
+/// blip.
 fn apply_registry_check(
     app: &AppWindow,
     msg: RegistryCheckMsg,
@@ -6240,28 +6536,7 @@ fn apply_registry_check(
                 "Registry index rejected — see the diagnostic log for the reason",
             ));
         }
-        RegistryCheckMsg::Success(index) => {
-            let dir = seed::plugins_dir();
-            let installed: Vec<(String, String, String)> = plugins
-                .borrow()
-                .iter()
-                .filter_map(|m| {
-                    let path = find_plugin_manifest_path(&dir, &m.id)?;
-                    // Bounded and FIFO-safe, the same as every other manifest
-                    // read: this path came out of the plugins folder, exactly
-                    // as reachable by another program as any third-party
-                    // manifest is.
-                    let text = tickover::plugin::read_regular_file(
-                        &path,
-                        tickover::plugin::SMALL_FILE_MAX_BYTES,
-                    )?;
-                    Some((
-                        m.id.clone(),
-                        registry::sha256_hex(text.as_bytes()),
-                        m.version.clone(),
-                    ))
-                })
-                .collect();
+        RegistryCheckMsg::Success(index, installed) => {
             let lockfile = registry::load_lockfile(&registry::lockfile_path());
             let diff = fold_registry_diff(&index, &installed, &lockfile);
 
@@ -9475,10 +9750,10 @@ mod title_tests {
         // the row label already names what is counted. This case is easy to
         // misread as incomparable — two bare numbers with no unit look like
         // they have nothing to compare — so it is settled here directly:
-        // `unit_tag` gives a unitless number the tag `number:`, which equals
-        // itself, so the pair holds. The same reading is what has always
-        // paired Grok's unitless used/cap row, asserted just below so the two
-        // cannot drift apart.
+        // `same_unit` matches two `Number`s by their `unit` field, and `None`
+        // pairs with `None`, so the pair holds. The same reading is what has
+        // always paired Grok's unitless used/cap row, asserted just below so
+        // the two cannot drift apart.
         let bare = |v: f64| tickover::model::BalanceAmount::Number {
             value: v,
             unit: None,
@@ -10304,6 +10579,44 @@ mod title_tests {
             out.iter().map(|w| w.seen.at).collect::<Vec<_>>(),
             vec![NOW + 7200],
             "and the same however they are ordered"
+        );
+    }
+
+    /// `record_seen_windows` is the only writer of the registry on the
+    /// one-second tick, and the ping loop right after it reads the same
+    /// window back through the map this returns rather than asking
+    /// `config.json` again — so the map has to hold exactly what actually
+    /// landed on disk, not merely what this call *decided* to write.
+    #[test]
+    fn record_seen_windows_returns_exactly_what_it_wrote_to_disk() {
+        let id = format!("rs-seen-{}", std::process::id());
+        let plugins = vec![stub_manifest(&id, 10)];
+        let readings = vec![stub_reading(&id)];
+
+        let written = record_seen_windows(&plugins, &readings, NOW);
+
+        let expected = config::SeenWindow {
+            at: NOW + 100,
+            period_minutes: Some(300),
+        };
+        assert_eq!(
+            written.get(&(id.clone(), id.clone(), Role::Primary)),
+            Some(&expected),
+            "the map carries the window this call just recorded"
+        );
+        assert_eq!(
+            config::plugin_seen_window_for(&id, &id, "primary"),
+            Some(expected),
+            "and it matches what actually landed on disk"
+        );
+
+        // A second call with the same reading writes nothing new — the
+        // window has not moved — and the map it returns reflects that: empty,
+        // not last tick's entry repeated.
+        let written_again = record_seen_windows(&plugins, &readings, NOW);
+        assert!(
+            written_again.is_empty(),
+            "an unchanged window is not written, so it is not in the map either"
         );
     }
 
@@ -11531,6 +11844,29 @@ mod title_tests {
         assert!(!plugin_ping_armed(false, false), "neither: never pings");
     }
 
+    /// The one predicate behind both the tick's hidden-window gate and every
+    /// `present_popover` call site's forced refresh: on screen, about to be
+    /// shown, both, or neither.
+    #[test]
+    fn should_refresh_panel_is_true_when_visible_or_forced_or_both() {
+        assert!(
+            should_refresh_panel(true, false),
+            "on screen: the tick's ordinary gate refreshes it"
+        );
+        assert!(
+            should_refresh_panel(false, true),
+            "about to be shown: every present path forces a refresh regardless of visibility"
+        );
+        assert!(
+            should_refresh_panel(true, true),
+            "on screen and about to be shown again: still a refresh"
+        );
+        assert!(
+            !should_refresh_panel(false, false),
+            "hidden and nothing forcing it: the one case a refresh is skipped"
+        );
+    }
+
     /// [`renewal_ping_due`]'s floor and its clamp of a `pinged_at` from the
     /// future — the same two cases `ping_due`'s own tests pin for the
     /// window ping — with the defensive no-value case (`renewal = None`)
@@ -12006,6 +12342,29 @@ mod title_tests {
         );
     }
 
+    /// The count in the one-line summary `load_plugins_from` logs comes from
+    /// what it actually parsed — not a directory listing taken before it ever
+    /// tried, which would count a manifest this same call is about to reject.
+    #[test]
+    fn load_plugins_from_logs_the_count_it_actually_parsed_not_a_raw_directory_listing() {
+        let dir = temp_plugins_dir("logs-parsed-count");
+        std::fs::write(dir.join("a.toml"), stub_manifest_toml("aaa", 10)).expect("write fixture");
+        std::fs::write(dir.join("b.toml"), stub_manifest_toml("bbb", 20)).expect("write fixture");
+        std::fs::write(dir.join("broken.toml"), "not valid toml at all").expect("write fixture");
+        let _ = diag::take_recorded(); // drain anything left on this thread
+
+        let found = load_plugins_from(&dir);
+        let lines = diag::take_recorded();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(found.len(), 2, "the broken manifest is skipped, not loaded");
+        assert!(
+            lines.iter().any(|l| l.contains("loaded 2 plugin manifest")
+                && l.contains(&dir.display().to_string())),
+            "expected a summary naming the parsed count (2, not 3) and the directory: {lines:?}"
+        );
+    }
+
     // ── plugin manager actions: native-dialog output parsing ───────────────
 
     #[test]
@@ -12205,6 +12564,38 @@ mod title_tests {
     // (the module's two network calls) are never invoked; fixtures are built
     // directly or via `RegistryIndex::from_str`/`PluginManifest::from_str` on
     // in-memory text.
+
+    /// `hash_installed_manifests` is the file-read-and-sha256 half of "Check
+    /// updates" moved onto the worker thread — this exercises exactly that
+    /// half, with no network and no UI thread involved, matching a manifest
+    /// by id (not by filename, same rule as `find_plugin_manifest_path`) and
+    /// carrying the caller's `version` straight through unexamined.
+    #[test]
+    fn hash_installed_manifests_reads_and_hashes_by_id_and_keeps_the_given_version() {
+        let dir = temp_plugins_dir("hash-installed");
+        let bytes = stub_manifest_toml("real-id", 5);
+        std::fs::write(dir.join("whatever-filename.toml"), &bytes).expect("write fixture");
+
+        let out = hash_installed_manifests(
+            &dir,
+            &[
+                ("real-id".to_string(), "3.2.1".to_string()),
+                ("not-installed".to_string(), "9.9.9".to_string()),
+            ],
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            out,
+            vec![(
+                "real-id".to_string(),
+                registry::sha256_hex(bytes.as_bytes()),
+                "3.2.1".to_string(),
+            )],
+            "the id with a manifest on disk is hashed and keeps its given version; \
+             the one with none contributes nothing, not an entry with an empty hash"
+        );
+    }
 
     #[test]
     fn plugin_row_defaults_registry_fields_when_no_check_has_run() {
@@ -13013,6 +13404,101 @@ mod title_tests {
             "an id with no record must not even rewrite the file"
         );
         assert!(reloaded.get("stays").is_some());
+    }
+
+    /// The first call within the TTL reuses the earlier answer without
+    /// calling `poll` again; once `now` has moved past the TTL, the next
+    /// call polls once more and remembers the new answer in its place.
+    #[test]
+    fn ttl_cached_reuses_the_value_until_the_ttl_elapses_then_polls_again() {
+        let cache: Cell<Option<(Instant, u32)>> = Cell::new(None);
+        let calls = Cell::new(0u32);
+        let poll = || {
+            calls.set(calls.get() + 1);
+            calls.get()
+        };
+        let ttl = Duration::from_secs(5);
+        let t0 = Instant::now();
+
+        assert_eq!(
+            ttl_cached(&cache, ttl, t0, poll),
+            1,
+            "nothing cached yet — the first call polls"
+        );
+        assert_eq!(
+            ttl_cached(&cache, ttl, t0 + Duration::from_secs(4), poll),
+            1,
+            "still inside the ttl — the cached answer is reused, poll is not called again"
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "poll ran exactly once across both calls above"
+        );
+        assert_eq!(
+            ttl_cached(&cache, ttl, t0 + Duration::from_secs(5), poll),
+            2,
+            "the ttl has fully elapsed — this call polls again and moves the cache forward"
+        );
+    }
+
+    /// With no `TICKOVER_DEMO_ACCOUNT` set (the ordinary case, and the only
+    /// one safe to exercise here — the override is resolved once per process
+    /// into a `OnceLock`, so no test can flip it back and forth), the address
+    /// passed in comes back unchanged.
+    #[test]
+    fn display_account_passes_the_real_address_through_with_no_demo_override() {
+        assert_eq!(display_account("person@example.com"), "person@example.com");
+        assert_eq!(display_account(""), "", "an empty account stays empty");
+    }
+
+    /// [`tray_indicator_key`] changes exactly when something it is a proxy
+    /// for changed — the widget's own [`menubar::cache_key`], the
+    /// disabled/empty/rendered shape, or the tooltip's own minute-by-minute
+    /// text — and stays put otherwise, so `sync_tray_indicator_from`'s "same
+    /// key, no work" shortcut neither redraws on nothing nor misses a real
+    /// change.
+    #[test]
+    fn tray_indicator_key_changes_with_the_widget_or_the_tooltip_and_only_then() {
+        let row = |used_percent: f64| menubar::ProviderRow {
+            label: "Cx".to_string(),
+            five_hour: Some(menubar::WindowStat {
+                used_percent,
+                time_progress: None,
+            }),
+            weekly: None,
+        };
+        let widget = Some((vec![row(10.0)], true));
+
+        let base = tray_indicator_key(&widget, true, "5h 10% · wk 20%");
+        assert_eq!(
+            base,
+            tray_indicator_key(&widget, true, "5h 10% · wk 20%"),
+            "identical input, identical key"
+        );
+        assert_ne!(
+            base,
+            tray_indicator_key(&widget, true, "5h 10% · wk 21%"),
+            "the tooltip alone changing must move the key"
+        );
+
+        let changed_widget = Some((vec![row(11.0)], true));
+        assert_ne!(
+            base,
+            tray_indicator_key(&changed_widget, true, "5h 10% · wk 20%"),
+            "a widget row's own cache_key changing must move the key"
+        );
+
+        assert_ne!(
+            base,
+            tray_indicator_key(&None, true, "5h 10% · wk 20%"),
+            "rendered vs. empty-but-enabled must not share a key with the same tooltip"
+        );
+        assert_ne!(
+            tray_indicator_key(&None, true, "5h 10% · wk 20%"),
+            tray_indicator_key(&None, false, "5h 10% · wk 20%"),
+            "empty-but-enabled vs. disabled must not share a key either"
+        );
     }
 }
 

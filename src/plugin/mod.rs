@@ -467,11 +467,19 @@ pub const KEY_ENTRY_SEPARATOR: char = ':';
 /// (`plugin.<id>.seen.<reading>.<key>`), and one inside it would split the path
 /// and grow a neighbouring table in the user's `config.json`.
 pub fn encode_key_part(part: &str) -> String {
+    use std::fmt::Write;
     let mut out = String::with_capacity(part.len());
     for byte in part.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' => out.push(byte as char),
-            other => out.push_str(&format!("%{other:02X}")),
+            // `write!` into the same buffer rather than `format!` + `push_str`
+            // — this runs on every escaped byte, on the one-second tick
+            // (`refresh_model` → `window_rows` → `window_key`), and the
+            // `format!` allocated a throwaway `String` per byte only to copy
+            // it right back out.
+            other => {
+                let _ = write!(out, "%{other:02X}");
+            }
         }
     }
     out

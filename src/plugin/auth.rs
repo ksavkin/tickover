@@ -1486,20 +1486,39 @@ static CLIENT_DISCOVERY_FOUND: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 fn client_discovery_found_lookup(config_key: u64, path: &Path) -> Option<(String, String)> {
-    let guard = CLIENT_DISCOVERY_FOUND
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let entry = guard.as_ref()?.get(&(config_key, path.to_path_buf()))?;
+    // `len`/`mtime` are `Copy`, and the two strings are cloned here rather
+    // than borrowed past this block — the lock is released before the `stat`
+    // below runs, not held across it. Fetches for different plugins run on
+    // concurrent threads, each capable of reaching this same cache; holding
+    // a process-wide `Mutex` through a filesystem call would serialize every
+    // one of them on this plugin's `stat`, for the length of however long the
+    // OS takes to answer it.
+    let (len, mtime, id, secret) = {
+        let guard = CLIENT_DISCOVERY_FOUND
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = guard.as_ref()?.get(&(config_key, path.to_path_buf()))?;
+        (
+            entry.len,
+            entry.mtime,
+            entry.id.clone(),
+            entry.secret.clone(),
+        )
+    };
     // The file's current identity, not the cached one — a changed length or
     // modification time means whatever is at this path now is not what was
     // scanned, and the cached pair is treated as though nothing were cached
-    // at all (the caller rescans).
-    let meta = std::fs::metadata(path).ok()?;
-    let mtime = meta.modified().ok()?;
-    if meta.len() != entry.len || mtime != entry.mtime {
+    // at all (the caller rescans). The `stat` runs against `path` after the
+    // lock above is released, never against a second, independently-`stat`ed
+    // copy taken *before* the lock: that shape would compare two different
+    // moments in time against each other and call it a match — this compares
+    // the disk exactly once, against the values the cache actually held.
+    let disk_meta = std::fs::metadata(path).ok()?;
+    let disk_mtime = disk_meta.modified().ok()?;
+    if disk_meta.len() != len || disk_mtime != mtime {
         return None;
     }
-    Some((entry.id.clone(), entry.secret.clone()))
+    Some((id, secret))
 }
 
 /// `len`/`mtime` come from [`scan_candidate`]'s own handle-level `stat` —
@@ -1909,6 +1928,19 @@ fn discover_client_within(
     client: &AuthClientDiscovery,
     limits: ScanLimits,
 ) -> Option<(String, String)> {
+    let key = client_config_key(client);
+    // `cache_now`, not `now_unix`: this whole backoff is a purely
+    // in-process pacing decision (see `cache_now`'s own doc). Checked before
+    // either pattern below is compiled — a real `regex::bytes::Regex::new`,
+    // twice — since a hit here answers `None` regardless of whether either
+    // pattern would even compile, and compiling both first only to throw the
+    // work away is exactly the compile-for-nothing the backoff exists to
+    // save the scan itself from.
+    let now = cache_now();
+    if client_discovery_miss_lookup(key, now) {
+        return None;
+    }
+
     // `?`, not `unwrap_or_default()`: `manifest::validate` requires both
     // patterns present (and non-blank) on any `client` table, so `None` here
     // means this was reached some other way, e.g. a hand-built `AuthStep` in
@@ -1919,14 +1951,6 @@ fn discover_client_within(
     // carry the shape.
     let id_pattern = compile_scan_pattern(client.id_pattern.as_deref()?)?;
     let secret_pattern = compile_scan_pattern(client.secret_pattern.as_deref()?)?;
-
-    let key = client_config_key(client);
-    // `cache_now`, not `now_unix`: this whole backoff is a purely
-    // in-process pacing decision (see `cache_now`'s own doc).
-    let now = cache_now();
-    if client_discovery_miss_lookup(key, now) {
-        return None;
-    }
 
     let candidates: Vec<PathBuf> = client
         .files
@@ -1996,7 +2020,13 @@ fn discover_client_within(
     } else {
         CLIENT_DISCOVERY_RETRY_SECS
     };
-    client_discovery_miss_store(key, now.saturating_add(retry_secs));
+    // Stamped from a fresh read, not `now` from before the scan: a truncated
+    // pass has by definition just spent its whole `pass_budget` (up to 1 GiB)
+    // reading candidates, and on a slow disk that can take real time — long
+    // enough that `now.saturating_add(retry_secs)` lands in the past before
+    // this even stores it, so the very next fetch scans the same gigabyte
+    // again instead of backing off at all.
+    client_discovery_miss_store(key, cache_now().saturating_add(retry_secs));
     if had_truncation {
         queue_diag_once(truncated_key(key), client_truncated_diag());
     }
@@ -2810,18 +2840,112 @@ fn require_vec<'a>(
 #[cfg(any(target_os = "macos", test))]
 const KEYCHAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The current fetch pass, bumped by [`begin_fetch_pass`] and read by
+/// [`keychain_password`]'s memo below. Not gated to macOS — `main.rs` calls
+/// `begin_fetch_pass` from the one-second tick unconditionally, the same
+/// call on every platform, and the counter itself is a plain atomic with
+/// nothing OS-specific about it; only the memo that reads it is macOS-only,
+/// alongside the Keychain call it exists to save.
+static FETCH_PASS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Start a new fetch pass. [`keychain_password`]'s memo is scoped to this
+/// number rather than to the process: a surface asked again minutes later
+/// (its own next `refresh_secs`) still gets a live Keychain read — this is
+/// not a TTL, and deliberately not one, since a short TTL would not save
+/// anything at that cadence and a long one would hide a token CLI-side
+/// rotation just replaced, handing the surface a stale credential and the
+/// wrong 401 — but several surfaces sharing one tick's wave of spawned
+/// fetches (or one surface asked twice in quick succession, an impatient
+/// tray click while the previous fetch is still settling) share one read per
+/// distinct `service` instead of one each. Called once per one-second tick,
+/// before any fetch for it is spawned, never from inside a fetch itself —
+/// that would just be another process-lifetime static with extra steps.
+pub fn begin_fetch_pass() -> u64 {
+    FETCH_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// One `service`'s most recent [`keychain_password`] outcome, alongside the
+/// pass it was read under — see [`begin_fetch_pass`] for what a pass is.
+#[cfg(target_os = "macos")]
+type KeychainMemo = std::collections::HashMap<String, (u64, Result<Option<String>, String>)>;
+
+/// [`keychain_password`]'s memo, keyed by `service` — see [`begin_fetch_pass`]
+/// for the pass it is scoped to. Every `Mutex` this module keeps recovers
+/// from poison the same way (`.lock().unwrap_or_else(|e| e.into_inner())`,
+/// [`REFRESH_CACHE`]'s own convention): a panic in some other thread while
+/// holding one of these must not be what stops every later Keychain read in
+/// the process.
+#[cfg(target_os = "macos")]
+static KEYCHAIN_MEMO: std::sync::Mutex<Option<KeychainMemo>> = std::sync::Mutex::new(None);
+
+/// The read half of a pass-scoped memo: `Some(value)` only when `key` was
+/// last stored under exactly `pass`, `None` for a miss or a value stored
+/// under any other pass — pulled out of [`keychain_password`] pure, with no
+/// `Mutex` or Keychain call of its own, so the one property this memo exists
+/// for ("bound to a pass, not to the process") is directly testable without
+/// a real `security` invocation anywhere near the test. `cfg`-gated the same
+/// way as its only real caller, plus `test`: on a platform build with no
+/// Keychain to memoise, nothing else calls this, and the tests below call it
+/// directly regardless of platform.
+#[cfg(any(target_os = "macos", test))]
+fn pass_memo_get<T: Clone>(
+    memo: &Option<std::collections::HashMap<String, (u64, T)>>,
+    key: &str,
+    pass: u64,
+) -> Option<T> {
+    memo.as_ref()?
+        .get(key)
+        .filter(|(cached_pass, _)| *cached_pass == pass)
+        .map(|(_, value)| value.clone())
+}
+
 /// Read a Keychain "generic password" item. `Ok(None)` means the item
 /// doesn't exist (Absent); `Err` means it exists but couldn't be read
 /// (usually a denied access prompt) — or that `security` did not finish
 /// within [`KEYCHAIN_DEADLINE`] and was killed.
+///
+/// Memoised for the current [`begin_fetch_pass`] pass, by `service`: three
+/// surfaces (or one, asked more than once) sharing one pass collapse into
+/// one `security` spawn — two threads to drain its pipes and a `try_wait`
+/// loop against [`KEYCHAIN_DEADLINE`], every time this would otherwise run —
+/// without losing freshness, since a pass this stale is never served (see
+/// `begin_fetch_pass`'s own doc for why that is a pass boundary and not a
+/// TTL).
+///
+/// Check-then-act, not a single atomic lookup-or-insert: the miss check
+/// below and the store after `security` returns are two separate critical
+/// sections, so two fetch threads that both miss the memo for the same
+/// `service` in the same pass can both spawn `security` and both write the
+/// result. Deliberate — the alternative is holding the lock across the
+/// subprocess itself, which would make every other plugin's fetch (any
+/// service, not just this one) wait out this one's up-to-[`KEYCHAIN_DEADLINE`]
+/// call before it could even check its own memo. The shipped manifests as of
+/// this writing name three distinct services (Claude CLI's Keychain item,
+/// Claude Desktop's Safe Storage key, and Antigravity's), so today this memo
+/// has nothing to collapse *across* surfaces — it pays off on a surface
+/// asked more than once in one pass, and on any future manifest that reuses
+/// a `service` another one already names.
 #[cfg(target_os = "macos")]
 fn keychain_password(service: &str) -> Result<Option<String>, String> {
-    let out = run_command_with_deadline(
-        "security",
-        &["find-generic-password", "-s", service, "-w"],
-        KEYCHAIN_DEADLINE,
-    )?;
-    classify_keychain_output(out.success, &out.stdout, &out.stderr, service)
+    let pass = FETCH_PASS.load(std::sync::atomic::Ordering::Relaxed);
+    {
+        let memo = KEYCHAIN_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = pass_memo_get(&memo, service, pass) {
+            return hit;
+        }
+    }
+    let result = (|| {
+        let out = run_command_with_deadline(
+            "security",
+            &["find-generic-password", "-s", service, "-w"],
+            KEYCHAIN_DEADLINE,
+        )?;
+        classify_keychain_output(out.success, &out.stdout, &out.stderr, service)
+    })();
+    let mut memo = KEYCHAIN_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    memo.get_or_insert_with(std::collections::HashMap::new)
+        .insert(service.to_string(), (pass, result.clone()));
+    result
 }
 
 /// What [`run_command_with_deadline`] collected: whatever a command wrote to
@@ -6156,6 +6280,54 @@ mod tests {
         assert!(
             b >= a,
             "cache_now must never run backwards within the process: {a} then {b}"
+        );
+    }
+
+    /// The one property [`keychain_password`]'s memo exists to have: a hit
+    /// under the exact pass it was stored at, a miss — never a stale reuse —
+    /// under any other. Exercised through [`pass_memo_get`] directly, with no
+    /// `Mutex` and no real Keychain call anywhere near it.
+    #[test]
+    fn pass_memo_get_serves_a_hit_only_under_the_pass_it_was_stored_at() {
+        let mut map: std::collections::HashMap<String, (u64, Result<Option<String>, String>)> =
+            std::collections::HashMap::new();
+        map.insert("svc".to_string(), (5, Ok(Some("tok".to_string()))));
+        let memo = Some(map);
+
+        assert_eq!(
+            pass_memo_get(&memo, "svc", 5),
+            Some(Ok(Some("tok".to_string()))),
+            "a lookup under the pass it was stored at is a hit"
+        );
+        assert_eq!(
+            pass_memo_get(&memo, "svc", 6),
+            None,
+            "a different pass — even one number over — is a miss, not a stale reuse"
+        );
+        assert_eq!(
+            pass_memo_get(&memo, "other-svc", 5),
+            None,
+            "a different key is a miss regardless of the pass"
+        );
+        assert_eq!(
+            pass_memo_get::<Result<Option<String>, String>>(&None, "svc", 5),
+            None,
+            "an empty memo (nothing stored yet this process) is a miss"
+        );
+    }
+
+    /// [`begin_fetch_pass`] is what keeps the memo from becoming a
+    /// process-lifetime static in practice: every call must move it forward,
+    /// on a shared, process-wide counter (concurrent test threads calling it
+    /// at the same time are exactly what `main.rs`'s tick and a fetch thread
+    /// unlucky enough to straddle two ticks would do for real).
+    #[test]
+    fn begin_fetch_pass_is_strictly_increasing() {
+        let a = begin_fetch_pass();
+        let b = begin_fetch_pass();
+        assert!(
+            b > a,
+            "every call starts a newer pass than the one before it: {a} then {b}"
         );
     }
 

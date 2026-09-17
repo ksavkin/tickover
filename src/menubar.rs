@@ -18,7 +18,7 @@
 //! font can be loaded `render` returns `None` and the caller falls back to a
 //! plain-text tray title.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use ab_glyph::{point, Font, FontVec, PxScale, ScaleFont};
 use image::RgbaImage;
@@ -299,7 +299,26 @@ fn draw_gauge(img: &mut RgbaImage, x: f32, y: f32, size: u32, ink: [u8; 4]) {
     else {
         return;
     };
-    let scaled = image::imageops::resize(src, size, size, image::imageops::FilterType::CatmullRom);
+    // The source PNG is cached in `GAUGE` above, but `imageops::resize` still
+    // allocated and resampled a fresh `RgbaImage` on every call — and `size`
+    // is one of a handful of values in practice (the pill's `icon` at
+    // whatever `scale` the caller asked for, or the tray badge's `px`), each
+    // asked for on every one-second tick that redraws. Remembering only the
+    // last `(size, image)` pair, not one entry per size ever seen, matches
+    // that: this app never interleaves two different sizes within one
+    // process, and a `Mutex` (not a plain cache) is what makes that safe to
+    // assume instead of assert — a test suite that did call this concurrently
+    // with two sizes would still get correct pixels, just no reuse between
+    // them, rather than a torn read.
+    static SCALED: Mutex<Option<(u32, RgbaImage)>> = Mutex::new(None);
+    let mut cached = SCALED.lock().unwrap_or_else(|e| e.into_inner());
+    if cached.as_ref().map(|(s, _)| *s) != Some(size) {
+        *cached = Some((
+            size,
+            image::imageops::resize(src, size, size, image::imageops::FilterType::CatmullRom),
+        ));
+    }
+    let scaled = &cached.as_ref().expect("populated just above").1;
     for (sx, sy, p) in scaled.enumerate_pixels() {
         let cov = p[3] as f32 / 255.0;
         blend(img, x as i32 + sx as i32, y as i32 + sy as i32, ink, cov);
@@ -316,9 +335,18 @@ fn draw_gauge(img: &mut RgbaImage, x: f32, y: f32, size: u32, ink: [u8; 4]) {
 /// own separator.
 fn used_num(w: &Option<WindowStat>) -> String {
     match w {
-        Some(s) => format!("{:.0}", used_fraction(s) * 100.0),
+        Some(s) => rounded_percent(used_fraction(s)).to_string(),
         None => "--".to_string(),
     }
+}
+
+/// The integer percentage this pill draws for a `0..1` fraction — the one
+/// rounding path this module has for it. [`used_num`] and [`cache_key`] both
+/// call this rather than rounding independently, so an exact tie (a `.5`)
+/// rounds the same way — `{:.0}` formatting's round-to-even — for both the
+/// digits on screen and the key that stands in for them.
+fn rounded_percent(fraction: f32) -> u32 {
+    format!("{:.0}", fraction * 100.0).parse().unwrap_or(0)
 }
 
 /// A window's used percentage as a 0..1 fraction, with anything the caller
@@ -341,26 +369,48 @@ fn time_fraction(stat: &WindowStat) -> Option<f32> {
         .map(|t| t.clamp(0.0, 1.0))
 }
 
-/// Cheap change-detection key: same key ⇒ the rendered image would be
-/// identical (percent rounded, playhead in 2 % steps, theme).
-pub fn cache_key(rows: &[ProviderRow], dark: bool) -> String {
-    use std::fmt::Write;
-    let mut k = format!("d{}", dark as u8);
-    for r in rows {
-        let _ = write!(k, ";{}", r.label);
+/// Cheap change-detection key: a different rendered image always changes the
+/// key; two different images sharing a key is possible only as a hash
+/// collision, roughly one chance in 2^64 (percent rounded, playhead in 2 %
+/// steps, and theme are the fields hashed).
+///
+/// A `u64` hash of the fields [`render`] actually reads, not a `String` —
+/// this runs once a second whether or not anything on
+/// screen actually moved, and every caller does is compare it against the
+/// value from the tick before. A fresh `DefaultHasher` is legitimate for
+/// that: process-local, never persisted, nothing here needs it stable across
+/// a restart or portable to another machine. Limited to the first two rows
+/// and their [`capped_label`], matching exactly what [`render`]/
+/// [`render_badge`] read — a change past that point, or past
+/// [`LABEL_MAX_CHARS`], would change this key for a picture that comes out
+/// byte-identical.
+pub fn cache_key(rows: &[ProviderRow], dark: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    dark.hash(&mut h);
+    for r in rows.iter().take(2) {
+        capped_label(&r.label).hash(&mut h);
         for w in [&r.five_hour, &r.weekly] {
-            match w {
-                Some(s) => {
-                    let tick = time_fraction(s)
-                        .map(|p| (p * 50.0).round() as i32)
-                        .unwrap_or(-1);
-                    let _ = write!(k, ",{:.0}:{}", used_fraction(s) * 100.0, tick);
-                }
-                None => k.push_str(",-"),
+            // A leading discriminant, not just the two fields below: without
+            // it, `None` and a `Some` that happens to round to the same
+            // `(used, tick)` pair as some other window would hash identically
+            // by coincidence — a bare digit sequence carries no signal for
+            // absence, so the boolean has to state it directly.
+            w.is_some().hash(&mut h);
+            if let Some(s) = w {
+                let tick = time_fraction(s)
+                    .map(|p| (p * 50.0).round() as i32)
+                    .unwrap_or(-1);
+                // The exact number `used_num` draws — see `rounded_percent`'s
+                // own doc for why a second, independently-rounded value here
+                // could move this key on an exact `.5` tie without the pill's
+                // text changing at all, or the other way round.
+                rounded_percent(used_fraction(s)).hash(&mut h);
+                tick.hash(&mut h);
             }
         }
     }
-    k
+    h.finish()
 }
 
 /// Poor-man's bold: draw twice with a small horizontal offset. Avoids
@@ -378,6 +428,16 @@ fn draw_text_bold(
     draw_text(img, f, px, x + px * 0.05, baseline, s, c);
 }
 
+/// One provider row, [`render`]'s once-per-frame work already done: the
+/// label capped, and both `used_num` strings formatted — everything below
+/// that measures a width or draws text reads these instead of redoing either.
+struct RenderRow<'a> {
+    row: &'a ProviderRow,
+    label: String,
+    five_hour_num: String,
+    weekly_num: String,
+}
+
 /// Render the widget: a single-line pill
 /// `⌾ Cx ▂▂ 91/68 · Cl ▂▂ 6/77` — per provider: label, two stacked mini
 /// bars (5-hour on top, weekly below; fill = used, tick = elapsed time) and
@@ -391,11 +451,19 @@ pub fn render(rows: &[ProviderRow], dark: bool, scale: f32) -> Option<RgbaImage>
     // provider's own `label` reaches this module from its manifest's
     // `menu_label` (or the plan-derived tag), unbounded on this side of that
     // boundary; without this, an absurd label sizes the allocation a few
-    // lines down (`RgbaImage::new`) off a width nothing validated.
-    let rows: Vec<(&ProviderRow, String)> = rows
+    // lines down (`RgbaImage::new`) off a width nothing validated. The two
+    // `used_num` strings are formatted here for the same reason: measuring
+    // (`val_pair_w`, below) and drawing both need them, and without holding
+    // them here each row would format the same four strings twice.
+    let rows: Vec<RenderRow> = rows
         .iter()
         .take(2)
-        .map(|r| (r, capped_label(&r.label)))
+        .map(|r| RenderRow {
+            row: r,
+            label: capped_label(&r.label),
+            five_hour_num: used_num(&r.five_hour),
+            weekly_num: used_num(&r.weekly),
+        })
         .collect();
     if rows.is_empty() {
         return None;
@@ -425,23 +493,20 @@ pub fn render(rows: &[ProviderRow], dark: bool, scale: f32) -> Option<RgbaImage>
     let sep_w = text_width(f, label_px, "·");
     let slash_w = text_width(f, val_px, "/");
 
-    let val_pair_w = |r: &ProviderRow| -> f32 {
-        text_width(f, val_px, &used_num(&r.five_hour))
-            + slash_w
-            + text_width(f, val_px, &used_num(&r.weekly))
-            + val_px * 0.1
+    let val_pair_w = |five: &str, weekly: &str| -> f32 {
+        text_width(f, val_px, five) + slash_w + text_width(f, val_px, weekly) + val_px * 0.1
     };
-    let group_w = |r: &ProviderRow, label: &str| -> f32 {
-        let label_w = text_width(f, label_px, label) + label_px * 0.05;
-        label_w + gap + bar_w + gap + val_pair_w(r)
+    let group_w = |rt: &RenderRow| -> f32 {
+        let label_w = text_width(f, label_px, &rt.label) + label_px * 0.05;
+        label_w + gap + bar_w + gap + val_pair_w(&rt.five_hour_num, &rt.weekly_num)
     };
 
     let mut w = pad + icon + 4.0 * s;
-    for (i, (r, label)) in rows.iter().enumerate() {
+    for (i, rt) in rows.iter().enumerate() {
         if i > 0 {
             w += 4.0 * s + sep_w + 4.0 * s;
         }
-        w += group_w(r, label);
+        w += group_w(rt);
     }
     w += pad;
 
@@ -492,34 +557,37 @@ pub fn render(rows: &[ProviderRow], dark: bool, scale: f32) -> Option<RgbaImage>
         }
     };
 
-    for (i, (row, label)) in rows.iter().enumerate() {
+    for (i, rt) in rows.iter().enumerate() {
         if i > 0 {
             x += 4.0 * s;
             draw_text(&mut img, f, label_px, x, baseline, "·", p.faint);
             x += sep_w + 4.0 * s;
         }
 
-        draw_text_bold(&mut img, f, label_px, x, baseline, label, p.ink);
-        x += text_width(f, label_px, label) + label_px * 0.05 + gap;
+        draw_text_bold(&mut img, f, label_px, x, baseline, &rt.label, p.ink);
+        x += text_width(f, label_px, &rt.label) + label_px * 0.05 + gap;
 
         // Stacked bars: 5-hour above, weekly below.
-        draw_bar(&mut img, x, cy - (bar_h + bar_gap) / 2.0, &row.five_hour);
-        draw_bar(&mut img, x, cy + (bar_h + bar_gap) / 2.0, &row.weekly);
+        draw_bar(&mut img, x, cy - (bar_h + bar_gap) / 2.0, &rt.row.five_hour);
+        draw_bar(&mut img, x, cy + (bar_h + bar_gap) / 2.0, &rt.row.weekly);
         x += bar_w + gap;
 
         // Left-% pair "91/68", each half in its own severity colour.
-        for (idx, stat) in [&row.five_hour, &row.weekly].into_iter().enumerate() {
+        let pair = [
+            (&rt.row.five_hour, &rt.five_hour_num),
+            (&rt.row.weekly, &rt.weekly_num),
+        ];
+        for (idx, (stat, text)) in pair.into_iter().enumerate() {
             if idx > 0 {
                 draw_text(&mut img, f, val_px, x, baseline, "/", p.faint);
                 x += slash_w;
             }
-            let text = used_num(stat);
             let color = match stat {
                 Some(st) => p.sev(used_fraction(st) as f64 * 100.0),
                 None => p.faint,
             };
-            draw_text_bold(&mut img, f, val_px, x, baseline, &text, color);
-            x += text_width(f, val_px, &text) + val_px * 0.05;
+            draw_text_bold(&mut img, f, val_px, x, baseline, text, color);
+            x += text_width(f, val_px, text) + val_px * 0.05;
         }
     }
 
@@ -738,6 +806,72 @@ mod tests {
         let mut nudged = rows();
         nudged[0].five_hour.as_mut().unwrap().time_progress = Some(0.556);
         assert_eq!(base, cache_key(&nudged, true));
+    }
+
+    /// `render`/`render_badge` only ever look at the first two rows, and cut
+    /// each label to [`LABEL_MAX_CHARS`] before drawing it — a third
+    /// provider's reading, or a change past that cap, produces the exact
+    /// same picture, so the key must not treat it as a change either.
+    #[test]
+    fn cache_key_ignores_what_render_never_looks_at() {
+        let base = cache_key(&rows(), true);
+
+        let mut with_a_third = rows();
+        with_a_third.push(ProviderRow {
+            label: "Ov".into(),
+            five_hour: Some(WindowStat {
+                used_percent: 50.0,
+                time_progress: Some(0.5),
+            }),
+            weekly: None,
+        });
+        assert_eq!(
+            base,
+            cache_key(&with_a_third, true),
+            "a third row changes nothing render ever draws"
+        );
+
+        // Same first `LABEL_MAX_CHARS`, different tails past it.
+        let prefix = "C".repeat(LABEL_MAX_CHARS);
+        let mut long_label = rows();
+        long_label[0].label = prefix.clone() + "-one";
+        let mut differently_long_label = rows();
+        differently_long_label[0].label = prefix + "-a-rather-longer-tail";
+        assert_eq!(
+            cache_key(&long_label, true),
+            cache_key(&differently_long_label, true),
+            "labels differing only past LABEL_MAX_CHARS render byte-identically"
+        );
+    }
+
+    /// 12.5 is an exact rounding tie: `{:.0}` formatting (what `used_num`
+    /// draws) rounds it to "12" — ties to even — while a plain `f32::round`
+    /// (ties away from zero) would call it 13, the same digits an
+    /// unambiguous `13.0%` draws. `cache_key` must side with the text it
+    /// stands in for, or two rows drawing different numbers could share one
+    /// key.
+    #[test]
+    fn cache_key_and_the_drawn_number_agree_on_an_exact_rounding_tie() {
+        let with_five_hour = |used_percent: f64| {
+            vec![ProviderRow {
+                label: "Cx".into(),
+                five_hour: Some(WindowStat {
+                    used_percent,
+                    time_progress: None,
+                }),
+                weekly: None,
+            }]
+        };
+        let tie = with_five_hour(12.5);
+        let unambiguous = with_five_hour(13.0);
+
+        assert_eq!(used_num(&tie[0].five_hour), "12");
+        assert_eq!(used_num(&unambiguous[0].five_hour), "13");
+        assert_ne!(
+            cache_key(&tie, true),
+            cache_key(&unambiguous, true),
+            "12.5% and 13.0% draw different digits and must not share a key"
+        );
     }
 
     #[test]

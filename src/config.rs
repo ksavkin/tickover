@@ -335,6 +335,14 @@ fn write_atomically(path: &std::path::Path, text: &str) {
     let Some(dir) = path.parent() else { return };
     let _ = std::fs::create_dir_all(dir);
     backup_if_corrupt(path);
+    // Dropped before the write is even attempted, not only once it lands: a
+    // failed write still leaves the file's stat in a state `with_config`
+    // hasn't seen (the temp file below may have been created and removed, or
+    // `backup_if_corrupt` may have just replaced `path`'s corrupt bytes with
+    // nothing this call wrote), so treating the cache as trustworthy on every
+    // failure branch costs more reasoning than one avoidable reparse the next
+    // time something reads it.
+    invalidate_config_cache();
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     // Created, not written into whatever is already there: the temp path is
     // predictable, and a symlink left on it by anything running as this user
@@ -358,11 +366,65 @@ fn write_atomically(path: &std::path::Path, text: &str) {
     }
 }
 
-fn load() -> Value {
-    let Some(p) = path() else {
-        return json!({});
-    };
-    let text = tickover::plugin::read_regular_file(&p, tickover::plugin::SMALL_FILE_MAX_BYTES);
+/// Drop this thread's cached config unconditionally — called from
+/// [`write_atomically`] before it creates the temp file or renames it over
+/// `path`, so every write it goes on to attempt, landed or not, is covered by
+/// the same call. See the comment at that call site for why "not only on
+/// success" is deliberate.
+fn invalidate_config_cache() {
+    CONFIG_CACHE.with(|c| *c.borrow_mut() = None);
+}
+
+struct CachedConfig {
+    path: PathBuf,
+    // `None` when `path` had no metadata the moment this was cached: the file
+    // does not exist yet, or `mtime` is unavailable on this filesystem. A
+    // later stat that again comes back with no metadata reads as the same
+    // absence, not a reason to reload.
+    stamp: Option<(std::time::SystemTime, u64)>,
+    value: Value,
+}
+
+thread_local! {
+    /// One thread's most recently parsed `config.json`, invalidated by
+    /// [`with_config`] itself (on a moved `mtime`/size) and by every
+    /// [`write_atomically`] call (unconditionally, win or lose — see the
+    /// comment there). Per-thread for the same reason `TEST_PATH_OVERRIDE`
+    /// and `TEST_SCRATCH_PATH` above are: production code only ever touches
+    /// config from the main thread, and keying by path as well means two
+    /// tests sharing a reused libtest thread can never serve one another's
+    /// cached value.
+    static CONFIG_CACHE: std::cell::RefCell<Option<CachedConfig>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`read_uncached`] has actually opened and parsed the
+    /// file on this thread, since the last [`take_read_count`]. The
+    /// `WRITE_COUNT` idiom above, for the read side: a "the cache serves the
+    /// second lookup without touching disk" test needs to see the parse
+    /// itself skipped, not infer it from timing.
+    static READ_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Take (and reset) the number [`READ_COUNT`] has reached on this thread.
+#[cfg(test)]
+fn take_read_count() -> u64 {
+    READ_COUNT.with(|c| c.replace(0))
+}
+
+fn stamp_of(p: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let m = std::fs::metadata(p).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+/// Parse `config.json` off disk — no memoisation. Called only from
+/// [`with_config`], once it has already decided the cached value is stale;
+/// this is where the `open` + read + `serde_json::from_str` actually happens.
+fn read_uncached(p: &Path) -> Value {
+    #[cfg(test)]
+    READ_COUNT.with(|c| c.set(c.get() + 1));
+    let text = tickover::plugin::read_regular_file(p, tickover::plugin::SMALL_FILE_MAX_BYTES);
     // `read_regular_file` also returns `None` for a plain missing file — the
     // ordinary first-run case, silent by design — so this only fires when
     // something is actually sitting at `p` and got refused for its kind
@@ -394,6 +456,47 @@ fn load() -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
+/// Borrow the parsed config, reading it off disk only when [`stamp_of`] shows
+/// `mtime`/size have moved since the last borrow on this thread — a hand
+/// edit to `config.json` is still picked up, at the cost of one `stat` per
+/// call in place of the `open` + read + parse the uncached form paid every
+/// time. The lookups this app makes on the one-second tick (`get_bool_opt`,
+/// `get_u64`, `plugin_seen_window_for`, …) go through here rather than
+/// [`load`], so a read never pays for an owned copy it only reads one field
+/// out of.
+fn with_config<T>(f: impl FnOnce(&Value) -> T) -> T {
+    let Some(p) = path() else {
+        return f(&json!({}));
+    };
+    let stamp = stamp_of(&p);
+    CONFIG_CACHE.with(|cell| {
+        let stale =
+            !matches!(&*cell.borrow(), Some(cached) if cached.path == p && cached.stamp == stamp);
+        if stale {
+            let value = read_uncached(&p);
+            *cell.borrow_mut() = Some(CachedConfig {
+                path: p,
+                stamp,
+                value,
+            });
+        }
+        let cached = cell.borrow();
+        f(&cached
+            .as_ref()
+            .expect("populated on the stale branch just above, or already held a match")
+            .value)
+    })
+}
+
+/// An owned copy of the whole persisted config — for the setters below, each
+/// of which builds a new [`Value`] from it, and for the handful of tests that
+/// assert on it whole. A clone of a config with a couple dozen scalar
+/// entries is the cheap kind, nothing like the file read [`with_config`]
+/// exists to skip.
+fn load() -> Value {
+    with_config(Value::clone)
+}
+
 fn get_bool(key: &str) -> bool {
     get_bool_opt(key).unwrap_or(false)
 }
@@ -402,7 +505,7 @@ fn get_bool(key: &str) -> bool {
 /// `false` — needed by [`plugin_enabled`], whose default is the manifest's own
 /// `enabled`, not a blanket `false`.
 fn get_bool_opt(key: &str) -> Option<bool> {
-    load().get(key).and_then(Value::as_bool)
+    with_config(|cfg| cfg.get(key).and_then(Value::as_bool))
 }
 
 fn set_bool(key: &str, v: bool) {
@@ -571,18 +674,22 @@ pub fn set_plugin_option(id: &str, key: &str, v: bool) {
 // window.
 
 fn get_u64(key: &str) -> u64 {
-    load().get(key).and_then(Value::as_u64).unwrap_or(0)
+    with_config(|cfg| cfg.get(key).and_then(Value::as_u64)).unwrap_or(0)
 }
 
 fn set_u64(key: &str, v: u64) {
-    if get_u64(key) == v {
+    // One `load()` for both the comparison and the mutation below, not one
+    // each — the value it returns is the owned copy this function goes on to
+    // insert into and write back regardless, so there is nothing a second
+    // call would see that this one hasn't already.
+    let mut cfg = load();
+    if cfg.get(key).and_then(Value::as_u64).unwrap_or(0) == v {
         return;
     }
     let Some(p) = path() else { return };
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let mut cfg = load();
     if let Some(obj) = cfg.as_object_mut() {
         obj.insert(key.to_string(), Value::from(v));
     }
@@ -618,7 +725,19 @@ fn seen_key(plugin_id: &str, reading_id: &str, role: &str, field: &str) -> Strin
 /// `plugin.<id>.` all the same, so [`remove_plugin_keys`] still takes the whole
 /// registry with the plugin.
 pub fn plugin_seen_window_for(plugin_id: &str, reading_id: &str, role: &str) -> Option<SeenWindow> {
-    let cfg = load();
+    with_config(|cfg| seen_window_from(cfg, plugin_id, reading_id, role))
+}
+
+/// The read [`plugin_seen_window_for`] and [`set_plugin_seen_window_for`]'s
+/// comparison guard both need, factored out so the setter can run it against
+/// its own already-loaded `cfg` instead of paying a second [`load`] for the
+/// same lookup the getter would make.
+fn seen_window_from(
+    cfg: &Value,
+    plugin_id: &str,
+    reading_id: &str,
+    role: &str,
+) -> Option<SeenWindow> {
     let at = cfg
         .get(seen_key(plugin_id, reading_id, role, "at"))
         .and_then(Value::as_u64)
@@ -650,14 +769,17 @@ pub fn set_plugin_seen_window_for(plugin_id: &str, reading_id: &str, role: &str,
         at: seen.at,
         period_minutes: seen.period_minutes.filter(|m| *m > 0),
     };
-    if plugin_seen_window_for(plugin_id, reading_id, role) == Some(seen) {
+    // One `load()` for both the comparison and the mutation below — `cfg` is
+    // the same owned copy either way, so a second call here would only ask
+    // the disk the identical question this one already has the answer to.
+    let mut cfg = load();
+    if seen_window_from(&cfg, plugin_id, reading_id, role) == Some(seen) {
         return;
     }
     let Some(p) = path() else { return };
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let mut cfg = load();
     if let Some(obj) = cfg.as_object_mut() {
         obj.insert(
             seen_key(plugin_id, reading_id, role, "at"),
@@ -707,10 +829,11 @@ pub fn set_plugin_pinged_at(id: &str, when: u64) {
 
 /// The built-in version this plugin's manifest was last migrated to, if any.
 pub fn builtin_migrated(id: &str) -> Option<String> {
-    load()
-        .get(format!("plugin.{id}.builtin_migrated"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+    with_config(|cfg| {
+        cfg.get(format!("plugin.{id}.builtin_migrated"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
 }
 
 /// Drop the `plugin.<id>.accounts` map an older build kept: a remembered
@@ -858,6 +981,77 @@ mod tests {
         let id = "tickover-scratch-probe";
         set_builtin_migrated(id, "9.9.9");
         assert_eq!(builtin_migrated(id).as_deref(), Some("9.9.9"));
+    }
+
+    /// Two reads with no write between them must parse the file only once —
+    /// `get_bool_opt`/`get_u64`/`plugin_seen_window_for` sit on the
+    /// one-second tick, and a reparse on every lookup is exactly the cost
+    /// [`with_config`]'s cache exists to remove.
+    #[test]
+    fn two_reads_with_no_write_between_them_reparse_the_file_once() {
+        with_test_config_path(|| {
+            set_plugin_enabled("acme", true);
+            take_read_count(); // drop whatever the write above already caused
+
+            assert!(plugin_enabled("acme", false));
+            assert!(plugin_enabled("acme", false));
+            assert!(!plugin_ping("acme"));
+
+            assert_eq!(
+                take_read_count(),
+                1,
+                "the file is parsed once; the next two lookups are served from the cache"
+            );
+        });
+    }
+
+    /// A `config.json` edited by something other than this module — a user's
+    /// text editor, another process — between two reads is picked up on the
+    /// very next one: the cache [`with_config`] keeps is invalidated by a
+    /// moved `mtime`/size, not only by this module's own writes.
+    #[test]
+    fn a_hand_edit_between_two_reads_is_picked_up() {
+        with_test_config_path(|| {
+            set_plugin_enabled("acme", true);
+            assert!(plugin_enabled("acme", false), "the write above is visible");
+
+            let p = path().expect("test config path resolves");
+            let before = r#"{"plugin.acme.enabled":false}"#;
+            std::fs::write(&p, before).expect("a hand edit outside this module");
+
+            assert!(
+                !plugin_enabled("acme", true),
+                "the hand edit is visible on the next read, not a value cached from before it"
+            );
+
+            // A same-length edit moves nothing `stamp_of` could tell apart
+            // through `len` alone — only `mtime` changes — so this is the
+            // half of the stamp a length-only comparison would miss. The
+            // mtime is set explicitly, ahead of `now`, rather than trusted to
+            // land on a different value than `before`'s on its own: a
+            // filesystem with second-resolution mtimes could otherwise stamp
+            // both writes identically within the same test.
+            let after = r#"{"plugin.acme.enabled":"aaa"}"#;
+            assert_eq!(
+                before.len(),
+                after.len(),
+                "this fixture only proves anything if the byte length does not move"
+            );
+            std::fs::write(&p, after).expect("a same-length hand edit");
+            let touched = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&p)
+                .expect("open for mtime")
+                .set_modified(touched)
+                .expect("advance mtime explicitly");
+
+            assert_eq!(
+                with_config(|v| v["plugin.acme.enabled"].clone()),
+                json!("aaa"),
+                "a same-length hand edit is still picked up once its mtime has moved"
+            );
+        });
     }
 
     /// One scratch file per thread, resolved once — not one per call to

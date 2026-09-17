@@ -75,23 +75,36 @@ pub fn fetch(
     match m.logfile.as_ref() {
         Some(lf) => {
             let root = resolve_root(lf, options);
-            // The primary row: the current login's account, `id = <plugin id>`.
-            // Its `account_match` filter keeps a shared session tree from
-            // showing another account's usage under this login (see
-            // `resolve_account_match`).
             // One walk per fetch, shared by both readers below. These trees
             // are somebody else's and they are not small — 3975 files on the
             // author's machine — so walking them twice to answer one question
-            // is a cost with nothing to show for it.
+            // is a cost with nothing to show for it. Sorted once here too —
+            // `fetch_from_root` and `secondary_accounts` both trust the order
+            // they are handed rather than each re-sorting their own copy.
             let glob = crate::plugin::substitute_options(&lf.glob, options);
-            let files = cap_to_newest_files(collect_log_files(&root, &glob), &m.id);
-            let mut out = vec![fetch_from_root(m, lf, &root, &files)];
+            let mut files = collect_log_files(&root, &glob);
+            newest_first(&mut files);
+            let files = cap_to_newest_files(files, &m.id);
+            // The primary row: the current login's account, `id = <plugin id>`.
+            // Its `account_match` filter keeps a shared session tree from
+            // showing another account's usage under this login (see
+            // `resolve_account_match`) — resolved once here (a file read, a
+            // base64 decode, and a JSON parse) rather than separately by each
+            // of the two callers below.
+            let account_match = resolve_account_match(m, lf);
+            let mut out = vec![fetch_from_root(
+                m,
+                lf,
+                &root,
+                &files,
+                account_match.as_ref(),
+            )];
             // Additional rows, one per *other* account whose readings share the
             // same log tree (Codex Desktop signed into a different ChatGPT
             // account than the CLI). Empty unless `[logfile.account_match]` is
             // configured and the current login's identity is readable — so a
             // plain single-account plugin is completely unaffected.
-            out.extend(secondary_accounts(m, lf, &files));
+            out.extend(secondary_accounts(m, lf, &files, account_match.as_ref()));
             out
         }
         // Built and then failed, rather than assembled with `error` set by
@@ -159,12 +172,15 @@ fn resolve_root(lf: &LogFileConfig, options: &BTreeMap<String, bool>) -> PathBuf
 /// Takes no `options`: every `{option.<key>}` substitution this engine makes
 /// (`root`, `root_env_join`, `glob`) happens in [`fetch`] before `files` is
 /// ever walked, so by the time a caller reaches this function the option set
-/// has already done its only job.
+/// has already done its only job. `account_match` is likewise resolved by
+/// the caller, once, rather than asked for again here — see
+/// [`resolve_account_match`].
 fn fetch_from_root(
     m: &PluginManifest,
     lf: &LogFileConfig,
     root: &Path,
-    files: &[(PathBuf, SystemTime)],
+    files: &[LogFile],
+    account_match: Option<&(String, String)>,
 ) -> ProviderReading {
     let mut reading = ProviderReading {
         id: m.id.clone(),
@@ -183,8 +199,7 @@ fn fetch_from_root(
         bare_when_sole: false,
     };
 
-    let account_match = resolve_account_match(m, lf);
-    match latest_reading(files, &m.id, &lf.container_key, account_match.as_ref()) {
+    match latest_reading(files, &m.id, &lf.container_key, account_match) {
         Some(raw) => {
             reading.tag = resolve_tag(m, Some(&raw.container));
             match windows_from_raw(m, lf, &raw) {
@@ -256,17 +271,21 @@ struct PlanGroup {
 /// (`in_menu_bar = false`) — the menu-bar pill stays pinned to the current
 /// login — and carry no email (a rollout log holds no account identity beyond
 /// its plan tier, so the *other* account can only be labelled by plan).
+///
+/// `account_match` is resolved once by [`fetch`] and handed to both this and
+/// [`fetch_from_root`], rather than asked for again here.
 fn secondary_accounts(
     m: &PluginManifest,
     lf: &LogFileConfig,
-    files: &[(PathBuf, SystemTime)],
+    files: &[LogFile],
+    account_match: Option<&(String, String)>,
 ) -> Vec<ProviderReading> {
     // No account_match (or an unreadable current login) → no "other accounts"
     // to contrast against. The primary row already stands alone.
-    let Some((field, expected)) = resolve_account_match(m, lf) else {
+    let Some((field, expected)) = account_match else {
         return Vec::new();
     };
-    let groups = collect_plan_groups(files, &m.id, &lf.container_key, &field);
+    let groups = collect_plan_groups(files, &m.id, &lf.container_key, field);
 
     // Recency is measured against the freshest reading of *any* account, so a
     // quiet-but-current login still anchors "recent" for its busier siblings.
@@ -288,7 +307,7 @@ fn secondary_accounts(
     // clock/RNG (both unavailable to the engine).
     groups
         .iter()
-        .filter(|(value, _)| **value != expected) // the primary already covers this login
+        .filter(|(value, _)| value.as_str() != expected.as_str()) // the primary already covers this login
         .filter(|(_, g)| g.ts >= cutoff) // drop accounts whose window has since reset
         .map(|(value, g)| build_secondary_reading(m, lf, value, &g.raw))
         .collect()
@@ -354,17 +373,18 @@ fn build_secondary_reading(
 /// the reading with the newest `timestamp` that actually carries window data.
 /// Containers with no slots (Codex emits bare `rate_limits` lines) and those
 /// whose `field` is absent/non-string are skipped, so a plan-less or empty
-/// line can't spawn a phantom row. Files are walked newest-mtime-first and the
-/// walk stops once mtime falls a couple of weekly windows behind the newest —
-/// a cost bound only (selection is by the line's own `timestamp`), generous
-/// enough that the file-mtime anomaly can't hide a genuinely recent line.
+/// line can't spawn a phantom row. `files` is expected to already be sorted
+/// newest-first ([`newest_first`]) — the walk stops once mtime falls a couple
+/// of weekly windows behind the newest entry, `files[0]` — a cost bound only
+/// (selection is by the line's own `timestamp`), generous enough that the
+/// file-mtime anomaly can't hide a genuinely recent line.
 ///
 /// Bounded by its own [`FETCH_BYTE_BUDGET`], separate from
 /// [`latest_reading`]'s own — the two run one after the other in [`fetch`]
 /// and a shared budget would let whichever ran first spend all of it.
 /// `plugin_id` is for the one diagnostic this can produce.
 fn collect_plan_groups(
-    files: &[(PathBuf, SystemTime)],
+    files: &[LogFile],
     plugin_id: &str,
     container_key: &str,
     field: &str,
@@ -374,20 +394,16 @@ fn collect_plan_groups(
             .map(|d| d.as_secs())
             .unwrap_or(0)
     };
-    let mut files = files.to_vec();
-    // Newest first, path as the tiebreak for two files stamped the same
-    // instant — see `latest_reading`'s copy of the same reasoning.
-    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let newest_mtime = files.first().map(|(_, mt)| mtime_secs(*mt)).unwrap_or(0);
+    let newest_mtime = files.first().map(|(_, mt, _)| mtime_secs(*mt)).unwrap_or(0);
     let mtime_floor = newest_mtime.saturating_sub(SECONDARY_RECENCY_SECS.saturating_mul(2));
 
     let mut groups: BTreeMap<String, PlanGroup> = BTreeMap::new();
     let mut budget = FETCH_BYTE_BUDGET;
-    for (path, mtime) in &files {
+    for (path, mtime, len) in files {
         if mtime_secs(*mtime) < mtime_floor {
             break;
         }
-        let cost = file_read_cost(path);
+        let cost = tail_cost(*len);
         if cost > budget {
             queue_diag_once(plugin_id, "secondary-byte-budget", || {
                 format!(
@@ -398,7 +414,7 @@ fn collect_plan_groups(
             break;
         }
         budget -= cost;
-        for (value, ts, raw) in parse_file_groups(path, container_key, field) {
+        for (value, (ts, raw)) in parse_file_groups(path, container_key, field) {
             let newer = groups.get(&value).is_none_or(|g| ts > g.ts);
             if newer {
                 groups.insert(value, PlanGroup { ts, raw });
@@ -488,22 +504,27 @@ fn read_line_capped(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Re
     Ok(CappedLine::Read)
 }
 
-/// Every `(field value, timestamp, reading)` triple in one file that carries a
-/// window-bearing container, a string `field`, and a parseable top-level
-/// `timestamp`. Lines missing any of the three are skipped.
+/// One file's readings, folded down to at most one per `field` value as the
+/// scan goes rather than materialised line by line and folded afterwards: a
+/// value's kept entry is only replaced by a line with a strictly newer
+/// `timestamp`, so a tie keeps whichever line came first in file-read order,
+/// and a line that cannot beat what is already kept never pays for
+/// [`parse_container`]'s clone of the whole container at all. A line missing
+/// a window-bearing container, a string `field`, or a parseable top-level
+/// `timestamp` is skipped.
 fn parse_file_groups(
     path: &Path,
     container_key: &str,
     field: &str,
-) -> Vec<(String, u64, RawReading)> {
+) -> BTreeMap<String, (u64, RawReading)> {
+    let mut out: BTreeMap<String, (u64, RawReading)> = BTreeMap::new();
     let Ok(file) = File::open(path) else {
-        return Vec::new();
+        return out;
     };
     let Ok(mut reader) = tail_reader(file) else {
-        return Vec::new();
+        return out;
     };
     let needle = format!("\"{container_key}\"");
-    let mut out = Vec::new();
     let mut buf = Vec::new();
     loop {
         match read_line_capped(&mut reader, &mut buf) {
@@ -526,9 +547,6 @@ fn parse_file_groups(
         let Some(field_value) = json_path(container, field).and_then(Value::as_str) else {
             continue; // no plan tier → not attributable to an account
         };
-        let Some(raw) = parse_container(container) else {
-            continue; // a slot-less container carries no usage
-        };
         let Some(ts) = value
             .get("timestamp")
             .and_then(Value::as_str)
@@ -536,7 +554,16 @@ fn parse_file_groups(
         else {
             continue; // no timestamp → can't place it on the recency line
         };
-        out.push((field_value.to_string(), ts, raw));
+        if out
+            .get(field_value)
+            .is_some_and(|(kept_ts, _)| ts <= *kept_ts)
+        {
+            continue; // this file already kept a line for `field_value` at least as new
+        }
+        let Some(raw) = parse_container(container) else {
+            continue; // a slot-less container carries no usage
+        };
+        out.insert(field_value.to_string(), (ts, raw));
     }
     out
 }
@@ -711,10 +738,18 @@ fn resets_at_for(slot: &RawSlot, format: ResetsAtFormat) -> Option<u64> {
 
 // ── File discovery ───────────────────────────────────────────────────────
 
+/// One matched file: its path, mtime, and length — the length carried along
+/// from [`collect_log_files`]'s own walk rather than asked for again by
+/// [`tail_cost`].
+type LogFile = (PathBuf, SystemTime, u64);
+
 /// Find the freshest container reading under `root`: walk every file whose
 /// basename matches `glob`, newest-first by mtime, and return the last
 /// reading in the first file that has one — a file with zero matching
-/// readings (a session that just started) falls through to the next.
+/// readings (a session that just started) falls through to the next. `files`
+/// is expected to already be sorted newest-first ([`newest_first`]) — the
+/// caller sorts once for both this and [`collect_plan_groups`] rather than
+/// each doing its own pass over the same list.
 ///
 /// `account_match` (`Some((field, expected))`) additionally requires the
 /// container's `field` to equal `expected` — so a session tree that
@@ -729,21 +764,14 @@ fn resets_at_for(slot: &RawSlot, format: ResetsAtFormat) -> Option<u64> {
 /// simply not looked for this fetch. `plugin_id` is for the one diagnostic
 /// this can produce, nothing else — the search itself does not change.
 fn latest_reading(
-    files: &[(PathBuf, SystemTime)],
+    files: &[LogFile],
     plugin_id: &str,
     container_key: &str,
     account_match: Option<&(String, String)>,
 ) -> Option<RawReading> {
-    let mut files = files.to_vec();
-    // Newest first. Files without a readable mtime sort last (they carry
-    // `UNIX_EPOCH`, the earliest possible value). Two files stamped the same
-    // instant — not impossible on a filesystem some other tool writes to in
-    // a batch — break the tie on path rather than on walkdir's visit order,
-    // which is an accident of the filesystem, not a decision anyone made.
-    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let mut budget = FETCH_BYTE_BUDGET;
-    for (path, _mtime) in files {
-        let cost = file_read_cost(&path);
+    for (path, _mtime, len) in files {
+        let cost = tail_cost(*len);
         if cost > budget {
             queue_diag_once(plugin_id, "primary-byte-budget", || {
                 format!(
@@ -754,7 +782,7 @@ fn latest_reading(
             break;
         }
         budget -= cost;
-        if let Some(found) = parse_file(&path, container_key, account_match) {
+        if let Some(found) = parse_file(path, container_key, account_match) {
             return Some(found);
         }
     }
@@ -772,11 +800,15 @@ fn latest_reading(
 /// so this only ever bites a manifest that got its root wrong.
 const LOG_WALK_MAX_ENTRIES: usize = 200_000;
 
-/// All files under `root` whose basename matches `glob`, paired with their
-/// mtime (full resolution — truncating to whole seconds before the freshness
-/// sort is what let two files written a fraction of a second apart tie and
-/// fall back to whatever order the filesystem happened to hand them in).
-fn collect_log_files(root: &Path, glob: &str) -> Vec<(PathBuf, SystemTime)> {
+/// All files under `root` whose basename matches `glob` — including a
+/// symlink to one, so a provider's log directory laid out through a symlink
+/// (a relocated `$HOME`, a bind-mount stand-in) is not silently invisible to
+/// this engine — paired with their mtime (full resolution — truncating to
+/// whole seconds before the freshness sort is what let two files written a
+/// fraction of a second apart tie and fall back to whatever order the
+/// filesystem happened to hand them in) and their length, so [`tail_cost`]
+/// never has to ask the filesystem for it a second time.
+fn collect_log_files(root: &Path, glob: &str) -> Vec<LogFile> {
     let mut out = Vec::new();
     for entry in walkdir::WalkDir::new(root)
         .follow_links(false)
@@ -784,21 +816,48 @@ fn collect_log_files(root: &Path, glob: &str) -> Vec<(PathBuf, SystemTime)> {
         .filter_map(Result::ok)
         .take(LOG_WALK_MAX_ENTRIES)
     {
-        if !entry.file_type().is_file() {
+        let ty = entry.file_type();
+        if !ty.is_file() && !ty.is_symlink() {
             continue;
         }
         let name = entry.file_name().to_string_lossy();
         if !glob_matches(glob, &name) {
             continue;
         }
-        let mtime = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .unwrap_or(UNIX_EPOCH);
-        out.push((entry.into_path(), mtime));
+        // A followed `stat`, not `entry.metadata()`'s own: this walk never
+        // follows links (`follow_links(false)`, so a symlinked *directory*
+        // cannot recurse into a cycle), which makes `entry.metadata()` an
+        // `lstat` — a symlink's own mtime and length, not the file
+        // `tail_reader` will actually open and read. Following it here, once
+        // an entry has already passed the glob, both charges the length
+        // `tail_cost` needs correctly and turns away a symlink that resolves
+        // to a directory or to nothing (`metadata.is_file()` is false for
+        // both) — the two cases `entry.file_type()` alone could not tell
+        // apart from a symlink to a real log file.
+        let Ok(metadata) = std::fs::metadata(entry.path()) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let mtime = metadata.modified().unwrap_or(UNIX_EPOCH);
+        let len = metadata.len();
+        out.push((entry.into_path(), mtime, len));
     }
     out
+}
+
+/// Sort `files` newest-mtime-first, in place — the one comparator every
+/// caller that cares about freshness shares, rather than each sorting its own
+/// copy: [`fetch`] runs this once per fetch, and [`latest_reading`]/
+/// [`collect_plan_groups`] trust the order they are handed instead of
+/// re-deriving it. Files without a readable mtime sort last (they carry
+/// [`UNIX_EPOCH`], the earliest possible value). Two files stamped the same
+/// instant — not impossible on a filesystem some other tool writes to in a
+/// batch — break the tie on path rather than on `walkdir`'s visit order,
+/// which is an accident of the filesystem, not a decision anyone made.
+fn newest_first(files: &mut [LogFile]) {
+    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 }
 
 /// How many *matched* files ([`collect_log_files`]'s own output, not the
@@ -813,18 +872,15 @@ fn collect_log_files(root: &Path, glob: &str) -> Vec<(PathBuf, SystemTime)> {
 /// newest ones can ever answer.
 const LOG_WALK_MAX_FILES: usize = 200;
 
-/// Keep only the newest [`LOG_WALK_MAX_FILES`] of `files` by mtime (the same
-/// tie-break [`latest_reading`]/[`collect_plan_groups`] each already use —
-/// sorting here first only means their own sort has nothing left to do),
-/// logging once per plugin when anything is actually dropped.
-fn cap_to_newest_files(
-    mut files: Vec<(PathBuf, SystemTime)>,
-    plugin_id: &str,
-) -> Vec<(PathBuf, SystemTime)> {
+/// Keep only the newest [`LOG_WALK_MAX_FILES`] of `files`, logging once per
+/// plugin when anything is actually dropped. `files` is expected to already
+/// be sorted ([`newest_first`]) — this only truncates, so a caller that
+/// skipped that step silently keeps the wrong end of its own list rather than
+/// having this quietly re-sort for it.
+fn cap_to_newest_files(mut files: Vec<LogFile>, plugin_id: &str) -> Vec<LogFile> {
     if files.len() <= LOG_WALK_MAX_FILES {
         return files;
     }
-    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let matched = files.len();
     files.truncate(LOG_WALK_MAX_FILES);
     queue_diag_once(plugin_id, "matched-files", || {
@@ -844,15 +900,16 @@ fn cap_to_newest_files(
 /// lookup each paying it separately today regardless of this cap.
 const FETCH_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
 
-/// A file's cost against [`FETCH_BYTE_BUDGET`]: what [`tail_reader`] will
-/// actually read from it, capped at [`TAIL_BYTES`] — an upper bound, not an
-/// exact accounting (a file with few matching lines reads less than this),
-/// which is the right direction to round a *budget* rather than a report.
-fn file_read_cost(path: &Path) -> u64 {
-    std::fs::metadata(path)
-        .map(|m| m.len())
-        .unwrap_or(0)
-        .min(TAIL_BYTES)
+/// A file's charge against [`FETCH_BYTE_BUDGET`]: `len`, the length
+/// [`collect_log_files`] read off its own `stat` during the walk, capped at
+/// [`TAIL_BYTES`]. An estimate charged ahead of the read, not a bound on it —
+/// the file can grow or shrink between that walk and whichever read this
+/// pass gets to, and [`tail_reader`] answers to its own (freshly read) length
+/// and [`TAIL_BYTES`] regardless of what was charged here. Good enough for a
+/// *budget*: this only has to stay in the right neighbourhood across a
+/// fetch's worth of files, not account for each one exactly.
+fn tail_cost(len: u64) -> u64 {
+    len.min(TAIL_BYTES)
 }
 
 /// Diagnostics only the binary can write — `crate::diag` lives in `main.rs`'s
@@ -1271,6 +1328,21 @@ mod tests {
         path
     }
 
+    /// The same file-discovery + `account_match` resolution [`fetch`] does
+    /// once per fetch, so a `fetch_from_root`/`secondary_accounts` test below
+    /// exercises the exact preparation those two run behind, without
+    /// repeating it at every call site.
+    fn discover(
+        dir: &Path,
+        glob: &str,
+        m: &PluginManifest,
+        lf: &LogFileConfig,
+    ) -> (Vec<LogFile>, Option<(String, String)>) {
+        let mut files = collect_log_files(dir, glob);
+        newest_first(&mut files);
+        (files, resolve_account_match(m, lf))
+    }
+
     fn set_mtime(path: &Path, when: std::time::SystemTime) {
         let file = std::fs::OpenOptions::new()
             .write(true)
@@ -1458,14 +1530,20 @@ mod tests {
     #[test]
     fn cap_to_newest_files_keeps_the_newest_and_reports_the_drop_once() {
         let base = std::time::SystemTime::now();
-        let files: Vec<(PathBuf, SystemTime)> = (0..(LOG_WALK_MAX_FILES + 10))
+        // Already newest-first by construction (index 0 is `base` itself,
+        // increasing index moves further into the past) — `cap_to_newest_files`
+        // trusts that rather than sorting it again, matching what `fetch`
+        // itself hands it after its own `newest_first` call.
+        let mut files: Vec<LogFile> = (0..(LOG_WALK_MAX_FILES + 10))
             .map(|i| {
                 (
                     PathBuf::from(format!("rollout-{i}.jsonl")),
                     base - std::time::Duration::from_secs(i as u64),
+                    0,
                 )
             })
             .collect();
+        newest_first(&mut files);
         // Index 0 is the newest (smallest offset from `base`); the newest
         // `LOG_WALK_MAX_FILES` of them are indices 0..LOG_WALK_MAX_FILES.
         let capped = cap_to_newest_files(files, "cap-test-plugin");
@@ -1478,7 +1556,9 @@ mod tests {
                 .expect("test fixture names are always `rollout-{i}.jsonl`")
         };
         assert!(
-            capped.iter().all(|(p, _)| index_of(p) < LOG_WALK_MAX_FILES),
+            capped
+                .iter()
+                .all(|(p, ..)| index_of(p) < LOG_WALK_MAX_FILES),
             "only the newest files (the lowest indices) survive the cap"
         );
 
@@ -1491,7 +1571,7 @@ mod tests {
 
     #[test]
     fn cap_to_newest_files_is_a_no_op_under_the_cap() {
-        let files = vec![(PathBuf::from("a"), std::time::SystemTime::now())];
+        let files = vec![(PathBuf::from("a"), std::time::SystemTime::now(), 0u64)];
         let capped = cap_to_newest_files(files.clone(), "under-cap-plugin");
         assert_eq!(capped, files);
         assert!(take_pending_diagnostics().is_empty());
@@ -1525,7 +1605,8 @@ mod tests {
             base - std::time::Duration::from_secs(filler_count as u64 + 10),
         );
 
-        let files = collect_log_files(&dir, "rollout-*.jsonl");
+        let mut files = collect_log_files(&dir, "rollout-*.jsonl");
+        newest_first(&mut files);
         assert!(
             latest_reading(&files, "byte-budget-plugin", "rate_limits", None).is_none(),
             "the real reading sits past the byte budget and must never be opened"
@@ -1850,13 +1931,10 @@ mod tests {
         set_mtime(&has_data, base - std::time::Duration::from_secs(120));
         set_mtime(&has_no_data, base);
 
-        let raw = latest_reading(
-            &collect_log_files(&dir, "rollout-*.jsonl"),
-            "test-plugin",
-            "rate_limits",
-            None,
-        )
-        .expect("must fall back to the file that actually has a reading");
+        let mut files = collect_log_files(&dir, "rollout-*.jsonl");
+        newest_first(&mut files);
+        let raw = latest_reading(&files, "test-plugin", "rate_limits", None)
+            .expect("must fall back to the file that actually has a reading");
         assert_eq!(raw.primary.unwrap().used_percent, 11.0);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1881,18 +1959,58 @@ mod tests {
         set_mtime(&a, same_instant);
         set_mtime(&b, same_instant);
 
-        let raw = latest_reading(
-            &collect_log_files(&dir, "rollout-*.jsonl"),
-            "test-plugin",
-            "rate_limits",
-            None,
-        )
-        .expect("either file resolves a reading");
+        let mut files = collect_log_files(&dir, "rollout-*.jsonl");
+        newest_first(&mut files);
+        let raw = latest_reading(&files, "test-plugin", "rate_limits", None)
+            .expect("either file resolves a reading");
         assert_eq!(
             raw.primary.unwrap().used_percent,
             5.0,
             "an exact mtime tie must resolve deterministically by path, not by \
              whatever order the filesystem happened to hand the walk"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `entry.metadata()` under `follow_links(false)` is an `lstat` — the
+    /// symlink's own length, the byte length of the target path string it
+    /// stores, not the file this engine will actually open and tail-read.
+    /// `collect_log_files` must follow the link for its `stat`, matching
+    /// `tail_reader`'s own open, so a session tree reached through a symlink
+    /// is charged (and freshness-sorted, and byte-budgeted) by what is
+    /// actually inside it.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_log_is_charged_the_targets_length_not_the_links() {
+        let dir = temp_dir("symlink-length");
+        let real = write_file(
+            &dir,
+            "rollout-real.jsonl",
+            &[json!({ "rate_limits": { "primary": { "used_percent": 33.0 } } }).to_string()],
+        );
+        let real_len = std::fs::metadata(&real).unwrap().len();
+
+        let link = dir.join("rollout-link.jsonl");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink fixture");
+        // The link's own (lstat) length is the byte length of the target
+        // path string it stores, not the file it points at — different from
+        // `real_len` on any real fixture path, which is what makes this
+        // prove the followed stat is actually in use rather than
+        // coincidentally agreeing with it.
+        let link_lstat_len = std::fs::symlink_metadata(&link).unwrap().len();
+        assert_ne!(
+            link_lstat_len, real_len,
+            "the fixture only proves anything if the link's own length differs from the target's"
+        );
+
+        let files = collect_log_files(&dir, "rollout-*.jsonl");
+        let (_, _, charged_len) = files
+            .iter()
+            .find(|(p, ..)| p == &link)
+            .expect("the symlink is discovered, not silently skipped");
+        assert_eq!(
+            *charged_len, real_len,
+            "the symlink must be charged the target file's length, not the link's own"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2002,7 +2120,8 @@ mod tests {
             &auth_path.to_string_lossy(),
         );
         let lf = m.logfile.as_ref().unwrap();
-        let reading = fetch_from_root(&m, lf, &dir, &collect_log_files(&dir, &lf.glob));
+        let (files, account_match) = discover(&dir, &lf.glob, &m, lf);
+        let reading = fetch_from_root(&m, lf, &dir, &files, account_match.as_ref());
 
         assert_eq!(reading.id, "codex");
         assert_eq!(reading.name, "Codex");
@@ -2062,12 +2181,9 @@ mod tests {
         let mut opts = BTreeMap::new();
         opts.insert("enabled".to_string(), true);
 
-        let reading = fetch_from_root(
-            &m,
-            &lf,
-            &dir,
-            &collect_log_files(&dir, &crate::plugin::substitute_options(&lf.glob, &opts)),
-        );
+        let glob = crate::plugin::substitute_options(&lf.glob, &opts);
+        let (files, account_match) = discover(&dir, &glob, &m, &lf);
+        let reading = fetch_from_root(&m, &lf, &dir, &files, account_match.as_ref());
         assert!(
             reading.error.is_none(),
             "the substituted glob must match the fixture file"
@@ -2076,12 +2192,9 @@ mod tests {
 
         // With the option off, the same glob no longer matches the fixture.
         opts.insert("enabled".to_string(), false);
-        let reading = fetch_from_root(
-            &m,
-            &lf,
-            &dir,
-            &collect_log_files(&dir, &crate::plugin::substitute_options(&lf.glob, &opts)),
-        );
+        let glob = crate::plugin::substitute_options(&lf.glob, &opts);
+        let (files, account_match) = discover(&dir, &glob, &m, &lf);
+        let reading = fetch_from_root(&m, &lf, &dir, &files, account_match.as_ref());
         assert!(
             reading.error.is_some(),
             "a mismatched substituted glob must find nothing"
@@ -2124,7 +2237,8 @@ mod tests {
         let label = weekly.label.clone();
 
         let lf = m.logfile.as_ref().unwrap();
-        let reading = fetch_from_root(&m, lf, &dir, &collect_log_files(&dir, &lf.glob));
+        let (files, account_match) = discover(&dir, &lf.glob, &m, lf);
+        let reading = fetch_from_root(&m, lf, &dir, &files, account_match.as_ref());
 
         assert_eq!(
             reading.error.as_deref(),
@@ -2158,7 +2272,8 @@ mod tests {
             "/nonexistent",
         );
         let lf = m.logfile.as_ref().unwrap();
-        let reading = fetch_from_root(&m, lf, &dir, &collect_log_files(&dir, &lf.glob));
+        let (files, account_match) = discover(&dir, &lf.glob, &m, lf);
+        let reading = fetch_from_root(&m, lf, &dir, &files, account_match.as_ref());
 
         // This engine never reaches the window rule for such a line: a
         // container carrying no usable slot is discarded while parsing, so
@@ -2203,7 +2318,8 @@ mod tests {
             "/nonexistent",
         );
         let lf = m.logfile.as_ref().unwrap();
-        let reading = fetch_from_root(&m, lf, &dir, &collect_log_files(&dir, &lf.glob));
+        let (files, account_match) = discover(&dir, &lf.glob, &m, lf);
+        let reading = fetch_from_root(&m, lf, &dir, &files, account_match.as_ref());
 
         assert!(
             reading.error.is_none(),
@@ -2233,7 +2349,8 @@ mod tests {
             "/nonexistent",
         );
         let lf = m.logfile.as_ref().unwrap();
-        let reading = fetch_from_root(&m, lf, &dir, &collect_log_files(&dir, &lf.glob));
+        let (files, account_match) = discover(&dir, &lf.glob, &m, lf);
+        let reading = fetch_from_root(&m, lf, &dir, &files, account_match.as_ref());
 
         assert!(reading.error.is_some());
         assert!(reading.windows.is_empty());
@@ -2366,7 +2483,8 @@ mod tests {
 
         let m = codex_like_manifest_with_match("/nonexistent", &auth_path.to_string_lossy());
         let lf = m.logfile.as_ref().unwrap();
-        let reading = fetch_from_root(&m, lf, &dir, &collect_log_files(&dir, &lf.glob));
+        let (files, account_match) = discover(&dir, &lf.glob, &m, lf);
+        let reading = fetch_from_root(&m, lf, &dir, &files, account_match.as_ref());
 
         assert!(
             reading.error.is_none(),
@@ -2401,7 +2519,8 @@ mod tests {
 
         let m = codex_like_manifest_with_match("/nonexistent", &auth_path.to_string_lossy());
         let lf = m.logfile.as_ref().unwrap();
-        let reading = fetch_from_root(&m, lf, &dir, &collect_log_files(&dir, &lf.glob));
+        let (files, account_match) = discover(&dir, &lf.glob, &m, lf);
+        let reading = fetch_from_root(&m, lf, &dir, &files, account_match.as_ref());
 
         assert!(
             reading.error.is_some(),
@@ -2424,7 +2543,8 @@ mod tests {
 
         let m = codex_like_manifest_with_match("/nonexistent", "/nonexistent/auth.json");
         let lf = m.logfile.as_ref().unwrap();
-        let reading = fetch_from_root(&m, lf, &dir, &collect_log_files(&dir, &lf.glob));
+        let (files, account_match) = discover(&dir, &lf.glob, &m, lf);
+        let reading = fetch_from_root(&m, lf, &dir, &files, account_match.as_ref());
 
         assert!(
             reading.error.is_none(),
@@ -2492,12 +2612,9 @@ mod tests {
             ],
         );
 
-        let groups = collect_plan_groups(
-            &collect_log_files(&dir, "rollout-*.jsonl"),
-            "test-plugin",
-            "rate_limits",
-            "plan_type",
-        );
+        let mut files = collect_log_files(&dir, "rollout-*.jsonl");
+        newest_first(&mut files);
+        let groups = collect_plan_groups(&files, "test-plugin", "rate_limits", "plan_type");
         assert_eq!(
             groups.keys().collect::<Vec<_>>(),
             vec!["plus"],
@@ -2507,6 +2624,29 @@ mod tests {
             groups["plus"].raw.secondary.as_ref().unwrap().used_percent,
             100.0,
             "the newest slotted plus reading wins, not the slot-less newest line"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn two_records_tied_on_timestamp_keep_the_one_earlier_in_the_file() {
+        let dir = temp_dir("groups-tie");
+        write_file(
+            &dir,
+            "rollout-a.jsonl",
+            &[
+                ts_weekly_line("2026-07-20T00:00:00Z", "plus", 11.0), // earlier in the file
+                ts_weekly_line("2026-07-20T00:00:00Z", "plus", 42.0), // same instant, later line
+            ],
+        );
+
+        let mut files = collect_log_files(&dir, "rollout-*.jsonl");
+        newest_first(&mut files);
+        let groups = collect_plan_groups(&files, "tie-test-plugin", "rate_limits", "plan_type");
+        assert_eq!(
+            groups["plus"].raw.secondary.as_ref().unwrap().used_percent,
+            11.0,
+            "two records tied on timestamp: the one earlier in the file wins"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2534,7 +2674,8 @@ mod tests {
 
         let m = codex_like_manifest_with_match("/nonexistent", &auth_path.to_string_lossy());
         let lf = m.logfile.as_ref().unwrap();
-        let secondaries = secondary_accounts(&m, lf, &collect_log_files(&dir, &lf.glob));
+        let (files, account_match) = discover(&dir, &lf.glob, &m, lf);
+        let secondaries = secondary_accounts(&m, lf, &files, account_match.as_ref());
 
         assert_eq!(
             secondaries.len(),
@@ -2612,8 +2753,9 @@ mod tests {
         // account.path points nowhere → no "current login" to contrast against.
         let m = codex_like_manifest_with_match("/nonexistent", "/nonexistent/auth.json");
         let lf = m.logfile.as_ref().unwrap();
+        let (files, account_match) = discover(&dir, &lf.glob, &m, lf);
         assert!(
-            secondary_accounts(&m, lf, &collect_log_files(&dir, &lf.glob)).is_empty(),
+            secondary_accounts(&m, lf, &files, account_match.as_ref()).is_empty(),
             "without a known current account there is no notion of an 'other' account"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -2648,7 +2790,8 @@ mod tests {
 
         let m = codex_like_manifest_with_match("/nonexistent", &auth_path.to_string_lossy());
         let lf = m.logfile.as_ref().unwrap();
-        let secondaries = secondary_accounts(&m, lf, &collect_log_files(&dir, &lf.glob));
+        let (files, account_match) = discover(&dir, &lf.glob, &m, lf);
+        let secondaries = secondary_accounts(&m, lf, &files, account_match.as_ref());
 
         assert_eq!(
             secondaries.len(),
@@ -2998,7 +3141,8 @@ mod tests {
         // the "root does not exist" branch of the installed check.
         std::fs::remove_dir_all(&dir).ok();
 
-        let reading = fetch_from_root(&m, &lf, &dir, &collect_log_files(&dir, &lf.glob));
+        let (files, account_match) = discover(&dir, &lf.glob, &m, &lf);
+        let reading = fetch_from_root(&m, &lf, &dir, &files, account_match.as_ref());
         assert_eq!(
             reading.error.as_deref(),
             Some("Codex CLI not found.\nInstall: npm i -g @openai/codex")

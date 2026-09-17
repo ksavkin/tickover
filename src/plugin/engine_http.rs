@@ -186,8 +186,11 @@ fn fetch_surface(
     // never reach it — see `build_request`'s docs), so it costs nothing to
     // resolve ahead of everything below. Checking `allowed_hosts` here, before
     // `resolve_version`/`resolve_values` do any file I/O, means a blocked host
-    // is refused without either of those ever running.
-    let url = crate::plugin::substitute_options(&req.url, options);
+    // is refused without either of those ever running. Kept in `url` for the
+    // rest of this function, including `build_request` below, rather than
+    // substituted a second time out of the same `req`/`options` for no
+    // different an answer.
+    let url = resolve_request_url(req, options);
     if !auth::host_allowed(&surface.allowed_hosts, &url) {
         // Defence in depth: never let a surface's token reach a host the
         // manifest didn't explicitly allow — no request of any kind for this
@@ -237,7 +240,7 @@ fn fetch_surface(
         .as_ref()
         .map(resolve_version)
         .unwrap_or_default();
-    let (url, headers, timeout) = build_request(req, &token, &version, options, &values);
+    let (headers, timeout) = build_request(req, &token, &version, options, &values);
     // Same substitution set as a header value, kept out of `build_request`
     // itself so that function's existing signature (and the tests pinned to
     // it) stay exactly as they were — a request's body is one more
@@ -657,9 +660,9 @@ fn resolve_json_file_value(v: &HttpValueConfig) -> Option<String> {
 /// The `(substitute, then allow-list check)` half of [`resolve_account`],
 /// split out — pure, no network — so the substitute-before-check order is
 /// directly testable. `account.url` gets the same `{option.<key>}`
-/// substitution as `[[http.request]].url` ([`build_request`]); like that URL,
-/// `{token}`/`{version}` are deliberately never substituted here (they stay
-/// confined to headers). The `allowed_hosts` check runs on the *substituted*
+/// substitution as `[[http.request]].url` ([`resolve_request_url`]); like
+/// that URL, `{token}`/`{version}` are deliberately never substituted here
+/// (they stay confined to headers). The `allowed_hosts` check runs on the *substituted*
 /// URL — the same order `fetch_surface` already used for the main usage
 /// request — so a manifest can't use an option placeholder to smuggle a
 /// request past the allow-list.
@@ -678,22 +681,30 @@ fn resolve_account_url(
 
 // ── Request building (pure — no network) ─────────────────────────────────
 
-/// Build the `(url, headers, timeout)` for one `[[http.request]]` entry.
-/// Header values get the full `{token}`/`{version}`/`{option.<key>}`
-/// substitution ([`substitute`]); the URL only ever gets `{option.<key>}`
-/// ([`crate::plugin::substitute_options`]) — `{token}`/`{version}` are
+/// The URL for one `[[http.request]]` entry: `{option.<key>}` substitution
+/// only ([`crate::plugin::substitute_options`]) — `{token}`/`{version}` are
 /// deliberately never substituted into a URL, keeping the bearer token
 /// confined to headers (defence in depth alongside `allowed_hosts` /
-/// `redirects(0)` — see module docs).
+/// `redirects(0)` — see module docs). Split out from [`build_request`] so
+/// `fetch_surface`'s `allowed_hosts` gate and the request it goes on to build
+/// share this one substitution instead of each running it on the same
+/// `req.url`/`options`.
+fn resolve_request_url(req: &HttpRequestConfig, options: &BTreeMap<String, bool>) -> String {
+    crate::plugin::substitute_options(&req.url, options)
+}
+
+/// Build the `(headers, timeout)` for one `[[http.request]]` entry. No `url`
+/// parameter, deliberately — [`resolve_request_url`] is the one place that
+/// substitutes it, and by the time this runs the caller already called that
+/// for the `allowed_hosts` check, so there is nothing left here to hand it.
 fn build_request(
     req: &HttpRequestConfig,
     token: &str,
     version: &str,
     options: &BTreeMap<String, bool>,
     values: &BTreeMap<String, String>,
-) -> (String, Vec<(String, String)>, Duration) {
+) -> (Vec<(String, String)>, Duration) {
     (
-        crate::plugin::substitute_options(&req.url, options),
         substitute_headers(&req.headers, token, version, options, values),
         Duration::from_secs(req.timeout_secs),
     )
@@ -2370,13 +2381,11 @@ mod tests {
     }
 
     #[test]
-    fn build_request_substitutes_every_header_and_carries_url_timeout() {
+    fn build_request_substitutes_every_header_and_carries_the_timeout() {
         let m = claude_like_manifest();
         let req = &m.http.as_ref().unwrap().request[0];
-        let (url, headers, timeout) =
-            build_request(req, "tok-1", "9.9.9", &no_options(), &no_values());
+        let (headers, timeout) = build_request(req, "tok-1", "9.9.9", &no_options(), &no_values());
 
-        assert_eq!(url, "https://api.anthropic.com/api/oauth/usage");
         assert_eq!(timeout, Duration::from_secs(8));
         let get = |k: &str| {
             headers
@@ -2390,7 +2399,7 @@ mod tests {
     }
 
     #[test]
-    fn build_request_substitutes_option_placeholders_in_the_url() {
+    fn resolve_request_url_substitutes_option_placeholders_in_the_url() {
         let req = HttpRequestConfig {
             url: "https://example.com/usage?beta={option.include_beta}".to_string(),
             timeout_secs: 8,
@@ -2400,12 +2409,14 @@ mod tests {
         };
         let mut opts = BTreeMap::new();
         opts.insert("include_beta".to_string(), true);
-        let (url, _headers, _timeout) = build_request(&req, "tok-1", "9.9.9", &opts, &no_values());
-        assert_eq!(url, "https://example.com/usage?beta=true");
+        assert_eq!(
+            resolve_request_url(&req, &opts),
+            "https://example.com/usage?beta=true"
+        );
     }
 
     #[test]
-    fn build_request_never_substitutes_token_or_version_into_the_url() {
+    fn resolve_request_url_never_substitutes_token_or_version() {
         // Defence in depth: {token}/{version} must stay confined to headers,
         // never leak into the URL (see module docs / build_request docs).
         let req = HttpRequestConfig {
@@ -2415,9 +2426,10 @@ mod tests {
             body: None,
             headers: HashMap::new(),
         };
-        let (url, _headers, _timeout) =
-            build_request(&req, "tok-1", "9.9.9", &no_options(), &no_values());
-        assert_eq!(url, "https://example.com/usage?tok={token}&v={version}");
+        assert_eq!(
+            resolve_request_url(&req, &no_options()),
+            "https://example.com/usage?tok={token}&v={version}"
+        );
     }
 
     #[test]
