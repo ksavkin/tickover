@@ -28,7 +28,8 @@ export global Theme {
     out property <color> accent: #3ddc97;        // brand / live dot
 
     // ── Type ────────────────────────────────────────────────────────────
-    // The window uses a system UI face; changing metrics opt into monospace.
+    // `AppWindow`'s own `default-font-family` sets the window to its
+    // monospace face; `fs-body` here only ever sets a size on top of it.
     out property <length> fs-body: 13px;
 
     // Severity → accent color from a used-percent value.

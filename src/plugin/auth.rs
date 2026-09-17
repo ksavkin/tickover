@@ -43,7 +43,7 @@ pub const NO_CREDENTIALS: &str = "no credentials found";
 /// `plugin::engine_http` matches this literal to offer a renewal ping
 /// (`[ping] renews_token`) instead of the plain "no credentials" treatment —
 /// see its own docs for what a plugin without such a ping gets instead.
-pub const TOKEN_LAPSED: &str = "the only credential found had lapsed";
+pub(crate) const TOKEN_LAPSED: &str = "the only credential found had lapsed";
 
 /// Walk a surface's `[[surface.auth]]` chain and return the first token
 /// found, paired with whether the step that yielded it declares
@@ -580,11 +580,13 @@ const MIN_PLAUSIBLE_EXPIRY_UNIX: i64 = 946_684_800;
 /// How large a normalized `expiry_json_path` number has to be before
 /// [`expiry_seconds`] reads it as epoch milliseconds rather than seconds:
 /// `1e11`. `1e11` seconds is the year 5138 — no genuine expiry states
-/// that — and `1e11` milliseconds is 1973, comfortably inside the plausible
-/// range once divided down. No real seconds-scale timestamp this app will
-/// see before the year 5138 can be misread as milliseconds by this line, and
-/// no genuine millisecond-scale one (any expiry this century) reads as
-/// anything but.
+/// that — so no real seconds-scale timestamp this app will see before then
+/// can be misread as milliseconds by this line. The threshold itself,
+/// divided down, is `1e8` seconds — 1973, *below*
+/// [`MIN_PLAUSIBLE_EXPIRY_UNIX`], so a value landing exactly on it is refused
+/// as unreadable rather than accepted, which is fine: nothing genuinely
+/// expires there either. Any real millisecond-scale expiry (this century) is
+/// comfortably past `1e11` and reads as milliseconds without ambiguity.
 const MS_MAGNITUDE_THRESHOLD: i64 = 100_000_000_000;
 
 /// One `expiry_json_path` value read as Unix seconds: an RFC3339 string, or —
@@ -888,10 +890,11 @@ fn win_credential_step(
 /// this config no longer uses, rotated secret included: a client id an
 /// operator keeps while only replacing its secret must still be retried
 /// right away, not punished for the old secret's failure. `Fresh`
-/// deliberately does **not** carry either, even though an earlier version of
-/// this change did: a still-valid access token is served purely by expiry,
-/// exactly the fix this whole change makes (see [`REFRESH_CACHE`]'s own
-/// doc) — comparing it against a freshly-*resolved* pair on every `Fresh`
+/// deliberately does **not** carry either, even though an earlier design
+/// did: a still-valid access token is served purely by expiry — see
+/// [`REFRESH_CACHE`]'s own doc for why that is exactly what this cache
+/// exists to guarantee — comparing it against a freshly-*resolved* pair on
+/// every `Fresh`
 /// hit would mean resolving the client on every hit, reopening the very
 /// hole ("a transient discovery miss must not discard a still-valid cached
 /// access token") this closes. `Backoff` has no such risk: there is no
@@ -941,8 +944,9 @@ enum CacheLookup {
 /// cache one layer up too. Keyed by expiry, the same token comes back for its
 /// life (~an hour) and the fingerprint holds, so `throttle.rs` stays frozen.
 ///
-/// `client_id` is deliberately **not** part of the key (it used to be — see
-/// [`CacheEntry`]'s own doc for where it moved). A `client` table's
+/// `client_id` is deliberately **not** part of the key — the pair lives in
+/// [`CacheEntry`] instead, see its own doc for which variant carries it and
+/// why. A `client` table's
 /// discovery scan is exactly the cost this cache exists to avoid paying on
 /// every tick, and `oauth_refresh_step` reads this cache *before* resolving
 /// the pair, precisely so a transient discovery miss (the miss-cache

@@ -388,9 +388,8 @@ pub fn resolve_manifest_url(
     // the manifest name gets appended to the query instead of the directory —
     // a URL that resolves to the wrong thing, or to nothing.
     let base = base_index_url
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(base_index_url);
+        .split_once(['?', '#'])
+        .map_or(base_index_url, |(base, _)| base);
     // Anchored to the path separator, not a bare "index.toml": an index
     // published under a name that merely *ends* in those letters (a
     // "custom-index.toml", say) would otherwise have its suffix chopped
@@ -480,7 +479,7 @@ pub fn version_cmp(a: &str, b: &str) -> Ordering {
 /// `+` onward, if any) is stripped before anything else is parsed and simply
 /// discarded — per semver, it never affects precedence.
 fn parse_semver(v: &str) -> Option<SemverParts<'_>> {
-    let v = v.split('+').next().unwrap_or(v); // strip build metadata, if any
+    let v = v.split_once('+').map_or(v, |(v, _)| v); // strip build metadata, if any
     let (base, prerelease) = match v.split_once('-') {
         Some((b, p)) => (b, Some(p)),
         None => (v, None),
@@ -539,8 +538,9 @@ fn compare_prerelease(a: &str, b: &str) -> Ordering {
 
 /// Whether `registry` is a newer version than `installed` — `false` for
 /// equal or older ([`Ordering::Equal`]/[`Ordering::Less`]), never an
-/// "unknown" third state; an unparsable pair still resolves via
-/// [`version_cmp`]'s string fallback.
+/// "unknown" third state; a pair where neither side is version-shaped
+/// resolves to `Ordering::Equal` in [`version_cmp`] — no string fallback,
+/// see that function's own doc for why one would be meaningless here.
 fn update_available(installed: &str, registry: &str) -> bool {
     version_cmp(registry, installed) == Ordering::Greater
 }
@@ -575,9 +575,11 @@ pub fn verify_sha256(bytes: &[u8], expected_hex: &str) -> bool {
 /// disk. The contract with the caller (`src/main.rs`'s registry UI):
 ///
 /// 1. Download the manifest's raw bytes (via [`fetch_bytes`] — never
-///    [`fetch_text`], whose `into_string` UTF-8-decodes the response body
-///    before this function ever sees it; sha256 must be computed over the
-///    exact bytes the server sent, not a decoded/re-encoded copy of them).
+///    [`fetch_text`], which UTF-8-decodes the response body (`String::
+///    from_utf8`, after reading it through `into_reader()` — see that
+///    function's own doc) before this function ever sees it; sha256 must be
+///    computed over the exact bytes the server sent, not a decoded/re-encoded
+///    copy of them).
 /// 2. Call this function with those exact bytes and the index's `sha256`.
 /// 3. On `Ok`, write the **original, unmodified `raw_bytes`** to disk (never
 ///    a re-serialization of the returned [`PluginManifest`] — TOML
@@ -616,7 +618,11 @@ pub fn verify_and_prepare(
 pub struct RegistryLockEntry {
     /// The index URL this plugin was installed/updated from.
     pub origin_registry_url: String,
-    /// The registry `version` at the time of install/update.
+    /// The registry `version` at the time of install/update. Write-only:
+    /// [`diff_installed`] compares `origin_sha256` against the file on disk,
+    /// never this — but a lockfile exists to state provenance, and "what
+    /// version this file's bytes came from" is exactly that, whether or not
+    /// anything downstream reads it back.
     pub origin_version: String,
     /// The sha256 (lowercase hex) of the exact bytes written to disk at
     /// install/update time — compared against the *current* file's hash
@@ -1579,7 +1585,7 @@ fn is_https(url: &str) -> bool {
 ///
 /// Used only for the index's `.minisig` signature file — a short block of
 /// base64 that `signature::verify_index` parses once and never hashes or
-/// compares byte-for-byte, so `into_string`'s UTF-8 decode costs nothing.
+/// compares byte-for-byte, so decoding it to UTF-8 costs nothing.
 /// `index.toml` itself, and a manifest file, both go through [`fetch_bytes`]
 /// instead — see that function's own docs for why.
 ///
@@ -1590,8 +1596,12 @@ fn is_https(url: &str) -> bool {
 /// buffer megabytes of "signature" from a hostile or misbehaving server
 /// before `signature::verify_index` gets a chance to reject it — the same
 /// reasoning [`fetch_bytes`]'s own cap already gives, sized to what this
-/// function is actually ever asked to fetch instead. Not exercised by any
-/// test in this module — see the module docs.
+/// function is actually ever asked to fetch instead. Reading through
+/// `into_reader()` for the cap's sake is also why the UTF-8 decode below is
+/// a manual `String::from_utf8` on the buffer it filled, not a call to
+/// `into_string()`: the two are different methods on the response, and only
+/// one of them lets this function bound the read itself. Not exercised by
+/// any test in this module — see the module docs.
 pub fn fetch_text(url: &str) -> Result<String, String> {
     if !is_https(url) {
         return Err(format!("refusing non-https URL: {url}"));
@@ -1624,26 +1634,29 @@ pub fn fetch_text(url: &str) -> Result<String, String> {
 const MAX_MINISIG_BYTES: u64 = 8 * 1024;
 
 /// GET `url` and return the raw response body as bytes, **undecoded** —
-/// unlike [`fetch_text`]'s `into_string`, which UTF-8-decodes the body first.
-/// Used for anything a later step verifies against the exact bytes the
-/// server sent: `index.toml` itself (`signature::verify_index` checks its
-/// ed25519 signature over these bytes, not over a UTF-8 round-trip of them)
-/// and a manifest file ([`verify_and_prepare`]'s sha256 check is equally only
-/// meaningful against the exact bytes). Either one that isn't UTF-8-clean, or
-/// that round-trips through decode/re-encode with different line endings or
-/// a BOM, would then verify against something other than what was actually
-/// published — a false mismatch, or worse, a false match against bytes that
-/// were never actually served. Same HTTPS-only gate, `redirects(0)` and ~8s
-/// timeout as [`fetch_text`] — see its own docs for the rationale, which
-/// applies here unchanged; the response-size cap below has no counterpart
-/// documented on `fetch_text`'s side, because it doesn't need one written
-/// out: `into_string()` applies ureq's own 10MB `INTO_STRING_LIMIT`
-/// internally before ever returning, silently, whereas `into_reader()`
-/// enforces nothing at all — so this function re-imposes the same ceiling by
-/// hand. Without it, a hostile or misbehaving registry could make this
-/// function buffer an unbounded response into memory, and it would do so
-/// *before* whichever check downstream (a signature, a sha256) ever gets a
-/// chance to reject it.
+/// unlike [`fetch_text`], which still UTF-8-decodes the body first (via
+/// `String::from_utf8`, not ureq's own `into_string()` — see that function's
+/// own doc for why). Used for anything a later step verifies against the
+/// exact bytes the server sent: `index.toml` itself (`signature::
+/// verify_index` checks its ed25519 signature over these bytes, not over a
+/// UTF-8 round-trip of them) and a manifest file ([`verify_and_prepare`]'s
+/// sha256 check is equally only meaningful against the exact bytes). Either
+/// one that isn't UTF-8-clean, or that round-trips through decode/re-encode
+/// with different line endings or a BOM, would then verify against something
+/// other than what was actually published — a false mismatch, or worse, a
+/// false match against bytes that were never actually served. Same
+/// HTTPS-only gate, `redirects(0)` and ~8s timeout as [`fetch_text`] — see
+/// its own docs for the rationale, which applies here unchanged; the
+/// response-size cap below mirrors the one [`fetch_text`] writes out for
+/// itself (`MAX_MINISIG_BYTES`, through the same `into_reader().take(…)`
+/// pattern), just sized for a whole manifest rather than a signature block —
+/// `into_reader()` enforces no limit of its own, unlike `into_string()`'s
+/// internal 10MB `INTO_STRING_LIMIT`, so any function reading a response
+/// through it has to impose its own ceiling by hand, and both of these do.
+/// Without it, a hostile or misbehaving registry could make this function
+/// buffer an unbounded response into memory, and it would do so *before*
+/// whichever check downstream (a signature, a sha256) ever gets a chance to
+/// reject it.
 ///
 /// Not exercised by any test in this module — see the module docs.
 pub fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {

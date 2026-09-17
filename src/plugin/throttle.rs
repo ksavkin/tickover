@@ -1,6 +1,7 @@
 //! Request pacing for the HTTP engine: a floor under how often one surface
-//! may be asked, an exponential cool-off after a failure, and a full stop on
-//! the one failure retrying cannot fix.
+//! may be asked, an exponential cool-off after a failure, and a long wait —
+//! never a full stop, see rule 3 below — on the one failure a retry can
+//! never resolve.
 //!
 //! The refresh timer is not the only reason a fetch happens. Opening the
 //! panel fetches, the Refresh button fetches, the tray's "Refresh now"

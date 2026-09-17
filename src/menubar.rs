@@ -85,15 +85,14 @@ fn palette(dark: bool) -> Palette {
 /// The two percentages at which a window changes colour: amber from
 /// [`WARN_AT`], red from [`CRIT_AT`].
 ///
-/// Public, and the only Rust definition, because there was nearly a third: the
-/// panel has its own copy in `ui/theme.slint` (`Theme.sev`) — Slint cannot read
-/// a Rust constant, so that one is kept honest by
-/// `the_panel_colours_at_the_same_two_numbers_this_module_does` below rather
-/// than by the compiler. Public so anything else that needs to know where the
-/// colour changes reads these instead of redefining the numbers.
-pub const WARN_AT: f64 = 70.0;
+/// The only Rust definition, though there was nearly a second: the panel has
+/// its own copy in `ui/theme.slint` (`Theme.sev`) — Slint cannot read a Rust
+/// constant, so that copy is kept honest by
+/// `the_panel_colours_at_the_same_two_numbers_this_module_does` below, which
+/// reads both values directly; nothing else outside `severity_band` does.
+pub(crate) const WARN_AT: f64 = 70.0;
 /// See [`WARN_AT`].
-pub const CRIT_AT: f64 = 90.0;
+pub(crate) const CRIT_AT: f64 = 90.0;
 
 /// Which of the three bands a consumed percentage falls in. The colour is per
 /// window and comes from that window's own number — nothing here aggregates.
@@ -104,21 +103,10 @@ pub const CRIT_AT: f64 = 90.0;
 /// every test still green. Exhaustive matching is the whole point of having
 /// a type here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Band {
+pub(crate) enum Band {
     Ok,
     Warn,
     Crit,
-}
-
-impl Band {
-    /// The band's short name, useful for logging or a diagnostic.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Band::Ok => "ok",
-            Band::Warn => "warn",
-            Band::Crit => "crit",
-        }
-    }
 }
 
 /// See [`Band`]. Classifies `used.round()`, not the raw value: the panel

@@ -436,8 +436,9 @@ fn read_uncached(p: &Path) -> Value {
     // was ever read.
     if text.is_none() && p.exists() {
         crate::diag::line(format!(
-            "{} exists but is not a regular file under 4 MiB (or a symlink to one) — reading as no config",
-            p.display()
+            "{} exists but is not a regular file under {} MiB (or a symlink to one) — reading as no config",
+            p.display(),
+            tickover::plugin::SMALL_FILE_MAX_BYTES / (1024 * 1024)
         ));
     }
     text
@@ -544,28 +545,35 @@ pub fn set_dock_mode(v: bool) {
 
 /// Also monitor the Claude *desktop* account (needs a one-time macOS Keychain
 /// grant; off by default so no surprise prompt appears).
-pub fn monitor_desktop() -> bool {
+// Reachable only from the bridge match arms just below — `plugin_ping` /
+// `set_plugin_ping` / `plugin_surface_enabled` / `set_plugin_surface_enabled`
+// are what `main.rs` actually calls, across the crate boundary that makes
+// `pub` a real signal there. Nothing outside this file ever names one of
+// these six directly, so they stay file-private — `config` is itself a
+// module of the binary crate, not the library, so this is a readability
+// choice rather than a reachability one either way.
+fn monitor_desktop() -> bool {
     get_bool("monitor_desktop")
 }
-pub fn set_monitor_desktop(v: bool) {
+fn set_monitor_desktop(v: bool) {
     set_bool("monitor_desktop", v);
 }
 
 /// Auto-send `codex exec hello` while the Codex 5-hour window sits empty (to
 /// start a fresh one). Consumes a little quota, so it's a toggle. One ping per
 /// window — see `main.rs::ping_due`/`window_start` and the two keys below.
-pub fn auto_ping_codex() -> bool {
+fn auto_ping_codex() -> bool {
     get_bool("auto_ping_codex")
 }
-pub fn set_auto_ping_codex(v: bool) {
+fn set_auto_ping_codex(v: bool) {
     set_bool("auto_ping_codex", v);
 }
 
 /// Same, for Claude (`claude -p hello`), keyed on the CLI account's 5h window.
-pub fn auto_ping_claude() -> bool {
+fn auto_ping_claude() -> bool {
     get_bool("auto_ping_claude")
 }
-pub fn set_auto_ping_claude(v: bool) {
+fn set_auto_ping_claude(v: bool) {
     set_bool("auto_ping_claude", v);
 }
 

@@ -76,7 +76,7 @@ use std::collections::HashSet;
 /// One reader capability: a name a manifest may declare, and the manifest keys
 /// whose presence means it is being used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Capability {
+pub(crate) struct Capability {
     /// The name as written in `requires_reader`. Kebab-case, and a shipped
     /// contract once published — a manifest in somebody else's registry spells
     /// it, so it is renamed only by adding the new name beside the old.
@@ -102,7 +102,7 @@ pub struct Capability {
 /// the panel comes from what a provider actually reports, and each one
 /// changes what a manifest field means rather than only adding one.
 /// `implemented` is the per-capability bit — see the module docs.
-pub const CAPABILITIES: &[Capability] = &[
+pub(crate) const CAPABILITIES: &[Capability] = &[
     // Window presence. A window whose paths do not resolve in a successfully
     // parsed response stops being emitted at all, instead of being emitted
     // blank, and `required` marks the windows whose absence is the provider's
@@ -314,9 +314,10 @@ pub fn check(raw: &toml::Value) -> Result<(), String> {
 /// A value of the wrong shape reads as *less* than it says here — a bare
 /// string declares nothing, a non-string entry is skipped — and never as more,
 /// so nothing gets past the check by being mistyped. What the difference costs
-/// is only which complaint arrives first: `["window-presence", 7]` is refused
-/// here for the name, and the `7` is never mentioned, where deserializing into
-/// `Vec<String>` would have named it.
+/// is only which complaint arrives first: `["window-severity", 7]` is refused
+/// here for the name (a capability this build knows but does not implement),
+/// and the `7` is never mentioned, where deserializing into `Vec<String>`
+/// would have named it.
 fn declared_in(raw: &toml::Value) -> Vec<&str> {
     raw.get("requires_reader")
         .and_then(toml::Value::as_array)
@@ -329,7 +330,7 @@ fn declared_in(raw: &toml::Value) -> Vec<&str> {
 /// Split out for the tests: a synthetic table keeps both sides of
 /// `implemented` reachable and deterministic, independent of which
 /// capabilities the shipped table happens to have flipped to `true`.
-pub fn check_against(table: &[Capability], raw: &toml::Value) -> Result<(), String> {
+pub(crate) fn check_against(table: &[Capability], raw: &toml::Value) -> Result<(), String> {
     let declared = declared_in(raw);
     // Two passes, and the split matters: a list that is malformed as a *list*
     // is said so whatever this build happens to implement. Folded into one
@@ -401,13 +402,19 @@ pub fn check_against(table: &[Capability], raw: &toml::Value) -> Result<(), Stri
         //
         // One refusal and two texts, which the corpus counter in
         // `tests/manifest_corpus.rs` sees as one rule — it counts early
-        // returns, so this comment carefully does not spell one. The row
-        // exercises
-        // the `false` branch, because until a capability is implemented there
-        // is nothing to build a `true` fixture out of; the `true` branch is
-        // covered by `using_an_implemented_capability_without_declaring_it_is_refused`
-        // against a synthetic table. When the first capability flips, that
-        // corpus row moves to the `true` branch on its own.
+        // returns, so this comment carefully does not spell one. The corpus
+        // row ("a manifest that uses a capability's fields has to declare
+        // it") exercises the `true` branch: `windows.required` belongs to
+        // `window-presence`, implemented since that capability shipped —
+        // `using_an_implemented_capability_without_declaring_it_is_refused`
+        // covers the same branch again, against a synthetic table, so it
+        // stays reachable however the shipped one changes. The `false`
+        // branch is covered here in this file instead, against a capability
+        // this build genuinely does not implement yet:
+        // `window_severity_is_named_but_not_implemented_so_its_field_is_refused`
+        // (the shipped table) and the second half of
+        // `a_capability_this_build_does_not_implement_is_refused_either_way`
+        // (a synthetic one).
         return Err(match cap.implemented {
             true => format!(
                 "this plugin sets `{key}`, which needs the reader capability \"{}\" — declare it \

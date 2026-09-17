@@ -51,8 +51,8 @@ use serde_json::Value;
 
 use crate::model::{ProviderReading, TokenRenewal, Window};
 use crate::plugin::manifest::{
-    AccountMatchConfig, AccountType, LogFileConfig, PeriodMode, PluginManifest, ResetsAtFormat,
-    Role as ManifestRole, TagFrom, TagTransform, WindowConfig,
+    AccountMatchConfig, AccountType, LogFileConfig, LogFileFormat, LogFileSelect, PeriodMode,
+    PluginManifest, ResetsAtFormat, Role as ManifestRole, TagFrom, TagTransform, WindowConfig,
 };
 use crate::plugin::time::parse_iso8601;
 
@@ -199,7 +199,14 @@ fn fetch_from_root(
         bare_when_sole: false,
     };
 
-    match latest_reading(files, &m.id, &lf.container_key, account_match) {
+    match latest_reading(
+        files,
+        &m.id,
+        &lf.container_key,
+        account_match,
+        lf.format,
+        lf.select,
+    ) {
         Some(raw) => {
             reading.tag = resolve_tag(m, Some(&raw.container));
             match windows_from_raw(m, lf, &raw) {
@@ -768,6 +775,8 @@ fn latest_reading(
     plugin_id: &str,
     container_key: &str,
     account_match: Option<&(String, String)>,
+    format: LogFileFormat,
+    select: LogFileSelect,
 ) -> Option<RawReading> {
     let mut budget = FETCH_BYTE_BUDGET;
     for (path, _mtime, len) in files {
@@ -782,7 +791,7 @@ fn latest_reading(
             break;
         }
         budget -= cost;
-        if let Some(found) = parse_file(path, container_key, account_match) {
+        if let Some(found) = parse_file(path, container_key, account_match, format, select) {
             return Some(found);
         }
     }
@@ -1009,12 +1018,15 @@ fn match_wildcard(pattern: &str, text: &str) -> bool {
     true
 }
 
-/// Parse one log file, returning the **last** container reading in it that
-/// satisfies `account_match` (every reading, when `account_match` is `None`).
+/// Parse one log file, returning a container reading in it that satisfies
+/// `account_match` (every reading, when `account_match` is `None`) —
+/// `select` decides which one when more than one qualifies.
 fn parse_file(
     path: &Path,
     container_key: &str,
     account_match: Option<&(String, String)>,
+    format: LogFileFormat,
+    select: LogFileSelect,
 ) -> Option<RawReading> {
     let file = File::open(path).ok()?;
     let mut reader = tail_reader(file).ok()?;
@@ -1034,15 +1046,28 @@ fn parse_file(
         if !line.contains(&needle) {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
+        let value = match format {
+            // The one shape this engine's parser understands: one JSON
+            // object per line. A manifest naming any other `[logfile]
+            // format` is refused before this function is ever reached (see
+            // `LogFileFormat`'s own doc).
+            LogFileFormat::Jsonl => match serde_json::from_str::<Value>(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            },
         };
         if let Some(container) = find_container(&value, container_key) {
             if !container_matches(container, account_match) {
                 continue;
             }
             if let Some(raw) = parse_container(container) {
-                latest = Some(raw);
+                match select {
+                    // The one policy this engine's scan implements: each
+                    // qualifying line replaces the one kept before it, so the
+                    // scan's own forward order over the file decides — see
+                    // `LogFileSelect`'s own doc.
+                    LogFileSelect::Last => latest = Some(raw),
+                }
             }
         }
     }
@@ -1509,7 +1534,14 @@ mod tests {
         std::fs::write(&path, &text).unwrap();
 
         assert!(
-            parse_file(&path, "rate_limits", None).is_none(),
+            parse_file(
+                &path,
+                "rate_limits",
+                None,
+                LogFileFormat::Jsonl,
+                LogFileSelect::Last
+            )
+            .is_none(),
             "the only reading in the file sits before the tail window and must never be read"
         );
 
@@ -1520,7 +1552,14 @@ mod tests {
         text.push('\n');
         std::fs::write(&path, &text).unwrap();
 
-        let reading = parse_file(&path, "rate_limits", None).expect("the tail's reading is found");
+        let reading = parse_file(
+            &path,
+            "rate_limits",
+            None,
+            LogFileFormat::Jsonl,
+            LogFileSelect::Last,
+        )
+        .expect("the tail's reading is found");
         assert_eq!(reading.primary.as_ref().map(|s| s.used_percent), Some(42.0));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1608,7 +1647,15 @@ mod tests {
         let mut files = collect_log_files(&dir, "rollout-*.jsonl");
         newest_first(&mut files);
         assert!(
-            latest_reading(&files, "byte-budget-plugin", "rate_limits", None).is_none(),
+            latest_reading(
+                &files,
+                "byte-budget-plugin",
+                "rate_limits",
+                None,
+                LogFileFormat::Jsonl,
+                LogFileSelect::Last,
+            )
+            .is_none(),
             "the real reading sits past the byte budget and must never be opened"
         );
 
@@ -1638,8 +1685,14 @@ mod tests {
         text.push('\n');
         std::fs::write(&path, &text).unwrap();
 
-        let reading =
-            parse_file(&path, "rate_limits", None).expect("the line after the huge one is read");
+        let reading = parse_file(
+            &path,
+            "rate_limits",
+            None,
+            LogFileFormat::Jsonl,
+            LogFileSelect::Last,
+        )
+        .expect("the line after the huge one is read");
         assert_eq!(reading.primary.as_ref().map(|s| s.used_percent), Some(11.0));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1799,8 +1852,14 @@ mod tests {
                 json!({ "rate_limits": { "primary": { "used_percent": 40.0 } } }).to_string(),
             ],
         );
-        let raw = parse_file(&path, "rate_limits", None)
-            .expect("must skip the broken lines and parse the good one");
+        let raw = parse_file(
+            &path,
+            "rate_limits",
+            None,
+            LogFileFormat::Jsonl,
+            LogFileSelect::Last,
+        )
+        .expect("must skip the broken lines and parse the good one");
         assert_eq!(raw.primary.unwrap().used_percent, 40.0);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1933,8 +1992,15 @@ mod tests {
 
         let mut files = collect_log_files(&dir, "rollout-*.jsonl");
         newest_first(&mut files);
-        let raw = latest_reading(&files, "test-plugin", "rate_limits", None)
-            .expect("must fall back to the file that actually has a reading");
+        let raw = latest_reading(
+            &files,
+            "test-plugin",
+            "rate_limits",
+            None,
+            LogFileFormat::Jsonl,
+            LogFileSelect::Last,
+        )
+        .expect("must fall back to the file that actually has a reading");
         assert_eq!(raw.primary.unwrap().used_percent, 11.0);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1961,8 +2027,15 @@ mod tests {
 
         let mut files = collect_log_files(&dir, "rollout-*.jsonl");
         newest_first(&mut files);
-        let raw = latest_reading(&files, "test-plugin", "rate_limits", None)
-            .expect("either file resolves a reading");
+        let raw = latest_reading(
+            &files,
+            "test-plugin",
+            "rate_limits",
+            None,
+            LogFileFormat::Jsonl,
+            LogFileSelect::Last,
+        )
+        .expect("either file resolves a reading");
         assert_eq!(
             raw.primary.unwrap().used_percent,
             5.0,
@@ -2889,8 +2962,8 @@ mod tests {
             root_env_join: None,
             root: "~/.codex/sessions".to_string(),
             glob: "rollout-*.jsonl".to_string(),
-            format: "jsonl".to_string(),
-            select: "last".to_string(),
+            format: LogFileFormat::Jsonl,
+            select: LogFileSelect::Last,
             container_key: "rate_limits".to_string(),
             classify_threshold_minutes: 720,
             detect_bin: None,
@@ -2912,8 +2985,8 @@ mod tests {
             root_env_join: Some("sessions".to_string()),
             root: "~/.codex/sessions".to_string(),
             glob: "rollout-*.jsonl".to_string(),
-            format: "jsonl".to_string(),
-            select: "last".to_string(),
+            format: LogFileFormat::Jsonl,
+            select: LogFileSelect::Last,
             container_key: "rate_limits".to_string(),
             classify_threshold_minutes: 720,
             detect_bin: None,
@@ -2938,8 +3011,8 @@ mod tests {
             root_env_join: Some("{option.subdir}".to_string()),
             root: "~/.codex/sessions".to_string(),
             glob: "rollout-*.jsonl".to_string(),
-            format: "jsonl".to_string(),
-            select: "last".to_string(),
+            format: LogFileFormat::Jsonl,
+            select: LogFileSelect::Last,
             container_key: "rate_limits".to_string(),
             classify_threshold_minutes: 720,
             detect_bin: None,
@@ -2966,8 +3039,8 @@ mod tests {
             root_env_join: None,
             root: "~/.codex-{option.variant}".to_string(),
             glob: "rollout-*.jsonl".to_string(),
-            format: "jsonl".to_string(),
-            select: "last".to_string(),
+            format: LogFileFormat::Jsonl,
+            select: LogFileSelect::Last,
             container_key: "rate_limits".to_string(),
             classify_threshold_minutes: 720,
             detect_bin: None,
@@ -2991,8 +3064,8 @@ mod tests {
             root_env_join: Some("sessions".to_string()),
             root: "~/.codex/sessions".to_string(),
             glob: "rollout-*.jsonl".to_string(),
-            format: "jsonl".to_string(),
-            select: "last".to_string(),
+            format: LogFileFormat::Jsonl,
+            select: LogFileSelect::Last,
             container_key: "rate_limits".to_string(),
             classify_threshold_minutes: 720,
             detect_bin: None,

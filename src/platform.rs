@@ -290,7 +290,7 @@ pub fn app_is_active() -> bool {
 /// [`take_reopen_requests`]. A count rather than a flag: each click is a
 /// toggle, so two clicks arriving inside one poll interval must not collapse
 /// into one or the panel ends up in the opposite state to what was asked for.
-pub static REOPEN_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static REOPEN_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Number of Dock-icon clicks since the last call.
 pub fn take_reopen_requests() -> usize {

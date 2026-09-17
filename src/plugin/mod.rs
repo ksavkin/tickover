@@ -458,7 +458,7 @@ pub fn window_element_key(w: &WindowConfig, index: usize, element_id: &str) -> S
 }
 
 /// Between `<entry>` and `<element>`.
-pub const KEY_ENTRY_SEPARATOR: char = ':';
+pub(crate) const KEY_ENTRY_SEPARATOR: char = ':';
 
 /// Percent-encode everything outside the unreserved set, so a key part can
 /// never contain a separator or a `.`.

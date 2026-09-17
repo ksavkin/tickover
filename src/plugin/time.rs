@@ -5,12 +5,13 @@
 //! RFC3339 parser for `resets_at_format = "iso8601"` ([`parse_iso8601`]), and
 //! a Unix-seconds reader tolerant of a provider that quotes its numbers
 //! ([`read_unix_timestamp`]), for `resets_at_format = "unix"`. One copy,
-//! here, re-exported by name into each engine so every existing call site —
-//! including the tests pinned to `engine_logfile::resets_at_for` — compiles
-//! unchanged.
+//! here, called directly from `engine_http` and, from `engine_logfile`,
+//! through a small private wrapper of the same name the tests already
+//! pinned to (`engine_logfile::resets_at_for`) — no `pub use` re-exports it
+//! into either module.
 //!
 //! [`resets_at`] adds the rule neither copy enforced on its own:
-//! [`plausible_resets_at`] refuses a parsed value more than ten years from
+//! `plausible_resets_at` refuses a parsed value more than ten years from
 //! now rather than let it through. The shape this exists for is a provider
 //! sending milliseconds where the manifest declares `resets_at_format =
 //! "unix"` (seconds) — a reset half an hour away then reads as one some
@@ -30,7 +31,7 @@ use crate::plugin::manifest::ResetsAtFormat;
 /// Parse an RFC3339 / ISO-8601 timestamp to Unix seconds. Negative
 /// (pre-1970) results clamp to 0 rather than wrap — `chrono` accepts years
 /// this app has no business trusting either way, which is what
-/// [`plausible_resets_at`] is for; this function only speaks RFC3339, not
+/// `plausible_resets_at` is for; this function only speaks RFC3339, not
 /// "sane".
 pub fn parse_iso8601(s: &str) -> Option<u64> {
     chrono::DateTime::parse_from_rfc3339(s)
@@ -60,7 +61,7 @@ pub fn read_unix_timestamp(v: &Value) -> Option<u64> {
 const MAX_RESETS_AT_SECS_AHEAD: u64 = 10 * 365 * 24 * 60 * 60;
 
 /// Whether `secs` (Unix seconds) is close enough to now to show.
-pub fn plausible_resets_at(secs: u64) -> bool {
+pub(crate) fn plausible_resets_at(secs: u64) -> bool {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -81,7 +82,7 @@ pub fn plausible_period_minutes(minutes: u64) -> bool {
 }
 
 /// `v` read as `format` says, refused outright when the result is not
-/// [`plausible_resets_at`] — the one rule both engines need after parsing,
+/// `plausible_resets_at` — the one rule both engines need after parsing,
 /// enforced here once rather than however many times it would otherwise get
 /// copied.
 pub fn resets_at(v: &Value, format: ResetsAtFormat) -> Option<u64> {

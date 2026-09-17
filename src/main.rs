@@ -73,9 +73,13 @@ struct InFlight {
     generation: u64,
     started: Instant,
     /// Whether the "still running" line below has already been logged for
-    /// this fetch. Set the first tick past `FETCH_PATIENCE` finds it still
-    /// outstanding, checked every tick after — a fetch that never finishes
-    /// earns one line, not one every tick for the rest of the process's life.
+    /// this fetch. Set the first time [`spawn_plugin_fetch`] is asked to
+    /// start this plugin again and finds it still outstanding past
+    /// `FETCH_PATIENCE`, checked on every such ask after — those asks come
+    /// from whatever next triggers a fetch (the plugin's own `refresh_secs`,
+    /// the panel opening, a manual refresh), not from a fixed one-second
+    /// cadence — a fetch that never finishes earns one line total, not one
+    /// per ask for the rest of the process's life.
     stall_logged: bool,
 }
 
@@ -233,16 +237,6 @@ fn menu_bar_text_label() -> &'static str {
     }
 }
 
-fn ui_family() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "SF Pro Text"
-    } else if cfg!(target_os = "windows") {
-        "Segoe UI"
-    } else {
-        "sans-serif"
-    }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Before anything else so much as looks at the config directory:
     // `platform::claim_single_instance` below, `diag::line` and
@@ -306,7 +300,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = AppWindow::new()?;
     app.set_mono_family(ss(mono_family()));
-    app.set_ui_family(ss(ui_family()));
     app.set_autostart(autostart::is_enabled());
 
     // First-run seeding happens exactly once, here — never inside
@@ -1239,7 +1232,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── First readings ──────────────────────────────────────────────────
-    if std::env::var_os("TICKOVER_SNAPSHOT").is_some() {
+    // Read once, at start-up, and carried to both places below that ask
+    // about it — this and the `TICKOVER_SNAPSHOT_SETTINGS`/snapshot-taking
+    // block further down.
+    let snapshot_path = std::env::var_os("TICKOVER_SNAPSHOT");
+    if snapshot_path.is_some() {
         // A screenshot needs data present synchronously, before the first
         // render — every plugin is fetched on this thread, blocking.
         *cache.borrow_mut() = sync_fetch_all(&plugins.borrow());
@@ -1260,7 +1257,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         present_popover(&app, &anchor, &shown_at, Shown::ByAnythingElse);
     }
 
-    if let Some(path) = std::env::var_os("TICKOVER_SNAPSHOT") {
+    if let Some(path) = snapshot_path {
         present_popover(&app, &anchor, &shown_at, Shown::ByAnythingElse);
         // Snapshot the settings sheet instead of the gauges when asked.
         if std::env::var_os("TICKOVER_SNAPSHOT_SETTINGS").is_some() {
@@ -1289,11 +1286,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             #[cfg(not(target_os = "windows"))]
             if let Some(app) = weak.upgrade() {
-                if let Ok(buf) = app.window().take_snapshot() {
-                    let (w, h) = (buf.width(), buf.height());
-                    if let Some(img) = image::RgbaImage::from_raw(w, h, buf.as_bytes().to_vec()) {
-                        let _ = img.save(std::path::Path::new(&path));
-                        diag::line(format!("snapshot {w}x{h} -> {path:?}"));
+                match app.window().take_snapshot() {
+                    Ok(buf) => {
+                        let (w, h) = (buf.width(), buf.height());
+                        let bytes = buf.as_bytes().to_vec();
+                        let got = bytes.len();
+                        let want = (w as usize) * (h as usize) * 4;
+                        match image::RgbaImage::from_raw(w, h, bytes) {
+                            Some(img) => match img.save(std::path::Path::new(&path)) {
+                                Ok(()) => diag::line(format!("snapshot {w}x{h} -> {path:?}")),
+                                Err(e) => diag::line(format!(
+                                    "snapshot {w}x{h}: failed to write {path:?}: {e}"
+                                )),
+                            },
+                            None => diag::line(format!(
+                                "snapshot {w}x{h}: buffer holds {got} bytes, {want} needed \
+                                 for RGBA8 at that size, nothing written to {path:?}"
+                            )),
+                        }
+                    }
+                    Err(e) => {
+                        diag::line(format!("snapshot: take_snapshot failed: {e}"));
                     }
                 }
             }
@@ -2539,7 +2552,8 @@ fn show_alert(title: &str, message: &str) {
 /// Each platform's own dialog rather than a crate that draws one: a native
 /// dialog is indistinguishable from a Slint-drawn one to the user, and both
 /// platforms already ship what this needs (`osascript` here, `MessageBoxW`
-/// there — see [`windows_message_box`]).
+/// there — see `windows_message_box`, `#[cfg(target_os = "windows")]` only,
+/// so not a doc link from this un-gated function).
 ///
 /// Any failure to get an answer at all (no display, a missing binary, an API
 /// that returned nothing) is treated as "not confirmed", never as
@@ -2752,7 +2766,7 @@ fn active_surface_ids(m: &PluginManifest) -> Vec<String> {
 /// Every `[[option]]` a plugin declares, resolved to its current value
 /// ([`config::plugin_option`]: config override if the user set one, else the
 /// manifest's own `default`). `BTreeMap` for the deterministic iteration
-/// order [`crate::plugin::substitute_options`] relies on. Read once per fetch
+/// order [`tickover::plugin::substitute_options`] relies on. Read once per fetch
 /// (mirrors [`active_surface_ids`]) and passed straight into
 /// [`scheduler::fetch`] — the engines never read config themselves (see their
 /// module docs).
@@ -2993,7 +3007,9 @@ fn surface_reading_id(plugin_id: &str, surface_id: &str) -> String {
 /// distinguishes accounts for the per-row window model without being a surface
 /// of its own. Existing ids carry no `#`, so their routing is unchanged.
 fn surface_id_active(reading_id: &str, active_ids: &HashSet<String>) -> bool {
-    let base = reading_id.split('#').next().unwrap_or(reading_id);
+    let base = reading_id
+        .split_once('#')
+        .map_or(reading_id, |(base, _)| base);
     active_ids.contains(base)
 }
 
@@ -3036,7 +3052,9 @@ fn owning_manifest<'a>(
     plugins: &'a [PluginManifest],
     reading_id: &str,
 ) -> Option<&'a PluginManifest> {
-    let base = reading_id.split('#').next().unwrap_or(reading_id);
+    let base = reading_id
+        .split_once('#')
+        .map_or(reading_id, |(base, _)| base);
     let mut claimants = plugins.iter().filter(|m| {
         m.surface
             .iter()
@@ -3234,8 +3252,8 @@ struct PingWindow {
 /// reading with no windows at all; "the provider reports no 5-hour window
 /// because it is empty" arrived as a window with every field `None`. The
 /// difference between them was that the second one was *emitted*, and the
-/// presence rule has just deleted that signal — a window nothing resolved for
-/// is no longer emitted, so both now look like an absent Primary slot.
+/// presence rule removes that signal — a window nothing resolved for is
+/// never emitted, so both look like an absent Primary slot.
 ///
 /// So the question is asked of the manifest instead, which is where it always
 /// belonged: the manifest is what knows the window exists. An errored reading
@@ -3323,6 +3341,11 @@ struct SeenRecord<'a> {
     manifest: &'a PluginManifest,
     reading_id: String,
     role: Role,
+    /// [`seen_role_key`] of `role`, resolved once here rather than asked
+    /// again by every consumer: every `SeenRecord` that exists has already
+    /// passed the `Role::Extra` filter below, so `role` never reaches a
+    /// consumer without a key to go with it.
+    key: &'static str,
     seen: config::SeenWindow,
 }
 
@@ -3349,9 +3372,9 @@ fn seen_records<'a>(
             continue;
         };
         for w in &r.windows {
-            if seen_role_key(w.role).is_none() {
+            let Some(key) = seen_role_key(w.role) else {
                 continue;
-            }
+            };
             // `0` is filtered here for the same reason
             // `config::plugin_seen_window_for` filters it on the way back out:
             // a boundary of `0` and "the provider never stated one" have to
@@ -3365,6 +3388,7 @@ fn seen_records<'a>(
                 manifest: m,
                 reading_id: r.id.clone(),
                 role: w.role,
+                key,
                 // The manifest is the fallback, never the source: only a
                 // manifest whose window declares `period.mode = "assumed"` has
                 // a length to give, and the windows that vanish read theirs out
@@ -3564,10 +3588,7 @@ fn record_seen_windows(
 ) -> HashMap<(String, String, Role), config::SeenWindow> {
     let mut written = HashMap::new();
     for rec in seen_writes(seen_records(plugins, readings), seen_window_for, now) {
-        let Some(key) = seen_role_key(rec.role) else {
-            continue;
-        };
-        config::set_plugin_seen_window_for(&rec.manifest.id, &rec.reading_id, key, rec.seen);
+        config::set_plugin_seen_window_for(&rec.manifest.id, &rec.reading_id, rec.key, rec.seen);
         written.insert(
             (rec.manifest.id.clone(), rec.reading_id.clone(), rec.role),
             rec.seen,
@@ -4493,6 +4514,13 @@ fn window_rows(
                 .map(|used| (w.role, w.key.clone(), window_data(now, w, used)))
         })
         .collect();
+    // Stable, and the reason the `slot` search below is allowed to assume
+    // `rows` is already role-ordered: `r.windows` carries whatever order the
+    // reading arrived in, which every shipped manifest happens to declare as
+    // primary → secondary → extra, but nothing validates that — a
+    // third-party manifest declaring `extra` first would otherwise draw it
+    // first too.
+    rows.sort_by_key(|(role, _, _)| role_rank(*role));
     if let Some(m) = m.filter(|_| r.error.is_none()) {
         for (index, declared) in m.windows.iter().enumerate() {
             let role = tickover::plugin::map_role(declared.role);
@@ -4535,9 +4563,10 @@ fn window_rows(
 }
 
 /// Row order within a provider: the subscription's short window, then its long
-/// one, then everything that is neither. Fixed here rather than left to the
-/// order windows happen to arrive in, because a row that moves as its
-/// neighbour empties reads as a different limit.
+/// one, then everything that is neither. [`window_rows`] sorts the live rows
+/// by this rather than leaving them in whatever order the reading happened
+/// to arrive in, because a row that moves as its neighbour empties reads as a
+/// different limit.
 fn role_rank(role: Role) -> u8 {
     match role {
         Role::Primary => 0,
@@ -5348,9 +5377,11 @@ fn tray_badge_px() -> u32 {
 const TRAY_CLICK_OWNS_ACTIVATION: Duration = Duration::from_millis(600);
 
 /// Whether an activation edge is the tail of a status-item click rather than a
-/// Dock click of its own. Saturating, so a clock that jumps backwards reads as
-/// "not the tray's" — the worse failure is a click that toggles twice, not one
-/// that toggles once.
+/// Dock click of its own. `Instant` is monotonic, so `now` can never precede
+/// `at` here and `saturating_duration_since` never actually saturates — it is
+/// defensive against the type system, not against a real backward jump (one
+/// would in any case read as *the tray's*, `Duration::ZERO` being well under
+/// `TRAY_CLICK_OWNS_ACTIVATION`, not the other way around).
 fn activation_owned_by_tray(tray_click_at: Option<Instant>, now: Instant) -> bool {
     tray_click_at.is_some_and(|at| now.saturating_duration_since(at) < TRAY_CLICK_OWNS_ACTIVATION)
 }
@@ -5866,6 +5897,15 @@ const PING_DEADLINE: Duration = Duration::from_secs(600);
 
 /// Most stderr worth quoting from a failed run; the rest is dropped. A CLI
 /// that fails by printing a megabyte must not put a megabyte in the log.
+///
+/// Two units under one name: [`drain_capped`] applies it as a **byte** cap on
+/// the raw read, which is where it actually does the work; [`quotable`]'s own
+/// `.take(PING_STDERR_MAX)` then applies the same number again as a
+/// **character** cap. That second application cannot currently cut
+/// anything — a lossy UTF-8 decode of at most this many bytes never yields
+/// more than this many characters — so it stands as a defensive floor under
+/// a name that promises one unit, not two, should a caller ever hand
+/// `quotable` more bytes than `drain_capped` already bounded.
 const PING_STDERR_MAX: usize = 2000;
 
 /// A command's stderr as one quotable line.
@@ -6423,14 +6463,19 @@ fn fetch_registry_index(url: &str, installed: Vec<(String, String, String)>) -> 
 struct RegistryDiff {
     updates: HashMap<String, (String, bool)>,
     new_rows: Vec<RegistryPluginRow>,
-    update_count: usize,
-    new_count: usize,
 }
 
 /// Fold [`registry::diff_installed`]'s per-entry states into a
 /// [`RegistryDiff`]. `installed` and `lockfile` are exactly
 /// `diff_installed`'s own parameters — see that function's doc comment for
 /// their contract (byte-exact `current_file_sha256` in particular).
+///
+/// `RegistryDiff` carries no running counts of its own: a `Vec` and a
+/// `HashMap` keyed by an id `index.plugins` never repeats (registry ids are
+/// unique at parse time) are already their own counts, so a caller wanting
+/// "how many" reads `.len()` off whichever collection it means rather than
+/// trusting a third field to have been kept in step with the two that
+/// actually hold the rows.
 fn fold_registry_diff(
     index: &RegistryIndex,
     installed: &[(String, String, String)],
@@ -6440,17 +6485,13 @@ fn fold_registry_diff(
     let mut diff = RegistryDiff {
         updates: HashMap::new(),
         new_rows: Vec::new(),
-        update_count: 0,
-        new_count: 0,
     };
     for (entry, state) in index.plugins.iter().zip(states.iter()) {
         match state {
             RegistryPluginState::New => {
-                diff.new_count += 1;
                 diff.new_rows.push(registry_entry_row(entry));
             }
             RegistryPluginState::UpdateAvailable { overwrite_safe, .. } => {
-                diff.update_count += 1;
                 diff.updates
                     .insert(entry.id.clone(), (entry.version.clone(), !overwrite_safe));
             }
@@ -6548,6 +6589,11 @@ fn apply_registry_check(
         RegistryCheckMsg::Success(index, installed) => {
             let lockfile = registry::load_lockfile(&registry::lockfile_path());
             let diff = fold_registry_diff(&index, &installed, &lockfile);
+            // Read before `diff.updates`/`diff.new_rows` are moved out below
+            // — `RegistryDiff` no longer carries its own running counts (see
+            // `fold_registry_diff`'s own doc), so this is where the two
+            // collections it built are the counts.
+            let (update_count, new_count) = (diff.updates.len(), diff.new_rows.len());
 
             // Rebuild every plugin row from a clean slate (this also
             // re-aligns the model's length/order with `plugins`), then layer
@@ -6574,10 +6620,10 @@ fn apply_registry_check(
             last_registry_check.set(Some(now_unix()));
             app.set_registry_checked_at(ss(relative_checked_at(0)));
 
-            if diff.update_count == 0 && diff.new_count == 0 {
+            if update_count == 0 && new_count == 0 {
                 app.set_registry_status(4);
             } else {
-                app.set_registry_summary(ss(registry_summary(diff.update_count, diff.new_count)));
+                app.set_registry_summary(ss(registry_summary(update_count, new_count)));
                 app.set_registry_status(5);
             }
         }
@@ -6741,6 +6787,14 @@ impl RegistryGuard {
 
 impl Drop for RegistryGuard {
     fn drop(&mut self) {
+        // `tx`/`entry` still being `Some` here means `finish` never ran —
+        // today that only happens on a panic, so the two branches below stay
+        // in step. Only the log line actually asks `thread::panicking()`;
+        // the outcome sent to the UI always reads "worker panicked" once
+        // this branch is reached at all. A future early return that skips
+        // `finish` without panicking would land here too and report a panic
+        // that never happened — nothing today takes that path, but nothing
+        // stops one from being added without noticing this asymmetry.
         if let (Some(tx), Some(entry)) = (self.tx.take(), self.entry.take()) {
             if std::thread::panicking() {
                 diag::line(format!(
@@ -10369,6 +10423,32 @@ mod title_tests {
         assert_eq!(rows[0].1.pct, 12.0);
     }
 
+    /// Row order comes from [`role_rank`], not from the order the reading
+    /// happens to list its windows in — which is whatever order the source
+    /// manifest declared them, something nothing validates. Every shipped
+    /// manifest declares primary → secondary → extra, but a third-party one
+    /// is free to declare `extra` first, and the reading it produces would
+    /// then report `extra` first too.
+    #[test]
+    fn live_rows_are_ordered_by_role_not_by_the_order_the_reading_reports_them_in() {
+        let m = two_window_manifest();
+        let scrambled = reading_with(
+            vec![
+                win("GPT-5.3-Codex-Spark", Role::Extra, 5.0, 900, 300),
+                win("WK", Role::Secondary, 40.0, 604_800, 10_080),
+                win("5H", Role::Primary, 12.0, 600, 300),
+            ],
+            None,
+        );
+
+        let rows = window_rows(Some(&m), &scrambled, NOW, &|_| None);
+        assert_eq!(
+            labels(&rows),
+            vec!["5-hour limit", "Weekly limit", "GPT-5.3-Codex-Spark"],
+            "primary, then secondary, then extra, whatever order the reading listed them in"
+        );
+    }
+
     /// "Not started" is a claim about *usage*, so only a window the provider
     /// did not report at all may carry it. A window reported without a usable
     /// percentage draws no row (it has no figure to draw) — but it must not
@@ -12774,8 +12854,7 @@ mod title_tests {
 
         let diff = fold_registry_diff(&index, &installed, &lockfile);
 
-        assert_eq!(diff.update_count, 1);
-        assert_eq!(diff.new_count, 1);
+        assert_eq!(diff.updates.len(), 1);
         let (available, has_local_edits) = diff
             .updates
             .get("existing")
@@ -12843,8 +12922,8 @@ mod title_tests {
 
         let diff = fold_registry_diff(&index, &installed, &lockfile);
 
-        assert_eq!(diff.update_count, 1);
-        assert_eq!(diff.new_count, 0);
+        assert_eq!(diff.updates.len(), 1);
+        assert_eq!(diff.new_rows.len(), 0);
         let (_, has_local_edits) = diff.updates.get("prov").expect("prov has an update");
         assert!(
             has_local_edits,

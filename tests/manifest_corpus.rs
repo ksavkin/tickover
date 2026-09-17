@@ -2324,7 +2324,7 @@ fn the_corpus_has_a_line_for_every_rule_the_validator_enforces() {
         "\n        Ok(())\n    }\n}",
     ) + refusals_in(
         include_str!("../src/plugin/capability.rs"),
-        "pub fn check_against(",
+        "pub(crate) fn check_against(",
         "\n    Ok(())\n}",
     );
 

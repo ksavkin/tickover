@@ -122,8 +122,10 @@ pub struct PluginManifest {
     #[serde(default)]
     pub windows: Vec<WindowConfig>,
     /// `[[balances]]` — figures against a calendar period (credits left, spent
-    /// this month). Empty for a provider that reports only windows, which is
-    /// both shipped manifests today.
+    /// this month). Empty for a provider that reports only windows — two of
+    /// the five shipped manifests today (`claude`, `antigravity`); the other
+    /// three (`codex`, `copilot`, `grok`) declare at least one, and `copilot`
+    /// and `grok` declare no `[[windows]]` at all.
     #[serde(default)]
     pub balances: Vec<BalanceConfig>,
     /// `[status]` — where the provider states the standing of the quota
@@ -972,10 +974,14 @@ impl PluginManifest {
                         .to_string(),
                 );
             }
-            // A path present but blank passes `is_empty()` above (it only
-            // asks whether every path is absent) and then resolves to
-            // nothing at fetch time — the same gap the `[[balances]]` blank
-            // check below closes for its own paths.
+            // `is_empty()` above already refuses a *lone* blank path — it
+            // treats absent and blank the same way, per-field. What it
+            // cannot catch is one blank path sitting beside another that
+            // genuinely has content: that combination reads as "not empty"
+            // (the real path keeps the whole section from being refused
+            // there), and the blank sibling then resolves to nothing at
+            // fetch time with no error naming it — the same gap the
+            // `[[balances]]` blank check below closes for its own paths.
             let blank_paths = [
                 ("allowed_path", &status.allowed_path),
                 ("limit_reached_path", &status.limit_reached_path),
@@ -1345,8 +1351,6 @@ impl PluginManifest {
                      {{value.<name>}} are substituted into headers only"
                 ));
             }
-        }
-        if let Some(url) = &self.account.url {
             if super::https_host(url).is_none() {
                 return Err(format!(
                     "`[account] url` must be https — refusing to send a request over {url}"
@@ -3111,7 +3115,7 @@ fn template_complaint(label: &str) -> Option<&'static str> {
 /// declared `id`, and never records an `Extra`-role window at all (see
 /// `main.rs`'s `seen_role_key`). Capped here rather than left open, because a
 /// manifest that already shipped with a 4 KB id would have to keep working.
-pub const WINDOW_ID_MAX_BYTES: usize = 64;
+pub(crate) const WINDOW_ID_MAX_BYTES: usize = 64;
 
 impl WindowConfig {
     /// The `<entry>` half of this window's key: the declared `id`, or the
@@ -3124,8 +3128,11 @@ impl WindowConfig {
     /// label is a caption, and the response slot moves on its own (Codex sends
     /// its weekly window in `primary_window` whenever the 5-hour one has
     /// nothing to report). A third-party manifest that wants its rows to keep
-    /// their registry entries across edits declares `id`; both shipped
-    /// manifests do.
+    /// their registry entries across edits declares `id`; of the five shipped
+    /// manifests, the three that declare any `[[windows]]` at all
+    /// (`antigravity`, `claude`, `codex`) declare `id` on every one — the
+    /// other two (`copilot`, `grok`) report only `[[balances]]` and have no
+    /// windows to give one to.
     pub fn entry_key(&self, index: usize) -> String {
         match self.id.is_empty() {
             true => format!("w{index}"),
@@ -3463,12 +3470,14 @@ pub struct LogFileConfig {
     pub root: String,
     /// Glob (relative to `root`) matching the provider's log files.
     pub glob: String,
-    /// Log file format.
-    #[serde(default = "default_logfile_format")]
-    pub format: String,
-    /// Which reading to keep when a file has more than one.
-    #[serde(default = "default_logfile_select")]
-    pub select: String,
+    /// Log file format — the one this engine's readers parse a line as. See
+    /// [`LogFileFormat`].
+    #[serde(default)]
+    pub format: LogFileFormat,
+    /// Which reading to keep when a file has more than one. See
+    /// [`LogFileSelect`].
+    #[serde(default)]
+    pub select: LogFileSelect,
     /// JSON key that wraps a window-bearing reading (e.g. `"rate_limits"`).
     pub container_key: String,
     /// Windows at most this many minutes long classify as "short"; used to
@@ -3525,12 +3534,42 @@ pub struct AccountMatchConfig {
     pub auth_claim: Vec<String>,
 }
 
-fn default_logfile_format() -> String {
-    "jsonl".to_string()
+/// The shape this engine reads a matched line as. One variant today —
+/// `engine_logfile::parse_file` matches on it at the point that parses each
+/// line, so a manifest naming a format nothing here understands is refused at
+/// load rather than read as `jsonl` regardless of what it asked for.
+/// `engine_logfile::parse_file_groups` (the secondary-accounts path, reached
+/// from `collect_plan_groups`) parses JSONL directly instead, without
+/// consulting this field at all — a second variant would have to be threaded
+/// there too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LogFileFormat {
+    /// One JSON object per line.
+    #[default]
+    Jsonl,
 }
 
-fn default_logfile_select() -> String {
-    "last".to_string()
+/// Which reading this engine keeps, *within one file*, when it holds more
+/// than one matching line. One variant today — `engine_logfile::parse_file`
+/// matches on it where it decides whether a newly parsed reading replaces the
+/// one already kept, so a manifest naming a selection nothing here
+/// understands is refused at load rather than read as `last` regardless of
+/// what it asked for.
+///
+/// Choosing *between* the several files a `glob` matches is outside this
+/// field's scope: that is `latest_reading`'s own newest-file-first fallback,
+/// unconditional and not read from the manifest. `engine_logfile::
+/// parse_file_groups` (the secondary-accounts path, reached from
+/// `collect_plan_groups`) keeps the strictly-newer-by-timestamp line per
+/// account group instead, without consulting this field either — a second
+/// variant would have to be threaded there too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LogFileSelect {
+    /// The most recently written matching reading.
+    #[default]
+    Last,
 }
 
 fn default_classify_threshold_minutes() -> u64 {
@@ -4505,8 +4544,8 @@ mod tests {
         assert_eq!(lf.root_env.as_deref(), Some("CODEX_HOME"));
         assert_eq!(lf.root, "~/.codex/sessions");
         assert_eq!(lf.glob, "**/rollout-*.jsonl");
-        assert_eq!(lf.format, "jsonl", "format defaults to jsonl");
-        assert_eq!(lf.select, "last", "select defaults to last");
+        assert_eq!(lf.format, LogFileFormat::Jsonl, "format defaults to jsonl");
+        assert_eq!(lf.select, LogFileSelect::Last, "select defaults to last");
         assert_eq!(lf.container_key, "rate_limits");
         assert_eq!(lf.classify_threshold_minutes, 720, "default threshold");
 
@@ -4748,6 +4787,46 @@ mod tests {
         let m = PluginManifest::from_str(with_extra_status_and_balance_fields)
             .expect("unknown fields in [status]/[[balances]] must not break parsing either");
         assert_eq!(m.id, "y");
+    }
+
+    #[test]
+    fn an_unsupported_logfile_format_or_select_is_refused_not_silently_ignored() {
+        // `format`/`select` are typed enums with one variant each — the same
+        // shape `engine` already is — so a value neither names is refused by
+        // the typed parse itself, the way an unrecognized `engine` already
+        // is, rather than loading and being read as whatever this build
+        // happens to default to.
+        for (field, bad) in [("format", "yaml"), ("select", "first")] {
+            let manifest = format!(
+                r#"
+                    id         = "x"
+                    name       = "X"
+                    menu_label = "X"
+                    order      = 1
+                    engine     = "log-file"
+                    [[windows]]
+                    label = "5H"
+                    role  = "primary"
+                    [windows.period]
+                    mode = "assumed"
+                    assumed = 300
+                    [windows.source]
+                    used_percent_path = "p"
+                    resets_at_path = "r"
+                    [logfile]
+                    root          = "~/.x"
+                    glob          = "*.jsonl"
+                    container_key = "rate_limits"
+                    {field}        = "{bad}"
+                "#
+            );
+            let err = PluginManifest::from_str(&manifest)
+                .expect_err(&format!("`{field} = \"{bad}\"` must be refused"));
+            assert!(
+                err.contains(bad),
+                "the refusal must name the unrecognized value — {err}"
+            );
+        }
     }
 
     #[test]

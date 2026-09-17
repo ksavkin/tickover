@@ -1279,14 +1279,22 @@ fn select_container<'v>(w: &WindowConfig, value: &'v Value) -> Option<&'v Value>
 
 /// This window's declared length as read out of `container`, in minutes.
 /// `None` for `period.mode = "assumed"` (the length is a constant, not
-/// something the response states), when the field is missing/unparsable, or
-/// when the value is not [`crate::plugin::time::plausible_period_minutes`] —
-/// a saturating `as u64` on an absurd float, or a field a provider fills in a
-/// different unit than declared, is a length nothing here should draw a
-/// window from. The one implementation both [`select_container`]'s
-/// classification and [`build_window`]'s own `period_minutes` field call —
-/// they used to carry a second copy of this, which is exactly the kind of
-/// place a bound like this is easy to add to one and forget on the other.
+/// something the response states), when the field is missing, when the value
+/// is not a JSON integer, or when it is not
+/// [`crate::plugin::time::plausible_period_minutes`] — a field a provider
+/// fills in a different unit than declared is a length nothing here should
+/// draw a window from.
+///
+/// "Not a JSON integer" is `Value::as_u64` refusing a float outright, with no
+/// cast underneath it: a provider that serialises a whole number of minutes
+/// as `300.0` rather than `300` reads as "no length" here at all, never
+/// reaching the plausibility check — unlike `engine_logfile`'s own reader
+/// (`first_u64`), which does accept that shape via a saturating `as u64`.
+///
+/// The one implementation both [`select_container`]'s classification and
+/// [`build_window`]'s own `period_minutes` field call, rather than each
+/// carrying its own copy — exactly the kind of place a bound like this is
+/// easy to add to one and forget on the other.
 fn container_period_minutes(w: &WindowConfig, container: &Value) -> Option<u64> {
     if w.period.mode != PeriodMode::FromField {
         return None;
@@ -1464,9 +1472,12 @@ fn read_amount(value: &Value, cfg: &AmountConfig) -> Option<crate::model::Balanc
     }
 }
 
-/// Resolve a dotted JSON path (`"a.b.c"`) against an arbitrary value — object
-/// keys only, mirrors `crate::plugin::auth::json_path_str` /
-/// `engine_logfile::json_path`.
+/// Resolve a dotted JSON path (`"a.b.c"`) against an arbitrary value — plus
+/// the array-selector segments (`[0]`, `[field=value]`) [`pick`] below
+/// implements. `crate::plugin::auth::json_path_str` and
+/// `engine_logfile::json_path` walk the same dotted-key syntax but stop
+/// there, with no selector support of their own — this is the superset, not
+/// a mirror of either.
 fn json_path_get<'v>(root: &'v Value, path: &str) -> Option<&'v Value> {
     let mut cur = root;
     for seg in segments(path) {

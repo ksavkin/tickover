@@ -143,10 +143,15 @@ fn append_to_log(message: &str) {
 /// the last [`KEEP_BYTES`] from the first line boundary inside them — so the
 /// file never grows without bound and never starts mid-line.
 ///
-/// Reads only the tail — seeking to `len - KEEP_BYTES` rather than
-/// `std::fs::read`ing the whole file — so a log that has grown large reads
-/// [`KEEP_BYTES`] worth of bytes on every single line this app ever writes
-/// once it's over the trim threshold, not the whole (ever-growing) file.
+/// Called before every line this app ever writes, but the [`KEEP_BYTES`]
+/// tail read only happens on the line that finds the file already over
+/// [`MAX_BYTES`] — every other call stops after the one cheap `metadata`
+/// call in the body, because trimming drops the file back under that
+/// threshold, so it takes another `MAX_BYTES - KEEP_BYTES` worth of lines
+/// before the next one trips it again. When it does trip, this reads only
+/// the tail — seeking to `len - KEEP_BYTES` rather than `std::fs::read`ing
+/// the whole file — so even that one line never pays for the whole
+/// (ever-growing) file.
 ///
 /// Written through a temporary neighbour and renamed, the same way
 /// [`crate::config`] writes: a truncate-in-place interrupted half-way would

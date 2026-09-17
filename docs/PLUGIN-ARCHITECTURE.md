@@ -698,8 +698,8 @@ Required when `engine = "log-file"`.
 | `root_env_join` | string | — (optional) | subdirectory appended onto `root_env`'s value when it is set (`"sessions"` so `$CODEX_HOME` resolves to `$CODEX_HOME/sessions`); ignored otherwise. Must be a relative path with no `..` component — it is joined onto the env var's value, never used in its place |
 | `root` | string | — (required) | root directory to search; `~` and `{config_dir}` expand (see [Path expansion](#path-expansion)); no `..` component |
 | `glob` | string | — (required) | glob, relative to `root`, matching the provider's log files (e.g. `"**/rollout-*.jsonl"`) |
-| `format` | string | `"jsonl"` | log file format — currently the only supported value |
-| `select` | string | `"last"` | which reading to keep when a file has more than one — currently the only supported value |
+| `format` | `"jsonl"` | `"jsonl"` | log file format — the only value this build accepts; any other is refused at load |
+| `select` | `"last"` | `"last"` | which reading to keep when a file has more than one — the only value this build accepts; any other is refused at load |
 | `container_key` | string | — (required) | JSON key wrapping a window-bearing reading (e.g. `"rate_limits"`) |
 | `classify_threshold_minutes` | integer | `720` | default boundary used to classify a found window as "short" vs "long" when it doesn't declare its own `max_period_minutes`/`min_period_minutes` |
 
@@ -1153,10 +1153,11 @@ against the frozen schema above.
    generalized so windows aren't required to appear in a fixed position —
    Codex has been observed reporting the weekly window alone in the
    `primary` slot right after a 5-hour reset.
-5. Per `[logfile].select` (`"last"`, the only supported value today): keep
-   the last matching reading found across the file, falling back across
-   files if the newest one has none yet (a session that only just started
-   can legitimately contain zero readings so far).
+5. Per `[logfile].select` (`"last"`, the only value this build accepts —
+   any other is refused at load): keep the last matching reading found
+   across the file, falling back across files if the newest one has none
+   yet (a session that only just started can legitimately contain zero
+   readings so far).
 6. For each matched window, read the slot's own `used_percent` and
    `resets_at` fields (with the spelling tolerance listed at the top of
    `engine_logfile.rs`: `used_percent` / `usedPercent` / `percent_used`,
