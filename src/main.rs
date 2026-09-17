@@ -29,7 +29,9 @@ use tickover::plugin::registry::{
     self, RegistryEntry, RegistryIndex, RegistryPluginState, TrustDisclosure,
 };
 use tickover::plugin::signature;
-use tickover::plugin::{engine_http, engine_logfile, scheduler, seed, time as plugin_time};
+use tickover::plugin::{
+    engine_http, engine_logfile, is_invisible_or_directional, scheduler, seed, time as plugin_time,
+};
 
 use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
@@ -4578,13 +4580,20 @@ fn not_started_row(label: &str, role: Role, period_minutes: u64) -> WindowData {
 /// shape for the case it has already excluded.
 fn window_data(now: u64, w: &Window, used: f64) -> WindowData {
     // Whether the reset clock carries a date. A week away needs one; five
-    // hours away does not. An extra quota can be either length, so it is
-    // asked rather than assumed.
-    let weekly = match w.role {
-        Role::Secondary => true,
-        Role::Primary => false,
-        Role::Extra => w.period_minutes.is_some_and(|m| m > 720),
-    };
+    // hours away does not. Decided by length when the window states one —
+    // the same rule `window_title`/`window_title_of` already use to choose
+    // between "Weekly limit"/"Daily limit"/an hour count and a plain
+    // `{label} limit`, so the two agree instead of a `role = "primary"`
+    // window with a 10 080-minute period getting a "Weekly limit" caption
+    // and an undated countdown underneath it. Without a stated length this
+    // falls back to the old role default (`Secondary` is weekly, `Primary`
+    // is not) rather than always reading as short: a `Secondary` window that
+    // never declares `period_minutes` is exactly the case a date matters
+    // most for, and `role == Extra` had no better answer than the role
+    // either.
+    let weekly = w
+        .period_minutes
+        .map_or(w.role == Role::Secondary, |m| m > 720);
     let name = window_title(w);
     let (rel, at, tooltip, _, _) =
         window_view(now, used, w.resets_at, w.period_minutes, weekly, &name);
@@ -7129,18 +7138,24 @@ const TRUST_ITEM_MAX_CHARS: usize = 120;
 /// * C0 controls and DEL (`applescript_escape` already turns these into a
 ///   space for its own reason; the Windows `MessageBoxW` arm never calls
 ///   that function at all, so without this they'd reach it raw);
-/// * U+2028/U+2029 (LINE/PARAGRAPH SEPARATOR) — a line break
-///   `applescript_escape`'s `'\n'` match never catches, since neither is the
-///   ASCII newline it matches on;
-/// * the bidi control characters (U+200E/U+200F, U+202A–U+202E,
-///   U+2066–U+2069) — invisible on their own, but able to make a dialog
-///   *display* a string in an order its bytes don't have, up to hiding one
-///   sentence behind the visual shape of another.
+/// * [`is_invisible_or_directional`] — the same class `sanitize_provider_text`
+///   strips from a provider's own response, shared rather than reimplemented
+///   here: a bidi override (U+202A–U+202E) can make a dialog *display* a
+///   string in an order its bytes don't have, and a zero-width character
+///   (U+200B–U+200D, U+FEFF, a tag character, …) makes two different
+///   disclosures render identically — a manifest string reaching this
+///   dialog is trusted for content, never for shape, and a smaller,
+///   hand-picked class here than the one the rest of the app already
+///   maintains would leave exactly that gap open.
 ///
 /// Every one of those is turned into a space, then every run of whitespace
 /// (including the ones this just produced) collapses to a single space and
 /// the ends are trimmed, and the result is capped at
-/// [`TRUST_ITEM_MAX_CHARS`] characters plus `…`.
+/// [`TRUST_ITEM_MAX_CHARS`] characters plus `…`. Done in one pass over `s`
+/// rather than a filter-then-`split_whitespace`-then-`join`: the collapsing
+/// is tracked with a `last_was_space` flag as the characters are read, so
+/// there is no intermediate `String` for the stripped-but-uncollapsed text
+/// and no `Vec<&str>` of words materialised only to be rejoined.
 ///
 /// Applied to every manifest-supplied item [`build_trust_message`] renders —
 /// the ping command line, each `local_files`/`credential_sources` entry,
@@ -7149,18 +7164,24 @@ const TRUST_ITEM_MAX_CHARS: usize = 120;
 /// labelled lines, and collapsing whitespace across the whole message would
 /// destroy that layout along with whatever it was sanitising.
 fn sanitize_trust_item(s: &str) -> String {
-    let mut cleaned = String::with_capacity(s.len());
+    let mut collapsed = String::with_capacity(s.len());
+    // Starts `true` so a leading run of whitespace never gets a space of its
+    // own pushed ahead of the first real character — the same effect
+    // `split_whitespace` gave for free, kept without its intermediate `Vec`.
+    let mut last_was_space = true;
     for ch in s.chars() {
-        let strip = matches!(ch,
-            '\u{0}'..='\u{1F}' | '\u{7F}'
-            | '\u{2028}' | '\u{2029}'
-            | '\u{200E}' | '\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2066}'..='\u{2069}'
-        );
-        cleaned.push(if strip { ' ' } else { ch });
+        let strip = matches!(ch, '\u{0}'..='\u{1F}' | '\u{7F}') || is_invisible_or_directional(ch);
+        let out = if strip { ' ' } else { ch };
+        if out.is_whitespace() {
+            last_was_space = true;
+        } else {
+            if last_was_space && !collapsed.is_empty() {
+                collapsed.push(' ');
+            }
+            collapsed.push(out);
+            last_was_space = false;
+        }
     }
-    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= TRUST_ITEM_MAX_CHARS {
         collapsed
     } else {
@@ -7776,6 +7797,58 @@ mod title_tests {
             titled(Some(0)),
             "WK limit",
             "a zero-length window names nothing"
+        );
+    }
+
+    #[test]
+    fn a_primary_window_with_a_weekly_length_gets_a_dated_reset_clock() {
+        // `window_title` already names this "Weekly limit" from its length
+        // alone, independent of role — `window_data`'s own `weekly` flag
+        // used to disagree, reading `role = "primary"` as "never dated"
+        // regardless of length, so the caption and the clock underneath it
+        // told two different stories.
+        let w = win("5H", Role::Primary, 50.0, 3 * 86400, 10_080);
+        let data = window_data(NOW, &w, 50.0);
+        assert_eq!(data.label, "Weekly limit");
+        assert!(
+            data.reset_at.contains(' '),
+            "a week-away reset needs a date, not just a time of day: {:?}",
+            data.reset_at
+        );
+    }
+
+    #[test]
+    fn a_secondary_window_with_no_declared_length_still_gets_a_dated_reset_clock() {
+        // The old role default, kept as the fallback for exactly the case a
+        // date matters most for: a `Secondary` window that never states its
+        // own length at all.
+        let w = Window {
+            key: "w1:".to_string(),
+            label: "WK".into(),
+            role: Role::Secondary,
+            used_percent: Some(50.0),
+            resets_at: Some(NOW + 3 * 86400),
+            period_minutes: None,
+        };
+        let data = window_data(NOW, &w, 50.0);
+        assert!(
+            data.reset_at.contains(' '),
+            "a Secondary window with no stated length must still fall back to a dated clock: {:?}",
+            data.reset_at
+        );
+    }
+
+    #[test]
+    fn a_primary_window_with_a_short_length_still_gets_a_bare_time() {
+        // The mirror case, so the fix above isn't just "always show a date":
+        // a `Primary` window at its ordinary 5-hour length keeps the bare
+        // time it always had.
+        let w = win("5H", Role::Primary, 50.0, 3 * 3600, 300);
+        let data = window_data(NOW, &w, 50.0);
+        assert!(
+            !data.reset_at.contains(' '),
+            "a same-day reset needs no date: {:?}",
+            data.reset_at
         );
     }
 
@@ -13026,6 +13099,40 @@ mod title_tests {
             9,
             "sanitising an item must not add or remove a labelled line: {detailed:?}"
         );
+    }
+
+    #[test]
+    fn sanitize_trust_item_strips_the_same_zero_width_class_sanitize_provider_text_does() {
+        // These used to pass through a strictly smaller class of its own —
+        // none of a zero-width space, a BOM, a soft hyphen or a tag
+        // character were in it, so two disclosures that differed only in
+        // one of these could render identically in the dialog. Sharing
+        // `is_invisible_or_directional` with `sanitize_provider_text` closes
+        // that gap rather than widening the private list by hand. Each is
+        // turned into a *visible* space rather than dropped outright (the
+        // run of three in the middle collapses to exactly one) — dropping
+        // them would leave "evilhost.example" indistinguishable from a
+        // manifest that never had anything between the two words at all,
+        // which is the opposite of what a trust dialog is for; the trailing
+        // pair is trimmed away like any other trailing whitespace.
+        let hidden = "evil\u{200B}\u{FEFF}\u{00AD}host.example\u{E0041}\u{E01EF}";
+        assert_eq!(sanitize_trust_item(hidden), "evil host.example");
+    }
+
+    #[test]
+    fn sanitize_trust_item_collapses_whitespace_and_trims_in_one_pass() {
+        // The rewrite folds a filter, a `split_whitespace` and a `join` into
+        // one loop; this pins the observable behaviour that combination used
+        // to give — leading/trailing whitespace gone, internal runs (plain
+        // or manufactured by stripping a control/invisible character)
+        // collapsed to exactly one space.
+        assert_eq!(
+            sanitize_trust_item("  a\tb\u{200B}\u{200B}c   d  "),
+            "a b c d"
+        );
+        assert_eq!(sanitize_trust_item(""), "");
+        assert_eq!(sanitize_trust_item("   "), "");
+        assert_eq!(sanitize_trust_item("solo"), "solo");
     }
 
     #[test]

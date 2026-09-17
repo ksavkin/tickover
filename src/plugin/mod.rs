@@ -545,7 +545,18 @@ pub fn sanitize_provider_text(text: &str) -> String {
 /// render as nothing at all in a normal font, and a run of tag characters
 /// used to be able to smuggle arbitrary text invisibly inside what looked
 /// like an ordinary short caption.
-fn is_invisible_or_directional(c: char) -> bool {
+///
+/// `pub`, not file-local: `src/main.rs`'s `sanitize_trust_item` — the trust
+/// dialog's own sanitiser, a step earlier than this one's caller — used to
+/// keep a smaller, hand-picked class of its own. Two classes for the same
+/// "make this invisible thing visible" job meant the dialog could pass a
+/// string this function would still call worth stripping; sharing the one
+/// definition is what closes that gap rather than narrowing it in two places
+/// that could drift apart again. `pub(crate)` is not enough here: `main.rs`
+/// is a separate binary crate that reaches this library only through
+/// `tickover::plugin::…`, the same external-facing surface `map_role`/
+/// `collect_windows`/`substitute_options` already cross on.
+pub fn is_invisible_or_directional(c: char) -> bool {
     matches!(
         c,
         // Directional marks and overrides: reorder what is printed after them.

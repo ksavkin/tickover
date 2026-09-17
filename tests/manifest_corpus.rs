@@ -294,6 +294,24 @@ fn rules() -> Vec<Rule> {
             names: "declared more than once",
         },
         Rule {
+            // Every other label in the schema already refuses blank; this
+            // one didn't, and the explicit-surface branch of `resolve_tag`
+            // hands it straight to the tag chip unfiltered.
+            says: "a surface has a label, like every other one in the schema",
+            broken_by: plus(LOGFILE, "[[surface]]\nid = \"x\"\nlabel = \"  \""),
+            names: "`label` must not be empty",
+        },
+        Rule {
+            // Same shape as the window-label cap: a row caption, not a
+            // paragraph.
+            says: "a surface label is a row caption, not a paragraph",
+            broken_by: plus(
+                LOGFILE,
+                &format!("[[surface]]\nid = \"x\"\nlabel = \"{}\"", "x".repeat(121)),
+            ),
+            names: "cap for a row caption",
+        },
+        Rule {
             says: "an id shaped like a Windows device name would open the device, not a file",
             broken_by: changed(LOGFILE, r#"id         = "sample""#, r#"id = "con""#),
             names: "reserved device name",
@@ -325,6 +343,18 @@ fn rules() -> Vec<Rule> {
                 &format!(r#"menu_label = "{}""#, "x".repeat(17)),
             ),
             names: "cap for the menu-bar pill",
+        },
+        Rule {
+            // A row caption drawn on a card with `wrap: word-wrap`
+            // (`ui/app.slint`), not a paragraph — same shape as `name`/
+            // `menu_label`'s own caps just above.
+            says: "a window label is a row caption, not a paragraph",
+            broken_by: changed(
+                LOGFILE,
+                r#"label = "5H""#,
+                &format!(r#"label = "{}""#, "x".repeat(121)),
+            ),
+            names: "cap for a row caption",
         },
         Rule {
             says: "a refresh interval of zero is not an interval",
@@ -424,6 +454,19 @@ fn rules() -> Vec<Rule> {
             names: "{token}",
         },
         Rule {
+            // `engine_http::build_window` matches `(&used_percent_path,
+            // &remaining_fraction_path)` on *`Some`-ness*, not on which one
+            // actually resolves — a blank `used_percent_path` beside a
+            // perfectly good `remaining_fraction_path` would win that match
+            // arm, read nothing at `json_path_get(v, "")`, and silently drop
+            // the whole window even though the manifest plainly stated a
+            // real figure one field over. Refused outright, before either
+            // "name only one" or "no figure to show" below ever sees it.
+            says: "a figure path present but blank is refused, not merely excluded from the count",
+            broken_by: changed(HTTP, "used_percent_path = \"used_percent\"", "used_percent_path = \"\""),
+            names: "`used_percent_path` is present but blank",
+        },
+        Rule {
             // A window states its consumed figure one way, not two: spent
             // (`used_percent_path`) or what is left (`remaining_fraction_path`),
             // never both at once, or the engine is left to pick.
@@ -441,6 +484,16 @@ fn rules() -> Vec<Rule> {
             says: "an http-api window with neither figure path resolves to nothing",
             broken_by: changed(HTTP, "used_percent_path = \"used_percent\"\n", ""),
             names: "it has no figure to show otherwise",
+        },
+        Rule {
+            // `resets_at_path` is a required `String`, not an `Option`, so a
+            // manifest author can still leave it blank — `json_path_get`
+            // then reads `segments("")` as `[""]`, matching nothing on any
+            // real response, and the window's reset time silently stops
+            // showing on every fetch.
+            says: "resets_at_path may not be blank",
+            broken_by: changed(HTTP, "resets_at_path    = \"resets_at\"", "resets_at_path = \"\""),
+            names: "`resets_at_path` must not be blank",
         },
         Rule {
             says: "a provider with no window has nothing to show",
@@ -479,6 +532,16 @@ fn rules() -> Vec<Rule> {
                 "label = \"  \"\n[balances.remaining]\nkind = \"text\"\npath = \"credits.balance\"",
             ),
             names: "`[[balances]] label`",
+        },
+        Rule {
+            // Same shape as the window-label cap: a row caption, not a
+            // paragraph.
+            says: "a balance label is a row caption, not a paragraph",
+            broken_by: with_balance(&format!(
+                "label = \"{}\"\n[balances.remaining]\nkind = \"text\"\npath = \"credits.balance\"",
+                "x".repeat(121)
+            )),
+            names: "cap for a row caption",
         },
         Rule {
             // Same rule as a window id, same reason: it becomes a segment of a
@@ -523,6 +586,28 @@ fn rules() -> Vec<Rule> {
             names: "`unit_label` belongs to",
         },
         Rule {
+            // `path` is `number`/`text`'s own field — `money-minor` reads
+            // its figure from `amount_path`/`currency_path`/`exponent_path`
+            // instead, and never looks at `path` at all.
+            says: "money-minor names amount/currency/exponent, never a bare path",
+            broken_by: with_balance(
+                "label = \"Spend\"\n[balances.used]\nkind = \"money-minor\"\n\
+                 amount_path = \"a\"\ncurrency_path = \"c\"\nexponent_path = \"e\"\n\
+                 path = \"spend.used.amount_minor\"",
+            ),
+            names: "`path` belongs to",
+        },
+        Rule {
+            // The mirror: `amount_path` is `money-minor`'s own field, and a
+            // `number` amount naming it loads clean and never has it read.
+            says: "a bare number never names amount_path/currency_path/exponent_path",
+            broken_by: with_balance(
+                "label = \"Credits\"\n[balances.cap]\nkind = \"number\"\npath = \"c\"\n\
+                 amount_path = \"c\"",
+            ),
+            names: "`amount_path` belongs to",
+        },
+        Rule {
             // `is_none()` is false for `path = "  "`, so the manifest loads and
             // then reads nothing on every fetch — accepted, and silently inert.
             says: "a balance path can be present and still be blank",
@@ -541,6 +626,17 @@ fn rules() -> Vec<Rule> {
                  unit_label = \"   \"",
             ),
             names: "nothing printable",
+        },
+        Rule {
+            // Appended after a number, not a caption of its own — a quarter
+            // of a row caption's own room.
+            says: "a unit label is appended after a number, not a caption of its own",
+            broken_by: with_balance(&format!(
+                "label = \"Credits\"\n[balances.cap]\nkind = \"number\"\npath = \"c\"\n\
+                 unit_label = \"{}\"",
+                "x".repeat(33)
+            )),
+            names: "`unit_label` is",
         },
         Rule {
             says: "two balances cannot share an id",
@@ -693,6 +789,20 @@ fn rules() -> Vec<Rule> {
             names: "period.field",
         },
         Rule {
+            // The same shape as `period.field` just above, for `[tag]`:
+            // `resolve_tag` reads `value` only on `from = "static"`, so a
+            // manifest that named the mode and not the value loads clean
+            // and draws no chip at all.
+            says: "a static tag has to say what the static text is",
+            broken_by: plus(LOGFILE, "[tag]\nfrom = \"static\""),
+            names: "`[tag] from = \"static\"` requires `value`",
+        },
+        Rule {
+            says: "a field-read tag has to say which field",
+            broken_by: plus(LOGFILE, "[tag]\nfrom = \"field\""),
+            names: "`[tag] from = \"field\"` requires `path`",
+        },
+        Rule {
             says: "source.containers has a count cap of its own, past the from_field requirement",
             broken_by: changed(
                 &changed(
@@ -739,6 +849,24 @@ fn rules() -> Vec<Rule> {
             names: "min_period_minutes",
         },
         Rule {
+            // A `min_period_minutes` greater than `max_period_minutes`
+            // bounds an empty range on either engine — nothing a response
+            // could report satisfies both, so `effective_bounds`/
+            // `select_container` never classify a candidate into this
+            // window.
+            says: "min_period_minutes greater than max_period_minutes classifies nothing, ever",
+            broken_by: changed(
+                &changed(
+                    LOGFILE,
+                    "mode    = \"assumed\"\nassumed = 300",
+                    "mode = \"from_field\"\nfield = \"window_minutes\"",
+                ),
+                "used_percent_path = \"used_percent\"",
+                "min_period_minutes = 200\nmax_period_minutes = 100\nused_percent_path = \"used_percent\"",
+            ),
+            names: "is greater than",
+        },
+        Rule {
             says: "a credential never goes in a URL, where whatever fronts the endpoint logs it",
             broken_by: changed(
                 HTTP,
@@ -767,6 +895,16 @@ fn rules() -> Vec<Rule> {
             says: "a surface that carries a token has to say where the token may go",
             broken_by: changed(HTTP, "allowed_hosts = [\"example.com\"]", "allowed_hosts = []"),
             names: "allowed_hosts",
+        },
+        Rule {
+            // `min_interval` is the only thing standing between a person and
+            // a request on every panel open, `Refresh` click and app start —
+            // the one floor of the four in this table that was not already
+            // zero-refused the way `backoff_start_secs`/
+            // `unauthorized_retry_secs` are just below.
+            says: "a request floor of zero is not a floor",
+            broken_by: changed(HTTP, "[http]\n", "[http]\nmin_interval_secs = 0\n"),
+            names: "`[http] min_interval_secs` must be greater than 0",
         },
         Rule {
             // `refresh_secs` defaults to 60 here (`HTTP` never sets it), so a
@@ -962,9 +1100,10 @@ fn rules() -> Vec<Rule> {
         Rule {
             // One shared helper, one row: every field it covers (`allowed_hosts`
             // here, but the same check reaches `[ping] args`, every label,
-            // `message`, `service`, `targets`, `client.id_env`/`secret_env`,
-            // `client.files` and `[http.version] files` too) trips the same
-            // refusal.
+            // `message`, `service`, `targets`, `client.id_env`/`secret_env`/
+            // `client.files`/`client.bins`/`client.id_pattern`/
+            // `client.secret_pattern` and `[http.version] files` too) trips
+            // the same refusal.
             says: "a control character or bidi override in a manifest string is refused at load",
             broken_by: changed(
                 HTTP,
@@ -982,6 +1121,30 @@ fn rules() -> Vec<Rule> {
             says: "root_env_join must not walk outside the directory root_env named",
             broken_by: plus(LOGFILE, "root_env_join = \"../escape\""),
             names: "must not contain a `..`",
+        },
+        Rule {
+            // A blank `container_field` compares against no field of any
+            // container, ever — `[logfile] account_match`'s own doc calls
+            // both halves required, but only this one is a plain `String`
+            // that can still be blank.
+            says: "[logfile] account_match's container_field must not be blank",
+            broken_by: plus(
+                LOGFILE,
+                "[logfile.account_match]\ncontainer_field = \"   \"\nauth_claim = [\"plan_type\"]",
+            ),
+            names: "container_field",
+        },
+        Rule {
+            // An empty `auth_claim` walks zero segments into the decoded
+            // JWT — `cur` stays the whole claims object, `.as_str()` on it
+            // fails, and `resolve_account_match` returns `None` on every
+            // call, silently defeating the filter this table exists to be.
+            says: "[logfile] account_match's auth_claim must name at least one segment",
+            broken_by: plus(
+                LOGFILE,
+                "[logfile.account_match]\ncontainer_field = \"plan_type\"\nauth_claim = []",
+            ),
+            names: "auth_claim",
         },
         Rule {
             // One shared sweep, the same shape as the control-character one
@@ -1022,6 +1185,16 @@ fn rules() -> Vec<Rule> {
             says: "an option is offered to a person, so it has something to read",
             broken_by: plus(LOGFILE, "[[option]]\nkey = \"k\"\nlabel = \"\""),
             names: "`label`",
+        },
+        Rule {
+            // Same shape as the window-label cap: a row caption (the
+            // settings sheet's checkbox text), not a paragraph.
+            says: "an option label is a row caption, not a paragraph",
+            broken_by: plus(
+                LOGFILE,
+                &format!("[[option]]\nkey = \"k\"\nlabel = \"{}\"", "x".repeat(121)),
+            ),
+            names: "cap for a row caption",
         },
         Rule {
             says: "two options cannot answer to the same key",
@@ -1087,6 +1260,32 @@ fn rules() -> Vec<Rule> {
                 "type              = \"env\"\nvar               = \"SAMPLE_TOKEN\"\nexpiry_json_path  = \"token.expiry\"",
             ),
             names: "expiry_json_path",
+        },
+        Rule {
+            // `macos_keychain_key` is read only by
+            // `auth::electron_safe_storage_step` — a `credentials-file` step
+            // never touches it, so setting it there would load clean and
+            // never do anything, the same silent-no-op `expiry_json_path` is
+            // refused for just above.
+            says: "macos_keychain_key only means something on an electron-safe-storage step",
+            broken_by: changed(
+                HTTP,
+                "token_json_path = \"token\"",
+                "token_json_path    = \"token\"\nmacos_keychain_key = \"Sample Safe Storage\"",
+            ),
+            names: "macos_keychain_key",
+        },
+        Rule {
+            // `unless_json_path` is `auth::reject_when_step`'s own escape
+            // hatch — a `credentials-file` step never reads it, same shape
+            // as the row just above.
+            says: "unless_json_path only means something on a reject-when step",
+            broken_by: changed(
+                HTTP,
+                "token_json_path = \"token\"",
+                "token_json_path  = \"token\"\nunless_json_path = \"tokens.access_token\"",
+            ),
+            names: "unless_json_path",
         },
         Rule {
             // `[surface.auth.client]` is `oauth-refresh`'s own sub-table; a

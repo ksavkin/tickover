@@ -77,7 +77,14 @@ pub struct Limits {
 impl Limits {
     pub fn from_http(http: &HttpConfig) -> Self {
         Limits {
-            min_interval: Duration::from_secs(http.min_interval_secs),
+            // `refresh_secs` paces the timer; `min_interval` is the only
+            // thing standing between a person and a request on every panel
+            // open, `Refresh` click and app start — `.max(1)` the same
+            // defensive floor the other three durations already get, so a
+            // manifest naming `0` (refused at `validate` too, see
+            // `manifest.rs`) cannot reach `is_throttled`'s `<` comparison as
+            // a duration no `Instant` gap is ever shorter than.
+            min_interval: Duration::from_secs(http.min_interval_secs.max(1)),
             backoff_start: Duration::from_secs(http.backoff_start_secs.max(1)),
             backoff_max: Duration::from_secs(http.backoff_max_secs.max(1)),
             unauthorized_retry: Duration::from_secs(http.unauthorized_retry_secs.max(1)),
@@ -982,8 +989,13 @@ mod tests {
 
     /// Pacing knobs drawn from the plausible and the awkward alike: a floor
     /// of zero, a cool-off ceiling below its own starting point, a session
-    /// wait shorter than the floor. A manifest may declare any of these, and
-    /// the seams this module has already had came from exactly such corners.
+    /// wait shorter than the floor. `min_interval = 0` is refused at
+    /// `manifest::validate` and clamped again by `Limits::from_http`'s own
+    /// `.max(1)` now, so a manifest cannot actually produce it any more —
+    /// still drawn here anyway, to keep this decision logic itself proven
+    /// against the corner rather than only against what a manifest happens
+    /// to be allowed to say; the seams this module has already had came from
+    /// exactly such corners.
     fn generated_limits(rng: &mut Rng) -> Limits {
         Limits {
             min_interval: Duration::from_secs(rng.pick(&[0, 1, 55, 300])),

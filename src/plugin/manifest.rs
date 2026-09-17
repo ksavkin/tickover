@@ -203,6 +203,21 @@ const NAME_MAX_CHARS: usize = 64;
 /// characters ("Cx", "Cl", "Cp", "Gk", "Ag"); 16 is headroom, not a fit.
 const MENU_LABEL_MAX_CHARS: usize = 16;
 
+/// Cap on `windows[].label`, `balances[].label`, `surface[].label` and
+/// `option[].label` — a row caption drawn on a card with `wrap: word-wrap`
+/// (`ui/app.slint`), not a paragraph. Between [`MENU_LABEL_MAX_CHARS`] (a
+/// pill, sized to a couple of characters) and [`NAME_MAX_CHARS`] (a section
+/// header, 64): a row caption sits beside a figure rather than above a whole
+/// section, so it gets more room than the pill and less than the header —
+/// wide enough for a legitimate label in any of the four places while
+/// bounding how far a hostile one can grow the card it lands in.
+const LABEL_MAX_CHARS: usize = 120;
+
+/// Cap on `[[balances]] used/cap/remaining unit_label` — appended after a
+/// number (`credits`, `interactions`), not a caption of its own, so it gets
+/// a quarter of [`LABEL_MAX_CHARS`] rather than the same room.
+const UNIT_LABEL_MAX_CHARS: usize = 32;
+
 // Count caps on every array a manifest can declare — none tuned to any one
 // provider, all far past what one has ever needed (the largest shipped,
 // Antigravity's four windows and two surfaces, sits well under every figure
@@ -413,6 +428,29 @@ impl PluginManifest {
                     surface.id
                 ));
             }
+            // Every other label in the schema (`menu_label`, `[[windows]]
+            // label`, `[[balances]] label`, `[[option]] label`) already
+            // refuses blank; this one didn't, and `engine_http::resolve_tag`
+            // hands a declared surface's own `label` straight to the tag
+            // chip with no `.filter(|s| !s.is_empty())` the way its
+            // `[tag] from = "field"` branch gets — a blank one loads clean
+            // and draws an empty chip.
+            if surface.label.trim().is_empty() {
+                return Err(format!(
+                    "`[[surface]]` id \"{}\": `label` must not be empty",
+                    surface.id
+                ));
+            }
+            // Same reasoning as `[[windows]] label`'s own cap: a row caption
+            // on a card with `wrap: word-wrap`, not a paragraph.
+            if surface.label.chars().count() > LABEL_MAX_CHARS {
+                return Err(format!(
+                    "`[[surface]]` id \"{}\": label is {} characters — {LABEL_MAX_CHARS} is the \
+                     cap for a row caption",
+                    surface.id,
+                    surface.label.chars().count()
+                ));
+            }
         }
 
         if self.refresh_secs == 0 {
@@ -510,6 +548,33 @@ impl PluginManifest {
                     ));
                 }
             }
+            // Both halves of `account_match` are required, and the same
+            // "present but useless" gap the blank check above closes for
+            // `root`/`glob`/`container_key` reaches this table too: a blank
+            // `container_field` matches no container's field ever (the same
+            // `json_path_get`-shaped miss `resets_at_path` above is refused
+            // for), and an `auth_claim` with no segments, or with a blank one
+            // among them, walks a `.get("")` that a real JWT claims object
+            // never has a key for — `cur` stops resolving, `.as_str()` on
+            // whatever it stopped at fails, and `resolve_account_match`
+            // returns `None` on every call exactly as the empty-vec case
+            // does. Either way the filter this table declares never actually
+            // filters, silently defeating the reason a manifest author set
+            // it at all (see `resolve_account_match` in `engine_logfile`).
+            if let Some(am) = &lf.account_match {
+                if am.container_field.trim().is_empty() {
+                    return Err(
+                        "`[logfile.account_match] container_field` must not be blank".to_string(),
+                    );
+                }
+                if am.auth_claim.is_empty() || am.auth_claim.iter().any(|s| s.trim().is_empty()) {
+                    return Err(
+                        "`[logfile.account_match] auth_claim` must name at least one non-blank \
+                         segment — empty, or a blank one among them, never matches"
+                            .to_string(),
+                    );
+                }
+            }
         }
         // Same for the one endpoint an http manifest calls: an empty URL is a
         // request that cannot be sent, and `allowed_hosts` has no host to
@@ -540,44 +605,60 @@ impl PluginManifest {
                 );
             }
         }
-        // A `{` earlier in a body, header value or URL than a real
-        // placeholder — most commonly a JSON object's own opening brace in a
-        // body, but nothing about the shape is body-specific: a header value
-        // someone wrote a JSON fragment into, or a URL whose query string
-        // opens with an unrelated `{`, swallows a later placeholder exactly
-        // the same way — can pair that placeholder's own closing brace with
-        // the earlier `{` before this app, or the engine, ever reads its
-        // name; see `swallowed_placeholder` for the exact failure this
-        // catches. Checked here, at load, rather than left to be discovered
-        // as a request sent with a literal `{token}` still in it. One sweep
-        // over every field of the one request an http-api manifest sends,
-        // the same shape as the control-character and `..` sweeps below.
+        // A `{` earlier in a template than a real placeholder — most commonly
+        // a JSON object's own opening brace in an http body, but nothing
+        // about the shape is body-specific, or even http-specific: a header
+        // value someone wrote a JSON fragment into, a URL whose query string
+        // opens with an unrelated `{`, or a log-file `root`/`glob` that does
+        // the same, swallows a later placeholder exactly the same way — can
+        // pair that placeholder's own closing brace with the earlier `{`
+        // before this app, or the engine, ever reads its name; see
+        // `swallowed_placeholder` for the exact failure this catches. Checked
+        // here, at load, rather than left to be discovered as a request sent
+        // — or a directory searched — with a literal `{option.foo}` still in
+        // it. One sweep over every `{option.<key>}`-substituted template in
+        // the manifest (`crate::plugin::substitute_options`'s own doc names
+        // every one of them: `[[http.request]]` url/headers/body,
+        // `[logfile] root`/`root_env_join`/`glob`, and `[account] url`, which
+        // gets the same substitution as an http request's own URL —
+        // `engine_http::resolve_account_url`), the same shape as the
+        // control-character and `..` sweeps below.
+        let mut option_templates: Vec<(String, &str)> = Vec::new();
         if let Some(http) = &self.http {
             for req in &http.request {
-                let mut request_texts: Vec<(String, &str)> =
-                    vec![("`[[http.request]] url`".to_string(), req.url.as_str())];
+                option_templates.push(("`[[http.request]] url`".to_string(), req.url.as_str()));
                 for (header, value) in &req.headers {
-                    request_texts.push((
+                    option_templates.push((
                         format!("`[[http.request]]` header `{header}`"),
                         value.as_str(),
                     ));
                 }
                 if let Some(body) = &req.body {
-                    request_texts.push(("`[[http.request]] body`".to_string(), body.as_str()));
-                }
-                if let Some((where_it_is, marker)) =
-                    request_texts.iter().find_map(|(where_it_is, text)| {
-                        swallowed_placeholder(text).map(|marker| (where_it_is, marker))
-                    })
-                {
-                    return Err(format!(
-                        "{where_it_is} names {marker}, but an earlier `{{` — typically a JSON \
-                         object's own opening brace — pairs with that placeholder's closing brace \
-                         before its name is ever read, so it would be sent on the wire exactly as \
-                         written"
-                    ));
+                    option_templates.push(("`[[http.request]] body`".to_string(), body.as_str()));
                 }
             }
+        }
+        if let Some(lf) = &self.logfile {
+            option_templates.push(("`[logfile] root`".to_string(), lf.root.as_str()));
+            if let Some(join) = &lf.root_env_join {
+                option_templates.push(("`[logfile] root_env_join`".to_string(), join.as_str()));
+            }
+            option_templates.push(("`[logfile] glob`".to_string(), lf.glob.as_str()));
+        }
+        if let Some(url) = &self.account.url {
+            option_templates.push(("`[account] url`".to_string(), url.as_str()));
+        }
+        if let Some((where_it_is, marker)) =
+            option_templates.iter().find_map(|(where_it_is, text)| {
+                swallowed_placeholder(text).map(|marker| (where_it_is, marker))
+            })
+        {
+            return Err(format!(
+                "{where_it_is} names {marker}, but an earlier `{{` — typically a JSON \
+                 object's own opening brace — pairs with that placeholder's closing brace \
+                 before its name is ever read, so it would be sent on the wire exactly as \
+                 written"
+            ));
         }
 
         // A provider has to report *something*. Windows were the only shape
@@ -617,6 +698,21 @@ impl PluginManifest {
             return Err(format!(
                 "at most one window may have role = \"primary\", found {primary_count}"
             ));
+        }
+
+        // A row caption, not a paragraph — the panel draws it on a card with
+        // `wrap: word-wrap` (`ui/app.slint`), so a manifest with no cap of
+        // its own grows that card to whatever length it names, the same
+        // shape `name`/`menu_label`'s own caps exist to bound.
+        for w in &self.windows {
+            if w.label.chars().count() > LABEL_MAX_CHARS {
+                return Err(format!(
+                    "windows[label = \"{}\"]: label is {} characters — {LABEL_MAX_CHARS} is the \
+                     cap for a row caption",
+                    w.label,
+                    w.label.chars().count()
+                ));
+            }
         }
 
         // `[[windows]] id` becomes the `<entry>` half of this window's
@@ -787,8 +883,44 @@ impl PluginManifest {
         // record itself — see `engine_logfile`), so it is exempt from the "at
         // least one" half while still barred from naming both.
         for w in &self.windows {
-            let has_used = w.source.used_percent_path.is_some();
-            let has_remaining = w.source.remaining_fraction_path.is_some();
+            // A field present but blank (`Some("")`) is not a declaration,
+            // and refusing it outright — rather than only excluding it from
+            // "one of the two is named" below — matters here in a way it
+            // would not for a field `build_window` reads on its own:
+            // `engine_http::build_window` matches `(&used_percent_path,
+            // &remaining_fraction_path)` on *`Some`-ness*, not on which one
+            // actually resolves, so `used_percent_path = ""` beside a
+            // perfectly good `remaining_fraction_path` would win that match
+            // arm, read nothing at `json_path_get(v, "")`, and drop the
+            // whole window — silently discarding a figure the manifest did
+            // state, in a shape "the two fields disagree about which is
+            // declared" would otherwise slip through as merely "the one
+            // that lost". Same gap the `[status]` blank sweep closes for its
+            // own paths.
+            let blank_figure_paths = [
+                ("used_percent_path", &w.source.used_percent_path),
+                ("remaining_fraction_path", &w.source.remaining_fraction_path),
+            ];
+            if let Some((field, _)) = blank_figure_paths
+                .iter()
+                .find(|(_, p)| p.as_deref().is_some_and(|s| s.trim().is_empty()))
+            {
+                return Err(format!(
+                    "windows[label = \"{}\"]: `{field}` is present but blank — a path that reads \
+                     nothing is not a path",
+                    w.label
+                ));
+            }
+            let has_used = w
+                .source
+                .used_percent_path
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty());
+            let has_remaining = w
+                .source
+                .remaining_fraction_path
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty());
             if has_used && has_remaining {
                 return Err(format!(
                     "windows[label = \"{}\"]: name only one of `used_percent_path` or \
@@ -800,6 +932,18 @@ impl PluginManifest {
                 return Err(format!(
                     "windows[label = \"{}\"]: an `http-api` window needs `used_percent_path` or \
                      `remaining_fraction_path` — it has no figure to show otherwise",
+                    w.label
+                ));
+            }
+            // `resets_at_path` is the one path in this table that is not
+            // optional — every window states a reset time — so blank never
+            // reads as "not declared" anywhere else the way the two above
+            // do; it just resolves to nothing (`segments("")` = `[""]`) on
+            // every fetch, and the panel silently stops showing a reset time
+            // for this window.
+            if w.source.resets_at_path.trim().is_empty() {
+                return Err(format!(
+                    "windows[label = \"{}\"]: `resets_at_path` must not be blank",
                     w.label
                 ));
             }
@@ -865,6 +1009,16 @@ impl PluginManifest {
         for b in &self.balances {
             if b.label.trim().is_empty() {
                 return Err("`[[balances]] label` must not be empty".to_string());
+            }
+            // Same reasoning as the `[[windows]] label` cap above: a row
+            // caption on a card with `wrap: word-wrap`, not a paragraph.
+            if b.label.chars().count() > LABEL_MAX_CHARS {
+                return Err(format!(
+                    "`[[balances]] label` = \"{}\" is {} characters — {LABEL_MAX_CHARS} is the \
+                     cap for a row caption",
+                    b.label,
+                    b.label.chars().count()
+                ));
             }
             // Same charset and cap as `[[windows]] id`, and for the same
             // reason: it becomes a segment of a dotted key on disk.
@@ -975,6 +1129,16 @@ impl PluginManifest {
                             b.label
                         ));
                     }
+                    // Appended after a number, not a caption of its own — a
+                    // quarter of a row caption's own room.
+                    if label.chars().count() > UNIT_LABEL_MAX_CHARS {
+                        return Err(format!(
+                            "balances[label = \"{}\"].{field}: `unit_label` is {} characters — \
+                             {UNIT_LABEL_MAX_CHARS} is the cap",
+                            b.label,
+                            label.chars().count()
+                        ));
+                    }
                 }
                 // A unit label on money would compete with the currency the
                 // response states; on text it would annotate a sentence.
@@ -985,6 +1149,35 @@ impl PluginManifest {
                          states, and text is the provider's own wording",
                         b.label
                     ));
+                }
+                // The same restriction one step earlier, on the path fields
+                // themselves: `path` is `number`/`text`'s own field
+                // (`missing_path` above requires it for exactly those two),
+                // and `amount_path`/`currency_path`/`exponent_path` are
+                // `money-minor`'s own triplet — neither engine ever reads
+                // either set for the other kind, so the wrong one present
+                // loads clean and is silently ignored.
+                if amount.kind == AmountKind::MoneyMinor && amount.path.is_some() {
+                    return Err(format!(
+                        "balances[label = \"{}\"].{field}: `path` belongs to `kind = \"number\"`/\
+                         `\"text\"` — `kind = \"money-minor\"` reads `amount_path`/`currency_path`/\
+                         `exponent_path` instead",
+                        b.label
+                    ));
+                }
+                if amount.kind != AmountKind::MoneyMinor {
+                    let irrelevant: &[(&str, bool)] = &[
+                        ("amount_path", amount.amount_path.is_some()),
+                        ("currency_path", amount.currency_path.is_some()),
+                        ("exponent_path", amount.exponent_path.is_some()),
+                    ];
+                    if let Some((name, _)) = irrelevant.iter().find(|(_, present)| *present) {
+                        return Err(format!(
+                            "balances[label = \"{}\"].{field}: `{name}` belongs to \
+                             `kind = \"money-minor\"` only",
+                            b.label
+                        ));
+                    }
                 }
             }
         }
@@ -1020,6 +1213,22 @@ impl PluginManifest {
                 }
                 _ => {}
             }
+        }
+
+        // The same `mode`/field cross-check as `[windows.period]` just
+        // above, for `[tag]`: `resolve_tag` (`engine_http`/`engine_logfile`,
+        // identically) reads `value` only on `from = "static"` and `path`
+        // only on `from = "field"` — either without its own field loads
+        // clean and then resolves to `None` on every fetch, drawing no chip
+        // at all for a manifest that plainly declared one.
+        match self.tag.from {
+            TagFrom::Static if self.tag.value.is_none() => {
+                return Err("`[tag] from = \"static\"` requires `value`".to_string());
+            }
+            TagFrom::Field if self.tag.path.is_none() => {
+                return Err("`[tag] from = \"field\"` requires `path`".to_string());
+            }
+            _ => {}
         }
         // A window this short turns `main.rs`'s `ping_due` arithmetic —
         // `pinged_at + PING_GRACE_SECS < start` with `start = reset − period`
@@ -1094,6 +1303,26 @@ impl PluginManifest {
                         "windows[label = \"{}\"]: min_period_minutes/max_period_minutes classify \
                          a candidate by length on engine = \"http-api\" — meaningless when \
                          period.mode = \"assumed\" already states the length outright",
+                        w.label
+                    ));
+                }
+            }
+        }
+
+        // A `min_period_minutes` greater than `max_period_minutes` bounds an
+        // empty range — no length a response could ever report satisfies
+        // both at once, so `engine_logfile::effective_bounds`/
+        // `engine_http::select_container` never classify a candidate into
+        // this window, and a `role = "extra"` window built this way silently
+        // never draws.
+        for w in &self.windows {
+            if let (Some(min), Some(max)) =
+                (w.source.min_period_minutes, w.source.max_period_minutes)
+            {
+                if min > max {
+                    return Err(format!(
+                        "windows[label = \"{}\"]: min_period_minutes ({min}) is greater than \
+                         max_period_minutes ({max}) — nothing can ever classify into this window",
                         w.label
                     ));
                 }
@@ -1222,6 +1451,19 @@ impl PluginManifest {
                         "`[http.version] files` entry \"{bad}\" must be an absolute path"
                     ));
                 }
+            }
+            // `refresh_secs` paces the *scheduled* timer; `min_interval` is
+            // the only thing standing between a person and a request on
+            // every panel open, `Refresh` click and app start — the one
+            // floor of the four in this table that was not already zero-
+            // refused the way `backoff_start_secs`/`unauthorized_retry_secs`
+            // are just below, even though `Limits::from_http` now clamps it
+            // with the identical `.max(1)` those two already got. Caught
+            // here rather than only at the clamp so the manifest author
+            // sees why, not a request rate that quietly stopped matching
+            // what `0` reads as.
+            if http.min_interval_secs == 0 {
+                return Err("`[http] min_interval_secs` must be greater than 0".to_string());
             }
             // `min_interval_secs`'s own doc states this: a floor at or above
             // the scheduled cadence skips every other tick (the timer lands
@@ -1824,6 +2066,33 @@ impl PluginManifest {
                         auth_type_name(step.kind)
                     ));
                 }
+                // `macos_keychain_key` is read exactly once, by
+                // `auth::electron_safe_storage_step` — the Keychain service
+                // name that holds the Safe Storage password it hands to
+                // `electron_decrypt`. Every other step kind never looks at
+                // it, so a manifest setting it there would load clean and
+                // never do anything, the same silent-no-op `expiry_json_path`
+                // is refused above for.
+                if step.macos_keychain_key.is_some() && step.kind != AuthType::ElectronSafeStorage {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `macos_keychain_key`, which only \
+                         `electron-safe-storage` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                // `unless_json_path` is `reject_when_step`'s own escape hatch
+                // — read nowhere else. Same reasoning as the two checks
+                // above: present on any other kind, it loads without
+                // complaint and is never consulted.
+                if step.unless_json_path.is_some() && step.kind != AuthType::RejectWhen {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `unless_json_path`, which only \
+                         `reject-when` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
             }
             // `allowed_hosts` is an exact-match list — no wildcards, by design
             // (see `crate::plugin::auth::host_allowed`). A manifest writing
@@ -1935,6 +2204,16 @@ impl PluginManifest {
                     opt.key
                 ));
             }
+            // Same reasoning as `[[windows]] label`'s own cap: a row caption
+            // (the settings sheet's checkbox text), not a paragraph.
+            if opt.label.chars().count() > LABEL_MAX_CHARS {
+                return Err(format!(
+                    "`[[option]] key = \"{}\"`: label is {} characters — {LABEL_MAX_CHARS} is \
+                     the cap for a row caption",
+                    opt.key,
+                    opt.label.chars().count()
+                ));
+            }
             if !seen_option_keys.insert(opt.key.as_str()) {
                 return Err(format!(
                     "`[[option]]` key \"{}\" is declared more than once",
@@ -1959,52 +2238,104 @@ impl PluginManifest {
         // place. `sanitize_provider_text` strips these from a *response*
         // before it reaches the screen; a manifest is data this app decided
         // to trust, not a response, so the right answer for it is to refuse
-        // at load rather than launder at render time. One shared check
-        // ([`has_disruptive_control_char`]) over every field named above,
-        // rather than a copy of the same three lines at each site.
-        let mut control_char_fields: Vec<(String, &str)> = vec![
-            ("`name`".to_string(), self.name.as_str()),
-            ("`menu_label`".to_string(), self.menu_label.as_str()),
+        // at load rather than launder at render time.
+        //
+        // Not every field here is checked the same way, though: a
+        // [`CharClass::Narrow`] field is display text the app's own UI
+        // renders after install — `name`, `menu_label`, a window/balance/
+        // surface/option label, a panel message — where a legitimate emoji
+        // sequence (👨‍💻 is a base character plus a zero-width joiner;
+        // most emoji as an app actually renders them carry a trailing
+        // variation selector) must not be refused just because it shares a
+        // code point range with something that hides text. A
+        // [`CharClass::Wide`] field is one that reaches the install-time
+        // trust dialog before any of that is installed, or is resolved
+        // directly against the filesystem or the network — see each field's
+        // own tag below, and [`CharClass`]'s own doc for the reasoning.
+        // Whichever class, one shared check
+        // ([`control_char_field_is_disruptive`]) over every field named
+        // above, rather than a copy of the same lines at each site.
+        let mut control_char_fields: Vec<(String, &str, CharClass)> = vec![
+            ("`name`".to_string(), self.name.as_str(), CharClass::Narrow),
+            (
+                "`menu_label`".to_string(),
+                self.menu_label.as_str(),
+                CharClass::Narrow,
+            ),
         ];
         if let Some(ping) = &self.ping {
+            // `bin` is resolved on `PATH` and executed exactly like
+            // `client.bins` below; `args` rides the same command line.
+            control_char_fields.push((
+                "`[ping] bin`".to_string(),
+                ping.bin.as_str(),
+                CharClass::Wide,
+            ));
             for (i, arg) in ping.args.iter().enumerate() {
-                control_char_fields.push((format!("`[ping] args[{i}]`"), arg.as_str()));
+                control_char_fields.push((
+                    format!("`[ping] args[{i}]`"),
+                    arg.as_str(),
+                    CharClass::Wide,
+                ));
             }
         }
         for w in &self.windows {
             control_char_fields.push((
                 format!("windows[label = \"{}\"]: `label`", w.label),
                 w.label.as_str(),
+                CharClass::Narrow,
             ));
         }
         for b in &self.balances {
             control_char_fields.push((
                 format!("balances[label = \"{}\"]: `label`", b.label),
                 b.label.as_str(),
+                CharClass::Narrow,
             ));
         }
         if let Some(http) = &self.http {
+            for (i, req) in http.request.iter().enumerate() {
+                control_char_fields.push((
+                    format!("`[[http.request]][{i}] url`"),
+                    req.url.as_str(),
+                    CharClass::Wide,
+                ));
+            }
             if let Some(version) = &http.version {
                 for (i, f) in version.files.iter().enumerate() {
-                    control_char_fields.push((format!("`[http.version] files[{i}]`"), f.as_str()));
+                    control_char_fields.push((
+                        format!("`[http.version] files[{i}]`"),
+                        f.as_str(),
+                        CharClass::Wide,
+                    ));
                 }
             }
+        }
+        if let Some(url) = &self.account.url {
+            control_char_fields.push((
+                "`[account] url`".to_string(),
+                url.as_str(),
+                CharClass::Wide,
+            ));
         }
         for surface in &self.surface {
             control_char_fields.push((
                 format!("surface \"{}\": `label`", surface.id),
                 surface.label.as_str(),
+                CharClass::Narrow,
             ));
             for (i, host) in surface.allowed_hosts.iter().enumerate() {
                 control_char_fields.push((
                     format!("surface \"{}\": `allowed_hosts[{i}]`", surface.id),
                     host.as_str(),
+                    CharClass::Wide,
                 ));
             }
             if let Some(msg) = &surface.no_credentials_message {
                 control_char_fields.push((
                     format!("surface \"{}\": `no_credentials_message`", surface.id),
                     msg.as_str(),
+                    CharClass::Narrow,
                 ));
             }
             for step in &surface.auth {
@@ -2016,8 +2347,14 @@ impl PluginManifest {
                             surface.id
                         ),
                         msg.as_str(),
+                        CharClass::Narrow,
                     ));
                 }
+                // `service`/`targets` are technical identifiers, not prose —
+                // and both reach the trust dialog through
+                // `TrustDisclosure::credential_sources` (`"keychain
+                // \"<service>\""`/`"credential manager \"<target>\""`),
+                // which is exactly `CharClass::Wide`'s own criterion.
                 if let Some(service) = &step.service {
                     control_char_fields.push((
                         format!(
@@ -2025,6 +2362,7 @@ impl PluginManifest {
                             surface.id
                         ),
                         service.as_str(),
+                        CharClass::Wide,
                     ));
                 }
                 for (i, target) in step.targets.iter().flatten().enumerate() {
@@ -2034,6 +2372,17 @@ impl PluginManifest {
                             surface.id
                         ),
                         target.as_str(),
+                        CharClass::Wide,
+                    ));
+                }
+                if let Some(token_url) = &step.token_url {
+                    control_char_fields.push((
+                        format!(
+                            "surface \"{}\": a `{step_name}` auth step's `token_url`",
+                            surface.id
+                        ),
+                        token_url.as_str(),
+                        CharClass::Wide,
                     ));
                 }
                 if let Some(client) = &step.client {
@@ -2044,6 +2393,7 @@ impl PluginManifest {
                                 surface.id
                             ),
                             id_env.as_str(),
+                            CharClass::Wide,
                         ));
                     }
                     if let Some(secret_env) = &client.secret_env {
@@ -2053,6 +2403,7 @@ impl PluginManifest {
                                 surface.id
                             ),
                             secret_env.as_str(),
+                            CharClass::Wide,
                         ));
                     }
                     for (i, f) in client.files.iter().enumerate() {
@@ -2062,6 +2413,46 @@ impl PluginManifest {
                                 surface.id
                             ),
                             f.as_str(),
+                            CharClass::Wide,
+                        ));
+                    }
+                    // `bins`, `id_pattern` and `secret_pattern` reach the
+                    // trust dialog exactly like `files` does —
+                    // `registry::analyze_trust` folds every one of the three
+                    // into `local_files` (a `bins` entry as the candidate
+                    // name itself, the two patterns labelled
+                    // `"id_pattern: …"`/`"secret_pattern: …"`) — so they need
+                    // the same refusal `files` already gets, not a narrower
+                    // one that leaves this one table's other fields able to
+                    // rewrite what the dialog shows.
+                    for (i, name) in client.bins.iter().enumerate() {
+                        control_char_fields.push((
+                            format!(
+                                "surface \"{}\": a `{step_name}` auth step's `client.bins[{i}]`",
+                                surface.id
+                            ),
+                            name.as_str(),
+                            CharClass::Wide,
+                        ));
+                    }
+                    if let Some(id_pattern) = &client.id_pattern {
+                        control_char_fields.push((
+                            format!(
+                                "surface \"{}\": a `{step_name}` auth step's `client.id_pattern`",
+                                surface.id
+                            ),
+                            id_pattern.as_str(),
+                            CharClass::Wide,
+                        ));
+                    }
+                    if let Some(secret_pattern) = &client.secret_pattern {
+                        control_char_fields.push((
+                            format!(
+                                "surface \"{}\": a `{step_name}` auth step's `client.secret_pattern`",
+                                surface.id
+                            ),
+                            secret_pattern.as_str(),
+                            CharClass::Wide,
                         ));
                     }
                 }
@@ -2071,11 +2462,12 @@ impl PluginManifest {
             control_char_fields.push((
                 format!("`[[option]] key = \"{}\"`: `label`", opt.key),
                 opt.label.as_str(),
+                CharClass::Narrow,
             ));
         }
-        if let Some((where_it_is, _)) = control_char_fields
+        if let Some((where_it_is, _, _)) = control_char_fields
             .iter()
-            .find(|(_, text)| has_disruptive_control_char(text))
+            .find(|(_, text, class)| control_char_field_is_disruptive(text, *class))
         {
             return Err(format!(
                 "{where_it_is} contains a control character or a bidirectional override — refused \
@@ -3609,10 +4001,17 @@ fn is_windows_reserved_device_name(name: &str) -> bool {
 /// `..` component, no drive prefix — the shape `auth::bin_candidates` joins
 /// a directory onto. `files` has no equivalent rule: it is already a path,
 /// by design (see the field's own doc).
+///
+/// `name != ".."`, not `!name.contains("..")`: with no separator already
+/// refused a line above, `name` joins onto a directory as a single path
+/// component (`Path::join`), and only the exact string `".."` is that
+/// component ever reading as a parent-directory reference — a name that
+/// merely contains two dots without being that whole component
+/// (`my..tool`) walks nowhere and was refused for no reason.
 fn is_bare_program_name(name: &str) -> bool {
     let has_drive_prefix =
         name.len() >= 2 && name.as_bytes()[0].is_ascii_alphabetic() && name.as_bytes()[1] == b':';
-    !name.is_empty() && !name.contains(['/', '\\']) && !name.contains("..") && !has_drive_prefix
+    !name.is_empty() && !name.contains(['/', '\\']) && name != ".." && !has_drive_prefix
 }
 
 /// Whether `p` would be an absolute path on *some* platform this app runs
@@ -3652,20 +4051,26 @@ fn is_valid_env_var_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Whether `text` carries a control character (C0, DEL, and — for free, from
-/// `char::is_control` — C1) or a character that reorders or terminates a
-/// line without looking like it does: the Unicode line/paragraph separators
-/// `is_control` does not cover (U+2028/U+2029), and the bidi marks,
-/// embeddings/overrides and isolates (U+200E/F, U+202A–E, U+2066–9) that can
-/// visually reorder whatever follows them or hide where a message actually
-/// ends.
+/// Whether `text` carries a control character (`char::is_control` — ASCII
+/// 0x00–0x1F, DEL, and the 0x80–0x9F Latin-1 range for free) or a character
+/// that reorders or terminates a line without looking like it does: the
+/// Unicode line/paragraph separators `is_control` does not cover (U+2028/
+/// U+2029), and the bidi marks, embeddings/overrides and isolates (U+200E/F,
+/// U+202A–E, U+2066–9) that can visually reorder whatever follows them or
+/// hide where a message actually ends.
 ///
-/// The `[[surface.auth]].client` sibling of `is_invisible_or_directional` in
-/// `crate::plugin` — deliberately not the same function: that one also
-/// strips zero-width joiners and the soft hyphen, which change how response
-/// *text* renders but do not split a line or reorder a dialog, and this one
-/// is checked at load against a manifest, not at render time against a
-/// provider's response.
+/// The [`CharClass::Narrow`] half of [`control_char_field_is_disruptive`] —
+/// deliberately not [`super::is_invisible_or_directional`]: that one also
+/// strips zero-width joiners, variation selectors and the soft hyphen, which
+/// change how *rendered* text looks (an emoji sequence like "👨‍💻" is a base
+/// character plus a zero-width joiner, and most emoji carry a trailing
+/// variation selector) but do not split a line or reorder a dialog. A field
+/// this narrow class covers is display text the app's own UI renders after
+/// install — a section header, a menu-bar pill, a row caption, a panel
+/// message — never an install-time trust dialog and never a file, a host or
+/// a program name; refusing an emoji sequence there would reject an
+/// otherwise harmless third-party manifest for no reason connected to the
+/// hazard this check exists to catch.
 fn has_disruptive_control_char(text: &str) -> bool {
     text.chars().any(|c| {
         c.is_control()
@@ -3677,6 +4082,37 @@ fn has_disruptive_control_char(text: &str) -> bool {
                     | '\u{2066}'..='\u{2069}'
             )
     })
+}
+
+/// Which class of "disruptive" character one of `validate`'s swept
+/// `control_char_fields` is checked against — see
+/// [`has_disruptive_control_char`] for the narrow class's own reasoning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    /// Display text the app's own UI renders after install — refused only
+    /// for a control character or a bidi override, never for the zero-width
+    /// class a legitimate emoji sequence uses.
+    Narrow,
+    /// A field that reaches `registry::analyze_trust`'s install-time trust
+    /// dialog, or is resolved directly against the filesystem or the
+    /// network (a program name, a file path, a host, a URL) — refused for
+    /// [`super::is_invisible_or_directional`]'s full zero-width class too,
+    /// on top of the narrow one: a zero-width character there could make two
+    /// different disclosures, or two different destinations, render
+    /// identically. The same predicate `main.rs::sanitize_trust_item` shares
+    /// with `sanitize_provider_text`, checked here at load rather than
+    /// laundered at render time so the manifest author sees why.
+    Wide,
+}
+
+/// Dispatch to the class `text` was tagged with in `control_char_fields`.
+fn control_char_field_is_disruptive(text: &str, class: CharClass) -> bool {
+    match class {
+        CharClass::Narrow => has_disruptive_control_char(text),
+        CharClass::Wide => text
+            .chars()
+            .any(|c| c.is_control() || super::is_invisible_or_directional(c)),
+    }
 }
 
 /// The most bytes any match of `pattern` could ever return — `None` when
@@ -5314,6 +5750,38 @@ mod tests {
         assert_eq!(m.balances[0].entry_key(0), "b0");
     }
 
+    /// `path` is `number`/`text`'s own field — neither engine ever reads it
+    /// for `money-minor`, which takes its figure from `amount_path`/
+    /// `currency_path`/`exponent_path` instead.
+    #[test]
+    fn a_money_minor_amount_naming_path_is_refused() {
+        let toml = BALANCES_ONLY.replace(
+            "kind = \"number\"\n        path = \"config.used.val\"\n        unit_label = \"credits\"",
+            "kind          = \"money-minor\"\n        path          = \"config.used.val\"\n        \
+             amount_path   = \"config.used.val\"\n        currency_path = \"config.currency\"\n        \
+             exponent_path = \"config.exponent\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("path belongs to number/text, not money-minor");
+        assert!(err.contains("`path` belongs to"), "{err}");
+    }
+
+    /// The mirror: `amount_path`/`currency_path`/`exponent_path` are
+    /// `money-minor`'s own triplet — a `number` amount naming one loads
+    /// clean and it is silently never read.
+    #[test]
+    fn a_number_amount_naming_a_money_minor_field_is_refused() {
+        let toml = BALANCES_ONLY.replace(
+            "kind = \"number\"\n        path = \"config.used.val\"\n        unit_label = \"credits\"",
+            "kind = \"number\"\n        path = \"config.used.val\"\n        unit_label = \"credits\"\n        \
+             amount_path = \"config.used.val\"",
+        );
+        let err =
+            PluginManifest::from_str(&toml).expect_err("amount_path belongs to money-minor only");
+        assert!(err.contains("amount_path"), "{err}");
+        assert!(err.contains("money-minor"), "{err}");
+    }
+
     // ── http POST + body ────────────────────────────────────────────────
 
     /// A minimal `http-api` manifest, `method`/`body` left to their defaults
@@ -5475,6 +5943,69 @@ mod tests {
         );
     }
 
+    /// Nothing about `swallowed_placeholder`'s scan is http-specific either —
+    /// `[logfile] root` gets the same `{option.<key>}` substitution
+    /// (`engine_logfile::resolve_root`) and loses a placeholder the same
+    /// way; this used to only be checked for `[[http.request]]`'s own
+    /// fields.
+    #[test]
+    fn a_logfile_root_swallows_its_own_placeholder() {
+        let toml = CODEX_LIKE.replace(
+            "root          = \"~/.codex/sessions\"",
+            "root          = \"~/{\\\"a\\\":\\\"{option.deep}\\\"}\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a JSON-shaped root swallows its own placeholder");
+        assert!(err.contains("{option.<key>}"), "{err}");
+        assert!(err.contains("`[logfile] root`"), "{err}");
+    }
+
+    /// Same shape, for `glob` — substituted by the same `resolve_root`-
+    /// adjacent code path (`fetch`'s own `substitute_options(&lf.glob, …)`).
+    #[test]
+    fn a_logfile_glob_swallows_its_own_placeholder() {
+        let toml = CODEX_LIKE.replace(
+            "glob          = \"**/rollout-*.jsonl\"",
+            "glob          = \"{\\\"a\\\":\\\"{option.deep}\\\"}\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a JSON-shaped glob swallows its own placeholder");
+        assert!(err.contains("{option.<key>}"), "{err}");
+        assert!(err.contains("`[logfile] glob`"), "{err}");
+    }
+
+    /// And `root_env_join`, appended onto `root_env`'s own resolved value
+    /// (`engine_logfile::resolve_root`) — the third and last field
+    /// `substitute_options`'s own doc names for this engine.
+    #[test]
+    fn a_logfile_root_env_join_swallows_its_own_placeholder() {
+        let toml = CODEX_LIKE.replace(
+            "root          = \"~/.codex/sessions\"",
+            "root          = \"~/.codex/sessions\"\n        \
+             root_env_join = \"{\\\"a\\\":\\\"{option.deep}\\\"}\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a JSON-shaped root_env_join swallows its own placeholder");
+        assert!(err.contains("{option.<key>}"), "{err}");
+        assert!(err.contains("`[logfile] root_env_join`"), "{err}");
+    }
+
+    /// And `[account] url`, which `resolve_account_url` substitutes exactly
+    /// like `[[http.request]] url` — the fourth field, and the only one
+    /// outside `[logfile]`/`[[http.request]]` this sweep now covers.
+    #[test]
+    fn an_account_url_swallows_its_own_placeholder() {
+        let toml = format!(
+            "{HTTP_POST_BASE}\n[account]\ntype = \"http\"\n\
+             url = \"https://example.com/{{\\\"a\\\":\\\"{{option.deep}}\\\"}}\"\n\
+             json_path = \"email\""
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a JSON-shaped account url swallows its own placeholder");
+        assert!(err.contains("{option.<key>}"), "{err}");
+        assert!(err.contains("`[account] url`"), "{err}");
+    }
+
     // ── remaining-fraction window ───────────────────────────────────────
 
     /// The base for the remaining-fraction rows: one http-api window whose
@@ -5546,6 +6077,94 @@ mod tests {
         let err = PluginManifest::from_str(&toml)
             .expect_err("using remaining_fraction_path without declaring the reader is refused");
         assert!(err.contains("remaining-fraction"), "{err}");
+    }
+
+    /// `Some("")` satisfies `is_some()` — present, and blank
+    /// (`json_path_get` reads `segments("")` as `[""]`, matching nothing on
+    /// a real response) — refused outright now, same as `[status]`'s own
+    /// paths, rather than merely excluded from "one of the two is named".
+    #[test]
+    fn a_blank_remaining_fraction_path_is_refused() {
+        let toml = REMAINING_BASE.replace(
+            "remaining_fraction_path = \"groups.0.buckets.0.remainingFraction\"",
+            "remaining_fraction_path = \"\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a blank remaining_fraction_path must be refused");
+        assert!(err.contains("remaining_fraction_path"), "{err}");
+        assert!(err.contains("present but blank"), "{err}");
+    }
+
+    /// The mirror, and the one that matters most: `engine_http::build_window`
+    /// matches `(&used_percent_path, &remaining_fraction_path)` on
+    /// *`Some`-ness*, not on which one actually resolves — a blank
+    /// `used_percent_path` beside a perfectly good `remaining_fraction_path`
+    /// would win that match arm, read nothing at `json_path_get(v, "")`, and
+    /// silently drop the whole window at every fetch, even though the
+    /// manifest plainly stated a real figure one field over. Refused
+    /// outright, the same as the field above, closes that rather than only
+    /// excluding it from "name only one" below.
+    #[test]
+    fn a_blank_used_percent_path_beside_a_real_remaining_fraction_path_is_refused() {
+        let toml = REMAINING_BASE.replace(
+            "remaining_fraction_path = \"groups.0.buckets.0.remainingFraction\"",
+            "remaining_fraction_path = \"groups.0.buckets.0.remainingFraction\"\n\
+             used_percent_path       = \"\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a blank used_percent_path must be refused even beside a real figure");
+        assert!(err.contains("used_percent_path"), "{err}");
+        assert!(err.contains("present but blank"), "{err}");
+    }
+
+    /// `resets_at_path` has no `Option` to be absent through — a manifest
+    /// author can still leave it blank, and blank resolves to nothing on
+    /// every fetch exactly like the two figure paths above.
+    #[test]
+    fn a_blank_resets_at_path_is_refused() {
+        let toml = REMAINING_BASE.replace(
+            "resets_at_path          = \"groups.0.buckets.0.resetTime\"",
+            "resets_at_path          = \"\"",
+        );
+        let err =
+            PluginManifest::from_str(&toml).expect_err("a blank resets_at_path must be refused");
+        assert!(err.contains("resets_at_path"), "{err}");
+        assert!(err.contains("must not be blank"), "{err}");
+    }
+
+    /// `min_period_minutes` greater than `max_period_minutes` bounds an
+    /// empty range — nothing a response could report satisfies both, so
+    /// this window would never classify a candidate on either engine.
+    /// Built on [`CODEX_LIKE`] (log-file) rather than [`REMAINING_BASE`]
+    /// (http-api): a bound beside `period.mode = "assumed"` on the http
+    /// engine already trips a different, unrelated refusal, and this needs
+    /// to isolate the one min/max is actually testing.
+    #[test]
+    fn min_period_minutes_greater_than_max_period_minutes_is_refused() {
+        let toml = CODEX_LIKE.replace(
+            "max_period_minutes = 720",
+            "min_period_minutes = 900\n        max_period_minutes = 720",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("min greater than max classifies nothing, ever");
+        assert!(err.contains("min_period_minutes"), "{err}");
+        assert!(err.contains("max_period_minutes"), "{err}");
+    }
+
+    /// A one-element `auth_claim` whose one segment is blank passes
+    /// `is_empty()` (the vec has an element) just as surely as a wholesale
+    /// empty vec would have — `resolve_account_match` still walks a
+    /// `.get("")` no real JWT claims object ever has a key for, so this must
+    /// be refused the same way.
+    #[test]
+    fn an_auth_claim_with_a_blank_segment_is_refused() {
+        let toml = format!(
+            "{CODEX_LIKE}\n[logfile.account_match]\ncontainer_field = \"plan_type\"\n\
+             auth_claim = [\"\"]"
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("an auth_claim segment that is blank must be refused");
+        assert!(err.contains("auth_claim"), "{err}");
     }
 
     // ── keychain-expiry ─────────────────────────────────────────────────
@@ -5650,6 +6269,44 @@ mod tests {
         );
         PluginManifest::from_str(&win_credential)
             .expect("expiry_json_path on a win-credential step is accepted");
+    }
+
+    /// `macos_keychain_key` is `auth::electron_safe_storage_step`'s own
+    /// field — every other step kind never reads it, same shape as
+    /// `expiry_json_path` above.
+    #[test]
+    fn macos_keychain_key_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "macos_keychain_key = \"Sample Safe Storage\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("macos_keychain_key on a keychain step must be refused");
+        assert!(err.contains("macos_keychain_key"), "{err}");
+        assert!(err.contains("electron-safe-storage"), "{err}");
+        assert!(
+            err.contains("auth step 0"),
+            "names the step's own index: {err}"
+        );
+    }
+
+    /// `unless_json_path` is `auth::reject_when_step`'s own escape hatch —
+    /// every other step kind never reads it, same shape as
+    /// `expiry_json_path` above.
+    #[test]
+    fn unless_json_path_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "unless_json_path = \"tokens.access_token\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("unless_json_path on a keychain step must be refused");
+        assert!(err.contains("unless_json_path"), "{err}");
+        assert!(err.contains("reject-when"), "{err}");
+        assert!(
+            err.contains("auth step 0"),
+            "names the step's own index: {err}"
+        );
     }
 
     #[test]
@@ -5851,6 +6508,52 @@ mod tests {
         assert_eq!(client.bins, vec!["sample-cli".to_string()]);
     }
 
+    /// `client.bins`/`client.id_pattern`/`client.secret_pattern` reach the
+    /// trust dialog exactly like `client.files` does
+    /// (`registry::analyze_trust`), and the control-char/bidi sweep covers
+    /// all three the same way — pinned here directly, since the corpus's one
+    /// shared row for that sweep exercises `allowed_hosts`, not these.
+    #[test]
+    fn a_bidi_override_in_client_bins_is_refused() {
+        let toml = OAUTH_REFRESH_CLIENT_BASE.replace("sample-cli", "sample\u{202E}cli");
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a bidi override in client.bins must be refused");
+        assert!(err.contains("client.bins"), "{err}");
+        assert!(err.contains("bidirectional override"), "{err}");
+    }
+
+    /// Same sweep, `client.id_pattern` — inserted mid-word rather than beside
+    /// one of the pattern's own backslash escapes, so this stays a change to
+    /// the regex source (still compiles: `regex` matches the zero-width
+    /// space literally) rather than to TOML's own `\\` escaping.
+    /// `client.id_pattern` is `CharClass::Wide` (reaches the trust dialog),
+    /// so this keeps refusing even though a display-text field would not —
+    /// see the mirror test on `windows[].label`.
+    #[test]
+    fn a_zero_width_space_in_client_id_pattern_is_refused() {
+        let toml =
+            OAUTH_REFRESH_CLIENT_BASE.replace("googleusercontent", "google\u{200B}usercontent");
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a zero-width space in client.id_pattern must be refused");
+        assert!(err.contains("client.id_pattern"), "{err}");
+        assert!(err.contains("bidirectional override"), "{err}");
+    }
+
+    /// The mirror of the test above, on a `CharClass::Narrow` field: a ZWJ
+    /// emoji sequence ("👨‍💻" — a base character, a zero-width joiner
+    /// U+200D, and a second base character) is exactly the kind of thing a
+    /// legitimate manifest author puts in a caption. `windows[].label` never
+    /// reaches the trust dialog and never names a file, a host or a program,
+    /// so it must not be refused for a character class that only matters
+    /// where one of those is at stake.
+    #[test]
+    fn a_zwj_emoji_sequence_in_a_window_label_is_accepted() {
+        let toml = CODEX_LIKE.replace("label = \"5H\"", "label = \"👨\u{200D}💻 5H\"");
+        let m = PluginManifest::from_str(&toml)
+            .expect("a ZWJ emoji sequence in a display-text label must be accepted");
+        assert_eq!(m.windows[0].label, "👨\u{200D}💻 5H");
+    }
+
     #[test]
     fn a_client_table_on_a_non_oauth_refresh_step_is_refused() {
         let toml = OAUTH_REFRESH_CLIENT_BASE.replace(
@@ -5936,6 +6639,37 @@ mod tests {
             ));
             assert!(err.contains(bad), "{err}");
         }
+    }
+
+    /// `is_bare_program_name` used to search for `".."` as a substring
+    /// rather than compare the whole component to it — with no separator
+    /// (already refused above), `name` joins onto a directory as a single
+    /// path component, and only the component `".."` itself ever reads as
+    /// "go up one directory"; `"my..tool"` never walks anywhere and was
+    /// refused for no reason.
+    #[test]
+    fn a_client_bins_entry_that_merely_contains_two_dots_is_accepted() {
+        let toml = OAUTH_REFRESH_CLIENT_BASE.replace(
+            r#"bins           = ["sample-cli"]"#,
+            r#"bins           = ["my..tool"]"#,
+        );
+        let m = PluginManifest::from_str(&toml)
+            .expect("a bins entry that merely contains two dots is not a path escape");
+        let client = m.surface[0].auth[0].client.as_ref().unwrap();
+        assert_eq!(client.bins, vec!["my..tool".to_string()]);
+    }
+
+    /// The one shape that *is* still refused: the component being exactly
+    /// `".."`, which really does join as "go up one directory".
+    #[test]
+    fn a_client_bins_entry_that_is_exactly_dotdot_is_refused() {
+        let toml = OAUTH_REFRESH_CLIENT_BASE.replace(
+            r#"bins           = ["sample-cli"]"#,
+            r#"bins           = [".."]"#,
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a bins entry that is exactly \"..\" must still be refused");
+        assert!(err.contains("client.bins"), "{err}");
     }
 
     #[test]

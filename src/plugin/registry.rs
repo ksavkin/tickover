@@ -80,8 +80,8 @@ pub struct RegistryEntry {
     pub id: String,
     /// Display name — reaches the install/update UI unsanitised and
     /// unbounded, aside from what [`RegistryIndex::validate`] checks at
-    /// parse time: no control characters, and at most
-    /// [`REGISTRY_NAME_MAX_CHARS`].
+    /// parse time: no control, invisible or directional characters, and at
+    /// most [`REGISTRY_NAME_MAX_CHARS`].
     pub name: String,
     /// Publisher-declared version (compared with [`version_cmp`]).
     pub version: String,
@@ -181,17 +181,26 @@ const REGISTRY_DESCRIPTION_MAX_CHARS: usize = 256;
 /// otherwise reach well inside that byte cap.
 const MAX_INDEX_ENTRIES: usize = 500;
 
-/// Refuse a control character anywhere in `value` (`field`, on plugin `id`'s
-/// entry) — the same class [`crate::plugin::sanitize_provider_text`] strips
-/// from a provider *response*, refused outright here instead since this text
-/// is checked once, at load, rather than sanitised at every render. A
-/// `name`/`description`/`manifest` carrying a raw `\n` could otherwise split
-/// one log line into two, or a dialog caption into a shape its own layout
-/// never accounted for.
+/// Refuse a control character, or an invisible/directional one, anywhere in
+/// `value` (`field`, on plugin `id`'s entry) — the same class
+/// [`crate::plugin::sanitize_provider_text`] strips from a provider
+/// *response* (`char::is_control` alone is only the Unicode `Cc` category; it
+/// does not reach a bidi override or a zero-width character, both of which
+/// [`crate::plugin::is_invisible_or_directional`] does cover), refused
+/// outright here instead since this text is checked once, at load, rather
+/// than sanitised at every render. A `name`/`description`/`manifest`
+/// carrying a raw `\n` could otherwise split one log line into two, or a
+/// dialog caption into a shape its own layout never accounted for; a bidi
+/// override or a zero-width character could make two different index
+/// entries render identically.
 fn refuse_control_chars(id: &str, field: &str, value: &str) -> Result<(), String> {
-    if value.chars().any(|c| c.is_control()) {
+    if value
+        .chars()
+        .any(|c| c.is_control() || super::is_invisible_or_directional(c))
+    {
         return Err(format!(
-            "plugin \"{id}\": `{field}` must not contain control characters"
+            "plugin \"{id}\": `{field}` must not contain control, invisible or directional \
+             characters"
         ));
     }
     Ok(())
@@ -1878,6 +1887,33 @@ mod tests {
         assert!(RegistryIndex::from_str(&idx).is_err());
     }
 
+    /// `char::is_control` alone (Unicode `Cc`) misses a bidi override or a
+    /// zero-width character — `refuse_control_chars`'s own doc says it
+    /// covers the same class `sanitize_provider_text` does, and this pins
+    /// that it now actually does, not only C0/C1 controls.
+    #[test]
+    fn rejects_a_zero_width_character_in_a_name() {
+        let idx = entry_with("name", "Some\u{200B}Provider");
+        let err = RegistryIndex::from_str(&idx)
+            .expect_err("a zero-width space in a name must be rejected");
+        assert!(
+            err.contains("control, invisible or directional characters"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Same class, the other end of it: a bidi override.
+    #[test]
+    fn rejects_a_bidi_override_in_a_description() {
+        let idx = entry_with("description", "safe\u{202E}provider");
+        let err = RegistryIndex::from_str(&idx)
+            .expect_err("a bidi override in a description must be rejected");
+        assert!(
+            err.contains("control, invisible or directional characters"),
+            "unexpected error: {err}"
+        );
+    }
+
     // ── resolve_manifest_url ─────────────────────────────────────────────
 
     #[test]
@@ -2496,6 +2532,14 @@ mod tests {
         let path_line = matches!(auth_type, "credentials-file" | "credentials-map")
             .then(|| "path = \"~/.x/creds.json\"")
             .unwrap_or_default();
+        // `macos_keychain_key` is `electron-safe-storage`'s own field
+        // (`auth::electron_safe_storage_step`) — `validate` now refuses it on
+        // any other step kind, same as `expiry_json_path` already was, so
+        // this can no longer be wired in unconditionally like `service`/`var`/
+        // `config_path`/`blob_json_path`, none of which `validate` checks.
+        let macos_keychain_key_line = matches!(auth_type, "electron-safe-storage")
+            .then(|| "macos_keychain_key = \"key\"")
+            .unwrap_or_default();
         let toml = format!(
             r#"
             id         = "x"
@@ -2527,7 +2571,7 @@ mod tests {
             var = "SOME_VAR"
             config_path = "~/.x/config.json"
             blob_json_path = "blob"
-            macos_keychain_key = "key"
+            {macos_keychain_key_line}
             "#
         );
         PluginManifest::from_str(&toml).expect("valid manifest")

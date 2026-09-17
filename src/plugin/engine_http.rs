@@ -455,7 +455,11 @@ fn resolve_tag(
     value: Option<&Value>,
 ) -> Option<String> {
     if has_explicit_surfaces(m) {
-        return Some(surface.label.clone());
+        // `manifest::validate` already refuses a blank `[[surface]] label`
+        // at load — this filter is a second, cheap belt under that first
+        // one, the same "blank reads as none" rule the `[tag] from =
+        // "field"` branch below already applies to its own text.
+        return Some(surface.label.clone()).filter(|s| !s.is_empty());
     }
     let raw = match m.tag.from {
         TagFrom::Static => m.tag.value.clone(),
@@ -1630,6 +1634,7 @@ fn perform(
         Err(e) => Err(Failure::transient(redact_header_values(
             &format!("network error: {e}"),
             headers,
+            body,
         ))),
     }
 }
@@ -1668,19 +1673,51 @@ fn read_json_body(response: ureq::Response) -> Result<Value, String> {
     serde_json::from_slice(&buf).map_err(|e| format!("bad response: {e}"))
 }
 
+/// The shortest `body` worth comparing whole against an error message —
+/// below this, checking containment stops discriminating a real leak from
+/// coincidence. The one poverty-line case this app ships (`{}`, Antigravity's
+/// literal, unsubstituted body) is 2 bytes; a `Display` impl that happens to
+/// print an empty object *anywhere* in an unrelated error would otherwise
+/// have this function replace a genuine transport error with a redaction
+/// message for no reason connected to a credential at all. A real
+/// substituted secret (`{token}`, `{value.<name>}`) is always well past this.
+const MIN_LEAK_CHECK_BODY_LEN: usize = 16;
+
 /// `message`, verbatim, unless it happens to quote one of this request's own
-/// header values — which would mean a credential (the bearer token, most
-/// often) ended up inside an error string this app then shows on the panel
-/// and writes to `crate::diag`. Checked against the *formatted* message
-/// rather than prevented at its source, because by this point the message
-/// can come from anywhere: some other `Display` impl this engine did not
-/// write, quoting text it was never told was sensitive.
-fn redact_header_values(message: &str, headers: &[(String, String)]) -> String {
-    let leaked = headers
+/// header values, or its body — which would mean a credential (the bearer
+/// token, most often) ended up inside an error string this app then shows on
+/// the panel and writes to `crate::diag`. `build_body` substitutes
+/// `{token}`/`{version}`/`{value.<name>}`/`{option.<key>}` into `body` by
+/// exactly the same rules `build_request` uses for `headers` — checking one
+/// and not the other would leave a credential a manifest chose to place in
+/// its body able to reach this message unredacted, so both are scanned here.
+/// `body` is gated on [`MIN_LEAK_CHECK_BODY_LEN`] where a header value is
+/// only gated on non-empty: a header this engine builds is a name paired
+/// with a credential or a manifest literal meant to be read as a whole
+/// (`Authorization: Bearer <token>`), where a manifest's own `body` literal
+/// can legitimately be as short as `"{}"` — checking a 2-byte string for
+/// whole containment in an arbitrary message is a coincidence generator, not
+/// a credential detector.
+///
+/// The replacement names which of the two matched — a body match saying "a
+/// header value could not be sent" would blame the wrong part of the
+/// request, which is its own small information loss for whoever reads the
+/// panel or the log trying to tell a header problem from a body one.
+///
+/// Checked against the *formatted* message rather than prevented at its
+/// source, because by this point the message can come from anywhere: some
+/// other `Display` impl this engine did not write, quoting text it was never
+/// told was sensitive.
+fn redact_header_values(message: &str, headers: &[(String, String)], body: Option<&str>) -> String {
+    let header_leaked = headers
         .iter()
         .any(|(_, v)| !v.is_empty() && message.contains(v.as_str()));
-    if leaked {
+    let body_leaked =
+        body.is_some_and(|b| b.len() >= MIN_LEAK_CHECK_BODY_LEN && message.contains(b));
+    if header_leaked {
         "a header value could not be sent".to_string()
+    } else if body_leaked {
+        "a request body could not be sent".to_string()
     } else {
         message.to_string()
     }
@@ -4300,13 +4337,58 @@ mod tests {
             "Bearer secret-token".to_string(),
         )];
         assert_eq!(
-            redact_header_values("network error: Bearer secret-token", &headers),
+            redact_header_values("network error: Bearer secret-token", &headers, None),
             "a header value could not be sent"
         );
         assert_eq!(
-            redact_header_values("network error: timed out", &headers),
+            redact_header_values("network error: timed out", &headers, None),
             "network error: timed out",
             "a message that names nothing sensitive passes through unchanged"
+        );
+    }
+
+    /// `build_body` substitutes `{token}` into `body` by exactly the same
+    /// rules `build_request` uses for a header value — a credential a
+    /// manifest chose to place in its body must be redacted the same way one
+    /// placed in a header already is. Worded differently from the header
+    /// case (`"a request body could not be sent"`, not `"a header value
+    /// could not be sent"`) — the redaction should not misname which part of
+    /// the request actually leaked.
+    #[test]
+    fn redact_header_values_also_hides_a_leaked_body() {
+        let headers: Vec<(String, String)> = Vec::new();
+        assert_eq!(
+            redact_header_values(
+                "network error: {\"auth\":\"secret-token\"}",
+                &headers,
+                Some("{\"auth\":\"secret-token\"}"),
+            ),
+            "a request body could not be sent"
+        );
+        assert_eq!(
+            redact_header_values("network error: timed out", &headers, Some("{}")),
+            "network error: timed out",
+            "an empty or non-matching body leaves the message unchanged"
+        );
+    }
+
+    /// The shipped Antigravity body is the literal `"{}"` — two bytes, and a
+    /// coincidence away from appearing in a message that has nothing to do
+    /// with it (a `Display` impl printing an empty object of its own). Below
+    /// `MIN_LEAK_CHECK_BODY_LEN`, this must never fire, or a genuine
+    /// transport error would routinely be swapped for a redaction message
+    /// with no credential actually involved.
+    #[test]
+    fn redact_header_values_does_not_treat_a_short_body_like_antigravitys_own_as_a_leak() {
+        let headers: Vec<(String, String)> = Vec::new();
+        assert_eq!(
+            redact_header_values(
+                "some unrelated error printing {} in passing",
+                &headers,
+                Some("{}")
+            ),
+            "some unrelated error printing {} in passing",
+            "a body this short must never be enough to redact a whole message"
         );
     }
 

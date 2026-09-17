@@ -274,7 +274,7 @@ manifest fails validation with 2+. A manifest may declare at most 32
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `id` | string | no (default empty) | stable identity of this window — the `<entry>` half of its `Window::key`, matched across fetches (and, for an enumerating entry, the base a per-element row's key is built from); at most 64 bytes of lowercase ASCII letters, digits and hyphens, starting with a letter or digit. Empty means the entry's position stands in (`wN`) — and a caption is deliberately *not* used as identity, since a label is expected to change freely. Not a `config.json` key: the seen-window registry keys by *role* (`"primary"`/`"secondary"`) and never records an `Extra`-role window at all. Needs `requires_reader = ["window-identity"]` |
-| `label` | string | yes | short row label shown in the popup (`"5H"`, `"WK"`) |
+| `label` | string | yes | short row label shown in the popup (`"5H"`, `"WK"`); at most 120 characters — a row caption drawn on a card with `wrap: word-wrap`, not a paragraph |
 | `role` | `"primary"` \| `"secondary"` \| `"extra"` | yes | UI slot this window fills; primary drives the auto-ping and the pill's first mini-bar. `extra` fills neither slot: it is a row in the panel and nothing else — see below |
 | `required` | bool | no (default `false`) | whether this provider *always* reports this window, so its absence is the provider's error rather than a fact about the account — see [Presence](#presence-a-window-that-isnt-there). Needs `requires_reader = ["window-presence"]` |
 | `for_each`, `for_each_where`, `element_id_path` | strings | no | one row per element of an array in the response, instead of one row per entry — see [Enumerating entries](#enumerating-entries--for_each-http-api-only) |
@@ -585,7 +585,7 @@ provider unwritable as a plugin.
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `id` | string | no | stable identity, same charset and cap as `[[windows]] id` (it becomes the `<entry>` half of this balance's `Balance::key`, matched across fetches — no `config.json` registry keys a balance by it; balances have no seen-window-style persistence at all today). Without one the entry falls back to `bN` — never `wN`, so a balance and a window at the same index cannot share an identity |
-| `label` | string | yes | row label, a **literal**; never a template, so provider text cannot reach a caption this app vouches for |
+| `label` | string | yes | row label, a **literal**; never a template, so provider text cannot reach a caption this app vouches for; at most 120 characters — a row caption, not a paragraph |
 | `[balances.used]` | table | no | what has been spent |
 | `[balances.cap]` | table | no | the ceiling, when the provider states one |
 | `[balances.remaining]` | table | no | what is left, for providers that report the remainder instead of a used/cap pair |
@@ -601,11 +601,11 @@ nothing is a caption beside empty space. A manifest may declare at most 16
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `kind` | `"money-minor"` \| `"number"` \| `"text"` | yes | the form the provider states the figure in |
-| `path` | string | `number`, `text` | dotted JSON path to the value |
-| `amount_path` | string | `money-minor` | path to the amount in **minor units** |
-| `currency_path` | string | `money-minor` | path to the currency code |
-| `exponent_path` | string | `money-minor` | path to the scale (minor units per major one, as a power of ten) |
-| `unit_label` | string | no, `number` only | what the number counts, as a manifest literal |
+| `path` | string | `number`, `text` | dotted JSON path to the value; refused on `money-minor`, which reads `amount_path`/`currency_path`/`exponent_path` instead |
+| `amount_path` | string | `money-minor` | path to the amount in **minor units**; refused on `number`/`text` |
+| `currency_path` | string | `money-minor` | path to the currency code; refused on `number`/`text` |
+| `exponent_path` | string | `money-minor` | path to the scale (minor units per major one, as a power of ten); refused on `number`/`text` |
+| `unit_label` | string | no, `number` only | what the number counts, as a manifest literal; at most 32 characters — appended after a number, not a caption of its own |
 
 Three kinds and no more, because three are what live providers were observed to
 fill; a fourth would be a branch nothing can test.
@@ -783,7 +783,7 @@ declare zero, one, or several surfaces.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `id` | string | — (required) | stable identifier (`"cli"`, `"desktop"`); ASCII `[A-Za-z0-9_-]+` only, unique within the manifest — it becomes the reading id (`"<plugin id>-<surface id>"`, or the plugin id verbatim for `"default"`) and a throttle key |
-| `label` | string | — (required) | display label (`"CLI"`, `"Desktop"`) |
+| `label` | string | — (required) | display label (`"CLI"`, `"Desktop"`); must not be blank, and at most 120 characters — a row caption, not a paragraph |
 | `opt_in` | bool | `false` | if `true`, the surface is off unless the user explicitly enables it (for a credential lookup that needs a scary OS prompt) |
 | `in_menu_bar` | bool | `true` | whether this surface's readings show in the menu-bar pill/title; `false` for popup-only surfaces (e.g. the Claude desktop account) |
 | `allowed_hosts` | array of strings | empty | hosts this surface's requests are allowed to reach — see [Security](#security). Required, and refused when empty, on any surface whose auth chain has a step other than `reject-when` — regardless of `engine`, since a credential chain can exist ahead of an engine that reads it — an empty list would let its token be sent anywhere |
@@ -1029,7 +1029,7 @@ shipped manifest declares an option.
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `key` | string | yes | ASCII letters, digits and underscores only; unique within the plugin — it spells the `{option.<key>}` placeholder |
-| `label` | string | yes | display label for the checkbox; must not be blank |
+| `label` | string | yes | display label for the checkbox; must not be blank, and at most 120 characters — a row caption, not a paragraph |
 | `default` | bool | no (default `false`) | value used until the user overrides it |
 
 A template that spells `{option.<key>}` for a key no `[[option]]` declares is
