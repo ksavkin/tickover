@@ -471,9 +471,10 @@ pub fn system_dark_theme() -> bool {
     };
     // Anything other than a DWORD that was actually read leaves `value`
     // untouched, so the answer has to come from the status, not from it.
-    match status.is_ok() {
-        true => value == 0,
-        false => true,
+    if status.is_ok() {
+        value == 0
+    } else {
+        true
     }
 }
 

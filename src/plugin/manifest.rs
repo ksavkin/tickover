@@ -3146,9 +3146,10 @@ fn template_complaint(label: &str) -> Option<&'static str> {
         }
         rest = &after[close + 1..];
     }
-    match rest.contains('}') {
-        true => Some("a `}` with no `{` before it"),
-        false => None,
+    if rest.contains('}') {
+        Some("a `}` with no `{` before it")
+    } else {
+        None
     }
 }
 
@@ -3208,9 +3209,10 @@ impl WindowConfig {
     /// other two (`copilot`, `grok`) report only `[[balances]]` and have no
     /// windows to give one to.
     pub fn entry_key(&self, index: usize) -> String {
-        match self.id.is_empty() {
-            true => format!("w{index}"),
-            false => self.id.clone(),
+        if self.id.is_empty() {
+            format!("w{index}")
+        } else {
+            self.id.clone()
         }
     }
 }
@@ -3465,9 +3467,10 @@ impl BalanceConfig {
     /// with a `b` prefix so a balance and a window at the same index cannot
     /// produce the same string.
     pub fn entry_key(&self, index: usize) -> String {
-        match self.id.is_empty() {
-            true => format!("b{index}"),
-            false => self.id.clone(),
+        if self.id.is_empty() {
+            format!("b{index}")
+        } else {
+            self.id.clone()
         }
     }
 

@@ -54,7 +54,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::model::ProviderReading;
@@ -98,8 +98,13 @@ impl Limits {
 pub enum Decision {
     /// Make the request.
     Fetch,
-    /// Don't: hand back the last reading this surface produced.
-    Serve(Box<ProviderReading>),
+    /// Don't: hand back the last reading this surface produced. `Arc` rather
+    /// than an owned `ProviderReading` — the clone that adopts it for this
+    /// decision happens under [`STATES`]'s lock (see [`State::hold`]) and
+    /// has to be cheap; the caller is the one who may need to deep-clone the
+    /// reading itself, once it is back on its own thread and the lock is no
+    /// longer held.
+    Serve(Arc<ProviderReading>),
     /// Don't: there is nothing to show, only this error.
     Blocked(String),
 }
@@ -127,7 +132,7 @@ pub struct State {
     /// at a second endpoint (see [`State::account`]).
     account: Option<String>,
     /// The last reading a successful fetch produced.
-    cached: Option<ProviderReading>,
+    cached: Option<Arc<ProviderReading>>,
 }
 
 impl State {
@@ -177,7 +182,7 @@ impl State {
     /// and the row keeps its own countdown — else whatever went wrong.
     fn hold(&self) -> Decision {
         match &self.cached {
-            Some(reading) => Decision::Serve(Box::new(reading.clone())),
+            Some(reading) => Decision::Serve(reading.clone()),
             None => Decision::Blocked(
                 self.last_error
                     .clone()
@@ -195,18 +200,19 @@ impl State {
         self.next_allowed = None;
     }
 
-    /// Record a reading a request actually produced, and the account it names
-    /// (`None` leaves whatever was already known — a profile lookup that
-    /// failed this time doesn't unname the row). One good answer means the
-    /// provider is answering again, so the cool-off goes with it.
-    pub fn success(&mut self, reading: ProviderReading, account: Option<String>) {
+    /// Record a reading a request actually produced, and the account it
+    /// names (`reading.account`) — `None` there leaves whatever account was
+    /// already known — a profile lookup that failed this time doesn't
+    /// unname the row. One good answer means the provider is answering
+    /// again, so the cool-off goes with it.
+    pub fn success(&mut self, reading: ProviderReading) {
         self.failures = 0;
         self.next_allowed = None;
         self.last_error = None;
-        if account.is_some() {
-            self.account = account;
+        if reading.account.is_some() {
+            self.account = reading.account.clone();
         }
-        self.cached = Some(reading);
+        self.cached = Some(Arc::new(reading));
     }
 
     /// The account this surface's credentials resolved to, if it has been
@@ -268,14 +274,15 @@ fn deadline(now: Instant, wait: Duration) -> Instant {
 }
 
 /// The cool-off after `failures` consecutive failures: `backoff_start`
-/// doubled once per failure, capped at `backoff_max`. Saturating, so a long
-/// outage can't overflow the shift into a tiny (or enormous) delay.
+/// doubled once per failure, capped at `backoff_max`. `doublings` stops at
+/// 31 — one below `u32`'s bit width, so `1u32 << doublings` is always a
+/// valid shift rather than one that panics in a debug build (and wraps
+/// silently in release) — and `Duration::saturating_mul` turns a scale large
+/// enough to overflow the multiplication into `Duration::MAX`, which the
+/// trailing `.min(backoff_max)` then brings back down to the ceiling anyway.
 fn backoff_delay(failures: u32, limits: Limits) -> Duration {
-    let doublings = failures.saturating_sub(1).min(32);
-    let scaled = limits
-        .backoff_start
-        .checked_mul(1u32.checked_shl(doublings).unwrap_or(u32::MAX))
-        .unwrap_or(limits.backoff_max);
+    let doublings = failures.saturating_sub(1).min(31);
+    let scaled = limits.backoff_start.saturating_mul(1u32 << doublings);
     scaled.min(limits.backoff_max)
 }
 
@@ -356,13 +363,8 @@ pub fn decide(key: &str, fingerprint: u64, limits: Limits, now: Instant) -> Deci
     })
 }
 
-pub fn record_success(
-    key: &str,
-    fingerprint: u64,
-    reading: ProviderReading,
-    account: Option<String>,
-) {
-    with_state_of(key, fingerprint, |state| state.success(reading, account));
+pub fn record_success(key: &str, fingerprint: u64, reading: ProviderReading) {
+    with_state_of(key, fingerprint, |state| state.success(reading));
 }
 
 /// The account remembered for these credentials, if one has been resolved
@@ -382,6 +384,25 @@ pub fn record_failure(
     with_state_of(key, fingerprint, |state| {
         state.failure(now, message, terminal, limits)
     });
+}
+
+/// Drop every surface's state belonging to `plugin_id` — every key with the
+/// `plugin_id\u{1}` prefix `key` builds (see its own doc). Called from
+/// `main.rs`'s manifest-reload path whenever a plugin's manifest changes or
+/// disappears: the fingerprint invalidator in [`State::adopt`] only notices
+/// a *credential* change, so an edited `[[http.request]] url` under an
+/// unchanged token would otherwise go on being served from — or throttled
+/// against — the previous manifest's state; a removed plugin's state would
+/// otherwise sit in [`STATES`] for the rest of the process's life. Matching
+/// on the prefix rather than the bare id also drops nothing belonging to an
+/// id that merely starts with this one (`codex` vs `codex-beta`) — `key`'s
+/// own separator is what keeps those apart, and `forget` respects it.
+pub fn forget(plugin_id: &str) {
+    let mut guard = STATES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut() {
+        let prefix = format!("{plugin_id}\u{1}");
+        map.retain(|k, _| !k.starts_with(&prefix));
+    }
 }
 
 #[cfg(test)]
@@ -424,7 +445,7 @@ mod tests {
 
     fn served(decision: &Decision) -> Option<&ProviderReading> {
         match decision {
-            Decision::Serve(reading) => Some(reading),
+            Decision::Serve(reading) => Some(reading.as_ref()),
             _ => None,
         }
     }
@@ -455,7 +476,7 @@ mod tests {
             limit_reached: Some(true),
             reached_type: Some("rate_limit_reached".to_string()),
         });
-        state.success(blocked, None);
+        state.success(blocked);
 
         let decision = state.decide(t0 + Duration::from_secs(1), limits());
         let served = served(&decision).expect("inside the minimum interval, this is served");
@@ -474,7 +495,7 @@ mod tests {
         let t0 = Instant::now();
         let mut state = State::default();
         state.attempt(t0);
-        state.success(reading(69.0), None);
+        state.success(reading(69.0));
 
         for offset in [1, 9, 54] {
             let decision = state.decide(t0 + Duration::from_secs(offset), limits());
@@ -502,7 +523,7 @@ mod tests {
             let now = t0 + Duration::from_secs(60 * tick);
             assert_eq!(state.decide(now, limits()), Decision::Fetch, "tick {tick}");
             state.attempt(now);
-            state.success(reading(69.0), None);
+            state.success(reading(69.0));
         }
     }
 
@@ -525,6 +546,38 @@ mod tests {
                 Decision::Fetch,
                 "failure {} must retry after {wait}s",
                 i + 1
+            );
+        }
+    }
+
+    /// Pins `backoff_delay`'s curve at a handful of points along the
+    /// doubling, then the plateau every streak past the shift cap lands on —
+    /// the two things the old double-overflow trick was relying on to reach
+    /// `backoff_max` by way of `u32::MAX` rather than directly.
+    #[test]
+    fn backoff_delay_matches_the_documented_doubling_up_to_the_ceiling() {
+        let limits = Limits {
+            min_interval: Duration::from_secs(1),
+            backoff_start: Duration::from_secs(1),
+            backoff_max: Duration::from_secs(2_000_000_000),
+            unauthorized_retry: Duration::from_secs(1),
+        };
+        for (failures, expected_secs) in [(1, 1), (2, 2), (3, 4), (10, 512), (31, 1 << 30)] {
+            assert_eq!(
+                backoff_delay(failures, limits),
+                Duration::from_secs(expected_secs),
+                "failures = {failures}"
+            );
+        }
+        // `1 << 31` seconds (68 years) is past `backoff_max` here, and
+        // `doublings` never grows past 31 — so every streak from here on,
+        // including one nowhere near reachable in practice, lands on the
+        // same ceiling rather than wrapping or overflowing.
+        for failures in [32, 33, 40, 1_000, u32::MAX] {
+            assert_eq!(
+                backoff_delay(failures, limits),
+                limits.backoff_max,
+                "failures = {failures}"
             );
         }
     }
@@ -565,7 +618,7 @@ mod tests {
         let t0 = Instant::now();
         let mut state = State::default();
         state.attempt(t0);
-        state.success(reading(69.0), None);
+        state.success(reading(69.0));
         state.failure(t0 + Duration::from_secs(1), "HTTP 500", false, short);
 
         // Cool-off is over at t0+6, but only 6s have passed since the request.
@@ -592,7 +645,7 @@ mod tests {
         let recovered = t0 + Duration::from_secs(240);
         assert_eq!(state.decide(recovered, limits()), Decision::Fetch);
         state.attempt(recovered);
-        state.success(reading(70.0), None);
+        state.success(reading(70.0));
 
         state.failure(recovered, "HTTP 500", false, limits());
         assert_eq!(
@@ -607,7 +660,7 @@ mod tests {
         let t0 = Instant::now();
         let mut state = State::default();
         state.attempt(t0);
-        state.success(reading(69.0), None);
+        state.success(reading(69.0));
         state.failure(
             t0 + Duration::from_secs(60),
             "network error",
@@ -627,7 +680,7 @@ mod tests {
         let t0 = Instant::now();
         let mut state = State::default();
         state.attempt(t0);
-        state.success(reading(69.0), None);
+        state.success(reading(69.0));
         state.failure(t0, crate::plugin::engine_http::UNAUTHORIZED, true, limits());
 
         for minutes in [1, 5, 30, 59] {
@@ -662,7 +715,7 @@ mod tests {
 
         // And if that attempt succeeds, nothing about the stop lingers.
         state.attempt(t0 + Duration::from_secs(3600));
-        state.success(reading(69.0), None);
+        state.success(reading(69.0));
         assert!(
             matches!(
                 state.decide(t0 + Duration::from_secs(3630), limits()),
@@ -782,7 +835,7 @@ mod tests {
         let mut state = State::default();
         state.adopt(fingerprint("token-a", &BTreeMap::new()));
         state.attempt(t0);
-        state.success(reading(69.0), None);
+        state.success(reading(69.0));
 
         state.adopt(fingerprint("token-b", &BTreeMap::new()));
         assert_eq!(
@@ -893,7 +946,7 @@ mod tests {
             Decision::Blocked(_)
         ));
 
-        state.success(reading(69.0), None);
+        state.success(reading(69.0));
         assert_eq!(
             state.decide(t0 + Duration::from_secs(60), limits()),
             Decision::Fetch,
@@ -932,7 +985,7 @@ mod tests {
 
         // The first request finally answers, still speaking for the old login.
         record_failure(&surface, old, "network error", false, limits(), now);
-        record_success(&surface, old, reading_of(old), None);
+        record_success(&surface, old, reading_of(old));
 
         assert!(
             matches!(decide(&surface, new, limits(), now), Decision::Blocked(_)),
@@ -1133,7 +1186,7 @@ mod tests {
 
                     match rng.below(3) {
                         0 => {
-                            record_success(&surface, whose, reading_of(whose), None);
+                            record_success(&surface, whose, reading_of(whose));
                             if current {
                                 earliest = 0;
                                 streak = 0;
@@ -1271,6 +1324,62 @@ mod tests {
         Ok(())
     }
 
+    /// The scenario `forget` exists for: a manifest edited without touching
+    /// the token (the fingerprint stays the same) must not keep serving the
+    /// state a request against the previous manifest built. `decide` with
+    /// the *same* fingerprint before and after is the whole point — a new
+    /// fingerprint would already clear this on its own (`State::adopt`).
+    #[test]
+    fn forgetting_a_plugin_lifts_the_stale_serve_left_by_its_previous_manifest() {
+        let t0 = Instant::now();
+        let fp = fingerprint("tok", &BTreeMap::new());
+        let surface = key("test-forget-edit", "default");
+
+        assert_eq!(decide(&surface, fp, limits(), t0), Decision::Fetch);
+        record_success(&surface, fp, reading(69.0));
+        assert!(
+            matches!(
+                decide(&surface, fp, limits(), t0 + Duration::from_secs(1)),
+                Decision::Serve(_)
+            ),
+            "still inside the floor, served from the pre-edit manifest's reading"
+        );
+
+        forget("test-forget-edit");
+
+        assert_eq!(
+            decide(&surface, fp, limits(), t0 + Duration::from_secs(1)),
+            Decision::Fetch,
+            "forgotten, so the edited manifest is asked at once rather than served the old one's cache"
+        );
+    }
+
+    #[test]
+    fn forgetting_a_plugin_does_not_touch_one_whose_id_only_shares_a_prefix() {
+        let t0 = Instant::now();
+        let fp = fingerprint("tok", &BTreeMap::new());
+        let unrelated = key("test-forget-prefix-beta", "default");
+
+        assert_eq!(decide(&unrelated, fp, limits(), t0), Decision::Fetch);
+        record_success(&unrelated, fp, reading(1.0));
+
+        forget("test-forget-prefix");
+
+        assert!(
+            matches!(
+                decide(&unrelated, fp, limits(), t0 + Duration::from_secs(1)),
+                Decision::Serve(_)
+            ),
+            "\"test-forget-prefix-beta\" is a different plugin id, not a surface of \
+             \"test-forget-prefix\""
+        );
+    }
+
+    #[test]
+    fn forgetting_a_plugin_with_no_state_is_a_no_op() {
+        forget("test-forget-never-seen");
+    }
+
     #[test]
     fn the_process_wide_map_keeps_surfaces_apart() {
         let now = Instant::now();
@@ -1281,7 +1390,7 @@ mod tests {
         );
 
         assert_eq!(decide(&a, fp, limits(), now), Decision::Fetch);
-        record_success(&a, fp, reading(1.0), None);
+        record_success(&a, fp, reading(1.0));
         assert!(
             matches!(decide(&a, fp, limits(), now), Decision::Serve(_)),
             "the surface that just fetched is paced"

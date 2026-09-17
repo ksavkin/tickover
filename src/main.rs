@@ -31,7 +31,7 @@ use tickover::plugin::registry::{
 use tickover::plugin::signature;
 use tickover::plugin::{
     engine_http, engine_logfile, is_invisible_or_directional, push_host, scheduler, seed,
-    surface_reading_id, time as plugin_time, write_via_temp,
+    surface_reading_id, throttle, time as plugin_time, write_via_temp,
 };
 
 use tray_icon::{
@@ -56,6 +56,16 @@ type PluginCache = Rc<RefCell<HashMap<String, Vec<ProviderReading>>>>;
 /// Plugin ids with a background fetch currently in flight (dedup so a slow
 /// provider doesn't pile up redundant threads).
 type Fetching = Rc<RefCell<HashMap<String, InFlight>>>;
+
+/// `Child` handles for the fire-and-forget helper processes this app spawns
+/// (the file manager, a text editor — see `open_in_file_manager` and
+/// `open_in_text_editor`) and never otherwise needs again. `Child::drop`
+/// does not `wait()` on the process it owns, so simply discarding the value
+/// `.spawn()` returns leaves an exited child as a zombie for as long as this
+/// app keeps running; kept here instead, and reaped a `try_wait()` at a
+/// time in the fast timer, so each one is cleaned up without ever blocking
+/// the UI thread on it.
+type SpawnedHelpers = Rc<RefCell<Vec<std::process::Child>>>;
 
 /// One fetch this app is still waiting on.
 ///
@@ -253,6 +263,7 @@ struct Ctx {
     plugins: Plugins,
     cache: PluginCache,
     fetching: Fetching,
+    spawned_helpers: SpawnedHelpers,
     plugin_tx: mpsc::Sender<(String, u64, Vec<ProviderReading>)>,
     model: Providers,
     window_models: WindowModels,
@@ -388,6 +399,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let plugins: Plugins = Rc::new(RefCell::new(load_plugins()));
     let cache: PluginCache = Rc::new(RefCell::new(HashMap::new()));
     let fetching: Fetching = Rc::new(RefCell::new(HashMap::new()));
+    let spawned_helpers: SpawnedHelpers = Rc::new(RefCell::new(Vec::new()));
     let anchor: Anchor = Rc::new(RefCell::new(None));
     let shown_at = Rc::new(Cell::new(Instant::now()));
     // When the status item was last clicked. Clicking it activates the app,
@@ -469,6 +481,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         plugins: plugins.clone(),
         cache: cache.clone(),
         fetching: fetching.clone(),
+        spawned_helpers: spawned_helpers.clone(),
         plugin_tx: plugin_tx.clone(),
         model: model.clone(),
         window_models: window_models.clone(),
@@ -561,20 +574,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match app.window().take_snapshot() {
                     Ok(buf) => {
                         let (w, h) = (buf.width(), buf.height());
-                        let bytes = buf.as_bytes().to_vec();
+                        // Written straight from the buffer `take_snapshot`
+                        // handed back, not a copy of it: `image::save_buffer`
+                        // encodes from a `&[u8]` directly, so neither the
+                        // `.to_vec()` this used to make nor the intermediate
+                        // `RgbaImage` it fed are needed to reach `.save()`.
+                        let bytes = buf.as_bytes();
                         let got = bytes.len();
                         let want = (w as usize) * (h as usize) * 4;
-                        match image::RgbaImage::from_raw(w, h, bytes) {
-                            Some(img) => match img.save(std::path::Path::new(&path)) {
+                        if got != want {
+                            diag::line(format!(
+                                "snapshot {w}x{h}: buffer holds {got} bytes, {want} needed \
+                                 for RGBA8 at that size, nothing written to {path:?}"
+                            ));
+                        } else {
+                            match image::save_buffer(
+                                std::path::Path::new(&path),
+                                bytes,
+                                w,
+                                h,
+                                image::ColorType::Rgba8,
+                            ) {
                                 Ok(()) => diag::line(format!("snapshot {w}x{h} -> {path:?}")),
                                 Err(e) => diag::line(format!(
                                     "snapshot {w}x{h}: failed to write {path:?}: {e}"
                                 )),
-                            },
-                            None => diag::line(format!(
-                                "snapshot {w}x{h}: buffer holds {got} bytes, {want} needed \
-                                 for RGBA8 at that size, nothing written to {path:?}"
-                            )),
+                            }
                         }
                     }
                     Err(e) => {
@@ -903,7 +928,14 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
             if let Err(e) = seed::reseed_defaults(&dir) {
                 diag::line(format!("could not reset plugins in {}: {e}", dir.display()));
             }
+            let previous = ctx.plugins.borrow().clone();
             *ctx.plugins.borrow_mut() = load_plugins();
+            // A reseeded built-in's manifest can differ from the one it
+            // replaces (a customised URL reverting to the shipped one, say)
+            // under the same id and the same token — see
+            // `forget_changed_manifests`'s own doc for why that needs its
+            // own invalidation, separate from `ctx.cache.clear()` below.
+            forget_changed_manifests(&previous, &ctx.plugins.borrow());
             ctx.cache.borrow_mut().clear();
             // Clear in-flight markers so the fresh fetches below aren't
             // deduped away by an old worker that is still running against the
@@ -1133,7 +1165,7 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
             ctx.shown_at.set(Instant::now()); // the editor window steals focus
             let dir = seed::plugins_dir();
             match find_plugin_manifest_path(&dir, id.as_ref()) {
-                Some(path) => open_in_text_editor(&path),
+                Some(path) => open_in_text_editor(&path, &ctx.spawned_helpers),
                 None => diag::line(format!(
                     "edit-plugin: no manifest file found for id \"{id}\""
                 )),
@@ -1211,7 +1243,7 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
         let ctx = ctx.clone();
         app.on_open_plugins_folder(move || {
             ctx.shown_at.set(Instant::now()); // Finder/the file manager steals focus
-            open_in_file_manager(&seed::plugins_dir());
+            open_in_file_manager(&seed::plugins_dir(), &ctx.spawned_helpers);
         });
     }
 }
@@ -1253,8 +1285,9 @@ fn wire_registry_callbacks(app: &AppWindow, ctx: &Ctx) {
             // "checking…" with nothing left to ever move it off that — the same
             // failure mode `spawn_plugin_fetch`'s own doc comment describes.
             let spawned = std::thread::Builder::new().spawn(move || {
+                let guard = RegistryCheckGuard { tx: Some(tx) };
                 let hashed = hash_installed_manifests(&seed::plugins_dir(), &installed);
-                let _ = tx.send(fetch_registry_index(DEFAULT_REGISTRY_URL, hashed));
+                guard.finish(fetch_registry_index(DEFAULT_REGISTRY_URL, hashed));
             });
             if spawned.is_err() {
                 // No thread means no result will ever arrive on `registry_rx`
@@ -1395,6 +1428,14 @@ fn run_fast_timer(
     let settings_open_prev = Cell::new(false);
     event_timer.start(TimerMode::Repeated, Duration::from_millis(80), move || {
         let Some(app) = weak.upgrade() else { return };
+
+        // Reap any helper process (file manager, text editor) that has
+        // exited since the last tick — see `SpawnedHelpers`'s own doc for
+        // why this can't just be `.status()` on this thread (it's the UI
+        // thread) or a `SIGCHLD` `SIG_IGN` (this app also reads the exit
+        // status of other children it *does* wait on, e.g. `security`,
+        // which `SIG_IGN` would break).
+        reap_spawned_helpers(&ctx.spawned_helpers);
 
         // The settings sheet has no Rust-side "opened" callback (frozen
         // Slint contract: `settings-open` is a plain `in-out` property
@@ -2284,7 +2325,16 @@ fn colliding_reading_ids(manifests: &[PluginManifest]) -> Vec<String> {
 /// screen. Losing the whole later manifest, the same as a duplicate plain id,
 /// is what a screen behaving consistently for the survivor costs.
 fn dedup_plugin_ids(manifests: Vec<PluginManifest>) -> Vec<PluginManifest> {
-    let ids: Vec<String> = manifests.iter().map(|m| m.id.clone()).collect();
+    // Joined once, up front, rather than cloning every id into its own
+    // `Vec<String>` entry to `.join(", ")` again inside the closure below —
+    // this can only ever be read from, at most once per duplicate found, so
+    // one `String` built ahead of the loop is all either diagnostic line
+    // needs.
+    let ids = manifests
+        .iter()
+        .map(|m| m.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut seen_ids: HashSet<String> = HashSet::new();
     let mut claimed_reading_ids: HashSet<String> = HashSet::new();
     manifests
@@ -2296,10 +2346,9 @@ fn dedup_plugin_ids(manifests: Vec<PluginManifest>) -> Vec<PluginManifest> {
                 // and nothing about where from, and a folder holding one file
                 // per id can still produce one if something loads twice.
                 diag::line(format!(
-                    "ignoring plugin manifest with duplicate id \"{}\" version \"{}\" (keeping the first one loaded); loaded set was [{}]",
+                    "ignoring plugin manifest with duplicate id \"{}\" version \"{}\" (keeping the first one loaded); loaded set was [{ids}]",
                     m.id,
                     m.version,
-                    ids.join(", ")
                 ));
                 return false;
             }
@@ -2315,10 +2364,9 @@ fn dedup_plugin_ids(manifests: Vec<PluginManifest>) -> Vec<PluginManifest> {
                 diag::line(format!(
                     "ignoring plugin manifest \"{}\" version \"{}\": its reading id \"{collision}\" \
                      is already claimed by an earlier-loaded plugin (keeping the earlier one); \
-                     loaded set was [{}]",
+                     loaded set was [{ids}]",
                     m.id,
                     m.version,
-                    ids.join(", ")
                 ));
                 return false;
             }
@@ -2344,6 +2392,31 @@ fn plugin_by_id<'a>(plugins: &'a [PluginManifest], id: &str) -> Option<&'a Plugi
 // would add a dependency for a handful of one-liners that are already
 // written, on both platforms.
 
+/// Drop [`throttle`] state for every id whose manifest is not the same
+/// before and after a reload — added, removed or edited, by whole-manifest
+/// equality. `throttle::State::adopt`'s own invalidator only notices a
+/// *credential* change; an id whose `[[http.request]] url` (or anything
+/// else) changed under an unchanged token would otherwise go on being
+/// served from, or paced against, the state the previous manifest built —
+/// and one that disappeared entirely would sit in `throttle`'s process-wide
+/// map for good. `old`/`new` are compared by id rather than position:
+/// `load_plugins` sorts by `order` then `id` (see its own doc), which an
+/// edit can itself change.
+fn forget_changed_manifests(old: &[PluginManifest], new: &[PluginManifest]) {
+    let old_by_id: HashMap<&str, &PluginManifest> =
+        old.iter().map(|m| (m.id.as_str(), m)).collect();
+    let new_by_id: HashMap<&str, &PluginManifest> =
+        new.iter().map(|m| (m.id.as_str(), m)).collect();
+    let mut ids: Vec<&str> = old_by_id.keys().chain(new_by_id.keys()).copied().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    for id in ids {
+        if old_by_id.get(id) != new_by_id.get(id) {
+            throttle::forget(id);
+        }
+    }
+}
+
 /// Reload every plugin manifest from disk (**no reseed** — that's what
 /// `reset-plugins` is for; `load_plugins` is a pure read, see its own docs)
 /// and rebuild the plugin-manager model. `load_plugins` only reads local TOML
@@ -2353,7 +2426,9 @@ fn plugin_by_id<'a>(plugins: &'a [PluginManifest], id: &str) -> Option<&'a Plugi
 /// safe to call after the last plugin manifest was deleted without
 /// resurrecting the built-ins.
 fn reload_manifests_only(plugins: &Plugins, plugin_model: &PluginRows) {
+    let previous = plugins.borrow().clone();
     *plugins.borrow_mut() = load_plugins();
+    forget_changed_manifests(&previous, &plugins.borrow());
     refresh_plugins_model(plugin_model, &plugins.borrow());
 }
 
@@ -2474,20 +2549,60 @@ fn remove_lockfile_entry(path: &std::path::Path, id: &str) {
     }
 }
 
+/// Keep a helper process's `Child` around long enough to be reaped by a
+/// `try_wait()` on a later tick (see [`SpawnedHelpers`]'s own doc) instead of
+/// dropping it — and with it, any chance of ever reaping it — the moment
+/// `.spawn()` returns. A spawn that failed has nothing to keep; the error
+/// itself goes unreported here, matching every call site's existing "best
+/// effort" handling of the OS declining to run a file manager or an editor.
+fn keep_alive(helpers: &SpawnedHelpers, spawned: std::io::Result<std::process::Child>) {
+    if let Ok(child) = spawned {
+        helpers.borrow_mut().push(child);
+    }
+}
+
+/// Drop every entry in `helpers` whose process has already exited —
+/// `try_wait()` both asks and, on `Ok(Some(_))`, reaps it, the same call
+/// [`std::process::Child::wait`] makes, just non-blocking. A child still
+/// running is kept for the next tick to ask again; one `try_wait` itself
+/// fails on (a kernel-level error, not "still running") is dropped too —
+/// there is nothing more this app can do about it, and holding onto a
+/// `Child` it can no longer even poll would only grow the list forever.
+fn reap_spawned_helpers(helpers: &SpawnedHelpers) {
+    helpers
+        .borrow_mut()
+        .retain_mut(|child| match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            Err(e) => {
+                diag::line(format!(
+                    "spawned helper process: could not poll its exit status, giving up on it: {e}"
+                ));
+                false
+            }
+        });
+}
+
 /// Reveal the plugin manifests directory in the OS file manager.
-fn open_in_file_manager(dir: &std::path::Path) {
+fn open_in_file_manager(dir: &std::path::Path, helpers: &SpawnedHelpers) {
     let _ = std::fs::create_dir_all(dir); // best effort, so there is something to open
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open").arg(dir).spawn();
+        keep_alive(helpers, std::process::Command::new("open").arg(dir).spawn());
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("explorer").arg(dir).spawn();
+        keep_alive(
+            helpers,
+            std::process::Command::new("explorer").arg(dir).spawn(),
+        );
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+        keep_alive(
+            helpers,
+            std::process::Command::new("xdg-open").arg(dir).spawn(),
+        );
     }
 }
 
@@ -2497,21 +2612,30 @@ fn open_in_file_manager(dir: &std::path::Path) {
 /// flag, so they fall back to the same "open with whatever's registered"
 /// launcher used for the folder above — good enough for a manifest that is,
 /// after all, a plain-text file.
-fn open_in_text_editor(path: &std::path::Path) {
+fn open_in_text_editor(path: &std::path::Path, helpers: &SpawnedHelpers) {
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open")
-            .arg("-t")
-            .arg(path)
-            .spawn();
+        keep_alive(
+            helpers,
+            std::process::Command::new("open")
+                .arg("-t")
+                .arg(path)
+                .spawn(),
+        );
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("notepad").arg(path).spawn();
+        keep_alive(
+            helpers,
+            std::process::Command::new("notepad").arg(path).spawn(),
+        );
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+        keep_alive(
+            helpers,
+            std::process::Command::new("xdg-open").arg(path).spawn(),
+        );
     }
 }
 
@@ -2859,7 +2983,11 @@ fn spawn_plugin_fetch(
     if !plugin_enabled(m) {
         return; // disabled plugins are never fetched
     }
-    let generation = next_fetch_generation();
+    // Only spent on the `Admission::Start` arm below — `Wait`/`Stalled` both
+    // `return` before a generation would ever be read back out of `fetching`,
+    // so drawing one for them only to throw it away unused would move
+    // `NEXT_FETCH_GENERATION` for nothing.
+    let generation;
     {
         let mut in_flight = fetching.borrow_mut();
         let existing = in_flight.get(&m.id).copied();
@@ -2892,6 +3020,7 @@ fn spawn_plugin_fetch(
             }
             Admission::Start => {}
         }
+        generation = next_fetch_generation();
         in_flight.insert(
             m.id.clone(),
             InFlight {
@@ -6419,6 +6548,51 @@ enum RegistryCheckMsg {
     Success(RegistryIndex, Vec<(String, String, String)>),
 }
 
+/// Sends a "Check updates" worker's result exactly once — on
+/// [`RegistryCheckGuard::finish`] with the real [`RegistryCheckMsg`], or, if
+/// the worker never got that far (a panic unwinding through it), a
+/// synthesized [`RegistryCheckMsg::NetworkError`] on drop. Same idiom as
+/// [`FetchGuard`] and [`RegistryGuard`], and for the same reason:
+/// `registry_checking` is only ever cleared on the UI thread, when a message
+/// arrives on `registry_rx` (see the drain loop in `run_fast_timer`) — it is
+/// a `Rc<Cell<_>>`, not `Send`, so the worker thread cannot clear it
+/// directly, and without this a worker that panics sends nothing, leaving
+/// `registry_checking` `true` and every later "Check updates" click a silent
+/// no-op for the rest of the session. `Builder::spawn` itself failing —
+/// never reaching this guard at all — is the one failure it cannot cover;
+/// its own call site handles that the same way `spawn_plugin_fetch` does.
+///
+/// Same caveat as [`FetchGuard`]/[`RegistryGuard`]: this only runs under
+/// unwinding, which this crate's release profile allows (`Cargo.toml` does
+/// not set `panic = "abort"`).
+struct RegistryCheckGuard {
+    /// Taken by whichever of [`RegistryCheckGuard::finish`] and `drop` runs
+    /// first, so the result is sent exactly once and the guard still drops
+    /// normally either way.
+    tx: Option<mpsc::Sender<RegistryCheckMsg>>,
+}
+
+impl RegistryCheckGuard {
+    fn finish(mut self, msg: RegistryCheckMsg) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(msg);
+        }
+    }
+}
+
+impl Drop for RegistryCheckGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            if std::thread::panicking() {
+                diag::line(
+                    "check-updates: worker panicked, reporting it as unreachable".to_string(),
+                );
+            }
+            let _ = tx.send(RegistryCheckMsg::NetworkError);
+        }
+    }
+}
+
 /// The signature file that goes with an index, by minisign's convention:
 /// the index's own URL with `.minisig` on the end.
 fn signature_url(index_url: &str) -> String {
@@ -6657,8 +6831,9 @@ fn apply_registry_check(
             // for — see `plugin_row`'s own doc comment on why a plain
             // rebuild elsewhere in this file (add/remove/toggle) is allowed
             // to drop a still-pending badge until the next manual check.
-            refresh_plugins_model(plugin_model, &plugins.borrow());
-            for (i, m) in plugins.borrow().iter().enumerate() {
+            let plugins_ref = plugins.borrow();
+            refresh_plugins_model(plugin_model, &plugins_ref);
+            for (i, m) in plugins_ref.iter().enumerate() {
                 let Some((available, has_local_edits)) = diff.updates.get(&m.id) else {
                     continue;
                 };
@@ -6691,14 +6866,12 @@ fn apply_registry_check(
 /// deliberately never pluralizes: the template is literal — `"N update"` for
 /// any N, and `"N new"` — with no plural form, rather than guessing one.
 fn registry_summary(update_count: usize, new_count: usize) -> String {
-    let mut parts = Vec::new();
-    if update_count > 0 {
-        parts.push(format!("{update_count} update"));
+    match (update_count, new_count) {
+        (0, 0) => String::new(),
+        (updates, 0) => format!("{updates} update"),
+        (0, new) => format!("{new} new"),
+        (updates, new) => format!("{updates} update, {new} new"),
     }
-    if new_count > 0 {
-        parts.push(format!("{new_count} new"));
-    }
-    parts.join(", ")
 }
 
 /// `registry-checked-at`'s relative-time text ("just now" / "2m ago" / …),
@@ -11492,6 +11665,74 @@ mod title_tests {
             .expect("/bin/sh")
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn keep_alive_pushes_a_successful_spawn_and_ignores_a_failed_one() {
+        let helpers: SpawnedHelpers = Rc::new(RefCell::new(Vec::new()));
+        keep_alive(&helpers, Ok(sh("exit 0")));
+        assert_eq!(
+            helpers.borrow().len(),
+            1,
+            "a successful spawn is kept for a later tick to reap"
+        );
+
+        keep_alive(
+            &helpers,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no such helper",
+            )),
+        );
+        assert_eq!(
+            helpers.borrow().len(),
+            1,
+            "a spawn that failed has nothing to keep"
+        );
+
+        // Cleanup: reap the one real child this test spawned.
+        let _ = helpers.borrow_mut().remove(0).wait();
+    }
+
+    /// The scenario `reap_spawned_helpers` exists for: `Child::drop` does
+    /// not `wait()`, so a helper this app spawned and never otherwise checks
+    /// on again would sit as a zombie for the rest of the run without this.
+    #[cfg(unix)]
+    #[test]
+    fn reap_spawned_helpers_drops_a_child_once_it_has_exited() {
+        let helpers: SpawnedHelpers = Rc::new(RefCell::new(vec![sh("exit 0")]));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !helpers.borrow().is_empty() && Instant::now() < deadline {
+            reap_spawned_helpers(&helpers);
+            if !helpers.borrow().is_empty() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        assert!(
+            helpers.borrow().is_empty(),
+            "an exited helper is dropped (and its exit status reaped) once try_wait sees it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reap_spawned_helpers_keeps_a_child_that_has_not_exited_yet() {
+        let helpers: SpawnedHelpers = Rc::new(RefCell::new(vec![sh("sleep 5")]));
+
+        reap_spawned_helpers(&helpers);
+        assert_eq!(
+            helpers.borrow().len(),
+            1,
+            "a child still running must not be dropped — there would be nothing left to reap it"
+        );
+
+        // Cleanup: kill and reap it directly rather than waiting out the sleep.
+        let mut still_running = helpers.borrow_mut().remove(0);
+        let _ = still_running.kill();
+        let _ = still_running.wait();
+    }
+
     /// A `Read` that answers exactly the way an interrupted syscall would:
     /// `Err(Interrupted)` once, then the real bytes, then EOF. Standing in
     /// for a real pipe, which cannot be made to return `EINTR` on demand.
@@ -11871,6 +12112,57 @@ mod title_tests {
                 .iter()
                 .any(|l| l.contains("acme") && l.contains("panicked")),
             "expected a panic diagnostic naming the plugin, got {lines:?}"
+        );
+    }
+
+    /// The happy path: `finish` sends the real message and, being a
+    /// by-value method, consumes the guard on the way out — so there is no
+    /// `self` left for `drop` to find `tx` still `Some` on, and no way for
+    /// the panic-only message below to double up behind a normal reply.
+    #[test]
+    fn registry_check_guard_finish_sends_the_given_message_once() {
+        let (tx, rx) = mpsc::channel();
+        let guard = RegistryCheckGuard { tx: Some(tx) };
+        guard.finish(RegistryCheckMsg::Malformed);
+
+        assert!(
+            matches!(rx.recv(), Ok(RegistryCheckMsg::Malformed)),
+            "the message `finish` was given is what arrives"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one message — nothing left over from a drop"
+        );
+    }
+
+    /// Same shape as `fetch_guard_logs_when_dropped_mid_panic`: a
+    /// "Check updates" worker that panics before reaching `finish` must
+    /// still clear `registry_checking` (via the message this sends
+    /// [`apply_registry_check`]), or every later click would be refused for
+    /// good — see [`RegistryCheckGuard`]'s own doc.
+    #[test]
+    fn registry_check_guard_reports_unreachable_when_dropped_mid_panic() {
+        diag::take_recorded();
+        let (tx, rx) = mpsc::channel();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = RegistryCheckGuard { tx: Some(tx) };
+            panic!("simulated check-updates panic");
+        }));
+        assert!(unwound.is_err(), "the panic must still propagate out");
+
+        assert!(
+            matches!(
+                rx.recv()
+                    .expect("the guard sends on drop even while unwinding"),
+                RegistryCheckMsg::NetworkError
+            ),
+            "a panicked worker is reported the same as an unreachable registry"
+        );
+
+        let lines = diag::take_recorded();
+        assert!(
+            lines.iter().any(|l| l.contains("panicked")),
+            "expected a panic diagnostic, got {lines:?}"
         );
     }
 
@@ -12501,6 +12793,79 @@ mod title_tests {
             out.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             vec!["claude-cli"],
             "order, not which plugin id looks more legitimate, decides the winner"
+        );
+    }
+
+    // ── forget_changed_manifests: reload-time throttle invalidation ─────────
+
+    /// The pacing knobs `forget_changed_manifests`'s own tests drive
+    /// `throttle::decide` with — a floor wide enough that a served-vs-fetched
+    /// answer a second later is unambiguous.
+    fn forget_test_limits() -> throttle::Limits {
+        throttle::Limits {
+            min_interval: Duration::from_secs(55),
+            backoff_start: Duration::from_secs(60),
+            backoff_max: Duration::from_secs(900),
+            unauthorized_retry: Duration::from_secs(3600),
+        }
+    }
+
+    #[test]
+    fn forget_changed_manifests_only_forgets_the_id_whose_manifest_actually_changed() {
+        let t0 = Instant::now();
+        let limits = forget_test_limits();
+        let fp = throttle::fingerprint("tok", &BTreeMap::new());
+        let unchanged = throttle::key("rl-keep", "default");
+        let edited = throttle::key("rl-edit", "default");
+
+        for surface in [&unchanged, &edited] {
+            assert_eq!(
+                throttle::decide(surface, fp, limits, t0),
+                throttle::Decision::Fetch
+            );
+            throttle::record_success(surface, fp, stub_reading("x"));
+        }
+
+        let old = vec![stub_manifest("rl-keep", 1), stub_manifest("rl-edit", 2)];
+        let new = vec![
+            stub_manifest("rl-keep", 1),
+            stub_manifest("rl-edit", 99), // same id, different `order`
+        ];
+        forget_changed_manifests(&old, &new);
+
+        assert!(
+            matches!(
+                throttle::decide(&unchanged, fp, limits, t0 + Duration::from_secs(1)),
+                throttle::Decision::Serve(_)
+            ),
+            "an id whose manifest did not change keeps its cached reading"
+        );
+        assert_eq!(
+            throttle::decide(&edited, fp, limits, t0 + Duration::from_secs(1)),
+            throttle::Decision::Fetch,
+            "an edited manifest is asked at once rather than served the pre-edit reading"
+        );
+    }
+
+    #[test]
+    fn forget_changed_manifests_forgets_an_id_that_disappeared() {
+        let t0 = Instant::now();
+        let limits = forget_test_limits();
+        let fp = throttle::fingerprint("tok", &BTreeMap::new());
+        let removed = throttle::key("rl-gone", "default");
+
+        assert_eq!(
+            throttle::decide(&removed, fp, limits, t0),
+            throttle::Decision::Fetch
+        );
+        throttle::record_success(&removed, fp, stub_reading("x"));
+
+        forget_changed_manifests(&[stub_manifest("rl-gone", 1)], &[]);
+
+        assert_eq!(
+            throttle::decide(&removed, fp, limits, t0 + Duration::from_secs(1)),
+            throttle::Decision::Fetch,
+            "a plugin removed from the manifest set must not leave its state behind"
         );
     }
 

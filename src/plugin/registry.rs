@@ -390,12 +390,18 @@ pub fn resolve_manifest_url(
     let base = base_index_url
         .split_once(['?', '#'])
         .map_or(base_index_url, |(base, _)| base);
+    // Trailing slashes come off *before* the `/index.toml` suffix is looked
+    // for, not after: `strip_suffix` matches the literal bytes "/index.toml"
+    // at the very end, so a published URL ending "/index.toml/" would miss
+    // it in the other order, leave "index.toml" sitting in `base`, and
+    // resolve every manifest as a child of that file rather than of the
+    // directory it lives in.
+    let base = base.trim_end_matches('/');
     // Anchored to the path separator, not a bare "index.toml": an index
     // published under a name that merely *ends* in those letters (a
     // "custom-index.toml", say) would otherwise have its suffix chopped
     // instead of its whole filename, mangling the directory this joins onto.
     let base = base.strip_suffix("/index.toml").unwrap_or(base);
-    let base = base.trim_end_matches('/');
     let joined = format!("{base}/{relative_manifest}");
 
     let base_host = https_host(base_index_url)
@@ -551,11 +557,7 @@ fn update_available(installed: &str, registry: &str) -> bool {
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    crate::plugin::hex(&hasher.finalize())
 }
 
 /// Whether `bytes` hashes to `expected_hex` (case-insensitive on the
@@ -1623,6 +1625,18 @@ impl FetchError {
     }
 }
 
+/// This module's own [`ureq::Agent`], built once and shared by every
+/// [`fetch_raw`] call rather than a fresh one per fetch — see
+/// `engine_http`'s identically-shaped `agent()` for why: `Agent` wraps an
+/// `Arc`, so a shared one keeps TLS/keep-alive state between requests
+/// instead of throwing it away every time. `redirects(0)` never varies by
+/// call, so it is the one thing baked into the agent; the fixed 8s timeout
+/// stays a per-request `.timeout(..)` the same as it always was.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| ureq::AgentBuilder::new().redirects(0).build())
+}
+
 /// Shared GET body for [`fetch_text`]/[`fetch_bytes`]: HTTPS-only (a
 /// plain-`http://` URL is refused before any connection is attempted — the
 /// registry's whole trust story rests on verified integrity *and* a
@@ -1643,8 +1657,7 @@ fn fetch_raw(url: &str, max_bytes: u64, what: &str) -> Result<Vec<u8>, FetchErro
     if !is_https(url) {
         return Err(FetchError::NonHttps(url.to_string()));
     }
-    let agent = ureq::AgentBuilder::new().redirects(0).build();
-    let req = agent.get(url).timeout(Duration::from_secs(8));
+    let req = agent().get(url).timeout(Duration::from_secs(8));
     match req.call() {
         Ok(r) if (300..400).contains(&r.status()) => Err(FetchError::RedirectBlocked(r.status())),
         Ok(r) => {
@@ -1985,6 +1998,21 @@ mod tests {
             "a filename that merely ends in \"index.toml\" is not the index's own name and \
              must be left in the base path, not chopped"
         );
+    }
+
+    #[test]
+    fn a_trailing_slash_after_index_toml_does_not_defeat_the_suffix_strip() {
+        // Trailing slashes have to come off *before* the "/index.toml"
+        // suffix is looked for: in the other order, `strip_suffix` looks for
+        // those literal bytes at the very end, misses them behind the extra
+        // "/", and leaves "index.toml" in the base path — resolving every
+        // manifest as a child of that file rather than of its directory.
+        let url = resolve_manifest_url(
+            "https://example.com/registry/index.toml/",
+            "manifests/x.toml",
+        )
+        .expect("resolves");
+        assert_eq!(url, "https://example.com/registry/manifests/x.toml");
     }
 
     #[test]

@@ -40,7 +40,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read as _;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -230,7 +230,10 @@ fn fetch_surface(
     let now = Instant::now();
     match throttle::decide(&throttle_key, fingerprint, limits, now) {
         throttle::Decision::Fetch => {}
-        throttle::Decision::Serve(cached) => return *cached,
+        // The deep clone this app actually pays for — `Decision::Serve`
+        // itself only cloned the `Arc`, under `throttle`'s process-wide
+        // lock; this one runs back on this thread, lock-free.
+        throttle::Decision::Serve(cached) => return (*cached).clone(),
         throttle::Decision::Blocked(message) => {
             reading.fail(message);
             return reading;
@@ -312,12 +315,7 @@ fn fetch_surface(
             // answer. What it costs is one stale minute after the quota
             // starts reporting again; what it saves is a request per panel
             // open, forever.
-            throttle::record_success(
-                &throttle_key,
-                fingerprint,
-                reading.clone(),
-                reading.account.clone(),
-            );
+            throttle::record_success(&throttle_key, fingerprint, reading.clone());
         }
         Err(failure) => {
             // A 401 is the one `Failure` this app ever rewrites — see
@@ -957,7 +955,7 @@ fn build_windows(index: usize, w: &WindowConfig, value: &Value, plugin_id: &str)
     // array's order would let the rows change places between two fetches for
     // no reason a reader could see. Sorting by the key also makes the dedup
     // below a neighbour check rather than a scan.
-    produced.sort_by_key(|w| w.key.clone());
+    produced.sort_by(|a, b| a.key.cmp(&b.key));
     // Two elements with the same identity are one row, not two: a key is a
     // path in the user's config, and two rows writing the same one would take
     // turns overwriting each other's registry entry. The first wins, which
@@ -1136,13 +1134,7 @@ fn element_identity(element: &Value, path: &str) -> Option<String> {
         return Some(trimmed.to_string());
     }
     let digest = Sha256::digest(trimmed.as_bytes());
-    let suffix = format!(
-        "#{}",
-        digest[..8]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    );
+    let suffix = format!("#{}", crate::plugin::hex(&digest[..8]));
     let head: String = trimmed
         .chars()
         .take(cap.saturating_sub(suffix.chars().count()))
@@ -1194,7 +1186,7 @@ fn parse_quota(value: &Value, m: &PluginManifest) -> Option<crate::model::QuotaS
             .and_then(Value::as_str)
             .map(crate::plugin::sanitize_provider_text)
             .filter(|s| !s.is_empty())
-            .filter(|s| !matches!(s.to_ascii_lowercase().as_str(), "none" | "null")),
+            .filter(|s| !s.eq_ignore_ascii_case("none") && !s.eq_ignore_ascii_case("null")),
     };
     // A section that resolved to nothing is a response that did not answer,
     // and saying so with an empty status would be this app inventing the
@@ -1463,6 +1455,21 @@ fn read_amount(value: &Value, cfg: &AmountConfig) -> Option<crate::model::Balanc
 
 // ── Network (the only part that isn't unit-tested) ───────────────────────
 
+/// This module's own [`ureq::Agent`], built once and shared by every call to
+/// [`perform`] rather than a fresh one per request. `Agent` wraps an `Arc`
+/// (its own doc says so), so keep-alive and a request's TLS session survive
+/// between calls to the same host instead of being thrown away and
+/// renegotiated on the very next fetch of the same provider a refresh timer
+/// later. `redirects(0)` is the one piece of per-agent configuration this
+/// engine ever needs, and it never varies by request — the timeout does
+/// (`timeout`, below, is manifest-declared and per-surface), so it stays a
+/// per-request `.timeout(..)` call on top of the shared agent rather than
+/// baked into the agent itself.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| ureq::AgentBuilder::new().redirects(0).build())
+}
+
 /// GET or POST `url` (per `method`), with `headers` attached, `body`
 /// attached when `method` is a POST, and `timeout`; returns the parsed JSON
 /// body, and gives the 401 case its own error text (an expired OAuth token
@@ -1505,7 +1512,7 @@ fn perform(
             Err(_) => format!("refusing to fetch an unparsable URL: {url}"),
         }));
     }
-    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let agent = agent();
     let mut req = match method {
         HttpMethod::Get => agent.get(url),
         HttpMethod::Post => agent.post(url),
@@ -2646,10 +2653,10 @@ mod tests {
 
     #[test]
     fn a_path_without_a_selector_is_split_exactly_as_before() {
-        assert_eq!(segments("a.b.c"), vec!["a", "b", "c"]);
-        assert_eq!(segments("solo"), vec!["solo"]);
+        assert_eq!(segments("a.b.c").collect::<Vec<_>>(), vec!["a", "b", "c"]);
+        assert_eq!(segments("solo").collect::<Vec<_>>(), vec!["solo"]);
         assert_eq!(
-            segments("list[name=x.y].inner"),
+            segments("list[name=x.y].inner").collect::<Vec<_>>(),
             vec!["list[name=x.y]", "inner"],
             "a dot inside a selector belongs to the value, not to the path"
         );

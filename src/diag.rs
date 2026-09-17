@@ -76,6 +76,12 @@ pub fn line(message: String) {
     RECORDED.with(|r| r.borrow_mut().push(message));
 }
 
+/// The sixteen hex digits, indexed by nibble — every `\xHH` escape below
+/// needs exactly two of these and nothing wider, so a lookup replaces a
+/// `format!` call (its own throwaway `String`, allocated and discarded) for
+/// every control character a manifest or an error message happens to carry.
+const HEX_NIBBLES: [u8; 16] = *b"0123456789abcdef";
+
 /// Escape every C0 control character (`\n`/`\r` spelled out, everything else
 /// `\xHH`) in `message` — see [`line`]'s own doc for why. DEL (`\u{7F}`) is
 /// folded in with C0 for the same reason: neither is printable, and a stray
@@ -86,7 +92,11 @@ fn escape_control_chars(message: &str) -> String {
         match c as u32 {
             0x0A => escaped.push_str("\\n"),
             0x0D => escaped.push_str("\\r"),
-            0x00..=0x1F | 0x7F => escaped.push_str(&format!("\\x{:02x}", c as u32)),
+            n @ (0x00..=0x1F | 0x7F) => {
+                escaped.push_str("\\x");
+                escaped.push(HEX_NIBBLES[(n >> 4) as usize] as char);
+                escaped.push(HEX_NIBBLES[(n & 0xF) as usize] as char);
+            }
             _ => escaped.push(c),
         }
     }
@@ -125,20 +135,32 @@ fn append_to_log(message: &str) {
         chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z")
     );
     let Some(path) = path() else { return };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     // A poisoned lock still guards the file; a panic elsewhere must not be
     // what stops this app from recording anything ever again.
     let _writing = WRITING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     trim_if_large(&path);
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
+    let open = |path: &std::path::Path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    };
+    // The directory is created lazily, only once `open` says it isn't there
+    // (`NotFound` covers both "the log file is missing" and "the whole
+    // directory is") — not on every line this function writes, which is
+    // every one of them for as long as the process runs after the first.
+    let opened = match open(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            open(&path)
+        }
+        result => result,
+    };
+    if let Ok(mut file) = opened {
         let _ = file.write_all(stamped.as_bytes());
     }
 }

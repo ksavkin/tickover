@@ -2621,17 +2621,32 @@ fn read_capped_body(reader: impl std::io::Read) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
+/// This module's own [`ureq::Agent`], built once and shared by every
+/// [`oauth_refresh_request`] call rather than a fresh one per refresh — see
+/// `engine_http`'s identically-shaped `agent()` for why sharing is safe:
+/// `Agent` wraps an `Arc`, so nothing here is mutated per-request. Unlike
+/// that module's, this one's 15s timeout lives on the agent itself, not on
+/// a per-request `.timeout(..)` — `oauth_refresh_request` only ever calls it
+/// with the one fixed value, and building the agent is the one place a
+/// `ureq` version ever accepts it as a *default*, so there is nothing a
+/// per-call override here would be overriding.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+    })
+}
+
 fn oauth_refresh_request(
     token_url: &str,
     client_id: &str,
     client_secret: &str,
     refresh_token: &str,
 ) -> Result<Value, String> {
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout(std::time::Duration::from_secs(15))
-        .build();
-    let result = agent.post(token_url).send_form(&[
+    let result = agent().post(token_url).send_form(&[
         ("client_id", client_id),
         ("client_secret", client_secret),
         ("refresh_token", refresh_token),
@@ -2706,7 +2721,8 @@ fn oauth_error_message(code: &str, status: u16) -> String {
 /// does not call `oauth_error_message` itself — that needs a `status` this
 /// has no reason to know, since any status is still `invalid_client`.
 fn is_invalid_client(err: &str) -> bool {
-    err.starts_with(&format!("{OAUTH_ERROR_PREFIX}invalid_client "))
+    err.strip_prefix(OAUTH_ERROR_PREFIX)
+        .is_some_and(|rest| rest.starts_with("invalid_client "))
 }
 
 /// The most a refreshed token is ever cached as living, in seconds — 24

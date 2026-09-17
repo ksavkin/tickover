@@ -145,18 +145,21 @@ impl PublicKey {
             // under somebody else's key is the shape a swapped index takes.
             return Err(format!(
                 "the index is signed by key {}, not the one this build trusts ({})",
-                hex(&signature.id),
-                hex(&self.id)
+                crate::plugin::hex(&signature.id),
+                crate::plugin::hex(&self.id)
             ));
         }
         let key = UnparsedPublicKey::new(&signature::ED25519, self.key);
-        // What was actually signed: the file, or its hash.
-        let signed_bytes = match signature.algorithm {
-            Algorithm::Plain => index.to_vec(),
-            Algorithm::Prehashed => Blake2b512::digest(index).to_vec(),
+        // What was actually signed: the file, or its hash. Matched here,
+        // at the call, rather than built into an owned `Vec<u8>` first —
+        // `index` is already `&[u8]`, so the `Plain` arm has nothing to copy
+        // to hand `verify` the reference it wants; only `Prehashed` needs an
+        // owned digest to take that reference of.
+        let verified = match signature.algorithm {
+            Algorithm::Plain => key.verify(index, &signature.signature),
+            Algorithm::Prehashed => key.verify(&Blake2b512::digest(index), &signature.signature),
         };
-        key.verify(&signed_bytes, &signature.signature)
-            .map_err(|_| "the index does not match its signature".to_string())?;
+        verified.map_err(|_| "the index does not match its signature".to_string())?;
 
         // And the trusted comment, which is trusted only because of this.
         let mut signed = signature.signature.to_vec();
@@ -250,10 +253,6 @@ fn decode_base64(text: &str, what: &str) -> Result<Vec<u8>, String> {
     base64::engine::general_purpose::STANDARD
         .decode(text)
         .map_err(|e| format!("{what} is not valid base64: {e}"))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]

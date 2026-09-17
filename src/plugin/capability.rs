@@ -415,17 +415,18 @@ pub(crate) fn check_against(table: &[Capability], raw: &toml::Value) -> Result<(
         // (the shipped table) and the second half of
         // `a_capability_this_build_does_not_implement_is_refused_either_way`
         // (a synthetic one).
-        return Err(match cap.implemented {
-            true => format!(
+        return Err(if cap.implemented {
+            format!(
                 "this plugin sets `{key}`, which needs the reader capability \"{}\" — declare it \
                  with `requires_reader = [\"{}\"]`",
                 cap.name, cap.name
-            ),
-            false => format!(
+            )
+        } else {
+            format!(
                 "this plugin sets `{key}`, which needs the reader capability \"{}\" that this \
                  version of Tickover does not implement — update the app to use this plugin",
                 cap.name
-            ),
+            )
         });
     }
 
@@ -445,25 +446,35 @@ pub(crate) fn check_against(table: &[Capability], raw: &toml::Value) -> Result<(
 /// answer, so a scalar where our schema expects a table stops the walk one
 /// segment short and is left alone.
 fn has_key_path(raw: &toml::Value, path: &str) -> bool {
-    fn walk(value: &toml::Value, segments: &[&str]) -> bool {
-        let Some((head, rest)) = segments.split_first() else {
+    // `segments: impl Iterator<Item = &str> + Clone` rather than a collected
+    // `Vec<&str>` — this runs at every manifest load, and every path here is
+    // a handful of dotted words, so the allocation bought nothing `Split`
+    // (already `Clone`) didn't already have for free. `segments` itself is
+    // never advanced directly — only a clone of it is (`peek`, below) — so
+    // every recursive call still has the same concrete iterator type to
+    // pass on, whichever branch it takes.
+    fn walk<'a>(value: &toml::Value, segments: impl Iterator<Item = &'a str> + Clone) -> bool {
+        let mut peek = segments.clone();
+        let Some(head) = peek.next() else {
             // Every segment matched, so the key named by the last one exists —
             // whatever its value is. Presence is the question; a `required =
             // false` uses the capability exactly as much as a `true` does.
             return true;
         };
         match value {
-            toml::Value::Table(table) => match *head {
-                "*" => table.values().any(|v| walk(v, rest)),
-                key => table.get(key).is_some_and(|v| walk(v, rest)),
+            toml::Value::Table(table) => match head {
+                "*" => table.values().any(|v| walk(v, peek.clone())),
+                key => table.get(key).is_some_and(|v| walk(v, peek.clone())),
             },
             // Not a step of its own: `[[windows]]` is spelled `windows` in a
-            // path, and the elements are what the next segment applies to.
-            toml::Value::Array(items) => items.iter().any(|v| walk(v, segments)),
+            // path, and the elements are what the next segment applies to —
+            // `segments`, not `peek`, so `head` is still there for every
+            // element to match against in turn.
+            toml::Value::Array(items) => items.iter().any(|v| walk(v, segments.clone())),
             _ => false,
         }
     }
-    walk(raw, &path.split('.').collect::<Vec<&str>>())
+    walk(raw, path.split('.'))
 }
 
 #[cfg(test)]

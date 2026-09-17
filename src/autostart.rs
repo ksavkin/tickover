@@ -117,9 +117,28 @@ fn retire_windows_legacy_entry() -> bool {
 /// delete ran — the caller carries that forward to the new entry the same
 /// way the Windows half's `was_enabled` does.
 fn retire_macos_legacy_login_items() -> bool {
-    let was_enabled = names_legacy_install(&login_item_paths());
-    delete_legacy_login_items();
-    was_enabled
+    let paths = login_item_paths();
+    let matched = paths.as_deref().is_some_and(names_legacy_install);
+    if should_delete_legacy_login_items(paths.as_deref()) {
+        delete_legacy_login_items();
+    }
+    matched
+}
+
+/// Whether [`retire_macos_legacy_login_items`] should call
+/// [`delete_legacy_login_items`] at all, given what [`login_item_paths`]
+/// found. `true` on `None` — the listing itself failed (`osascript`
+/// missing, System Events refusing automation) — is the fail-safe this
+/// always had before `login_item_paths` could even distinguish "found
+/// nothing" from "couldn't check": a failed listing does not rule out that
+/// the legacy item is still there, so deletion still runs, same as every
+/// launch before this `Option` existed. Skipped only when the listing
+/// actually *ran* and found no match (`Some(paths)`, no match) — that is
+/// the one case safe to read as "nothing to clean up". Pulled out from
+/// `retire_macos_legacy_login_items` so this decision has a test that
+/// doesn't touch the machine's real login items.
+fn should_delete_legacy_login_items(paths: Option<&[String]>) -> bool {
+    paths.is_none() || paths.is_some_and(names_legacy_install)
 }
 
 /// The two path substrings a pre-rename "Codex Limits" macOS login item
@@ -146,12 +165,13 @@ fn names_legacy_install(paths: &[String]) -> bool {
 /// mirrors `auto-launch`'s own `is_enabled` (`"get the name of every login
 /// item"`), asking for `path` instead of `name` since a path is what
 /// [`names_legacy_install`] needs to tell a pre-rename "Codex Limits" entry
-/// apart from this app's own current one. Empty on any failure (`osascript`
-/// missing, System Events refusing automation, no login items at all) — the
-/// same "nothing to report" reading `auto-launch`'s own `is_enabled` gives a
-/// failed AppleScript call, since a permission dialog the user dismissed
-/// must never read as "go ahead and delete".
-fn login_item_paths() -> Vec<String> {
+/// apart from this app's own current one. `None` on any failure (`osascript`
+/// missing, System Events refusing automation) — distinct from `Some(vec![])`
+/// (the listing ran and genuinely found no login items at all), since
+/// [`should_delete_legacy_login_items`] has to tell those two apart: only
+/// the latter is safe to skip the deletion for, and a failed listing falls
+/// back to attempting it anyway (see that function's own doc).
+fn login_item_paths() -> Option<Vec<String>> {
     let output = std::process::Command::new("osascript")
         .args([
             "-e",
@@ -159,16 +179,18 @@ fn login_item_paths() -> Vec<String> {
         ])
         .output();
     let Ok(output) = output else {
-        return Vec::new();
+        return None;
     };
     if !output.status.success() {
-        return Vec::new();
+        return None;
     }
-    String::from_utf8_lossy(&output.stdout)
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    )
 }
 
 /// The `osascript` command that deletes every login item whose path contains
@@ -260,7 +282,10 @@ pub fn set(enabled: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{delete_by_path_command, names_legacy_install, run_key_path};
+    use super::{
+        delete_by_path_command, names_legacy_install, run_key_path,
+        should_delete_legacy_login_items,
+    };
 
     // Windows-only: the fixture is a Windows-shaped path with backslashes in
     // it, which `run_key_path`'s non-Windows arm now escapes (see
@@ -317,6 +342,29 @@ mod tests {
             "/Applications/Tickover.app/Contents/MacOS/tickover".to_string()
         ]));
         assert!(!names_legacy_install(&[]));
+    }
+
+    #[test]
+    fn should_delete_legacy_login_items_skips_only_a_successful_listing_that_found_nothing() {
+        assert!(
+            should_delete_legacy_login_items(Some(&["/usr/local/bin/codex-limits".to_string()])),
+            "a successful listing that named the pre-rename install is safe to act on"
+        );
+        assert!(
+            !should_delete_legacy_login_items(Some(&[
+                "/Applications/Tickover.app/Contents/MacOS/tickover".to_string()
+            ])),
+            "a successful listing that found only this app's own current entry has nothing to delete"
+        );
+        assert!(
+            !should_delete_legacy_login_items(Some(&[])),
+            "a successful listing that found no login items at all has nothing to delete"
+        );
+        assert!(
+            should_delete_legacy_login_items(None),
+            "a listing that failed outright cannot rule out the legacy item still being there, \
+             so the fail-safe is to still attempt the deletion"
+        );
     }
 
     #[test]

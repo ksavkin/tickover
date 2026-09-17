@@ -62,6 +62,11 @@ fn main() {
         println!("{id}: no active surfaces (try --all-surfaces to include opt-in ones)");
         return;
     }
+    // Read once, ahead of both loops below, rather than once per balance —
+    // it never changes mid-run, and this probe fetches every surface first
+    // anyway, so nothing is lost by reading it before the readings are even
+    // printed.
+    let show_values = show_values();
     for r in readings {
         let fmt = |w: Option<&tickover::model::Window>| {
             w.and_then(|w| w.used_percent)
@@ -121,7 +126,7 @@ fn main() {
                 b.period_end.is_some(),
                 b.limit_reached.is_some(),
             );
-            if show_values() {
+            if show_values {
                 println!(
                     "             VALUES {}: used={} cap={} remaining={} percent={:?} period_end={:?}",
                     b.key,

@@ -1,6 +1,7 @@
 //! Tiny persisted preferences (JSON under the OS config dir). Best-effort.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde_json::{json, Value};
 
@@ -320,6 +321,34 @@ fn take_write_count() -> u64 {
     WRITE_COUNT.with(|c| c.replace(0))
 }
 
+/// Serializes the load → mutate → write cycle every setter in this module
+/// performs — `set_bool`, `set_u64`, `set_plugin_seen_window_for`,
+/// `forget_remembered_accounts`, `set_builtin_migrated`,
+/// `remove_plugin_keys`, each acquiring this for its whole body, before its
+/// own `load()`.
+///
+/// **Invariant this stands in for:** every setter is called from the main
+/// thread, so nothing races another today, and the cross-process version of
+/// the same race is already closed by the single-instance file lock
+/// ([`crate::platform::claim_single_instance`]). Held here anyway, as
+/// insurance for the day a setter call moves onto a background thread — the
+/// fetch worker is the obvious future candidate. Without it, two overlapping
+/// load → mutate → write cycles could each read the same starting `Value`,
+/// mutate their own key, and have whichever writes second silently discard
+/// the first one's change; the predictable-temp-path pair inside
+/// [`tickover::plugin::write_via_temp`] (`remove_file` then
+/// `create_new(true)`) guards against a hostile symlink planted at that
+/// path, not against two honest writers racing each other.
+///
+/// A plain `Mutex`, not a `RwLock`: every caller through here writes, so
+/// there is no reader-heavy case to give a second lock kind a reason to
+/// exist. Poisoning is recovered (`unwrap_or_else(|e| e.into_inner())`) the
+/// same way `plugin::throttle::STATES`'s lock is — a panic mid-write on some
+/// future background thread must not turn every later config write into a
+/// permanent failure for a process this crate's own `panic = "abort"`
+/// decision (see `Cargo.toml`) never unwinds out of anyway.
+static CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
 /// Write `text` to `path` without ever leaving a half-written file behind —
 /// through [`tickover::plugin::write_via_temp`], the same temp-neighbour-
 /// then-rename sequence `main.rs`'s `install_write`/`update_write` use for a
@@ -497,6 +526,7 @@ fn get_bool_opt(key: &str) -> Option<bool> {
 }
 
 fn set_bool(key: &str, v: bool) {
+    let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(p) = path() else { return };
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -673,6 +703,7 @@ fn get_u64(key: &str) -> u64 {
 }
 
 fn set_u64(key: &str, v: u64) {
+    let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // One `load()` for both the comparison and the mutation below, not one
     // each — the value it returns is the owned copy this function goes on to
     // insert into and write back regardless, so there is nothing a second
@@ -752,6 +783,7 @@ fn seen_window_from(
 /// Record what the provider states about one window — both fields in a single
 /// write, so no reader can ever see the new reset beside the old length.
 pub fn set_plugin_seen_window_for(plugin_id: &str, reading_id: &str, role: &str, seen: SeenWindow) {
+    let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Normalised the same way the read above normalises what it returns: an
     // `at` of `0` never reads back as anything but `None`, so writing one here
     // would compare unequal to that `None` forever and rewrite the file every
@@ -837,6 +869,7 @@ pub fn builtin_migrated(id: &str) -> Option<String> {
 /// provider now — and what is left behind is an email address sitting in a
 /// config file for no reason at all.
 pub fn forget_remembered_accounts(id: &str) {
+    let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(p) = path() else { return };
     let mut cfg = load();
     let Some(obj) = cfg.as_object_mut() else {
@@ -850,6 +883,7 @@ pub fn forget_remembered_accounts(id: &str) {
 
 /// Record that this install has settled the built-in upgrade to `version`.
 pub fn set_builtin_migrated(id: &str, version: &str) {
+    let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(p) = path() else { return };
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -880,6 +914,7 @@ pub fn set_builtin_migrated(id: &str, version: &str) {
 /// shipped file the user just chose to delete — the seed step then treats
 /// "gone" the same as "never migrated".
 pub fn remove_plugin_keys(id: &str) {
+    let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(p) = path() else { return };
     let prefix = format!("plugin.{id}.");
     let keep = format!("plugin.{id}.builtin_migrated");

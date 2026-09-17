@@ -626,9 +626,12 @@ pub fn render(rows: &[ProviderRow], dark: bool, scale: f32) -> Option<RgbaImage>
                 );
             }
             if let Some(t) = time_fraction(st) {
+                // Already `0..1` — `time_fraction` clamps it, the same
+                // clamp `cache_key` trusts without re-checking; a second one
+                // here would only repeat that work.
                 let tick_w = 1.1 * s;
                 let tick_h = bar_h + 1.8 * s;
-                let tx = x + (bar_w - tick_w) * t.clamp(0.0, 1.0);
+                let tx = x + (bar_w - tick_w) * t;
                 fill_rrect(
                     img,
                     tx,
@@ -777,9 +780,10 @@ pub fn render_badge(rows: &[ProviderRow], dark: bool, px: u32) -> Option<RgbaIma
             // the 16pt tray at 100%, where the pair of figures in the
             // tooltip is carrying this information anyway.
             if let Some(t) = time_fraction(st).filter(|_| bar_h >= 3.0) {
+                // Already `0..1` — see the same-shaped comment in `render`.
                 let tick_w = (size * 0.07).max(1.0);
                 let tick_h = bar_h + unit;
-                let tx = pad + (bar_w - tick_w) * t.clamp(0.0, 1.0);
+                let tx = pad + (bar_w - tick_w) * t;
                 fill_rrect(
                     &mut img,
                     tx,

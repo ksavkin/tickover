@@ -2171,10 +2171,13 @@ fn mangled(rng: &mut Rng, base: &str) -> String {
             // Point the manifest at the other engine, leaving the section for
             // the one it came from — the mismatch a copied-and-edited
             // third-party manifest arrives as.
-            8 => match line.trim().starts_with("engine") {
-                true => "engine = \"http-api\"".to_string(),
-                false => format!("{line}\nengine = \"log-file\""),
-            },
+            8 => {
+                if line.trim().starts_with("engine") {
+                    "engine = \"http-api\"".to_string()
+                } else {
+                    format!("{line}\nengine = \"log-file\"")
+                }
+            }
             _ => format!("{line}\n[[surface]]\nid = \"extra\"\nlabel = \"Extra\""),
         };
     }

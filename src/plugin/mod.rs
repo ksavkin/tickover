@@ -125,14 +125,14 @@ where
         // this entry produced" is zero, one or many. `required` reads the
         // same either way — nothing produced is nothing reported.
         let produced = build(index, w);
-        match produced.is_empty() {
-            false => windows.extend(produced),
+        if produced.is_empty() {
             // First one wins: the message names a window rather than counting
             // them, and a reading that lost one has usually lost the lot.
-            true if w.required && missing_required.is_none() => {
+            if w.required && missing_required.is_none() {
                 missing_required = Some(w.label.as_str());
             }
-            true => {}
+        } else {
+            windows.extend(produced);
         }
     }
     if let Some(label) = missing_required {
@@ -140,9 +140,10 @@ where
         // that instead — an author reading `no "5H" window` goes looking for
         // what happened to the 5-hour window, and the answer is that nothing
         // came back at all.
-        return Err(match windows.is_empty() {
-            true => format!("no limit data in {noun}"),
-            false => format!("no \"{label}\" window in the {noun}"),
+        return Err(if windows.is_empty() {
+            format!("no limit data in {noun}")
+        } else {
+            format!("no \"{label}\" window in the {noun}")
         });
     }
     Ok(windows)
@@ -576,6 +577,22 @@ pub fn encode_key_part(part: &str) -> String {
     out
 }
 
+/// Lowercase hex of `bytes` — a sha256 digest (`registry::sha256_hex`,
+/// `signature`'s own verification) or a truncation suffix
+/// (`engine_http::element_identity`), never anything long enough for the
+/// difference to matter on its own; shared so it only has to be written
+/// once. `with_capacity` and `write!` into the same buffer rather than one
+/// `format!` per byte collected into a `String`, which allocates and then
+/// immediately discards a throwaway `String` for every byte encoded.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// Longest a provider-supplied string may be once it reaches the screen.
 ///
 /// Counted in Unicode scalar values rather than bytes, because truncating
@@ -615,13 +632,21 @@ pub const PROVIDER_TEXT_MAX_CHARS: usize = 64;
 /// because a provider deciding to answer with a megabyte is a provider
 /// deciding how tall the panel is.
 pub fn sanitize_provider_text(text: &str) -> String {
-    text.trim()
+    let mut out: String = text
+        .trim()
         .chars()
         .filter(|c| !c.is_control() && !is_invisible_or_directional(*c))
         .take(PROVIDER_TEXT_MAX_CHARS)
-        .collect::<String>()
-        .trim()
-        .to_string()
+        .collect();
+    // Trimmed once more, in place — `truncate`/`drain` shorten the buffer
+    // `collect` above already allocated, rather than handing `.trim()`'s
+    // slice to a second `.to_string()`, which would allocate all over again
+    // for what the cap can expose (a run of internal whitespace landing
+    // right at it — see this function's own doc).
+    out.truncate(out.trim_end().len());
+    let leading = out.len() - out.trim_start().len();
+    out.drain(..leading);
+    out
 }
 
 /// Characters that take up no space of their own but change how the text
@@ -715,11 +740,41 @@ pub const CLIENT_PATTERN_MAX_TEXT_BYTES: usize = 512;
 /// mistake visible in whatever field it lands in, instead of silently
 /// producing an empty/malformed URL, header or path.
 pub fn substitute_options(template: &str, options: &BTreeMap<String, bool>) -> String {
-    let mut out = template.to_string();
-    for (key, value) in options {
-        let placeholder = format!("{{option.{key}}}");
-        out = out.replace(&placeholder, if *value { "true" } else { "false" });
+    // One pass over the template, never a chain of `replace` calls (there are
+    // only ever 0-2 declared options, so the count was never the point —
+    // the shape is): with a chain, whatever an earlier option's `"true"`/
+    // `"false"` inserts is itself searched by the next `replace`, the same
+    // hazard `engine_http::substitute`'s own doc names for its wider
+    // placeholder set. Mirrors that function's scan, narrowed to the one
+    // placeholder family this one ever resolves.
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open..];
+        let Some(close) = after.find('}') else {
+            // An unclosed brace is literal text, not a placeholder — see
+            // `engine_http::substitute`'s own comment on why this pushes
+            // `after` whole rather than falling through to the
+            // `push_str(rest)` below.
+            out.push_str(after);
+            rest = "";
+            break;
+        };
+        let name = &after[1..close];
+        match name
+            .strip_prefix("option.")
+            .and_then(|key| options.get(key))
+        {
+            Some(value) => out.push_str(if *value { "true" } else { "false" }),
+            // A `{option.<key>}` whose `key` isn't declared, or a brace pair
+            // that isn't an `option.` placeholder at all, is left untouched —
+            // see this function's own doc.
+            None => out.push_str(&after[..=close]),
+        }
+        rest = &after[close + 1..];
     }
+    out.push_str(rest);
     out
 }
 
@@ -774,22 +829,62 @@ pub(crate) fn json_path_get<'v>(root: &'v Value, path: &str) -> Option<&'v Value
 /// is the last), and so is any number of dots. No escape is offered rather
 /// than invented — a manifest is meant to be read — and the boundary is
 /// pinned by a test rather than left to be discovered.
-pub(crate) fn segments(path: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let (mut start, mut depth) = (0usize, 0u32);
-    for (i, c) in path.char_indices() {
-        match c {
-            '[' => depth += 1,
-            ']' => depth = depth.saturating_sub(1),
-            '.' if depth == 0 => {
-                out.push(&path[start..i]);
-                start = i + c.len_utf8();
-            }
-            _ => {}
-        }
+///
+/// Lazy — [`Segments`], not a collected `Vec<&str>` — because every caller
+/// here (`json_path_get`) only ever asks for the segment currently in hand
+/// and whether there's another one; a path is a handful of characters at
+/// most, so the allocation this used to make was never expensive, only
+/// pointless.
+pub(crate) fn segments(path: &str) -> Segments<'_> {
+    Segments {
+        rest: path,
+        done: false,
     }
-    out.push(&path[start..]);
-    out
+}
+
+/// [`segments`]'s own iterator. `done` is load-bearing, not a shortcut:
+/// once `rest` has been reduced to the trailing segment (`.` found no more,
+/// or `rest` is already `""`), the scan below finds no more `depth == 0`
+/// `.` in it either, on every call — without `done`, that reads as "one more
+/// empty final segment" forever, the same string handed back on every
+/// `next()` past the real end.
+pub(crate) struct Segments<'a> {
+    rest: &'a str,
+    done: bool,
+}
+
+impl<'a> Iterator for Segments<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        if self.done {
+            return None;
+        }
+        // Depth starts fresh at zero on every call, not carried over from
+        // the last one — correct because a split is only ever recorded at
+        // `depth == 0`, so depth is already back at zero the instant a new
+        // segment begins, whether that is right after a split or at the
+        // very start of `path`. An unclosed `[` behaves the same either
+        // way too: depth never falls back to zero for the rest of this
+        // segment's scan, so the rest of `rest` — dots and all — becomes
+        // one final segment, exactly what a single cumulative pass over
+        // the whole string would also do once its own depth got stuck.
+        let mut depth = 0u32;
+        for (i, c) in self.rest.char_indices() {
+            match c {
+                '[' => depth += 1,
+                ']' => depth = depth.saturating_sub(1),
+                '.' if depth == 0 => {
+                    let seg = &self.rest[..i];
+                    self.rest = &self.rest[i + c.len_utf8()..];
+                    return Some(seg);
+                }
+                _ => {}
+            }
+        }
+        self.done = true;
+        Some(self.rest)
+    }
 }
 
 /// One element of an array, chosen the way the manifest asked: by position
