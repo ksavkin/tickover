@@ -70,6 +70,13 @@ Codex sandbox read-only and the usual CLI directories *appended* to `PATH`.
 Off by default, a switch per provider; costs a few tokens per window. The
 Codex and Claude manifests declare one today.
 
+A manifest can also set `[ping] renews_token = true` — Claude's does — which
+arms a second trigger for that same command: a surface whose auth chain
+declares a token expiry finding its token lapsed, or the provider flatly
+refusing it. That runs under the same ten-minute floor, at most once per
+distinct token per surface, and a renewal spends that tick's one allowed
+ping — the window check above does not also fire.
+
 ## What the meter shows
 
 Each quota window is one block — caption and figures, a full-width bar, the
@@ -137,20 +144,24 @@ exception — never *refreshes* one, because renewing a token invalidates the
 copy your CLI is holding. The exception is Antigravity, whose manifest asks
 for the exchange by name; the OAuth client it needs is read from the
 Antigravity app installed on your machine, not shipped in this repository,
-and the result is cached in memory until shortly before it expires. Four
-places in the code open a connection, carrying five kinds of request between
-them: a provider's pinned host on the timer, that token exchange, the
-registry index and its signature file when you press *Check updates*
-(two fetches, the index as bytes and the signature as text), and a manifest
-when you then choose
-to install or update one. The sixth kind of traffic is the ping, a local
-command. No telemetry, no crash reporting, nothing on a timer against a host
-this project controls.
+and the result is cached in memory until shortly before it expires. A
+manifest whose `[ping] renews_token` is set (Claude's) is a different case
+again: the app itself still never spends a refresh token there either — it
+runs the provider's own CLI, which renews its own token as a side effect of
+that run, and the row reads "token expired — renews on the next `claude`
+run" until it does. Four places in the code open a connection, carrying five
+kinds of request between them: a provider's pinned host on the timer, that
+token exchange, the registry index and its signature file when you press
+*Check updates* (two fetches, the index as bytes and the signature as
+text), and a manifest when you then choose to install or update one. The
+sixth kind of traffic is the ping, a local command. No telemetry, no crash
+reporting, nothing on a timer against a host this project controls.
 [`SECURITY.md`](SECURITY.md) lists all of it and the gaps that remain.
 
 ## Engineering notes
 
-About 31,000 lines of Rust, some 600 tests, one tree for both desktops.
+About 47,000 lines of Rust, roughly half of it tests — some 800 test
+functions — one tree for both desktops.
 Six things worth a look:
 
 - **A manifest from the future is refused, not misread.**

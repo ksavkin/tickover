@@ -67,6 +67,15 @@ Present-err or Absent, and the chain stops at the first Present — so
 "item not found" hides the row while "access denied" is reported, two
 states the code refuses to collapse.
 
+A `credentials-file`, `keychain` or `win-credential` step that declares
+`expiry_json_path` folds a fourth outcome into that same three-way answer:
+a token past its own stated expiry resolves Absent too, exactly like no
+token at all, so a step behind it in the chain still gets its turn. With
+nothing behind it to catch that, the chain reports the token as lapsed
+rather than merely missing — the distinction that drives both the row's
+"token expired — renews on the next `<bin>` run" text and the renewal ping
+(`[ping] renews_token`).
+
 Tokens live in memory for the request that uses them and are never written
 to disk. The one step that spends a credential, `oauth-refresh`, exists
 because Antigravity's access token lapses within hours; it exchanges the
@@ -135,6 +144,17 @@ read-only, and with the usual CLI install directories *appended* to `PATH`
 rather than prepended, because every one of them is user-writable and this
 command runs unattended.
 
+A second trigger fires that same command: a manifest whose `[ping]` sets
+`renews_token` (Claude's does) also runs it the moment a surface whose auth
+chain declares a token expiry finds that token lapsed or refused. That
+decision is `renewal_ping_due`, and `classify_renewal_across_surfaces`
+applies it across every renewal-eligible surface a plugin reports, since two
+surfaces on one plugin can lapse on independent schedules. It shares the
+window trigger's ten-minute floor, plus a bound of its own: a
+per-surface `LAST_RENEWED_FOR` table stops a token the CLI cannot itself
+renew from being pinged again every ten minutes forever, so a renewal fires
+at most once per distinct token per surface.
+
 ## Keeping the folder honest
 
 `src/plugin/seed.rs` seeds the plugins folder from the embedded manifests on
@@ -150,10 +170,14 @@ the clicked entry, install with `create_new` under a containment check,
 update by writing a temporary neighbour and renaming over the target. The
 ed25519 verification in `src/plugin/signature.rs` runs on the same path but
 no key is pinned yet, and the UI says "unverifiable" rather than pretending
-— the gap is named in `SECURITY.md`, not hidden. A registry manifest that
-reads a secret, declares a `[ping]` or reads local files cannot be installed
-without a native confirmation showing exactly what it will do
-(`analyze_trust`).
+— the gap is named in `SECURITY.md`, not hidden. A manifest that combines a
+store-backed secret with `http-api`, or declares a `[ping]`, or reads local
+files of its own choosing, or names a specific credential source — an
+`env` variable, the Keychain, Credential Manager, Electron Safe Storage —
+cannot be installed without a native confirmation showing exactly what it
+will do (`analyze_trust`, `requires_approval`). The same dialog gates a
+manifest picked from disk through *Add plugin*, not only one installed from
+the registry (`src/main.rs`'s import path calls `analyze_trust` too).
 
 ## One process, two desktops
 
@@ -191,9 +215,10 @@ by `src/menubar.rs`.
 
 ## Numbers
 
-About 31,000 lines of Rust, three Slint files, some 600 test functions, a
-release binary of about 8 MB per architecture (the macOS binary is
-universal, so twice that on disk; the zip is about 8 MB). CI builds and tests on macOS and Windows,
+About 47,000 lines of Rust (roughly half of it tests), three Slint files,
+some 800 test functions, a release binary of about 8 MB per architecture
+(the macOS binary is universal, so twice that on disk; the zip is about
+8 MB). CI builds and tests on macOS and Windows,
 with clippy at `-D warnings` on macOS — the half that can be reproduced on
 the machine this is developed on — actions pinned by commit, and the
 checkout token not persisted. A release run repeats the suite on both

@@ -14,7 +14,7 @@ a single semantic "live" dot.
 
 | Role | Hex |
 |---|---|
-| Background | `#0b0d10` |
+| Window | transparent — the card itself, not a background fill, reads as the panel |
 | Panel | `#111419` |
 | Panel top (header gradient) | `#14181f` |
 | Surface (card rows) | `#171b22` |

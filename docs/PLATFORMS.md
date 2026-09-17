@@ -10,11 +10,13 @@ one asks of an unsigned app.
 the `Info.plist` declares macOS 11 as the minimum, but no Intel Mac and no
 older macOS has been tried; treat that floor as declared, not measured.
 
-- **No Dock icon by default.** The app runs under the accessory
-  (`LSUIElement`) policy: it lives in the menu bar and nowhere else. Left-
-  click the glyph for the panel, right-click for the menu. The panel and
-  the menu-bar title call themselves "Limits" — the name of the meter
-  inside Tickover.
+- **No Dock icon by default.** The bundle's `Info.plist` declares no
+  `LSUIElement` key; the binary switches itself to the accessory activation
+  policy at launch instead (`src/platform.rs`'s `set_accessory_policy`), the
+  runtime equivalent — it lives in the menu bar and nowhere else. Left-click
+  the glyph for the panel, right-click for the menu. The panel and the
+  menu-bar title call themselves "Limits" — the name of the meter inside
+  Tickover.
 - **First launch of an unsigned build.** Releases are not yet signed with a
   Developer ID, so Gatekeeper says "Apple could not verify Tickover is free
   of malware". Right-click → *Open*, or System Settings → Privacy & Security
@@ -103,8 +105,7 @@ is handled by the app.
   Setup, WiX) is the option if a full setup experience is ever wanted.
 - **Credentials.** The Claude CLI account reads live from
   `~/.claude/.credentials.json`. The Credential Manager and DPAPI steps
-  compile and are reached but had nothing to find on the machine this was
-  checked on.
+  compile and are reached, but are unexercised against a real credential.
 - **The plugin manager's dialogs** — import, remove, install approval,
   error alerts — are native message boxes and the common file picker.
 - `TICKOVER_SNAPSHOT` is switched off on Windows: the renderer's snapshot

@@ -89,9 +89,9 @@ own.
 - **A lapsed CLI access token renews itself the next time the CLI runs —
   including a run this app triggers itself, if auto-ping is on for Claude**
   (off by default, like every plugin's ping). `claudeAiOauth.expiresAt`
-  (epoch milliseconds) is checked against both the credentials-file and
-  Keychain steps; past it, the chain reports the token lapsed rather than
-  handing back one that will 401. Because `[ping] renews_token = true`, the
+  (epoch milliseconds) is checked on the credentials-file, Keychain and
+  Credential Manager steps — three, not two; past it, the chain reports the
+  token lapsed rather than handing back one that will 401. Because `[ping] renews_token = true`, the
   row reads "token expired — renews on the next claude run" regardless of
   whether auto-ping is on — that text names what the *next* `claude` run
   does, by whoever runs it. With auto-ping on, the app also runs
@@ -116,8 +116,7 @@ that, and all three are why it changed:
 - A log says what the last session wrote. Leave Codex unused for a day and
   the panel quietly showed yesterday's figures as current.
 - A log line carries no identity — a plan tier and nothing else — so the
-  address on a row had to be guessed, and that guess once deleted a live
-  account's row as a duplicate of itself. The endpoint states the address.
+  address on a row had to be guessed. The endpoint states the address.
 - Logs interleave quota families: a `codex exec` run writes a
   `rate_limits` container for a model-specific limit, and "newest line wins"
   showed it as *the* Codex quota — 0 % used while the real weekly window sat

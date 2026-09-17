@@ -296,10 +296,10 @@ manifest fails validation with 2+. A manifest may declare at most 32
 with every field empty — that shape said "this window exists and we know
 nothing about it", which is a different sentence from the one the provider
 spoke, and every consumer upstream of the panel's filter believed the first
-one. The auto-ping in particular used to find its window by asking the reading
-for a primary row, and told "we could not read this provider" from "this
-provider reports no 5-hour window right now" purely by whether a blank row had
-been emitted.
+one. The auto-ping in particular is the sharpest case: asking the reading
+for a primary row cannot tell "we could not read this provider" from "this
+provider reports no 5-hour window right now" when a blank row can stand for
+either.
 
 Three states, kept apart:
 
@@ -318,22 +318,22 @@ exactly like a generous plan.
 because only it knows. Codex's 5-hour window is legitimately absent — a plan
 without one reports none, and an empty one stops being reported until
 something is spent. Codex's weekly window is not: every subscription has one,
-so a response without it has changed shape. The reader used to guess at this
-with a single rule — "not one window resolved" meant a broken response — which
-called a 5-hour-less plan broken and said nothing at all about a response that
-had lost half its shape.
+so a response without it has changed shape. A single rule — "not one window
+resolved" means a broken response — cannot tell the two apart: it calls a
+5-hour-less plan broken and says nothing at all about a response that has
+lost half its shape.
 
 A missing `required` window refuses the whole reading, with a message naming
 it. Deliberately stricter than showing the rest: half a response drawn
 confidently is a row that reads as "nothing used". Both engines share the rule
 (`plugin::collect_windows`) — it is about the manifest, not about JSON or log
 lines, and an engine that implemented it separately would make `required` mean
-two things. One of them once did: the log-file engine ignored the field
-entirely, so a manifest could state a guarantee the app did not keep.
+two things — an engine that ignores the field lets a manifest state a
+guarantee the app does not keep.
 
 **A reading with no windows at all is not refused.** The obvious rule —
-"nothing resolved, so the response must be broken" — was tried here and taken
-out again, because it is false for Codex. That provider reports an empty
+"nothing resolved, so the response must be broken" — does not hold here,
+because it is false for Codex. That provider reports an empty
 window by not reporting it, and an account can have *both* windows empty at
 once: in the hours after a weekly reset, with nothing spent since. The body
 then holds two nulls, which is byte-for-byte what a broken endpoint sends, so
@@ -361,8 +361,7 @@ What is remembered, in `config.json` under
 (`at`) and how long it said the window was (`period_minutes`). Keyed by reading
 and role rather than by plugin, because a plugin can report several accounts
 whose windows empty independently. Recorded for every plugin that produces a
-reading — not only ones with a `[ping]` section, which is where this bookkeeping
-used to live and where every third-party manifest silently missed out.
+reading — not only ones with a `[ping]` section.
 
 - **The length is remembered, not looked up.** The manifest is only a fallback:
   the windows that vanish are exactly the ones whose length arrives in the
@@ -1024,13 +1023,13 @@ value reaches the engines as the `{option.<key>}` substitution (`"true"` /
 `"false"`) in `[http]` headers and URLs and in `[logfile]` `root`,
 `root_env_join` and `glob`; the user's choice is stored in `config.json` under
 `plugin.<id>.option.<key>` and falls back to `default` until set. The schema,
-validation and substitution are in place; no shipped manifest declares an
-option yet, and Settings draws no checkbox for them yet.
+validation, substitution and the Settings checkbox are all in place; no
+shipped manifest declares an option.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `key` | string | yes | ASCII letters, digits and underscores only; unique within the plugin — it spells the `{option.<key>}` placeholder |
-| `label` | string | yes | display label for the (future) checkbox; must not be blank |
+| `label` | string | yes | display label for the checkbox; must not be blank |
 | `default` | bool | no (default `false`) | value used until the user overrides it |
 
 A template that spells `{option.<key>}` for a key no `[[option]]` declares is
@@ -1199,9 +1198,11 @@ sharing one.
    `source.containers`, in which case they are relative to whichever
    candidate classified as this window — see
    [`[windows.source]`](#windowssource).
-4. A window whose paths resolve to nothing is still emitted, with every
-   field blank. A reading whose windows are *all* blank renders as a
-   message ("no usage reported yet"), never as an empty card.
+4. A window whose paths resolve to nothing produces no window at all — never
+   one with every field blank. `required` decides whether that absence
+   refuses the whole reading (`plugin::mod::collect_windows`); a reading
+   left with no windows at all renders as a message ("no usage reported
+   yet", `src/main.rs`), never as an empty card.
 
 Pacing, backoff and the stop-on-expired-session rule apply to every request
 this engine makes, including the `[account] type = "http"` profile lookup —
@@ -1466,8 +1467,10 @@ Not in the home directory. These CLIs read the directory they start in —
 `codex exec` picks up an `AGENTS.md` there as instructions — and the ping is a
 model run on a timer that nobody watches and whose output is discarded, which
 is the ideal setting for a prompt injection. It runs in an empty directory this
-app owns instead (`main.rs::ping_cwd`, beside the plugins folder), so there is
-nothing there to read.
+app owns instead (`main.rs::ping_cwd`): a freshly created, uniquely named
+subdirectory of the OS temp directory, removed once the command exits, so
+there is nothing there to read. `ping-workdir/`, beside the plugins folder,
+is only the fallback used when the temp directory can't be created.
 
 Its `PATH` is the inherited one with the usual CLI install directories
 **appended** (`main.rs::cli_path_env`). A bundled app inherits launchd's
@@ -1481,8 +1484,8 @@ to is not.
 
 Every attempt is recorded — the command as it was run, then how it ended, with
 the command's own stderr quoted on failure. That quoted line ("Not inside a
-trusted directory…") is the one that made the last such failure diagnosable at
-all. It goes to `tickover.log` beside `config.json` as well as to stderr,
+trusted directory…") is what makes a failure like that diagnosable at all.
+It goes to `tickover.log` beside `config.json` as well as to stderr,
 because stderr is exactly the place a Finder-launched `.app` doesn't have (see
 `src/diag.rs`):
 
@@ -1512,7 +1515,7 @@ the pill just shows its numbers (e.g. `▂▂ 91/68` rather than
 
 ## Prior art: what the neighbours do, and what was taken from them
 
-Four codebases were read while this format was designed. Two are the *clients
+Four codebases inform this format. Two are the *clients
 whose endpoints this app reads*, so they are the authority on those response
 shapes; two are apps solving an adjacent problem. Recorded with what each one
 settled, because the same questions come back every stage.
@@ -1555,12 +1558,12 @@ accounts *and* Google Antigravity, in Swift/SwiftUI over a Python engine
 (`engine/keyswitcher.py`, `engine/antigravity.py`). It reads the same Codex
 endpoint this app does, and reaches Antigravity through
 `cloudcode-pa.googleapis.com (loadCodeAssist)`, with tokens out of
-`~/.codex/accounts/auth_*.json`, the macOS Keychain and SQLite. Reading it is
-where three items in this project's backlog came from: that `rate_limit.allowed`
-is the only hard "blocked" bit and was not being read; that a suspicious drop in
-`used_percent` deserves a second request; and the shape of the Antigravity
-credential problem — a token in a SQLite row, base64-wrapped, which is what
-`[[surface.auth]]`'s planned `sqlite-row`/`base64`/`command` steps are for.
+`~/.codex/accounts/auth_*.json`, the macOS Keychain and SQLite. Three things
+worth carrying over: `rate_limit.allowed` is the only hard "blocked" bit;
+a suspicious drop in `used_percent` deserves a second request; and the
+shape of the Antigravity credential problem — a token in a SQLite row,
+base64-wrapped — is what `[[surface.auth]]`'s planned
+`sqlite-row`/`base64`/`command` steps are for.
 
 **[get-bb/bb](https://github.com/get-bb/bb)** — an agentic IDE (TypeScript,
 Electron) that deliberately owns none of this: it "uses the provider CLI you
@@ -1690,7 +1693,7 @@ token cache above it in the chain.
 
 ## Full example: `codex.toml` (http-api)
 
-Shipped verbatim as `plugins/codex.toml`. Up to version 1.0.0 this was
+Shipped verbatim as `plugins/codex.toml`. Up to version 2.0.0 this was
 a `log-file` manifest reading `~/.codex/sessions/**/rollout-*.jsonl`; the
 comments below say why it isn't any more.
 
@@ -2233,8 +2236,10 @@ with zero network access.
 
 **Source of truth, same rule as the manifest schema above:** if anything
 below and `registry.rs` ever disagree, `registry.rs` wins. The **only**
-network calls in that module are `fetch_text` (the index) and `fetch_bytes`
-(a manifest, as raw bytes); everything downstream of a
+network calls in that module are `fetch_bytes` (`index.toml` itself and a
+manifest, both as raw bytes — the signature check runs over the exact
+transport bytes, not a UTF-8 round-trip of them) and `fetch_text` (only the
+index's `.minisig` signature file); everything downstream of a
 download — writing the verified bytes to disk, driving the trust-
 disclosure UI, enforcing the mandatory approval gate, calling the clock
 for `installed_at` — is orchestration `registry.rs` deliberately leaves to
@@ -2396,7 +2401,10 @@ opt-in surfaces.
 (`src/main.rs`) sequences them and performs the actual filesystem write.
 The contract the module's own doc comments make with that caller:
 
-1. Fetch `index.toml` via `fetch_text`, parse it with
+1. Fetch `index.toml` via `fetch_bytes` (raw bytes, not `fetch_text` — a
+   signature is over the exact bytes a server sent, not a decoded form),
+   check its signature before ever parsing it (see
+   [Publisher signature](#publisher-signature) below), then parse it with
    `RegistryIndex::from_str`.
 2. For a plugin the user chooses to install or update, resolve its
    `manifest` path against the index's own URL with
@@ -2409,10 +2417,11 @@ The contract the module's own doc comments make with that caller:
    string concatenation alone, but this is the one place that would notice
    if it somehow did.
 3. Fetch the manifest's raw bytes from that resolved URL via `fetch_bytes`
-   (raw `Vec<u8>`, **not** the UTF-8-decoding `fetch_text` used for the
-   index — the hash must be over the exact transport bytes, and the reader
-   is capped at 10 MB before buffering so a hostile unbounded response
-   can't exhaust memory before the hash gate runs).
+   (raw `Vec<u8>`, **not** the UTF-8-decoding `fetch_text` — `fetch_text`
+   only ever serves the index's `.minisig` signature file — the hash must
+   be over the exact transport bytes, and the reader is capped at 10 MB
+   before buffering so a hostile unbounded response can't exhaust memory
+   before the hash gate runs).
 4. Call `verify_and_prepare` with those exact bytes and the index entry's
    `sha256`: it hashes the bytes and compares against the expected hash
    **before ever attempting to parse**, then — only on a match — parses
@@ -2636,7 +2645,11 @@ but the dialog appears whether or not any host is untrusted.
 `requires_approval` is a **computed disclosure flag**, not an enforced
 gate, by itself — `analyze_trust` only tells the caller whether the
 stronger confirmation is required; the caller (`src/main.rs`) is the one
-that actually blocks the install pending that confirmation.
+that actually blocks the install pending that confirmation. The same gate
+runs for a manifest picked off disk through *Add plugin*, not only one
+installed from the registry: `src/main.rs`'s import path calls
+`analyze_trust` and shows the same dialog, since a file you chose yourself
+is exactly as third-party as one the registry would have downloaded.
 
 **Signing is a known, explicit gap — future hardening, not something
 silently deferred.** Manifest signing (as opposed to today's plain

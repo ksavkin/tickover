@@ -16,7 +16,7 @@ lives in one folder:
 
 | File | What it is |
 |---|---|
-| `config.json` | preferences and per-plugin toggles (`plugin.<id>.enabled`, `.ping`, `.surface.<sid>`, `.option.<key>`), plus two derived facts the auto-ping works from: when a stated window is due to reset and when a ping last fired. No percentage, no balance, no token. |
+| `config.json` | preferences and per-plugin toggles (`plugin.<id>.enabled`, `.ping`, `.surface.<sid>`, `.option.<key>`) — except that for `codex` and `claude` the ping toggle lives under the top-level `auto_ping_codex` / `auto_ping_claude` keys instead, and Claude's desktop surface under `monitor_desktop`, kept for settings-file compatibility; `plugin.codex.ping` itself is never read — plus two derived facts the auto-ping works from: when a stated window is due to reset and when a ping last fired. No percentage, no balance, no token. |
 | `plugins/*.toml` | the provider manifests — seeded from the shipped copies on first run, yours to edit or add to afterwards |
 | `tickover.log` | timestamped diagnostics, trimmed to its last ~32 KB once it passes 64 KB; never carries a token |
 | `registry-state.json` | origin URL, version and sha256 of anything installed from a registry — provenance, and how a local edit is detected |

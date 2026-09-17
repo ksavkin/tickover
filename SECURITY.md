@@ -84,7 +84,13 @@ newest by mtime kept when a glob matches more) and reads at most 64 MiB out
 of them per lookup (`engine_logfile::FETCH_BYTE_BUDGET`; the primary
 lookup and the secondary-accounts lookup each get their own), so years of
 session history cost a fixed amount of work rather than one proportional
-to how much has piled up. A registry index listing more than 500 plugins
+to how much has piled up. The `[surface.auth.client]` discovery scan reads
+at most 512 MiB of any one candidate binary and 1 GiB across one whole pass
+(`auth::CLIENT_DISCOVERY_MAX_SCAN_BYTES`,
+`auth::CLIENT_DISCOVERY_PASS_BUDGET_BYTES`); an OAuth token-exchange
+response is capped at 1 MiB (`auth::OAUTH_RESPONSE_MAX_BYTES`), and a
+credential file read off disk at 4 MB (`plugin::SMALL_FILE_MAX_BYTES`). A
+registry index listing more than 500 plugins
 (`registry::MAX_INDEX_ENTRIES`) is rejected wholesale rather than handed to
 the install UI to sort and draw. A refreshed OAuth token is never cached as
 living longer than 24 hours (`auth::EXPIRES_IN_MAX_SECS`), whatever a token
@@ -98,11 +104,14 @@ throttle gate behind it, forever.
 
 `[ping]` is the sixth way traffic leaves because of this app, and it is not an
 HTTP call of its own: it runs a local command the manifest names, shortly after
-that provider's window resets, and that command talks to its own provider. The
-shipped example is `codex exec … hello` — a real prompt, spending a little real
-quota, which is why it exists and why it is **off until you switch it on** per
-plugin. Once on, it is unattended: it fires on a reset, not on a click. What it
-sends is between that CLI and its provider; this app neither sees nor logs it.
+that provider's window resets — and, for a manifest that also sets
+`renews_token`, again the moment a surface whose auth chain declares a token
+expiry finds that token lapsed or refused outright — and that command talks
+to its own provider. The shipped example is `codex exec … hello` — a real
+prompt, spending a little real quota, which is why it exists and why it is
+**off until you switch it on** per plugin. Once on, it is unattended: it
+fires on a window reset or a lapsed token, not on a click. What it sends is
+between that CLI and its provider; this app neither sees nor logs it.
 
 ### Neither list contains
 
@@ -125,21 +134,26 @@ a program you did not read.
 
 **And one part of it is a program in the ordinary sense.** A manifest may
 declare `[ping]` — a binary and its arguments — which this app runs shortly
-after that provider's window resets, to start a fresh one. That is an
-arbitrary local command with your user's privileges. Four things bound it:
-the toggle is **off unless you turn it on**, per plugin, in Settings; it never
-fires before the window it targets has actually started, and never more than
-once every ten minutes regardless of what a manifest's own numbers claim,
-which is what stops a misconfigured or malicious manifest from turning this
-into a loop; it runs in a directory created fresh for that one command,
-normally under the OS temp directory and removed once the command exits, so
-there is nothing already on disk for it to read; and a manifest that declares
-`[ping]` at all cannot be installed from a registry without the confirmation
-dialog, which shows the exact command line.
+after that provider's window resets, to start a fresh one, and which a
+manifest that also sets `renews_token` runs again the moment a surface's
+own token has lapsed or been refused outright. That is an arbitrary local
+command with your user's privileges. Four things bound it: the toggle is
+**off unless you turn it on**, per plugin, in Settings; the window trigger
+never fires before the window it targets has actually started, and neither
+trigger fires more than once every ten minutes regardless of what a
+manifest's own numbers claim — a renewal is bound tighter still, offered at
+most once per distinct token per surface — which is what stops a
+misconfigured or malicious manifest from turning this into a loop; it runs
+in a directory created fresh for that one command, normally under the OS
+temp directory and removed once the command exits, so there is nothing
+already on disk for it to read; and a manifest that declares `[ping]` at
+all cannot be installed from a registry without the confirmation dialog,
+which shows the exact command line — appending " — also run when its token
+has expired or is no longer accepted" when that ping renews a token.
 
-The manifests that ship with the app (`plugins/*.toml`) are reviewed and
-versioned in this repository, and are seeded rather than installed — they never
-go through the registry path.
+The manifests that ship with the app (`plugins/*.toml`) are versioned in
+this repository, and are seeded rather than installed — they never go
+through the registry path.
 
 Details, including what each auth step does and why: `docs/PLUGIN-ARCHITECTURE.md`,
 sections "Auth chain semantics" and "Security".
@@ -170,13 +184,10 @@ sections "Auth chain semantics" and "Security".
   token file, not just a credential store's own path), the specific
   credential source named above, and the ping command line — and then a
   person decides, which is the part no code here can do for them.
-- **The Windows credential paths have been built and run, but not against a
-  real item.** The app has since been built and run on Windows 11 (x86_64,
-  MSVC); the Credential Manager (`CredRead`) and DPAPI desktop-token steps
-  compile and are reached, but the machine this was checked on had nothing in
-  either store for them to find. The gap that remains is narrower than "never
-  compiled": these paths are unexercised against a real credential, not
-  unbuilt.
+- **The Windows Credential Manager and DPAPI steps are unexercised against a
+  real credential.** On Windows 11 (x86_64, MSVC) the Credential Manager
+  (`CredRead`) and DPAPI desktop-token steps compile and are reached, but
+  neither has run against an item actually sitting in either store.
 - **The Antigravity token exchange needs an OAuth client id and secret, and
   this repository does not carry them.** The manifest declares where the
   installed Antigravity client keeps its own pair (the `language_server`

@@ -47,10 +47,10 @@ HOME="$FH" CARGO_HOME="$REAL_HOME/.cargo" RUSTUP_HOME="$REAL_HOME/.rustup" cargo
 
 Parts of the suite resolve the plugins folder and this app's config directory
 from the real `HOME`. Today nothing writes there, but that is a measurement
-rather than something the code enforces, and it has been false before: a run
-under the real `HOME` once wrote a "this manifest was already delivered" marker
-into a live install, which would have kept a shipped provider out of the panel
-for good. `docs/DEVELOPMENT.md` has the whole story.
+rather than something the code enforces: a test run must never touch the
+live install, since writing a "this manifest was already delivered" marker
+into it would keep a shipped provider out of the panel for good.
+`docs/DEVELOPMENT.md` has the whole story.
 
 ## What a change is expected to carry
 
