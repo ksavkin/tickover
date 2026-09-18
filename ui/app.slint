@@ -63,7 +63,10 @@ export struct BalanceData {
     // "\n"-joined figures: the used/cap pair on one line when their units
     // match (`Balance::pair_is_comparable`), the two on separate lines when
     // they don't, plus `remaining` on its own line — whichever of the three
-    // the provider stated. "" when none were.
+    // the provider stated. "" when none were. Just "Unlimited" when the
+    // provider stated this bucket has no ceiling at all (`Balance.unlimited`)
+    // — used/cap/remaining are never read for such a bucket, so this is the
+    // one line drawn.
     amount-line: string,
     // "12% used" — drawn only when the provider stated a percentage
     // (`Balance.stated_percent`); never computed from the figures above.

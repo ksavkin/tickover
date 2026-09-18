@@ -67,6 +67,17 @@ use crate::plugin::segments;
 /// failure retrying cannot fix.
 pub const UNAUTHORIZED: &str = "session expired — sign in again";
 
+/// The reading error for a credential past its own declared expiry
+/// (`expiry_json_path`) on a manifest with no `[ping] renews_token` to fix
+/// it — the pre-request twin of [`UNAUTHORIZED`], reached without a request
+/// ever going out. `docs/DEVELOPMENT.md`'s own rule for the auth chain
+/// (Keychain item-not-found hides the surface; access-denied surfaces an
+/// inline error) applies here too: a token the user *has*, just stale, is a
+/// problem they can fix by signing in again, not the same blank space as
+/// never having signed in at all, so this text — not
+/// [`auth::NO_CREDENTIALS`] — is what keeps the row on screen.
+pub const LAPSED: &str = "token expired — sign in again";
+
 // ── Public entry point ───────────────────────────────────────────────────
 
 /// Read usage for every surface named in `active_surface_ids`, in the order
@@ -131,10 +142,10 @@ fn fetch_surface(
         Err(auth::ResolveError::Empty(empty)) => {
             // A chain that ended `Lapsed` is a token this app cannot renew
             // on its own — unless the manifest names a ping that can, as a
-            // side effect of running (`[ping] renews_token`). Checked
-            // before the `NO_CREDENTIALS` rewrite below, which is exactly
-            // where a plugin *without* such a ping still ends up: to it,
-            // "found but lapsed" and "never found" read as the same fact.
+            // side effect of running (`[ping] renews_token`). Either way it
+            // returns here, before the `NO_CREDENTIALS` rewrite below: a
+            // lapsed token is a credential the user *has*, and stays a row
+            // on the panel whether or not anything can renew it for them.
             //
             // Needs no explicit `declares_token_expiry` check of its own:
             // `Lapsed` can only be produced here because some step on
@@ -156,17 +167,22 @@ fn fetch_surface(
                     reading.fail(renewal_text(&ping.bin));
                     return reading;
                 }
+                // No `[ping] renews_token` on this manifest, so nothing
+                // here can renew the token — only the user's own next
+                // sign-in can. That is exactly the fact `LAPSED` states,
+                // and it is a problem the user can act on, not an absent
+                // credential, so it is never routed through the
+                // `NO_CREDENTIALS` rewrite below (see the docs on
+                // `LAPSED` itself). No HTTP request is ever attempted for
+                // it.
+                reading.token_renewal = TokenRenewal::No;
+                reading.fail(LAPSED.to_string());
+                return reading;
             }
             // "No credential store here at all" is the one error a surface may
             // rename: for most providers it means "not installed", and the row
             // is hidden on the strength of this exact string; for one that is
             // worth naming in that state, the manifest supplies the sentence.
-            // A lapsed credential without a renewing ping folds back into
-            // `NO_CREDENTIALS` here: a manifest with no `[ping] renews_token`
-            // gets the same hide-the-row/custom-message treatment for a
-            // lapsed credential as for no credential at all, not a second,
-            // unrecognised string — both `empty` variants render the same
-            // text from this point on, whichever one it was.
             reading.fail(match &surface.no_credentials_message {
                 Some(message) => message.clone(),
                 None => auth::NO_CREDENTIALS.to_string(),
@@ -1358,13 +1374,48 @@ fn parse_balances(value: &Value, m: &PluginManifest) -> Vec<crate::model::Balanc
         .collect()
 }
 
+/// One declared path resolving to `true` and nothing else — the reading
+/// [`BalanceConfig::unlimited`]/[`BalanceConfig::when`] both need, and
+/// exactly the fail-safe every other boolean-gated figure in this schema
+/// uses: missing, present but not a boolean, or present and `false` all read
+/// the same as "no".
+fn bool_path_is_true(value: &Value, path: &str) -> bool {
+    json_path_get(value, path).and_then(Value::as_bool) == Some(true)
+}
+
 fn build_balance(index: usize, b: &BalanceConfig, value: &Value) -> Option<crate::model::Balance> {
+    // `[balances.when]` gates the entry as a whole, checked first: an
+    // account this balance does not apply to (Claude's `extra_usage`,
+    // disabled) must draw no row at all, not a row built from whatever the
+    // response's own (likely `null`) figures happen to read as.
+    if let Some(when) = &b.when {
+        if !bool_path_is_true(value, &when.path) {
+            return None;
+        }
+    }
+
+    // A bucket the response marks unlimited states no ceiling to draw a pair
+    // against — its own `used`/`cap`/`remaining` paths, if the manifest
+    // names any, are skipped rather than read: Copilot's `entitlement` on
+    // such a bucket is `0`, not "no cap", and pairing it with "Unlimited"
+    // would say the opposite of what the response means.
+    let unlimited = b
+        .unlimited
+        .as_ref()
+        .is_some_and(|u| bool_path_is_true(value, &u.path));
+
     let balance = crate::model::Balance {
         key: crate::plugin::balance_key(b, index),
         label: b.label.clone(),
-        used: b.used.as_ref().and_then(|a| read_amount(value, a)),
-        cap: b.cap.as_ref().and_then(|a| read_amount(value, a)),
-        remaining: b.remaining.as_ref().and_then(|a| read_amount(value, a)),
+        used: (!unlimited)
+            .then(|| b.used.as_ref().and_then(|a| read_amount(value, a)))
+            .flatten(),
+        cap: (!unlimited)
+            .then(|| b.cap.as_ref().and_then(|a| read_amount(value, a)))
+            .flatten(),
+        remaining: (!unlimited)
+            .then(|| b.remaining.as_ref().and_then(|a| read_amount(value, a)))
+            .flatten(),
         // The provider's own percentage, never computed and never adjusted.
         // There is no path in the grammar that would produce a derived one.
         // Not clamped, unlike a window's percentage. A window's percent is
@@ -1388,6 +1439,7 @@ fn build_balance(index: usize, b: &BalanceConfig, value: &Value) -> Option<crate
         limit_reached: path_of(&b.source.limit_reached_path)
             .and_then(|p| json_path_get(value, p))
             .and_then(Value::as_bool),
+        unlimited,
     };
     // A period end on its own is not a balance: every month has one, and a row
     // showing a date beside nothing would be this app announcing a figure it
@@ -1881,15 +1933,92 @@ mod tests {
     }
 
     #[test]
-    fn a_lapsed_auth_chain_without_a_renewing_ping_reads_as_no_credentials() {
+    fn a_lapsed_auth_chain_without_a_renewing_ping_keeps_the_row_with_the_lapsed_text() {
         let dir = temp_dir("lapsed-cli-no-ping");
         let m = claude_like_manifest_with_a_lapsed_cli_token(&dir, false);
+        // `surface.allowed_hosts` names only `api.anthropic.com`, and no
+        // server is listening on this thread for anything — the assertion
+        // below only holds if `fetch_surface` returned before ever building
+        // a request, since nothing here could answer one.
         let readings = fetch(&m, &["cli".to_string()], &no_options());
         assert_eq!(readings.len(), 1);
         assert_eq!(
             readings[0].error.as_deref(),
-            Some(auth::NO_CREDENTIALS),
-            "without a ping that can renew it, a lapsed token reads exactly like none at all"
+            Some(LAPSED),
+            "a token the user has, just stale, keeps its row and names the fix"
+        );
+        assert_eq!(readings[0].token_renewal, TokenRenewal::No);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Grok's own shape, not the claude-like fixture above: a
+    /// `credentials-map` step (the matched entry, not the whole file, carries
+    /// `expires_at`) on a manifest with no `[ping]` at all — not merely one
+    /// without `renews_token`. Grok's `expiry_json_path` catches a token its
+    /// own CLI still considers current but that has passed its
+    /// locally-stated expiry before a request ever goes out; with nothing
+    /// able to renew it, the row stays on screen with `LAPSED`'s text
+    /// instead of the live 401 ("session expired — sign in again") the same
+    /// account would have drawn before this step declared an expiry at all.
+    #[test]
+    fn a_lapsed_credentials_map_token_with_no_ping_at_all_keeps_the_row_with_the_lapsed_text() {
+        let dir = temp_dir("lapsed-credentials-map-no-ping");
+        let file = dir.join("auth.json");
+        std::fs::write(
+            &file,
+            r#"{"https://auth.x.ai::11111111-1111-1111-1111-111111111111":
+                {"key":"tok-grok","expires_at":"2000-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let toml = format!(
+            r#"
+            id         = "grok"
+            name       = "Grok"
+            menu_label = "Gr"
+            order      = 30
+            engine     = "http-api"
+            requires_reader = ["credentials-map", "keychain-expiry"]
+
+            [[windows]]
+            label = "Credits used"
+            role  = "primary"
+            [windows.period]
+            mode    = "assumed"
+            assumed = 10080
+            [windows.source]
+            used_percent_path = "config.creditUsagePercent"
+            resets_at_path    = "config.currentPeriod.end"
+            resets_at_format  = "iso8601"
+
+            [http]
+            [[http.request]]
+            url = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+
+            [[surface]]
+            id            = "default"
+            label         = "Default"
+            opt_in        = false
+            allowed_hosts = ["cli-chat-proxy.grok.com"]
+            [[surface.auth]]
+            type              = "credentials-map"
+            path              = '{path}'
+            key_prefix        = "https://auth.x.ai::"
+            token_json_path   = "key"
+            expiry_json_path  = "expires_at"
+        "#,
+            path = file.to_string_lossy(),
+        );
+        let m = PluginManifest::from_str(&toml).expect("valid test manifest");
+        // `allowed_hosts` names only `cli-chat-proxy.grok.com`, and nothing
+        // is listening for it here — the assertion below only holds if
+        // `fetch_surface` returned before ever building a request.
+        let readings = fetch(&m, &["default".to_string()], &no_options());
+        assert_eq!(readings.len(), 1);
+        assert_eq!(
+            readings[0].error.as_deref(),
+            Some(LAPSED),
+            "a manifest with no [ping] section at all still keeps the row, \
+             the same as one whose ping just doesn't renew_token"
         );
         assert_eq!(readings[0].token_renewal, TokenRenewal::No);
         std::fs::remove_dir_all(&dir).ok();
@@ -4899,14 +5028,12 @@ mod tests {
             "a path that resolves to nothing draws no row, not a 0-of-0"
         );
 
-        // And the case the manifest comment names as this row's known weakness.
-        // Constructed, like the two above: the measured account has this bucket
-        // metered, and `unlimited` was seen only on the two buckets nothing
-        // reads. What it pins is again a property of the manifest — a bucket
-        // marked unlimited is read exactly like any other, so its zeroes are
-        // drawn as sent. Nothing concludes "exhausted" from them, and nothing
-        // distinguishes them either, which is why this is written down rather
-        // than discovered later.
+        // Constructed, like the two above: the measured account has this
+        // bucket metered, and `unlimited` was seen only on the two buckets
+        // nothing here reads — this is the one bucket the manifest does
+        // read, arriving unlimited instead. `[balances.unlimited]` is what
+        // turns this from `cap 0 / remaining 0` (indistinguishable from an
+        // exhausted quota) into a row this app can tell apart from one.
         let unlimited = json!({
             "quota_reset_date_utc": "2026-09-01T00:00:00.000Z",
             "quota_snapshots": { "premium_interactions": bucket("premium_interactions", true, 0, 0.0) },
@@ -4915,15 +5042,25 @@ mod tests {
         assert_eq!(
             drawn.len(),
             1,
-            "the row is still drawn — `unlimited` is a field nothing here reads"
+            "the row is still drawn — as \"Unlimited\", not as nothing"
         );
-        // The whole pair, not just one half: a regression that dropped
-        // `remaining` would leave a lone `cap 0` on the panel and still satisfy
-        // an assertion about the ceiling alone.
-        assert_eq!(drawn[0].cap, number(0.0));
-        assert_eq!(drawn[0].remaining, number(0.0));
+        assert!(
+            drawn[0].unlimited,
+            "the response's own flag reaches the model"
+        );
+        // Not just absent from the panel's *pairing* logic — never read at
+        // all: `entitlement`/`quota_remaining` are `0` on this bucket, and a
+        // regression that read them anyway (leaving `unlimited` merely
+        // advisory) would put a real `Some(0)` back where this asserts
+        // `None`.
         assert!(drawn[0].used.is_none());
-        assert!(drawn[0].period_end.is_some());
+        assert!(drawn[0].cap.is_none());
+        assert!(drawn[0].remaining.is_none());
+        assert!(
+            drawn[0].period_end.is_some(),
+            "the period end is not part of the used/cap/remaining pairing this \
+             field skips, so it is still read"
+        );
     }
 
     /// Enumerating windows (`windows.for_each`) on the manifest that ships,
@@ -5108,6 +5245,78 @@ mod tests {
         let mut unnamed = body.clone();
         unnamed["limits"][2]["scope"] = json!({ "model": { "id": null } });
         assert_eq!(parse_usage(&unnamed, &m).expect("still readable").len(), 2);
+    }
+
+    /// `extra_usage` against the shape actually measured: every field but the
+    /// three bools is `null` on an account that never turned it on. Built
+    /// from that shape rather than from the enabled fixture alone, so a
+    /// regression that reads `extra_usage.*` unconditionally (ignoring
+    /// `is_enabled`) shows up as a row for an account that does not have one.
+    #[test]
+    fn the_shipped_claude_manifest_reads_extra_usage_only_when_enabled() {
+        let (_, contents) = crate::plugin::seed::DEFAULT_TEMPLATES
+            .iter()
+            .find(|(name, _)| *name == "claude.toml")
+            .expect("claude.toml ships");
+        let m = PluginManifest::from_str(contents).expect("the shipped manifest parses");
+
+        let disabled = json!({
+            "extra_usage": {
+                "is_enabled": false,
+                "monthly_limit": null,
+                "used_credits": null,
+                "utilization": null,
+                "currency": null,
+                "decimal_places": null,
+                "disabled_reason": null,
+                "user_disabled": true,
+                "spend_limit_reached": false,
+                "credits_ever_enabled": false,
+                "daily": null,
+                "weekly": null,
+            },
+        });
+        assert!(
+            parse_balances(&disabled, &m).is_empty(),
+            "is_enabled = false must draw no row at all — not one with two \
+             empty/unreadable figures"
+        );
+
+        let enabled = json!({
+            "extra_usage": {
+                "is_enabled": true,
+                "monthly_limit": 5000,
+                "used_credits": 1234,
+                "utilization": 24.68,
+                "currency": "USD",
+                "decimal_places": 2,
+                "disabled_reason": null,
+                "user_disabled": false,
+                "spend_limit_reached": false,
+                "credits_ever_enabled": true,
+                "daily": null,
+                "weekly": null,
+            },
+        });
+        let drawn = parse_balances(&enabled, &m);
+        assert_eq!(drawn.len(), 1, "is_enabled = true draws the row");
+        let extra = &drawn[0];
+        assert_eq!(
+            extra.used,
+            Some(crate::model::BalanceAmount::Money {
+                minor: 1234,
+                currency: "USD".into(),
+                exponent: 2,
+            })
+        );
+        assert_eq!(
+            extra.cap,
+            Some(crate::model::BalanceAmount::Money {
+                minor: 5000,
+                currency: "USD".into(),
+                exponent: 2,
+            })
+        );
     }
 
     // ── for_each caps / element identity ─────────────────────────────────

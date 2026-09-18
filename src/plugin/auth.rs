@@ -41,8 +41,9 @@ pub const NO_CREDENTIALS: &str = "no credentials found";
 /// on no token at all (so a refresh step behind it still gets its turn), and
 /// without this the two were indistinguishable once the chain ran out.
 /// `plugin::engine_http` matches this literal to offer a renewal ping
-/// (`[ping] renews_token`) instead of the plain "no credentials" treatment —
-/// see its own docs for what a plugin without such a ping gets instead.
+/// (`[ping] renews_token`) where the manifest names one that can — see its
+/// own docs for what a plugin without such a ping gets instead (its own
+/// row, kept on screen, naming the same fact in plain text).
 pub(crate) const TOKEN_LAPSED: &str = "the only credential found had lapsed";
 
 /// [`resolve_token`]'s chain running out — every step was absent — with
@@ -59,7 +60,7 @@ pub enum ResolveEmpty {
     NoCredentials,
     /// At least one step found a credential, but its own declared expiry
     /// had already passed — carries that Unix timestamp (see
-    /// [`token_expiry`] and `crate::model::TokenRenewal::Lapsed`). A later
+    /// [`token_expiry_at`] and `crate::model::TokenRenewal::Lapsed`). A later
     /// step still gets first refusal (an `oauth-refresh` behind a lapsed
     /// `keychain` step, say), so this only ever describes how the chain as
     /// a whole came up empty, never a token [`resolve_token`] actually
@@ -128,13 +129,14 @@ pub fn resolve_token(surface: &SurfaceConfig) -> Result<(String, bool), ResolveE
 ///
 /// `lapsed_expiry` is set — to the declared expiry, never cleared or
 /// overwritten once set — by whichever of `credentials_file_step`/
-/// `keychain_step`/`win_credential_step` is the *first* in the chain to find
-/// a credential past its own `expiry_json_path`; a later step's own lapsed
-/// finding is not this app's business once an earlier one has already named
-/// one (two stores disagreeing about the same account's expiry is not a
-/// state worth choosing between). Every other step kind leaves it exactly as
-/// it found it, which is why a single `&mut Option<u64>` threaded through the
-/// whole chain (rather than a richer per-step return type) is enough:
+/// `keychain_step`/`win_credential_step`/`credentials_map_step` is the
+/// *first* in the chain to find a credential past its own
+/// `expiry_json_path`; a later step's own lapsed finding is not this app's
+/// business once an earlier one has already named one (two stores
+/// disagreeing about the same account's expiry is not a state worth
+/// choosing between). Every other step kind leaves it exactly as it found
+/// it, which is why a single `&mut Option<u64>` threaded through the whole
+/// chain (rather than a richer per-step return type) is enough:
 /// [`resolve_token`] only ever reads it once, after the loop, and only when
 /// nothing else answered.
 fn run_step(
@@ -148,7 +150,7 @@ fn run_step(
         AuthType::Env => env_step(step),
         AuthType::ElectronSafeStorage => electron_safe_storage_step(step),
         AuthType::WinCredential => win_credential_step(step, lapsed_expiry),
-        AuthType::CredentialsMap => credentials_map_step(step),
+        AuthType::CredentialsMap => credentials_map_step(step, lapsed_expiry),
         AuthType::RejectWhen => reject_when_step(step),
         AuthType::OauthRefresh => oauth_refresh_step(step, allowed_hosts),
     }
@@ -228,6 +230,38 @@ pub fn host_allowed(allowed_hosts: &[String], url: &str) -> bool {
 
 // ── Step: credentials-file ────────────────────────────────────────────────
 
+/// `path`'s location, subject to `path_env`/`path_env_join` — the credential
+/// variant of `engine_logfile::resolve_root` (see that function's own doc):
+/// `path_env` (if set and the env var names an absolute path) is taken
+/// verbatim as the base, joined with `path_env_join` if the manifest sets
+/// one; otherwise `path` itself, `~`-expanded. Claude's CLI honours
+/// `CLAUDE_CONFIG_DIR` this same way for `.credentials.json` — see
+/// `AuthStep::path_env`'s own doc for why only the file is covered, not the
+/// Keychain item name `CLAUDE_CONFIG_DIR` also renames.
+///
+/// Unlike `resolve_root`, an env value that is empty or relative is treated
+/// exactly as if the variable were unset, falling back to `path` — a
+/// credential must never be read relative to this process's own working
+/// directory, which is what an empty or relative override would otherwise
+/// do (`PathBuf::from("").join(…)` resolves against the CWD). `path` itself
+/// carries no such risk: it is `~`-expanded, never CWD-relative, and a
+/// manifest author who wants a relative-looking credential path can already
+/// only spell it starting from `~`.
+fn resolve_credentials_file_path(step: &AuthStep, path: &str) -> std::path::PathBuf {
+    if let Some(env_name) = &step.path_env {
+        if let Some(v) = std::env::var_os(env_name) {
+            let base = std::path::PathBuf::from(v);
+            if base.is_absolute() {
+                return match &step.path_env_join {
+                    Some(join) => base.join(join),
+                    None => base,
+                };
+            }
+        }
+    }
+    super::expand_home(path)
+}
+
 fn credentials_file_step(
     step: &AuthStep,
     lapsed_expiry: &mut Option<u64>,
@@ -239,7 +273,7 @@ fn credentials_file_step(
         step.token_json_path.as_deref(),
     )?;
 
-    let file = super::expand_home(path);
+    let file = resolve_credentials_file_path(step, path);
     if !file.is_file() {
         return Ok(None); // surface not present on this machine
     }
@@ -273,7 +307,17 @@ fn credentials_file_step(
 /// state the manifest author did not anticipate (a login method the account
 /// never used, a schema change upstream), and silently moving on to the next
 /// step would hide that behind whatever step happens to follow.
-fn credentials_map_step(step: &AuthStep) -> Result<Option<String>, String> {
+///
+/// `expiry_json_path`, when the step sets one, is read from the *matched
+/// entry* the same way `token_from_blob` reads it from a whole file —
+/// `stale_expiry_at` is that same decision, against a [`Value`] already
+/// parsed out of the larger document rather than a fresh JSON string, since
+/// the entry `matches.next()` returns below is already exactly that
+/// `Value`.
+fn credentials_map_step(
+    step: &AuthStep,
+    lapsed_expiry: &mut Option<u64>,
+) -> Result<Option<String>, String> {
     let path = require_str("credentials-map", "path", step.path.as_deref())?;
     let key_prefix = require_str("credentials-map", "key_prefix", step.key_prefix.as_deref())?;
     let token_json_path = require_str(
@@ -311,14 +355,21 @@ fn credentials_map_step(step: &AuthStep) -> Result<Option<String>, String> {
             file.display()
         ));
     }
-    extract_token_at(entry, token_json_path)
-        .map(Some)
-        .ok_or_else(|| {
-            format!(
-                "no token at `{token_json_path}` in the entry matching `{key_prefix}` in {}",
-                file.display()
-            )
-        })
+    let Some(token) = extract_token_at(entry, token_json_path) else {
+        return Err(format!(
+            "no token at `{token_json_path}` in the entry matching `{key_prefix}` in {}",
+            file.display()
+        ));
+    };
+    if let Some(expiry_path) = step.expiry_json_path.as_deref() {
+        if let Some(expires_at) = stale_expiry_at(entry, expiry_path, now_unix()) {
+            if lapsed_expiry.is_none() {
+                *lapsed_expiry = Some(expires_at);
+            }
+            return Ok(None);
+        }
+    }
+    Ok(Some(token))
 }
 
 // ── Step: keychain (macOS) ────────────────────────────────────────────────
@@ -548,7 +599,7 @@ fn cache_now() -> i64 {
 }
 
 /// Whether the token in `json` has lapsed, judged by the value at
-/// `expiry_path` — see [`token_expiry`] for the shapes read. Pure and
+/// `expiry_path` — see [`token_expiry_at`] for the shapes read. Pure and
 /// fail-safe: an expiry this cannot place in time at all, or places
 /// somewhere implausible, reads as not stale — reading it wrong must never
 /// discard a token that might still work, only ever let a provably-expired
@@ -572,13 +623,24 @@ fn token_is_stale(json: &str, expiry_path: &str, now: i64) -> bool {
 /// expired too, say, and the CLI now needs an interactive login) must be
 /// pinged once, not once every ten minutes forever.
 ///
-/// `Some(expires_at)` when [`token_expiry`] reads a timestamp at or before
+/// `Some(expires_at)` when [`token_expiry_at`] reads a timestamp at or before
 /// `now` plus a 60-second margin (a token about to expire is already
 /// treated as stale, so a refresh happens *before* a request would 401 on
-/// it); `None` when it reads a later timestamp, or none at all.
+/// it); `None` when it reads a later timestamp, or none at all. Parses
+/// `json` itself and delegates to [`stale_expiry_at`] — the `Value`-based
+/// core [`credentials_map_step`] also calls directly, against an entry it
+/// has already parsed out of a larger document, so the two never drift
+/// about what "stale" means.
 fn stale_expiry(json: &str, expiry_path: &str, now: i64) -> Option<u64> {
+    let value: Value = serde_json::from_str(json).ok()?;
+    stale_expiry_at(&value, expiry_path, now)
+}
+
+/// [`stale_expiry`]'s decision against an already-parsed [`Value`] rather
+/// than raw JSON text.
+fn stale_expiry_at(value: &Value, expiry_path: &str, now: i64) -> Option<u64> {
     const MARGIN_SECS: i64 = 60;
-    let expires_at = token_expiry(json, expiry_path)?;
+    let expires_at = token_expiry_at(value, expiry_path)?;
     // `expires_at` came from `expiry_seconds`'s own `i64`, never negative
     // either way it was produced (the numeric branch is bounded below by
     // `MIN_PLAUSIBLE_EXPIRY_UNIX`, the RFC3339 branch clamps to 0), so
@@ -587,16 +649,14 @@ fn stale_expiry(json: &str, expiry_path: &str, now: i64) -> Option<u64> {
     (expires_at_i64 <= now.saturating_add(MARGIN_SECS)).then_some(expires_at)
 }
 
-/// The value at `expiry_path` inside `json`, read as Unix seconds: an
-/// RFC3339 timestamp (Antigravity's `token.expiry`), or a JSON
-/// number/numeric string read as epoch seconds or milliseconds (Claude's
-/// `claudeAiOauth.expiresAt`) — see [`expiry_seconds`] for how the two
-/// numeric shapes are told apart. `None` when `json` doesn't parse,
-/// `expiry_path` doesn't resolve, or the value there is neither shape
-/// [`expiry_seconds`] reads.
-fn token_expiry(json: &str, expiry_path: &str) -> Option<u64> {
-    let value: Value = serde_json::from_str(json).ok()?;
-    let expiry_value = json_path_value(&value, expiry_path)?;
+/// The value at `expiry_path` inside a already-parsed [`Value`], read as
+/// Unix seconds: an RFC3339 timestamp (Antigravity's `token.expiry`), or a
+/// JSON number/numeric string read as epoch seconds or milliseconds
+/// (Claude's `claudeAiOauth.expiresAt`) — see [`expiry_seconds`] for how the
+/// two numeric shapes are told apart. `None` when `expiry_path` doesn't
+/// resolve, or the value there is neither shape [`expiry_seconds`] reads.
+fn token_expiry_at(value: &Value, expiry_path: &str) -> Option<u64> {
+    let expiry_value = json_path_value(value, expiry_path)?;
     u64::try_from(expiry_seconds(expiry_value)?).ok()
 }
 
@@ -869,13 +929,13 @@ fn win_credential_step(
     // without the token at `token_json_path`, or one whose declared expiry
     // has lapsed): try the next target name; only if every target comes up
     // empty is the whole step Absent. A target that *is* found but doesn't
-    // yield a token moves on rather than stopping there — Claude's manifest
-    // ships two Credential Manager targets, and the first one existing with
-    // the wrong shape (or a lapsed token) must not hide a token sitting in
-    // the second. The last such error is only returned if no later target
-    // produces a token either — a lapsed target sets `lapsed_expiry` but
-    // leaves `last_err` alone, the same "Absent, not broken" treatment
-    // `token_from_blob` gives every other step it backs.
+    // yield a token moves on rather than stopping there — a manifest may
+    // list several targets, and the first one existing with the wrong shape
+    // (or a lapsed token) must not hide a token sitting in the next. The
+    // last such error is only returned if no later target produces a token
+    // either — a lapsed target sets `lapsed_expiry` but leaves `last_err`
+    // alone, the same "Absent, not broken" treatment `token_from_blob` gives
+    // every other step it backs.
     let mut last_err = None;
     for target in targets {
         if let Some(raw) = win_credential(target) {
@@ -2846,7 +2906,7 @@ fn json_path_str<'v>(root: &'v Value, path: &str) -> Option<&'v str> {
 
 /// Resolve a `.`-separated dotted path against a JSON value, returning
 /// whatever it names — not only a string ([`json_path_str`]'s own job), so
-/// [`token_expiry`] can read an `expiry_json_path` that names a number.
+/// [`token_expiry_at`] can read an `expiry_json_path` that names a number.
 /// Forwards to `crate::plugin::json_path_get`, the same walker
 /// `crate::plugin::engine_logfile::json_path` also forwards to, so a
 /// `[account] json_path`/`expiry_json_path` written with an array selector
@@ -3343,6 +3403,8 @@ mod tests {
         AuthStep {
             kind,
             path: None,
+            path_env: None,
+            path_env_join: None,
             token_json_path: None,
             expiry_json_path: None,
             key_prefix: None,
@@ -7192,6 +7254,155 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn credentials_file_step_falls_back_to_path_when_path_env_is_unset() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("cf-path-env-unset");
+        let file = dir.join("creds.json");
+        std::fs::write(&file, r#"{"claudeAiOauth":{"accessToken":"tok-fallback"}}"#).unwrap();
+        let unset_env = format!("TICKOVER_TEST_AUTH_PATH_ENV_UNSET_{}", std::process::id());
+        std::env::remove_var(&unset_env);
+        let step = AuthStep {
+            path: Some(file.to_string_lossy().into_owned()),
+            path_env: Some(unset_env),
+            token_json_path: Some("claudeAiOauth.accessToken".to_string()),
+            ..auth_step(AuthType::CredentialsFile)
+        };
+        assert_eq!(
+            credentials_file_step(&step, &mut None),
+            Ok(Some("tok-fallback".to_string())),
+            "an unset path_env must not stop path itself from being read"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn credentials_file_step_reads_from_path_env_when_set_joined_with_path_env_join() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("cf-path-env-set");
+        std::fs::write(
+            dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"tok-env-override"}}"#,
+        )
+        .unwrap();
+        let env_name = format!("TICKOVER_TEST_AUTH_PATH_ENV_{}", std::process::id());
+        std::env::set_var(&env_name, &dir);
+        let step = AuthStep {
+            // Deliberately pointed at a file that does not exist — the
+            // whole point of this test is that `path_env` wins over it.
+            path: Some("/nonexistent-should-not-be-used/.credentials.json".to_string()),
+            path_env: Some(env_name.clone()),
+            path_env_join: Some(".credentials.json".to_string()),
+            token_json_path: Some("claudeAiOauth.accessToken".to_string()),
+            ..auth_step(AuthType::CredentialsFile)
+        };
+        let result = credentials_file_step(&step, &mut None);
+        std::env::remove_var(&env_name);
+        assert_eq!(
+            result,
+            Ok(Some("tok-env-override".to_string())),
+            "must have found the fixture via the env-overridden path"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn credentials_file_step_resolves_absent_when_path_env_is_an_absolute_dir_with_no_file_inside()
+    {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("cf-path-env-absolute-empty");
+        let env_name = format!(
+            "TICKOVER_TEST_AUTH_PATH_ENV_ABSOLUTE_{}",
+            std::process::id()
+        );
+        std::env::set_var(&env_name, &dir);
+        let step = AuthStep {
+            // `path` names a file that *does* exist — the whole point of
+            // this test is that an absolute `path_env` wins the chain
+            // outright and replaces the directory, rather than being a
+            // second place to look: no fallback to `path` once `path_env`
+            // is itself absolute.
+            path: Some(dir.join("elsewhere.json").to_string_lossy().into_owned()),
+            path_env: Some(env_name.clone()),
+            path_env_join: Some(".credentials.json".to_string()),
+            token_json_path: Some("claudeAiOauth.accessToken".to_string()),
+            ..auth_step(AuthType::CredentialsFile)
+        };
+        std::fs::write(
+            dir.join("elsewhere.json"),
+            r#"{"claudeAiOauth":{"accessToken":"tok-should-not-be-read"}}"#,
+        )
+        .unwrap();
+        let result = credentials_file_step(&step, &mut None);
+        std::env::remove_var(&env_name);
+        assert_eq!(
+            result,
+            Ok(None),
+            "path_env is absolute, so the chain reads $env/.credentials.json — \
+             which does not exist — and never falls back to path"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn credentials_file_step_falls_back_to_path_when_path_env_is_set_empty() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("cf-path-env-empty");
+        let file = dir.join("creds.json");
+        std::fs::write(&file, r#"{"claudeAiOauth":{"accessToken":"tok-fallback"}}"#).unwrap();
+        let env_name = format!("TICKOVER_TEST_AUTH_PATH_ENV_EMPTY_{}", std::process::id());
+        // Exported but empty — one stray shell line (`CLAUDE_CONFIG_DIR=`)
+        // is enough to produce this, and without the `is_absolute` guard it
+        // would resolve `.credentials.json` relative to the process's own
+        // working directory rather than falling back to `path`.
+        std::env::set_var(&env_name, "");
+        let step = AuthStep {
+            path: Some(file.to_string_lossy().into_owned()),
+            path_env: Some(env_name.clone()),
+            path_env_join: Some(".credentials.json".to_string()),
+            token_json_path: Some("claudeAiOauth.accessToken".to_string()),
+            ..auth_step(AuthType::CredentialsFile)
+        };
+        let result = credentials_file_step(&step, &mut None);
+        std::env::remove_var(&env_name);
+        assert_eq!(
+            result,
+            Ok(Some("tok-fallback".to_string())),
+            "an empty path_env must be treated exactly as if it were unset"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn credentials_file_step_falls_back_to_path_when_path_env_is_set_relative() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("cf-path-env-relative");
+        let file = dir.join("creds.json");
+        std::fs::write(&file, r#"{"claudeAiOauth":{"accessToken":"tok-fallback"}}"#).unwrap();
+        let env_name = format!(
+            "TICKOVER_TEST_AUTH_PATH_ENV_RELATIVE_{}",
+            std::process::id()
+        );
+        std::env::set_var(&env_name, "relative/credentials/dir");
+        let step = AuthStep {
+            path: Some(file.to_string_lossy().into_owned()),
+            path_env: Some(env_name.clone()),
+            path_env_join: Some(".credentials.json".to_string()),
+            token_json_path: Some("claudeAiOauth.accessToken".to_string()),
+            ..auth_step(AuthType::CredentialsFile)
+        };
+        let result = credentials_file_step(&step, &mut None);
+        std::env::remove_var(&env_name);
+        assert_eq!(
+            result,
+            Ok(Some("tok-fallback".to_string())),
+            "a relative path_env must be treated exactly as if it were unset — \
+             a credential is never read relative to this process's own \
+             working directory"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ── resolve_token: lapsed vs. no credentials at all ───────────────────
 
     /// A surface named a credential, and it had lapsed — a different fact
@@ -7358,7 +7569,7 @@ mod tests {
         let dir = temp_dir("cm-absent");
         let mut step = credentials_map_step_for(&dir, "{}");
         step.path = Some(dir.join("no-such-file.json").to_string_lossy().into_owned());
-        assert_eq!(credentials_map_step(&step), Ok(None));
+        assert_eq!(credentials_map_step(&step, &mut None), Ok(None));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -7370,7 +7581,7 @@ mod tests {
             r#"{"https://auth.x.ai::11111111-1111-1111-1111-111111111111":{"key":"tok-grok"}}"#,
         );
         assert_eq!(
-            credentials_map_step(&step),
+            credentials_map_step(&step, &mut None),
             Ok(Some("tok-grok".to_string()))
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -7381,7 +7592,7 @@ mod tests {
         let dir = temp_dir("cm-no-match");
         let step =
             credentials_map_step_for(&dir, r#"{"https://other.example::abc":{"key":"tok"}}"#);
-        let err = credentials_map_step(&step)
+        let err = credentials_map_step(&step, &mut None)
             .expect_err("a store that exists but names no matching entry must not be Absent");
         assert!(err.contains("https://auth.x.ai::"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
@@ -7399,7 +7610,8 @@ mod tests {
                 "https://auth.x.ai::22222222-2222-2222-2222-222222222222": {"key": "tok-b"}
             }"#,
         );
-        let err = credentials_map_step(&step).expect_err("ambiguous match must be a Present-err");
+        let err = credentials_map_step(&step, &mut None)
+            .expect_err("ambiguous match must be a Present-err");
         assert!(err.contains("more than one"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -7408,7 +7620,7 @@ mod tests {
     fn credentials_map_step_present_err_when_root_is_not_an_object() {
         let dir = temp_dir("cm-not-object");
         let step = credentials_map_step_for(&dir, r#"["not", "an", "object"]"#);
-        assert!(credentials_map_step(&step).is_err());
+        assert!(credentials_map_step(&step, &mut None).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -7416,7 +7628,7 @@ mod tests {
     fn credentials_map_step_present_err_when_json_broken() {
         let dir = temp_dir("cm-broken");
         let step = credentials_map_step_for(&dir, "not json");
-        assert!(credentials_map_step(&step).is_err());
+        assert!(credentials_map_step(&step, &mut None).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -7427,7 +7639,7 @@ mod tests {
             &dir,
             r#"{"https://auth.x.ai::11111111-1111-1111-1111-111111111111":{"other":"x"}}"#,
         );
-        let err = credentials_map_step(&step)
+        let err = credentials_map_step(&step, &mut None)
             .expect_err("a matched entry without the token field is Present-err");
         assert!(err.contains('`'), "{err}"); // names the token_json_path
         std::fs::remove_dir_all(&dir).ok();
@@ -7436,7 +7648,53 @@ mod tests {
     #[test]
     fn credentials_map_step_missing_required_field_is_error() {
         let step = auth_step(AuthType::CredentialsMap); // no path, no key_prefix, no token_json_path
-        assert!(credentials_map_step(&step).is_err());
+        assert!(credentials_map_step(&step, &mut None).is_err());
+    }
+
+    /// `expiry_json_path` on a `credentials-map` step is read from the
+    /// *matched entry*, the same as `credentials-file`/`keychain` read it
+    /// from their whole blob — a lapsed one resolves Absent rather than
+    /// handing back the stale token, and records the expiry in
+    /// `lapsed_expiry`.
+    #[test]
+    fn credentials_map_step_falls_through_and_marks_lapsed_when_the_token_has_expired() {
+        let dir = temp_dir("cm-expiry-lapsed");
+        let mut step = credentials_map_step_for(
+            &dir,
+            r#"{"https://auth.x.ai::11111111-1111-1111-1111-111111111111":
+                {"key":"tok-grok","expires_at":"2000-01-01T00:00:00Z"}}"#,
+        );
+        step.expiry_json_path = Some("expires_at".to_string());
+        let mut lapsed_expiry = None;
+        assert_eq!(
+            credentials_map_step(&step, &mut lapsed_expiry),
+            Ok(None),
+            "a lapsed expiry on the matched entry must fall through to Absent, \
+             not hand back the stale token"
+        );
+        assert!(
+            lapsed_expiry.is_some(),
+            "the lapsed expiry must be recorded for the renewal ping to key on"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn credentials_map_step_returns_the_token_when_the_expiry_has_not_lapsed() {
+        let dir = temp_dir("cm-expiry-current");
+        let mut step = credentials_map_step_for(
+            &dir,
+            r#"{"https://auth.x.ai::11111111-1111-1111-1111-111111111111":
+                {"key":"tok-grok","expires_at":"2999-01-01T00:00:00Z"}}"#,
+        );
+        step.expiry_json_path = Some("expires_at".to_string());
+        let mut lapsed_expiry = None;
+        assert_eq!(
+            credentials_map_step(&step, &mut lapsed_expiry),
+            Ok(Some("tok-grok".to_string()))
+        );
+        assert_eq!(lapsed_expiry, None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── electron-safe-storage step (up to, but not touching, the Keychain) ─

@@ -104,8 +104,11 @@ is handled by the app.
   `%APPDATA%\Microsoft\Windows\Start Menu\Programs`; an installer (Inno
   Setup, WiX) is the option if a full setup experience is ever wanted.
 - **Credentials.** The Claude CLI account reads live from
-  `~/.claude/.credentials.json`. The Credential Manager and DPAPI steps
-  compile and are reached, but are unexercised against a real credential.
+  `%USERPROFILE%\.claude\.credentials.json` — the only store the CLI writes
+  there, so this is Claude's whole auth chain on Windows; it declares no
+  Credential Manager step to fall back to. Antigravity's Credential Manager
+  step and Claude Desktop's DPAPI-decrypted Safe Storage step compile and
+  are reached, but are unexercised against a real credential.
 - **The plugin manager's dialogs** — import, remove, install approval,
   error alerts — are native message boxes and the common file picker.
 - `TICKOVER_SNAPSHOT` is switched off on Windows: the renderer's snapshot

@@ -146,12 +146,42 @@ pub(crate) const CAPABILITIES: &[Capability] = &[
         implemented: true,
         keys: &["windows.id"],
     },
+    // Copilot. A `[[balances]]` entry's own `used`/`cap`/`remaining` read as
+    // an ordinary numeric pair by default — right for a metered bucket, wrong
+    // for one the response has marked `unlimited = true`, which an older
+    // build would draw as `0 / 0`, indistinguishable from an exhausted quota
+    // rather than one with no ceiling at all.
+    //
+    // Listed *before* `reading-balances` below, not just alongside it: its
+    // own key nests inside `balances.*`, which `reading-balances`' own
+    // wildcard also matches, and the backward check below reports whichever
+    // capability it reaches first in this array — after `reading-balances`,
+    // a document setting only `balances.unlimited.path` would be refused in
+    // that capability's name instead of this one's, and
+    // `every_key_in_the_shipped_table_reaches_its_own_capability` catches
+    // exactly that shadowing.
+    Capability {
+        name: "balance-unlimited",
+        implemented: true,
+        keys: &["balances.unlimited.path"],
+    },
+    // Claude's `extra_usage`, which the response states whether or not the
+    // account has it enabled — an older build has no notion of drawing an
+    // entry conditionally, so it would show a disabled account's own zeroed
+    // (`null`) figures as a real, empty balance rather than no row at all.
+    // Ordered before `reading-balances` for the same shadowing reason as
+    // `balance-unlimited` just above.
+    Capability {
+        name: "balance-conditional",
+        implemented: true,
+        keys: &["balances.when.path"],
+    },
     // Balances. Figures against a calendar period — credits left, spent this
     // month — which a provider may report instead of, not only beside, its
     // windows. A build without this ignores `[[balances]]` entirely, and for a
-    // provider that reports nothing else (Grok states no window key at all)
-    // that is a section header with nothing under it: the app would say the
-    // account reported no usage while the provider was answering fine.
+    // provider whose manifest declares no `[[windows]]` at all that is a
+    // section header with nothing under it: the app would say the account
+    // reported no usage while the provider was answering fine.
     //
     // `balances.*` rather than `balances`: the whole section is new, so every
     // key inside it is unreadable to an older build, and naming them one by one
@@ -199,8 +229,9 @@ pub(crate) const CAPABILITIES: &[Capability] = &[
         ],
     },
     // Grok. `[[surface.auth]]`'s dotted-path grammar cannot select a
-    // credential keyed by an opaque per-install string
-    // (`"https://auth.x.ai::<uuid>"`, unique to the install): `json_path` and
+    // credential keyed by `"https://auth.x.ai::<client-id>"` — the part
+    // after `::` is xAI's own OAuth client id, a fixed value this login flow
+    // always uses, not one that varies by install: `json_path` and
     // `token_json_path` split on `.`, and `token_json_path`'s own fallback
     // list splits on `|` on top of that — neither can name a key that itself
     // holds dots and colons. `credentials-map` reads the top-level object at
@@ -264,6 +295,18 @@ pub(crate) const CAPABILITIES: &[Capability] = &[
         name: "keychain-expiry",
         implemented: true,
         keys: &["surface.auth.expiry_json_path"],
+    },
+    // Claude's CLI honours `CLAUDE_CONFIG_DIR` for where it keeps
+    // `.credentials.json`; a `credentials-file` step reading the fixed
+    // `~/.claude/...` path unconditionally misses that override entirely —
+    // not merely a stale figure, but the wrong file (or none) once the
+    // account has ever set it. An older build has no notion of `path_env`/
+    // `path_env_join` at all, so it would keep reading the un-overridden
+    // path and report the surface as signed out.
+    Capability {
+        name: "credentials-file-path-env",
+        implemented: true,
+        keys: &["surface.auth.path_env", "surface.auth.path_env_join"],
     },
     // Antigravity's hybrid, continued. `oauth-refresh` is the one auth step
     // that spends a credential instead of only reading one; an older build has

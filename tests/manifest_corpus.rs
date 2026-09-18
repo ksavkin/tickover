@@ -617,6 +617,24 @@ fn rules() -> Vec<Rule> {
             names: "present but blank",
         },
         Rule {
+            // `unlimited`/`when`'s own single required field is a plain
+            // `String`, not wrapped in the `Option<String>` the loop above
+            // walks — so its own blank check is a separate `return Err(`,
+            // not a free branch of the shared one. One rule, one site,
+            // shared by both fields — the `when.path` half of the same site
+            // is pinned separately, below the corpus proper (see
+            // `a_blank_when_path_is_refused_the_same_way_as_a_blank_unlimited_path`),
+            // since a second `Rule` here would count as a second refusal
+            // site against `the_corpus_has_a_line_for_every_rule_the_validator_enforces`.
+            says: "unlimited.path/when.path can be present and still be blank",
+            broken_by: plus(
+                &http_declaring(r#"["reading-balances", "balance-unlimited"]"#),
+                "[[balances]]\nlabel = \"Credits\"\n[balances.remaining]\nkind = \"text\"\n\
+                 path = \"credits.balance\"\n[balances.unlimited]\npath = \"   \"",
+            ),
+            names: "`unlimited.path` is present but blank",
+        },
+        Rule {
             // The label is the one key in an amount table the panel prints, so
             // a blank one is accepted and then quietly changes what pairs with
             // what — two rows where the author wrote a pair.
@@ -1288,6 +1306,41 @@ fn rules() -> Vec<Rule> {
             names: "unless_json_path",
         },
         Rule {
+            // `path_env`/`path_env_join` are `credentials_file_step`'s own
+            // fields (`auth::resolve_credentials_file_path`) — every other
+            // step kind never reads either, the same silent-no-op reasoning
+            // `expiry_json_path` is refused under above.
+            says: "path_env/path_env_join only mean something on a credentials-file step",
+            broken_by: changed(
+                &http_declaring(r#"["credentials-file-path-env"]"#),
+                "type            = \"credentials-file\"\npath            = \"~/.sample/auth.json\"\ntoken_json_path = \"token\"",
+                "type      = \"env\"\nvar       = \"SAMPLE_TOKEN\"\npath_env  = \"SAMPLE_CONFIG_DIR\"",
+            ),
+            names: "path_env",
+        },
+        Rule {
+            // Same shape as `[logfile] root_env_join`, and the same reason:
+            // it is joined onto `path_env`'s value, never used in its place.
+            says: "path_env_join is appended to path_env's value, not used in its place",
+            broken_by: changed(
+                &http_declaring(r#"["credentials-file-path-env"]"#),
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\npath_env         = \"SAMPLE_CONFIG_DIR\"\n\
+                 path_env_join    = \"/absolute\"",
+            ),
+            names: "relative",
+        },
+        Rule {
+            says: "path_env_join must not walk outside the directory path_env named",
+            broken_by: changed(
+                &http_declaring(r#"["credentials-file-path-env"]"#),
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\npath_env         = \"SAMPLE_CONFIG_DIR\"\n\
+                 path_env_join    = \"../escape\"",
+            ),
+            names: "..",
+        },
+        Rule {
             // `[surface.auth.client]` is `oauth-refresh`'s own sub-table; a
             // manifest that wrote it under a `credentials-file` step is not
             // asking for anything this app knows how to do with it.
@@ -1574,6 +1627,23 @@ fn every_rule_refuses_its_manifest_and_says_which_field() {
     }
 }
 
+/// The `when.path` half of the blank-path rule the `unlimited.path`/`when.path`
+/// row above exercises through `unlimited.path` alone — both fields share one
+/// `return Err(` site (see that rule's own comment), so pinning `when.path`
+/// too needs a manifest of its own rather than a second row in `rules()`,
+/// which would count as a second refusal site against
+/// `the_corpus_has_a_line_for_every_rule_the_validator_enforces`.
+#[test]
+fn a_blank_when_path_is_refused_the_same_way_as_a_blank_unlimited_path() {
+    let toml = plus(
+        &http_declaring(r#"["reading-balances", "balance-conditional"]"#),
+        "[[balances]]\nlabel = \"Credits\"\n[balances.remaining]\nkind = \"text\"\n\
+         path = \"credits.balance\"\n[balances.when]\npath = \"   \"",
+    );
+    let err = PluginManifest::from_str(&toml).expect_err("a blank when.path must be refused");
+    assert!(err.contains("`when.path` is present but blank"), "{err}");
+}
+
 // ── The other half: what must be accepted ────────────────────────────────
 
 #[test]
@@ -1648,13 +1718,28 @@ fn the_shipped_grok_manifest_is_accepted() {
     let m =
         PluginManifest::from_str(text).unwrap_or_else(|e| panic!("grok.toml must be valid: {e}"));
     assert_eq!(m.id, "grok");
-    // The whole reason [[balances]] exists: Grok states no window length, no
-    // percentage and no reset moment — only two figures against a monthly
-    // billing period.
-    assert!(
-        m.windows.is_empty(),
-        "Grok reports no windows, only balances"
+    // One window — the account's current weekly usage period, read straight
+    // off `creditUsagePercent`/`currentPeriod` — beside the two
+    // absolute-dollar balances the deprecated fields still back.
+    assert_eq!(m.windows.len(), 1);
+    let window = &m.windows[0];
+    assert_eq!(window.id, "grok-period");
+    assert_eq!(
+        window.role,
+        Role::Extra,
+        "a weekly credit-spend figure, not a subscription window — extra \
+         keeps its own label and stays out of the 5H/WK slots"
     );
+    assert!(
+        !window.required,
+        "an account on the deprecated fields alone reports none of these"
+    );
+    assert_eq!(
+        window.source.used_percent_path.as_deref(),
+        Some("config.creditUsagePercent")
+    );
+    assert_eq!(window.source.resets_at_path, "config.currentPeriod.end");
+    assert_eq!(window.source.resets_at_format, ResetsAtFormat::Iso8601);
     assert!(
         m.status.is_none(),
         "Grok states nothing about the quota as a whole"
@@ -1689,6 +1774,11 @@ fn the_shipped_grok_manifest_is_accepted() {
         "the entry is selected by this prefix — a wrong one finds no credential at all"
     );
     assert_eq!(step.token_json_path.as_deref(), Some("key"));
+    assert_eq!(
+        step.expiry_json_path.as_deref(),
+        Some("expires_at"),
+        "a lapsed token must fall through rather than be handed back stale"
+    );
 
     assert_eq!(m.balances.len(), 2);
     let prepaid = &m.balances[0];
@@ -1790,11 +1880,17 @@ fn the_shipped_antigravity_manifest_is_accepted() {
         ],
         "the refresh step needs Google's OAuth host allowed alongside the quota host"
     );
-    // Hybrid auth: an expiry-aware keychain step first, an oauth-refresh
-    // fallback second — the fresh token while Antigravity runs, a refresh when
-    // it has lapsed. Order matters: a keychain step that could not stand aside
-    // would stop the chain before the refresh ever ran.
-    assert_eq!(surface.auth.len(), 2, "keychain then oauth-refresh");
+    // Hybrid auth: an expiry-aware keychain step first (macOS), the same
+    // token read from Windows Credential Manager second, an oauth-refresh
+    // fallback third — the fresh token while Antigravity runs, a refresh
+    // when it has lapsed. Order matters: a keychain/win-credential step that
+    // could not stand aside would stop the chain before the refresh ever
+    // ran.
+    assert_eq!(
+        surface.auth.len(),
+        3,
+        "keychain, win-credential, oauth-refresh"
+    );
     let keychain = &surface.auth[0];
     assert_eq!(keychain.kind, AuthType::Keychain);
     assert_eq!(keychain.service.as_deref(), Some("gemini"));
@@ -1807,7 +1903,22 @@ fn the_shipped_antigravity_manifest_is_accepted() {
         Some("token.expiry"),
         "without an expiry path the keychain step cannot fall through to the refresh"
     );
-    let refresh = &surface.auth[1];
+    let win_credential = &surface.auth[1];
+    assert_eq!(win_credential.kind, AuthType::WinCredential);
+    assert_eq!(
+        win_credential.targets,
+        Some(vec!["gemini:antigravity".to_string()]),
+        "the same token, read from Windows' own native store"
+    );
+    assert_eq!(
+        win_credential.token_json_path.as_deref(),
+        Some("token.access_token")
+    );
+    assert_eq!(
+        win_credential.expiry_json_path.as_deref(),
+        Some("token.expiry")
+    );
+    let refresh = &surface.auth[2];
     assert_eq!(refresh.kind, AuthType::OauthRefresh);
     assert_eq!(
         refresh.path.as_deref(),
@@ -1876,6 +1987,8 @@ fn the_shipped_antigravity_manifest_is_accepted() {
         vec![
             "/Applications/Antigravity.app/Contents/Resources/bin/language_server".to_string(),
             "~/Applications/Antigravity.app/Contents/Resources/bin/language_server".to_string(),
+            "/Applications/Antigravity IDE.app/Contents/Resources/bin/language_server".to_string(),
+            "~/Applications/Antigravity IDE.app/Contents/Resources/bin/language_server".to_string(),
         ]
     );
     assert_eq!(client.bins, vec!["agy".to_string()]);
@@ -1949,9 +2062,9 @@ fn the_shipped_copilot_manifest_is_accepted() {
     let m = PluginManifest::from_str(text)
         .unwrap_or_else(|e| panic!("copilot.toml must be valid: {e}"));
     assert_eq!(m.id, "copilot");
-    // Like Grok and unlike everything else shipped: a monthly allowance, no
-    // rolling window anywhere in the response, and nothing stated about the
-    // standing of the quota as a whole.
+    // Unlike everything else shipped: a monthly allowance, no rolling window
+    // anywhere in the response, and nothing stated about the standing of the
+    // quota as a whole.
     assert!(
         m.windows.is_empty(),
         "Copilot reports no window, only a monthly allowance"
@@ -1969,14 +2082,14 @@ fn the_shipped_copilot_manifest_is_accepted() {
     // provider it cannot understand as one that reported nothing.
     // Membership, not order: the list is a set, and a manifest that swaps two
     // lines has changed nothing a reader cares about.
-    for capability in ["reading-balances", "credentials-map"] {
+    for capability in ["reading-balances", "credentials-map", "balance-unlimited"] {
         assert!(
             m.requires_reader.iter().any(|c| c == capability),
             "{capability} is load-bearing here — without it an older build reads this manifest \
              as one that states nothing"
         );
     }
-    assert_eq!(m.requires_reader.len(), 2, "and nothing else is claimed");
+    assert_eq!(m.requires_reader.len(), 3, "and nothing else is claimed");
     assert_eq!(m.menu_label, "Cp");
     assert_eq!(m.order, 50, "after the four that shipped before it");
 
@@ -2043,6 +2156,12 @@ fn the_shipped_copilot_manifest_is_accepted() {
     // pairing, and the panel would show two rows where one was meant.
     assert_eq!(remaining.unit_label.as_deref(), Some("interactions"));
     assert_eq!(cap.unit_label.as_deref(), Some("interactions"));
+    assert_eq!(
+        premium.unlimited.as_ref().map(|u| u.path.as_str()),
+        Some("quota_snapshots.premium_interactions.unlimited"),
+        "the same bucket this row otherwise reads as a numeric pair, marked \
+         unlimited when the response says so"
+    );
     assert!(
         premium.used.is_none(),
         "no spent figure is stated, and one derived here would be ours"
@@ -2101,8 +2220,8 @@ fn the_shipped_copilot_manifest_is_accepted() {
 /// The panel draws `remaining` and `cap` as one pair when a balance states no
 /// `used` — a rendering branch added for Copilot. Which other shipped rows it
 /// reaches is a question about the manifests, so it is answered here: none.
-/// Claude declares no balances at all, Codex's is a lone remainder, and Grok's
-/// two are a lone remainder and a used/cap pair.
+/// Claude's is a used/cap pair, Codex's is a lone remainder, and Grok's two
+/// are a lone remainder and a used/cap pair.
 #[test]
 fn only_copilot_declares_the_remainder_pair_the_panel_draws_as_one_line() {
     for (name, contents) in DEFAULT_TEMPLATES {

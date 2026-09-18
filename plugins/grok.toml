@@ -5,34 +5,85 @@
 # bearer token. It is unofficial and undocumented — if its shape changes,
 # update this file, not Rust code.
 #
-# This provider reports no window at all: no percentage, no reset moment,
-# nothing a 5H/WK row could draw. What it states instead is two figures
-# against a monthly billing period — a prepaid balance and a pay-as-you-go
-# allowance — which is exactly the shape [[balances]] exists for (see
-# docs/PLUGIN-ARCHITECTURE.md and `crate::plugin::manifest::BalanceConfig`),
-# and why this manifest declares no [[windows]] section.
+# The response states a proper window now (`config.creditUsagePercent`, 0-100,
+# and `config.currentPeriod` naming its bounds) alongside two absolute-dollar
+# figures — a prepaid balance and a pay-as-you-go allowance, the shape
+# [[balances]] exists for (see docs/PLUGIN-ARCHITECTURE.md and
+# `crate::plugin::manifest::BalanceConfig`) — against the account's monthly
+# billing cycle, a different period from the weekly one the window above
+# reads.
+# `creditUsagePercent`/`currentPeriod` supersede an older
+# `monthlyLimit`/`used`/`billingPeriodStart`/`billingPeriodEnd` pair xAI's own
+# client library still serves alongside them — so both are declared: the
+# window for the percent-and-reset figure, the two balances below unchanged,
+# reading the fields they always have.
 #
-# The response never states a scale for these figures — no minor-unit
-# exponent the way a proper money triplet would carry, and the Grok client's
-# own leading "$" is not something this response confirms. So both figures
-# read as `kind = "number"`, with no `unit_label`: guessing a currency or a
-# word this app cannot verify is exactly what the manifest schema exists to
-# refuse. Grok also states no standing for the account above these two
-# figures (no "blocked"/"allowed" of its own), hence no [status] either.
+# The two balance figures never state a scale — no minor-unit exponent the way
+# a proper money triplet would carry, and the Grok client's own leading "$" is
+# not something this response confirms. So both read as `kind = "number"`,
+# with no `unit_label`: guessing a currency or a word this app cannot verify
+# is exactly what the manifest schema exists to refuse. Grok also states no
+# standing for the account above these figures (no "blocked"/"allowed" of its
+# own), hence no [status].
 
 id           = "grok"
 name         = "Grok"
 menu_label   = "Gr"
 order        = 30
-# `[[balances]]` needs a reader that knows a provider can report a balance
-# instead of a window at all; the credential lives in a JSON object keyed by
-# a per-install string the plain dotted-path auth grammar cannot select. See
+# `[[windows]] id` needs a reader that keys a window by identity rather than
+# by position; `[[balances]]` needs one that knows a provider can report a
+# balance instead of a window at all; `credentials-map`, because the
+# credential lives in a JSON object keyed by a string the plain dotted-path
+# auth grammar cannot select; `keychain-expiry` is what lets the auth step
+# below tell a stale token from a working one. See
 # docs/PLUGIN-ARCHITECTURE.md, "Reader capabilities".
-requires_reader = ["reading-balances", "credentials-map"]
-version      = "1.0.0"
+requires_reader = ["window-identity", "reading-balances", "credentials-map", "keychain-expiry"]
+version      = "1.0.1"
 engine       = "http-api"
 refresh_secs = 60
 
+# The account's current weekly usage period, read directly rather than derived
+# from the two balances below. Not `required`: an account still served only the
+# deprecated `monthlyLimit`/`used`/`billingPeriodStart`/`billingPeriodEnd` pair
+# reports none of `creditUsagePercent`/`currentPeriod` at all, and the two
+# `[[balances]]` below still draw for it either way.
+#
+# `role = "extra"`, not `primary`: a primary window is captioned by its own
+# length — a week-long one reads "Weekly limit" — which would rename this
+# credit-spend figure into a rate limit it isn't. `extra` keeps the label
+# above, "Credits used", on the panel instead, and stays out of the menu
+# bar's 5H/WK slots, which are for a subscription's rolling window, not a
+# credit period's spend.
+#
+# `[windows.period]` is `assumed`, not `from_field`: `currentPeriod` states
+# its own start and end as two absolute timestamps, and this grammar has no
+# way to turn a pair of those into a length the way `from_field` reads one
+# stated directly (Codex's `limit_window_seconds`, say) — computing one from
+# `start`/`end` would be exactly the kind of derived figure this schema
+# otherwise refuses to invent. `10080` (a week) is read off `currentPeriod`'s
+# own `type` field on the one response measured
+# (`"USAGE_PERIOD_TYPE_WEEKLY"`), not off a stated duration — an account
+# billed monthly instead would draw a correct percent against a wrong
+# elapsed-tick, until this is switched to whatever field states the period's
+# own kind, if xAI ever exposes it in `[[windows]]`-readable form.
+[[windows]]
+id    = "grok-period"
+label = "Credits used"
+role  = "extra"
+[windows.period]
+mode    = "assumed"
+assumed = 10080
+[windows.source]
+used_percent_path = "config.creditUsagePercent"
+resets_at_path    = "config.currentPeriod.end"
+resets_at_format  = "iso8601"
+
+# The two dollar figures below run against the account's monthly billing
+# cycle (`history[].billingCycle` is a year/month pair), not the weekly
+# `currentPeriod` the window above reads — so the period end they show is
+# the cycle's own, even though xAI's client marks `billingPeriodEnd` itself
+# as superseded for the *limit* figures `currentPeriod` now carries.
+#
 # Prepaid credit — reported as what remains, not as used-against-a-cap.
 [[balances]]
 id    = "prepaid"
@@ -73,15 +124,26 @@ in_menu_bar   = true
 allowed_hosts = ["cli-chat-proxy.grok.com"]
 
 # `~/.grok/auth.json` keys each account's credentials by
-# "https://auth.x.ai::<uuid>" — a string unique to the install and unknowable
-# in advance, and one the existing dotted-path grammar cannot reach at all: a
-# `.` in `token_json_path` walks object keys, and this key has colons and
-# dots of its own (`json_path_str` / `credentials_file_step` in
-# `src/plugin/auth.rs`). `credentials-map` selects the one entry whose key
+# "https://auth.x.ai::<client-id>" — the part after `::` is xAI's own OAuth
+# client id, a fixed value this login flow always uses, not one that varies
+# by install. The existing dotted-path grammar still cannot reach a key in
+# this shape at all: a `.` in `token_json_path` walks object keys, and this
+# key has colons and dots of its own (`json_path_str` / `credentials_file_step`
+# in `src/plugin/auth.rs`). `credentials-map` selects the one entry whose key
 # starts with `key_prefix`, then reads `key` inside it exactly the way
-# `credentials-file` reads `token_json_path` inside the whole file.
+# `credentials-file` reads `token_json_path` inside the whole file — matching
+# by prefix rather than the full, in-principle-known key so a future rotation
+# of xAI's own client id does not silently stop matching.
+#
+# `expires_at` sits beside `key` in the matched entry (an RFC3339 string) —
+# past it, the credential is treated as lapsed rather than handed back stale,
+# the same as every other provider's auth chain. Past `expires_at` the row
+# reads "token expired — sign in again" without a request ever going out.
+# This manifest declares no `[ping]`, so nothing here renews that token —
+# only the user's own next `grok` login does.
 [[surface.auth]]
-type            = "credentials-map"
-path            = "~/.grok/auth.json"
-key_prefix      = "https://auth.x.ai::"
-token_json_path = "key"
+type              = "credentials-map"
+path              = "~/.grok/auth.json"
+key_prefix        = "https://auth.x.ai::"
+token_json_path   = "key"
+expiry_json_path  = "expires_at"

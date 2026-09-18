@@ -329,8 +329,15 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "claude.toml",
         id: "claude",
-        to_version: "1.4.3",
+        to_version: "1.4.4",
         previous_sha256: &[
+            // 1.4.3 — before the ping pinned a model, before the `extra_usage`
+            // balance, and before `[surface.auth] path_env` — the default
+            // model paid for a renewal ping's own tokens, a disabled
+            // account's extra-usage spend never drew a row, and
+            // `CLAUDE_CONFIG_DIR` installs read the wrong credentials file.
+            // sha256 of claude.toml as shipped at manifest version 1.4.3.
+            "0eb73f6ba01d25da9c1d9ab3987d54adf0245628d76267fd324ff5cb8b3172c1",
             // 1.4.2 — before the ping could renew a lapsed token.
             // sha256 of claude.toml as shipped at manifest version 1.4.2.
             "ebe934f6649fde24ab919d3e091a55006acc3e17f993a258f7f37d66dc06469c",
@@ -397,8 +404,13 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "grok.toml",
         id: "grok",
-        to_version: "1.0.0",
-        previous_sha256: &[],
+        to_version: "1.0.1",
+        previous_sha256: &[
+            // 1.0.0 — balances only, no [[windows]] and no expiry on the
+            // credentials-map step.
+            // sha256 of grok.toml as shipped at manifest version 1.0.0.
+            "ce23cd7fd9164aa691f7a6b61786e471f41b389b52e0b109ab259e5129523a66",
+        ],
         deliver_if_absent: true,
     },
     // antigravity.toml, updated: the installed-app pair its `oauth-refresh`
@@ -422,8 +434,14 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "antigravity.toml",
         id: "antigravity",
-        to_version: "1.1.2",
+        to_version: "1.1.3",
         previous_sha256: &[
+            // 1.1.2 — before the win-credential step and the `Antigravity
+            // IDE.app` discovery paths, so a Windows install never read the
+            // token the CLI stored, and a rename of the app bundle stopped
+            // client discovery from finding it.
+            // sha256 of antigravity.toml as shipped at manifest version 1.1.2.
+            "29c98277959a3d68ec7f5bcc5453af51a6db879475a031af0fce71bb8eb11bda",
             // 1.1.1 — the client id pattern admitted twelve digits, which
             // finds the wrong client.
             // sha256 of antigravity.toml as shipped at manifest version 1.1.1.
@@ -447,8 +465,12 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "copilot.toml",
         id: "copilot",
-        to_version: "1.0.1",
+        to_version: "1.0.2",
         previous_sha256: &[
+            // 1.0.1 — before `[balances.unlimited]`, so an unlimited
+            // premium bucket still drew `cap 0 / remaining 0`.
+            // sha256 of copilot.toml as shipped at manifest version 1.0.1.
+            "a18f9019849426a7396a5be96bf8cb6cc8a81068ed07e7c0f754f7d9efc42a20",
             // 1.0.0 — comments only: the measurements no longer point
             // outside this repository.
             // sha256 of copilot.toml as shipped at manifest version 1.0.0.
@@ -1234,7 +1256,7 @@ mod tests {
         assert_eq!(m.id, "claude");
         assert_eq!(m.engine, EngineKind::HttpApi);
         assert_eq!(
-            m.version, "1.4.3",
+            m.version, "1.4.4",
             "the version BUILTIN_UPGRADES migrates to"
         );
         assert_eq!(m.surface.len(), 2, "cli + desktop surfaces");
@@ -1287,15 +1309,20 @@ mod tests {
             .expect("cli surface present");
         assert!(!cli.opt_in);
         assert!(cli.in_menu_bar);
-        assert_eq!(
-            cli.auth.len(),
-            3,
-            "credentials-file -> keychain -> win-credential"
-        );
+        assert_eq!(cli.auth.len(), 2, "credentials-file -> keychain");
         assert!(
             cli.declares_token_expiry(),
             "the cli surface's credentials-file/keychain steps both declare \
              expiry_json_path, so it is the one this app's ping renews"
+        );
+        assert_eq!(
+            cli.auth[0].path_env.as_deref(),
+            Some("CLAUDE_CONFIG_DIR"),
+            "the credentials-file step honours the CLI's own override"
+        );
+        assert_eq!(
+            cli.auth[0].path_env_join.as_deref(),
+            Some(".credentials.json")
         );
 
         for w in &m.windows {
@@ -1322,6 +1349,31 @@ mod tests {
             .find(|w| w.label == "WK")
             .expect("WK window");
         assert_eq!(wk.period.assumed, Some(10080));
+
+        let ping = m.ping.as_ref().expect("claude.toml declares [ping]");
+        assert_eq!(ping.bin, "claude");
+        assert_eq!(
+            ping.args,
+            vec!["-p", "hello", "--model", "haiku"],
+            "the ping pins the cheapest model by the CLI's own alias, not a \
+             dated snapshot id — starting the window and renewing the token \
+             do not need the account's default one, and an alias keeps \
+             resolving after the snapshot it names today is retired"
+        );
+        assert!(ping.renews_token);
+
+        assert_eq!(
+            m.balances.len(),
+            1,
+            "extra usage, gated on the account having it"
+        );
+        let extra_usage = &m.balances[0];
+        assert_eq!(extra_usage.id, "extra-usage");
+        assert_eq!(
+            extra_usage.when.as_ref().map(|w| w.path.as_str()),
+            Some("extra_usage.is_enabled"),
+            "a disabled account's own null figures must not draw an empty row"
+        );
     }
 
     #[test]

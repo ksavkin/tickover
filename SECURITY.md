@@ -113,6 +113,15 @@ prompt, spending a little real quota, which is why it exists and why it is
 fires on a window reset or a lapsed token, not on a click. What it sends is
 between that CLI and its provider; this app neither sees nor logs it.
 
+Antigravity's manifest declares no `[ping]` at all, deliberately. Google has
+confirmed banning accounts for third-party tools and proxies driving
+Antigravity's underlying quota, with the ban reported to cascade to Gemini
+CLI / Code Assist on the same account — see this
+[gemini-cli discussion](https://github.com/google-gemini/gemini-cli/discussions/20632) —
+a risk none of the bounds above (the toggle, the floor, the confirmation
+dialog) actually removes, since they all assume the provider tolerates being
+pinged at all.
+
 ### Neither list contains
 
 No telemetry, no crash reporting, no analytics, and nothing on a timer against
@@ -141,8 +150,9 @@ command with your user's privileges. Four things bound it: the toggle is
 **off unless you turn it on**, per plugin, in Settings; the window trigger
 never fires before the window it targets has actually started, and neither
 trigger fires more than once every ten minutes regardless of what a
-manifest's own numbers claim — a renewal is bound tighter still, offered at
-most once per distinct token per surface — which is what stops a
+manifest's own numbers claim — a renewal is bound tighter still: once per
+distinct token per surface when the run succeeds, up to three attempts,
+ten minutes apart, when it keeps failing — which is what stops a
 misconfigured or malicious manifest from turning this into a loop; it runs
 in a directory created fresh for that one command, normally under the OS
 temp directory and removed once the command exits, so there is nothing
@@ -185,9 +195,13 @@ sections "Auth chain semantics" and "Security".
   credential source named above, and the ping command line — and then a
   person decides, which is the part no code here can do for them.
 - **The Windows Credential Manager and DPAPI steps are unexercised against a
-  real credential.** On Windows 11 (x86_64, MSVC) the Credential Manager
-  (`CredRead`) and DPAPI desktop-token steps compile and are reached, but
-  neither has run against an item actually sitting in either store.
+  real credential.** On Windows 11 (x86_64, MSVC) Antigravity's Credential
+  Manager (`CredRead`, `gemini:antigravity`) step and Claude Desktop's
+  DPAPI-decrypted Safe Storage step compile and are reached, but neither has
+  run against an item actually sitting in either store. Claude's own CLI
+  surface declares no Credential Manager step on Windows — the CLI writes
+  only `%USERPROFILE%\.claude\.credentials.json` there, and that file is
+  where its chain stops.
 - **The Antigravity token exchange needs an OAuth client id and secret, and
   this repository does not carry them.** The manifest declares where the
   installed Antigravity client keeps its own pair (the `language_server`

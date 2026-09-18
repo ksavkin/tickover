@@ -74,7 +74,10 @@ token at all, so a step behind it in the chain still gets its turn. With
 nothing behind it to catch that, the chain reports the token as lapsed
 rather than merely missing — the distinction that drives both the row's
 "token expired — renews on the next `<bin>` run" text and the renewal ping
-(`[ping] renews_token`).
+(`[ping] renews_token`). Without a renewing ping — no `[ping]` at all, or
+`renews_token` left `false` — a lapsed token still keeps its row on screen,
+reading "token expired — sign in again" instead; only a credential that
+resolves Absent with nothing behind it to catch it hides a row.
 
 Tokens live in memory for the request that uses them and are never written
 to disk. The one step that spends a credential, `oauth-refresh`, exists
@@ -153,7 +156,8 @@ surfaces on one plugin can lapse on independent schedules. It shares the
 window trigger's ten-minute floor, plus a bound of its own: a
 per-surface `LAST_RENEWED_FOR` table stops a token the CLI cannot itself
 renew from being pinged again every ten minutes forever, so a renewal fires
-at most once per distinct token per surface.
+once per distinct token per surface when the run succeeds, and up to three
+attempts, ten minutes apart, when it keeps ending without success.
 
 ## Keeping the folder honest
 

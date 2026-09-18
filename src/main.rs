@@ -1824,16 +1824,19 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                             });
                     // Shares `PING_MIN_INTERVAL_SECS`'s floor with the
                     // window ping below, plus its own bound on top: at
-                    // most one ping per distinct token *per surface*
-                    // (`LAST_RENEWED_FOR` is keyed by surface reading id,
-                    // not by plugin — two renewal-eligible surfaces on
-                    // one plugin lapsing independently each get their
-                    // own once-per-token bound rather than overwriting
-                    // one another's), never one every ten minutes for as
-                    // long as a token the CLI cannot renew either stays
-                    // unrenewed. Silent when suppressed — logging it
-                    // would repeat every tick for exactly the token this
-                    // exists to stop pinging about.
+                    // most `RENEWAL_MAX_ATTEMPTS` pings per distinct token
+                    // *per surface* (`LAST_RENEWED_FOR` is keyed by surface
+                    // reading id, not by plugin — two renewal-eligible
+                    // surfaces on one plugin lapsing independently each get
+                    // their own budget rather than overwriting one
+                    // another's), and only that many when a run keeps
+                    // ending without success — a run that exits 0 stops at
+                    // one, the same once-per-token bound as before. Never
+                    // one every ten minutes forever, for as long as a token
+                    // the CLI genuinely cannot renew stays unrenewed. Silent
+                    // when suppressed — logging it would repeat every tick
+                    // for exactly the token this exists to stop pinging
+                    // about.
                     //
                     // `credit_renewal` runs *before* `send_ping`, not
                     // after: `Command::spawn`'s own failure is reported
@@ -3306,17 +3309,23 @@ fn readings_with(
             owners.push(m.id.as_str());
         }
     }
-    // The bare slot belongs to the first plugin with a *window*, not merely the
-    // first with a reading. What the flag licenses is printing this provider's
-    // numbers without its label — and the numbers in that title are window
-    // percentages. A balances-only provider (Grok reports no window at all)
-    // contributes none, so handing it the slot would leave the lone remaining
-    // provider printing `Cl 94/23` where it used to print `94/23`, and Grok
-    // alone would print the bare word `Limits` beside a live account.
+    // The bare slot belongs to the first plugin with a window that can
+    // actually print in the title, not merely the first with a reading or
+    // with any window at all. What the flag licenses is printing this
+    // provider's numbers without its label — and the numbers in that title
+    // are `Primary`/`Secondary` window percentages only (`menu_bar_title`'s
+    // own `chunk_pair` reads through `primary_window`/`secondary_window`,
+    // both role-filtered). A provider that reports only balances (Copilot's
+    // premium allowance) or only an `Extra`-role window (Grok's
+    // billing-period credit usage — a real window, just not a subscription
+    // one) contributes no title numbers either way, so handing it the slot
+    // would leave the lone remaining provider printing `Cl 94/23` where it
+    // used to print `94/23`, and such an account alone would print the bare
+    // word `Limits`.
     let bare_plugin_id = owners
         .iter()
         .zip(out.iter())
-        .find(|(_, r)| !r.windows.is_empty())
+        .find(|(_, r)| r.windows.iter().any(|w| w.role != Role::Extra))
         .map(|(owner, _)| *owner);
     for (r, owner) in out.iter_mut().zip(owners.iter()) {
         r.bare_when_sole = Some(*owner) == bare_plugin_id;
@@ -3370,9 +3379,12 @@ fn drop_surface_reading(cache: &PluginCache, plugin_id: &str, surface_id: &str) 
 /// *flaps* speaks once per disappearance — the honest count, rather than a
 /// promise of one that a latch would have to keep.
 ///
-/// This is not the expired-token case. A token that is present and no longer
-/// accepted comes back 401, which keeps the row and writes
-/// `engine_http::UNAUTHORIZED` on it. This is the credential being **gone**.
+/// This is not the expired-token case, in either of its two shapes. A token
+/// that is present and no longer accepted comes back 401, which keeps the
+/// row and writes `engine_http::UNAUTHORIZED` on it; a token whose own
+/// declared expiry has already passed, with no ping able to renew it, keeps
+/// the row too and writes `engine_http::LAPSED` instead — the user still has
+/// a credential, just a stale one. This is the credential being **gone**.
 fn credentials_just_lost<'a>(
     previous: &[ProviderReading],
     now: &'a [ProviderReading],
@@ -3958,6 +3970,42 @@ fn ping_due(
         .is_some_and(|start| pinged_at.saturating_add(PING_GRACE_SECS) < start)
 }
 
+/// How many renewal attempts one distinct `TokenRenewal` value may spend —
+/// see [`renewal_ping_due`]. A run that exits `0` never spends one of these
+/// at all (it keeps the older, once-per-token rule below this bound); only a
+/// run that ends without success (a non-zero exit, a deadline kill, or a
+/// failure to spawn the CLI in the first place — see [`RenewalPingOutcome`])
+/// counts against it. Three, not one, because a run can fail for a reason
+/// that has nothing to do with the token itself (a transient network error,
+/// the CLI momentarily unable to reach its own auth endpoint) and a single
+/// bad run must not condemn a token to going unrenewed until it lapses
+/// differently; not unbounded, because a token this app genuinely cannot
+/// renew (the CLI itself needs an interactive login) must still stop being
+/// retried rather than spend a process every floor forever.
+const RENEWAL_MAX_ATTEMPTS: u8 = 3;
+
+/// [`LAST_RENEWED_FOR`]'s per-surface memory of one `TokenRenewal`'s renewal
+/// attempts — replaces a bare `TokenRenewal` now that a lapsed token may be
+/// retried rather than pinged exactly once. `renewal` is what the classic
+/// once-per-token dedup still compares (a different value always resets
+/// `attempts`/`last_run_failed`, the same as the old bare-value memory did);
+/// `attempts` counts how many runs [`credit_renewal`] has started for this
+/// exact `renewal`, capped in practice at [`RENEWAL_MAX_ATTEMPTS`] by
+/// [`renewal_ping_due`] refusing anything past it; `last_run_failed` is set
+/// by [`report_renewal_outcome`] once the most recent attempt's fate is
+/// known, and is what tells [`renewal_ping_due`] a retry is wanted at all —
+/// a run that is still in flight, or that exited `0`, leaves it `false`
+/// (crediting an attempt always clears it first; only a report of an
+/// unsuccessful end sets it), which is what keeps a successful renewal (or
+/// one whose outcome this app never hears back from) at the original
+/// once-per-token bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenewalRecord {
+    renewal: TokenRenewal,
+    attempts: u8,
+    last_run_failed: bool,
+}
+
 /// Whether a renewal ping (see `[ping] renews_token`,
 /// `model::TokenRenewal`) is due — the floor it shares with [`ping_due`]
 /// ([`PING_MIN_INTERVAL_SECS`]), *and* a bound `ping_due` has no equivalent
@@ -3966,22 +4014,21 @@ fn ping_due(
 /// every ten minutes for as long as the token stayed unrenewed — forever, if
 /// the CLI cannot renew it either (its own refresh token has expired too,
 /// say, and it now needs an interactive login). `renewal` (the *current*
-/// reading's own `TokenRenewal`) and `last_renewed_for` (the reading the
-/// *last fired* renewal ping named, `main.rs`'s own in-memory memory of it —
-/// see [`LAST_RENEWED_FOR`]) answer that: due only once per distinct
-/// reading, however many ticks it keeps naming the same one. Compared as
-/// the whole `TokenRenewal` value (it is `Copy`/`Eq`) rather than an
-/// extracted `u64`, so `Lapsed { expires_at: 42 }` and
-/// `Unauthorized { token_hash: 42 }` can never be mistaken for the same
-/// key merely because the numbers inside them happen to collide.
+/// reading's own `TokenRenewal`) and `stored` (this reading's own
+/// [`RenewalRecord`] in `main.rs`'s in-memory memory of it — see
+/// [`LAST_RENEWED_FOR`]) answer that: due once per distinct reading — or,
+/// once `stored.last_run_failed` says the one attempt already spent on it
+/// did not succeed, due again for as long as `stored.attempts` has not yet
+/// reached [`RENEWAL_MAX_ATTEMPTS`]. `renewal` is compared against
+/// `stored.renewal` as the whole `TokenRenewal` value (it is `Copy`/`Eq`)
+/// rather than an extracted `u64`, so `Lapsed { expires_at: 42 }` and
+/// `Unauthorized { token_hash: 42 }` can never be mistaken for the same key
+/// merely because the numbers inside them happen to collide.
 ///
-/// `renewal == last_renewed_for` alone would wrongly treat "neither side has
-/// one" as a match — both `None`, which is not "the same token pinged
-/// again" but "nothing to dedup on". Guarded by `renewal.is_some()`, so that
-/// case falls straight through to the floor instead — defensive rather than
-/// reachable today, since every `TokenRenewal` variant this is actually
-/// called for carries a comparable value (`TokenRenewal::No` never reaches
-/// here — see [`classify_renewal`]'s own doc).
+/// A different `renewal` than `stored.renewal` is always due (subject to the
+/// floor) regardless of `stored`'s own attempt count — a token that lapsed
+/// again after being renewed, or renewed a different way, starts its own
+/// budget rather than inheriting what an unrelated earlier lapse spent.
 ///
 /// `pinged_at` is clamped to `now` first for the same reason `ping_due`
 /// clamps it: a `config.json` hand-edited into the future must not read as
@@ -3990,43 +4037,43 @@ fn renewal_ping_due(
     pinged_at: u64,
     now: u64,
     renewal: Option<TokenRenewal>,
-    last_renewed_for: Option<TokenRenewal>,
+    stored: Option<RenewalRecord>,
 ) -> bool {
-    if renewal.is_some() && renewal == last_renewed_for {
-        return false;
+    if let (Some(renewal), Some(stored)) = (renewal, stored) {
+        let retry_allowed = stored.last_run_failed && stored.attempts < RENEWAL_MAX_ATTEMPTS;
+        if renewal == stored.renewal && !retry_allowed {
+            return false;
+        }
     }
     now.saturating_sub(pinged_at.min(now)) >= PING_MIN_INTERVAL_SECS
 }
 
-/// Per-surface memory of the `TokenRenewal` a renewal ping was last
+/// Per-surface memory of the [`RenewalRecord`] a renewal ping was last
 /// credited for — read and written only by [`renewal_ping_due`]'s caller,
 /// never by that pure function itself. Credited by [`credit_renewal`]
 /// *before* an attempt runs, not after (see that function's own doc for
-/// why), and undone by [`uncredit_renewal`] if the attempt turns out never
-/// to have actually run — so what this remembers is not quite "fired for"
-/// so much as "credited and not yet un-credited", the two being
-/// indistinguishable once an attempt has genuinely succeeded. Keyed by
-/// *surface* reading id (`main.rs::surface_reading_id`, e.g. `"claude-cli"`),
-/// not by plugin id: a plugin with two renewal-eligible surfaces can have
-/// two tokens lapsing on independent schedules, and one shared slot would
-/// let recording one surface's renewal silently overwrite — and so
-/// re-arm — the other's, even though its own token never changed. Stores
-/// the whole `TokenRenewal` value, not an extracted `u64`: `Lapsed` and
-/// `Unauthorized` are stored and compared as the distinct variants they are,
-/// so a lapsed-chain expiry and a 401's token hash can never be read as the
-/// same key merely because the numbers inside them happen to match.
+/// why), marked failed by [`report_renewal_outcome`] once the attempt's own
+/// fate is known, and undone entirely by [`uncredit_renewal`] if the attempt
+/// turns out never to have actually run at all — so what this remembers is
+/// not quite "the outcome of the last attempt" so much as "credited, and
+/// what is known about it since". Keyed by *surface* reading id
+/// (`main.rs::surface_reading_id`, e.g. `"claude-cli"`), not by plugin id: a
+/// plugin with two renewal-eligible surfaces can have two tokens lapsing on
+/// independent schedules, and one shared slot would let recording one
+/// surface's renewal silently overwrite — and so re-arm — the other's, even
+/// though its own token never changed.
 /// In-memory only, unlike `config::plugin_pinged_at`: it exists purely to
-/// stop a token that stays unrenewed from being pinged again every ten
-/// minutes forever (see [`renewal_ping_due`]'s own doc). Losing it on
-/// restart costs one extra ping, never a missing one — once the CLI does
-/// renew the token, its declared expiry (or, after a 401, the token itself)
-/// changes, and a later lapse is a different value that pings again
-/// regardless of what this remembers.
-static LAST_RENEWED_FOR: Mutex<Option<HashMap<String, TokenRenewal>>> = Mutex::new(None);
+/// bound how many times a token that stays unrenewed gets retried (see
+/// [`renewal_ping_due`]'s own doc). Losing it on restart costs at most
+/// [`RENEWAL_MAX_ATTEMPTS`] extra pings, never a missing one — once the CLI
+/// does renew the token, its declared expiry (or, after a 401, the token
+/// itself) changes, and a later lapse is a different value that starts a
+/// fresh budget regardless of what this remembers.
+static LAST_RENEWED_FOR: Mutex<Option<HashMap<String, RenewalRecord>>> = Mutex::new(None);
 
-/// The `TokenRenewal` [`LAST_RENEWED_FOR`] remembers a renewal ping firing
-/// for, if any, for one surface reading id — see that static's own doc.
-fn last_renewed_for(surface_key: &str) -> Option<TokenRenewal> {
+/// The [`RenewalRecord`] [`LAST_RENEWED_FOR`] remembers for one surface
+/// reading id, if any — see that static's own doc.
+fn last_renewed_for(surface_key: &str) -> Option<RenewalRecord> {
     LAST_RENEWED_FOR
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -4034,49 +4081,115 @@ fn last_renewed_for(surface_key: &str) -> Option<TokenRenewal> {
         .and_then(|m| m.get(surface_key).copied())
 }
 
-/// Records `renewal` in [`LAST_RENEWED_FOR`] for `surface_key` — see that
-/// static's own doc. Called *before* [`send_ping`] is even asked to attempt
-/// anything (right after `config::set_plugin_pinged_at`, at the tick's one
-/// call site that credits a renewal at all), never after: `Command::spawn`'s
-/// own failure happens asynchronously, on [`spawn_hello`]'s background
-/// thread, and can run — and call [`uncredit_renewal`] — before the tick's
-/// own thread would otherwise get around to crediting anything. Crediting
-/// first, unconditionally, and un-crediting afterward on whichever side
-/// notices the run never actually happened (the tick itself, if
-/// `send_ping` returns `false`; the background thread, if `Command::spawn`
-/// fails inside it) is the only ordering of the two that cannot lose:
-/// crediting *after* risks landing behind an uncredit that found nothing
-/// yet to undo, which leaves the credit in place over a renewal that never
-/// ran — the token is then never retried, exactly the indefinite-repeat
-/// bound this whole mechanism exists to prevent, reintroduced from the
-/// other direction.
-fn credit_renewal(surface_key: &str, renewal: TokenRenewal) {
-    LAST_RENEWED_FOR
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(HashMap::new)
-        .insert(surface_key.to_string(), renewal);
+/// Records an attempt at `renewal` in [`LAST_RENEWED_FOR`] for
+/// `surface_key`, returning both the [`RenewalRecord`] that stood there
+/// before this call (`None` if nothing did) and the one just stored — read
+/// and written under the same lock acquisition, so a caller that needs both
+/// never has to pair this with a separate, separately-timed
+/// [`last_renewed_for`] read of its own (see [`run_renewal_ping`]'s own doc
+/// for why that separate read is unsafe). Starts `attempts` at `1` with
+/// `last_run_failed = false` when nothing was recorded yet, or when what was
+/// recorded named a *different* `renewal` (a fresh token gets its own fresh
+/// budget); adds one to the existing `attempts` (still clearing
+/// `last_run_failed`) when the record already named this exact `renewal` —
+/// a retry [`renewal_ping_due`] only allowed because the previous attempt
+/// had ended without success.
+///
+/// Called *before* [`send_ping`] is even asked to attempt anything (right
+/// after `config::set_plugin_pinged_at`, at the tick's one call site that
+/// credits a renewal at all), never after: `Command::spawn`'s own failure
+/// happens asynchronously, on [`spawn_hello`]'s background thread, and can
+/// run — and call [`report_renewal_outcome`] — before the tick's own thread
+/// would otherwise get around to crediting anything. Crediting first,
+/// unconditionally, and correcting afterward on whichever side notices what
+/// actually happened, is the only ordering of the two that cannot lose:
+/// crediting *after* risks landing behind a report that found nothing yet
+/// to update, which leaves this attempt looking like it never ran at all.
+fn credit_renewal(
+    surface_key: &str,
+    renewal: TokenRenewal,
+) -> (Option<RenewalRecord>, RenewalRecord) {
+    let mut guard = LAST_RENEWED_FOR.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    let previous = map.get(surface_key).copied();
+    let attempts = match previous {
+        Some(prev) if prev.renewal == renewal => prev.attempts.saturating_add(1),
+        _ => 1,
+    };
+    let record = RenewalRecord {
+        renewal,
+        attempts,
+        last_run_failed: false,
+    };
+    map.insert(surface_key.to_string(), record);
+    (previous, record)
 }
 
-/// Undoes [`credit_renewal`] for `surface_key`, but only if the value
-/// recorded there is still exactly `renewal` — never an unconditional
-/// removal. Called from two places, both only after [`credit_renewal`] has
-/// already run for this exact attempt (see that function's own doc for why
-/// the ordering is guaranteed): the tick's own thread, when `send_ping`
-/// returns `false` (no working directory, `find_bin` came up empty, or the
-/// background thread itself failed to start — nothing will ever run to
-/// notice the credit on this attempt's behalf otherwise); and
-/// [`spawn_hello`]'s background thread, when `Command::spawn` fails inside
-/// it (a binary that exists but can't actually be executed — permission
-/// denied, wrong architecture). The equality check is what keeps either
-/// caller safe regardless of exactly when it runs: a later tick's own
-/// successful renewal of the *same surface* (a different `TokenRenewal`)
-/// must never be erased by a failure report about a wholly earlier attempt.
-fn uncredit_renewal(surface_key: &str, renewal: TokenRenewal) {
+/// Marks the [`RenewalRecord`] [`credit_renewal`] stored for `surface_key`
+/// as failed, so a later tick's [`renewal_ping_due`] can allow a retry — but
+/// only if that record still equals `credited` in full (`renewal`,
+/// `attempts` and `last_run_failed` together), the exact value
+/// [`credit_renewal`] returned for this attempt — the same whole-record
+/// guard [`uncredit_renewal`] already uses, and for the same reason: a later
+/// credit for a *different* signal on the same surface, or a later attempt
+/// at the same `renewal` (a higher `attempts`, from a retry this report
+/// predates), must never be marked failed by a report about a wholly earlier
+/// attempt. Comparing only `renewal` would miss that second case — two
+/// attempts at the same lapsed token share one `renewal` value and differ
+/// only in `attempts`. [`spawn_hello`] calls this for every outcome its own
+/// run can end in — both where `Command::spawn` itself fails and where
+/// [`run_with_deadline`] returns — and this function is what returns early,
+/// before ever taking the lock, for the one outcome that must leave
+/// `last_run_failed` alone: [`RenewalPingOutcome::Exited`] with a success
+/// status, which is exactly what keeps a successfully renewed token at the
+/// original once-per-token bound.
+fn report_renewal_outcome(surface_key: &str, credited: RenewalRecord, outcome: RenewalPingOutcome) {
+    if matches!(outcome, RenewalPingOutcome::Exited(status) if status.success()) {
+        return;
+    }
     let mut guard = LAST_RENEWED_FOR.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = guard.as_mut() {
-        if map.get(surface_key) == Some(&renewal) {
-            map.remove(surface_key);
+        if let Some(record) = map.get_mut(surface_key) {
+            if *record == credited {
+                record.last_run_failed = true;
+            }
+        }
+    }
+}
+
+/// Undoes [`credit_renewal`] for `surface_key`, restoring whatever
+/// [`RenewalRecord`] `previous` says stood there before it — `None` when
+/// nothing did, in which case the entry is removed outright rather than
+/// left at some record that was never genuinely there. Never an
+/// unconditional write: only applied if the entry still holds exactly
+/// `credited`, the [`RenewalRecord`] [`credit_renewal`] itself just
+/// returned for this attempt. That equality check is what keeps this safe
+/// regardless of exactly when it runs relative to anything else touching
+/// this key — a later tick's own genuine attempt (a different `attempts`
+/// count, even for the same `renewal`) is never erased by an undo about a
+/// wholly earlier one.
+///
+/// Called from exactly one place — the tick's own thread, when `send_ping`
+/// returns `false` (no working directory, `find_bin` came up empty, or the
+/// background thread itself failed to start, so nothing will ever run to
+/// report an outcome on this attempt's behalf at all). A `Command::spawn`
+/// failure *inside* [`spawn_hello`]'s background thread is not this case any
+/// more — a binary that exists but can't actually be executed (permission
+/// denied, wrong architecture) is a real attempt that ended without
+/// success, reported through [`report_renewal_outcome`] instead so it still
+/// spends part of the retry budget rather than being retried forever.
+fn uncredit_renewal(surface_key: &str, credited: RenewalRecord, previous: Option<RenewalRecord>) {
+    let mut guard = LAST_RENEWED_FOR.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut() {
+        if map.get(surface_key) == Some(&credited) {
+            match previous {
+                Some(previous) => {
+                    map.insert(surface_key.to_string(), previous);
+                }
+                None => {
+                    map.remove(surface_key);
+                }
+            }
         }
     }
 }
@@ -4115,7 +4228,7 @@ enum RenewalOutcome {
 
 /// [`RenewalOutcome`] for one surface's reading: `None`, or
 /// `Some(TokenRenewal::No)`, reads as [`RenewalOutcome::NotWanted`];
-/// otherwise `renewal` is compared against `last_renewed_for` through
+/// otherwise `renewal` is compared against `stored` through
 /// [`renewal_ping_due`] to tell [`RenewalOutcome::Suppressed`] from
 /// [`RenewalOutcome::Due`]. `TokenRenewal::No` inside `Some` cannot reach
 /// the `Suppressed`/`Due` branches through the tick's own scan (which only
@@ -4126,13 +4239,13 @@ fn classify_renewal(
     renewal: Option<TokenRenewal>,
     pinged_at: u64,
     now: u64,
-    last_renewed_for: Option<TokenRenewal>,
+    stored: Option<RenewalRecord>,
 ) -> RenewalOutcome {
     let renewal = match renewal {
         Some(TokenRenewal::No) | None => return RenewalOutcome::NotWanted,
         Some(renewal) => renewal,
     };
-    if renewal_ping_due(pinged_at, now, Some(renewal), last_renewed_for) {
+    if renewal_ping_due(pinged_at, now, Some(renewal), stored) {
         RenewalOutcome::Due { renewal }
     } else {
         RenewalOutcome::Suppressed
@@ -4156,10 +4269,11 @@ fn classify_renewal(
 /// `TokenRenewal` of the first one [`classify_renewal`] finds
 /// [`RenewalOutcome::Due`], if any — `None` otherwise, whether because
 /// nothing was wanted or because every surface that wanted a renewal is
-/// still on cooldown (the tick's own caller treats both the same: nothing
-/// to do). At most one ping fires per tick regardless of how many surfaces
-/// are eligible, the same floor `renewal_ping_due` already enforces per
-/// surface.
+/// still on cooldown, whether for the shared floor or for having just spent
+/// its own [`RENEWAL_MAX_ATTEMPTS`] budget (the tick's own caller treats
+/// every reason the same: nothing to do). At most one ping fires per tick
+/// regardless of how many surfaces are eligible, the same floor
+/// `renewal_ping_due` already enforces per surface.
 ///
 /// The surface keys `surfaces` carries in are reading ids
 /// (`main.rs::surface_reading_id`), which the loaded plugin set already
@@ -4171,7 +4285,7 @@ fn classify_renewal_across_surfaces(
     surfaces: impl IntoIterator<Item = (String, Option<TokenRenewal>)>,
     pinged_at: u64,
     now: u64,
-    last_renewed_for: impl Fn(&str) -> Option<TokenRenewal>,
+    last_renewed_for: impl Fn(&str) -> Option<RenewalRecord>,
 ) -> Option<(String, TokenRenewal)> {
     for (surface_key, renewal) in surfaces {
         let last = last_renewed_for(&surface_key);
@@ -4428,7 +4542,7 @@ fn provider_data_from_reading(
         .map(quota_notice)
         .unwrap_or_default();
     // A balance row is exactly as much "usage reported" as a window row is —
-    // Grok never reports a window at all, so a section gated on `windows`
+    // Copilot never reports a window at all, so a section gated on `windows`
     // alone would show "no usage reported yet" over its own stated balance
     // forever. Both counts feed the same guard.
     let nothing_to_draw = windows.row_count() == 0 && balances.row_count() == 0;
@@ -4826,6 +4940,9 @@ fn balance_rows(r: &ProviderReading, now: u64) -> Vec<(String, BalanceData)> {
 /// label beside empty space reads as a rendering fault, exactly what
 /// `Balance::is_stated` exists to keep off the panel at parse time — and
 /// this dedup can produce that same emptiness at render time just as easily.
+///
+/// `b.unlimited` short-circuits the used/cap/remaining pairing below to a
+/// single "Unlimited" caption — see that field's own doc.
 fn balance_data(now: u64, b: &Balance, quota_blocked: bool) -> Option<BalanceData> {
     let mut lines = Vec::new();
     // Which of the two pairs this balance has, if either: a ceiling with what
@@ -4833,7 +4950,16 @@ fn balance_data(now: u64, b: &Balance, quota_blocked: bool) -> Option<BalanceDat
     // once, because the answer decides both what the first line says and
     // whether `remaining` still needs a line of its own.
     let remainder_paired = b.remainder_pair_is_comparable();
-    if b.pair_is_comparable() {
+    // The provider stated this bucket has no ceiling at all — drawn as a
+    // caption of its own, not a used/cap pair: `used`/`cap`/`remaining` are
+    // never populated for an unlimited balance
+    // (`plugin::engine_http::build_balance`), so without this branch the
+    // pairing logic below would see nothing to draw and drop the row
+    // entirely — turning the "0/0 reads as exhausted" ambiguity `unlimited`
+    // exists to resolve into a row that simply vanishes instead.
+    if b.unlimited {
+        lines.push("Unlimited".to_string());
+    } else if b.pair_is_comparable() {
         // `pair_is_comparable` already established both are `Some` — asked
         // again as `if let` rather than assumed with `.unwrap()`, because
         // that guarantee lives in a method this function does not re-derive.
@@ -6122,6 +6248,39 @@ enum RunOutcome {
     Unwaitable(std::io::Error),
 }
 
+/// What a renewal-eligible ping's run resolved to, for
+/// [`report_renewal_outcome`] — every [`RunOutcome`] a spawned command can
+/// reach, plus [`Self::SpawnFailed`] for the one failure that happens
+/// *before* a [`RunOutcome`] can even exist: `Command::spawn` itself
+/// erroring inside [`spawn_hello`]'s background thread, which never produces
+/// a child to wait on at all. Only [`Self::Exited`] can be a success — a
+/// non-zero status, same as [`Self::Killed`]/[`Self::Unwaitable`]/
+/// [`Self::SpawnFailed`], counts against [`RENEWAL_MAX_ATTEMPTS`].
+#[derive(Debug, Clone, Copy)]
+enum RenewalPingOutcome {
+    /// `Command::spawn` failed inside [`spawn_hello`]'s background thread —
+    /// a binary that exists but could not actually be executed (permission
+    /// denied, wrong architecture).
+    SpawnFailed,
+    /// The process ran and exited, successfully or not.
+    Exited(std::process::ExitStatus),
+    /// It outlived [`PING_DEADLINE`] and was killed.
+    Killed,
+    /// Waiting on it failed; its own fate could not be determined, so it is
+    /// treated the same as [`Self::Killed`] — not a success.
+    Unwaitable,
+}
+
+impl From<&RunOutcome> for RenewalPingOutcome {
+    fn from(outcome: &RunOutcome) -> Self {
+        match outcome {
+            RunOutcome::Exited(status) => RenewalPingOutcome::Exited(*status),
+            RunOutcome::Killed => RenewalPingOutcome::Killed,
+            RunOutcome::Unwaitable(_) => RenewalPingOutcome::Unwaitable,
+        }
+    }
+}
+
 /// Kill `child` and, on unix, everything else sharing its process group —
 /// which is only ever the group [`spawn_hello`] put it in alone via
 /// `process_group(0)` at spawn time, pgid equal to its own pid. A plain
@@ -6320,22 +6479,26 @@ fn run_with_deadline(mut child: std::process::Child, deadline: Duration) -> (Run
 /// itself runs on that background thread, so its own outcome is not known
 /// synchronously either — the same uncertainty [`send_ping`]'s own caller
 /// already tolerates for the window ping (`config::set_plugin_pinged_at` is
-/// recorded before a run that might not start either). For the renewal
-/// call site, which credits [`LAST_RENEWED_FOR`] *before* calling this (see
+/// recorded before a run that might not start either). For the renewal call
+/// site, which credits [`LAST_RENEWED_FOR`] *before* calling this (see
 /// [`credit_renewal`]'s own doc for why), this return is what tells it
-/// whether that credit needs undoing itself: `false` means nothing else
-/// will ever run to notice it on this attempt's behalf, so the caller must
-/// [`uncredit_renewal`] right away. For the one failure this leaves
-/// uncovered — `Command::spawn` itself failing inside the thread, an
-/// existing-but-unexecutable binary (permission denied, wrong architecture)
-/// — `on_renewal_spawn_failure`, when given, is called from inside the
-/// thread at exactly that point instead, undoing the same credit from the
-/// other side (see [`uncredit_renewal`]). `None` for the window ping, which
-/// has no renewal credit to undo.
+/// whether that credit needs undoing itself: `false` means nothing else will
+/// ever run to notice it on this attempt's behalf, so the caller must
+/// [`uncredit_renewal`] right away. For every way the run itself can end
+/// once it does start — `Command::spawn` failing inside the thread, a plain
+/// exit, a deadline kill, a wait that failed — `on_renewal_outcome`, when
+/// given, is reported through [`report_renewal_outcome`] from inside the
+/// thread at the point each becomes known, so a run that started but did not
+/// succeed still spends part of [`RENEWAL_MAX_ATTEMPTS`] rather than being
+/// retried forever. Carries the exact [`RenewalRecord`] [`credit_renewal`]
+/// returned for this attempt, not just its `renewal` value —
+/// `report_renewal_outcome` guards on the whole record, so this is what it
+/// has to be handed back with, `attempts` and all. `None` for the window
+/// ping, which has no renewal record to update.
 fn spawn_hello(
     bin: std::path::PathBuf,
     args: Vec<String>,
-    on_renewal_spawn_failure: Option<(String, TokenRenewal)>,
+    on_renewal_outcome: Option<(String, RenewalRecord)>,
 ) -> bool {
     let Some(cwd) = ping_cwd() else {
         diag::line(format!(
@@ -6392,14 +6555,17 @@ fn spawn_hello(
                 // assumed, the same way it is at every other exit from this
                 // closure.
                 cleanup_ping_workdir(&cwd);
-                if let Some((surface_key, renewal)) = on_renewal_spawn_failure {
-                    uncredit_renewal(&surface_key, renewal);
+                if let Some((surface_key, credited)) = &on_renewal_outcome {
+                    report_renewal_outcome(surface_key, *credited, RenewalPingOutcome::SpawnFailed);
                 }
                 return;
             }
         };
 
         let (outcome, raw) = run_with_deadline(child, PING_DEADLINE);
+        if let Some((surface_key, credited)) = &on_renewal_outcome {
+            report_renewal_outcome(surface_key, *credited, RenewalPingOutcome::from(&outcome));
+        }
         let quoted = match quotable(&raw) {
             why if why.is_empty() => String::new(),
             why => format!(": {why}"),
@@ -6453,20 +6619,19 @@ fn spawn_hello(
 /// cannot be found at all, otherwise [`spawn_hello`]'s own result. The
 /// window-ping call site ignores it (`config::set_plugin_pinged_at` is
 /// already recorded before this runs, by design — see that call site's own
-/// comment) and passes `on_renewal_spawn_failure = None`; the renewal call
-/// site does not ignore the return — it has already [`credit_renewal`]-ed
-/// this exact `(surface_key, renewal)` pair before calling this at all, and
-/// a `false` here means nothing else will ever run to notice that credit,
-/// so the caller undoes it itself. It also passes the same pair on as
-/// `on_renewal_spawn_failure`, so [`spawn_hello`] can undo the same credit
-/// from the other side if `Command::spawn` itself fails a moment later,
-/// inside its own thread — see that parameter's own doc.
+/// comment) and passes `on_renewal_outcome = None`; the renewal call site
+/// does not ignore the return — it has already [`credit_renewal`]-ed this
+/// exact `(surface_key, credited)` pair before calling this at all, and a
+/// `false` here means nothing else will ever run to notice that credit, so
+/// the caller undoes it itself. It also passes the same pair on as
+/// `on_renewal_outcome`, so [`spawn_hello`] can report how the run actually
+/// ended once it does start — see that parameter's own doc.
 fn send_ping(
     ping: &manifest::PingConfig,
-    on_renewal_spawn_failure: Option<(String, TokenRenewal)>,
+    on_renewal_outcome: Option<(String, RenewalRecord)>,
 ) -> bool {
     match find_bin(&ping.bin) {
-        Some(bin) => spawn_hello(bin, ping.args.clone(), on_renewal_spawn_failure),
+        Some(bin) => spawn_hello(bin, ping.args.clone(), on_renewal_outcome),
         None => {
             diag::line(format!("auto-ping: {} binary not found", ping.bin));
             false
@@ -6479,15 +6644,34 @@ fn send_ping(
 ///
 /// If the attempt never actually starts (`send_ping` returns `false`, e.g. an
 /// unresolvable binary or a thread the OS refused to hand out), both are
-/// undone — the credit via [`uncredit_renewal`], same as before, and
-/// `plugin_pinged_at` restored to whatever it held on entry. Leaving it at
-/// `now` would silence the *window* ping the tick loop tries right after
-/// this for a full `PING_MIN_INTERVAL_SECS`, over a renewal attempt that
-/// never ran anything.
+/// undone — the credit via [`uncredit_renewal`] (restoring whatever
+/// [`RenewalRecord`] stood for this surface before [`credit_renewal`] ran a
+/// moment ago), and `plugin_pinged_at` restored to whatever it held on
+/// entry. Leaving it at `now` would silence the *window* ping the tick loop
+/// tries right after this for a full `PING_MIN_INTERVAL_SECS`, over a
+/// renewal attempt that never ran anything. A run that *does* start and
+/// later fails is not undone here at all — [`spawn_hello`] reports that
+/// outcome itself, asynchronously, through [`report_renewal_outcome`], which
+/// spends part of the attempt's own budget instead of erasing it.
+///
+/// `previous` — what [`uncredit_renewal`] restores if this attempt turns
+/// out not to have started — comes from [`credit_renewal`]'s own return,
+/// not a separate [`last_renewed_for`] read taken just before it: the two
+/// must come from the same lock acquisition, or a [`report_renewal_outcome`]
+/// landing on [`spawn_hello`]'s background thread in the gap between a
+/// separate read and the credit would be invisible to a `previous` already
+/// captured stale — and a later undo restoring that stale value would erase
+/// the report's own update rather than the credit it was meant to undo.
 ///
 /// Returns whether an attempt was made — the tick loop's own `if let` used
 /// to run this inline; pulled out so a test can drive it without a live
 /// `[ping]` process.
+///
+/// `send_ping` is handed `credited` itself, not `renewal` — `spawn_hello`'s
+/// eventual [`report_renewal_outcome`] call guards on the whole
+/// [`RenewalRecord`], `attempts` included, so it has to be given back the
+/// exact value this attempt was credited under, the same one passed to
+/// [`uncredit_renewal`] on the line below.
 fn run_renewal_ping(
     plugin_id: &str,
     ping: &manifest::PingConfig,
@@ -6497,14 +6681,14 @@ fn run_renewal_ping(
 ) -> bool {
     let pinged_at_before = config::plugin_pinged_at(plugin_id);
     config::set_plugin_pinged_at(plugin_id, now);
-    credit_renewal(&surface_key, renewal);
+    let (previous, credited) = credit_renewal(&surface_key, renewal);
     diag::line(format!(
         "auto-ping: {plugin_id} token has lapsed, running {} to renew it",
         ping.bin
     ));
-    let spawned = send_ping(ping, Some((surface_key.clone(), renewal)));
+    let spawned = send_ping(ping, Some((surface_key.clone(), credited)));
     if !spawned {
-        uncredit_renewal(&surface_key, renewal);
+        uncredit_renewal(&surface_key, credited, previous);
         config::set_plugin_pinged_at(plugin_id, pinged_at_before);
     }
     spawned
@@ -8063,6 +8247,24 @@ mod title_tests {
     }
 
     #[test]
+    fn an_extra_window_keeps_its_own_label_even_at_a_weekly_length() {
+        // A billing-period credit-spend figure at a week-long length is not
+        // a rate limit — captioning it "Weekly limit" the way a Primary
+        // window's own length would rename it into one, which is exactly
+        // what `Role::Extra` exists to refuse.
+        assert_eq!(
+            window_title_of("Credits used", Role::Extra, Some(10_080)),
+            "Credits used"
+        );
+        assert_eq!(
+            window_title_of("Credits used", Role::Primary, Some(10_080)),
+            "Weekly limit",
+            "the same label and length as Primary is captioned by the length instead — \
+             the reason a credit-spend window is not declared Primary"
+        );
+    }
+
+    #[test]
     fn a_primary_window_with_a_weekly_length_gets_a_dated_reset_clock() {
         // `window_title` already names this "Weekly limit" from its length
         // alone, independent of role — `window_data`'s own `weekly` flag
@@ -8909,11 +9111,19 @@ mod title_tests {
 
     #[test]
     fn a_provider_with_only_balances_does_not_take_the_bare_tray_slot() {
-        // Grok reports no window at all — measured, both response shapes — so
-        // it contributes nothing to the tray title's numbers. If it took the
-        // bare slot anyway, the provider that *does* print numbers would start
-        // printing them with its label back on (`Cx 96/80` where it used to
-        // print `96/80`), and a lone Grok would render the bare word "Limits".
+        // A reading whose windows are cleared (a stand-in for a
+        // balances-only provider — Copilot's paid plan is one) contributes
+        // nothing to the tray title's numbers. If it took the bare slot
+        // anyway, the provider that *does* print numbers would start
+        // printing them with its label back on (`Cx 96/80` where the bare
+        // slot would otherwise print `96/80`), and a lone balances-only
+        // provider would render the bare word "Limits". Grok's real manifest
+        // keeps its own window out of the menu-bar title *and* out of the
+        // bare slot — it is `role = "extra"`, and neither `chunk_pair`
+        // (title numbers) nor the bare-slot search above admits anything
+        // but a `primary`/`secondary` window; see
+        // `an_extra_only_reading_does_not_take_the_bare_tray_slot_either`
+        // for that second claim on Grok's own shape rather than this stub.
         let plugins = vec![stub_manifest("grok", 5), stub_manifest("codex", 10)];
         let mut cache = HashMap::new();
         let mut balances_only = stub_reading("grok");
@@ -8930,6 +9140,7 @@ mod title_tests {
             stated_percent: None,
             period_end: None,
             limit_reached: None,
+            unlimited: false,
         }];
         cache.insert("grok".to_string(), vec![balances_only]);
         cache.insert("codex".to_string(), vec![stub_reading("codex")]);
@@ -8942,6 +9153,35 @@ mod title_tests {
         assert!(
             out.iter().find(|r| r.id == "codex").unwrap().bare_when_sole,
             "the slot goes to the first provider that actually reports a window"
+        );
+    }
+
+    /// Grok's own shape, not the cleared-windows stub above: a real
+    /// `role = "extra"` window is present, so `!r.windows.is_empty()` alone
+    /// would wrongly seat it — the gap the bare-slot search's `Role::Extra`
+    /// filter exists to close. An `extra` window prints no title numbers
+    /// (`menu_bar_title`'s `chunk_pair` reads only `primary`/`secondary`),
+    /// so a lower-order provider reporting only one must not take the slot
+    /// from a higher-order provider that reports an actual subscription
+    /// window.
+    #[test]
+    fn an_extra_only_reading_does_not_take_the_bare_tray_slot_either() {
+        let plugins = vec![stub_manifest("grok", 5), stub_manifest("codex", 10)];
+        let mut cache = HashMap::new();
+        let mut extra_only = stub_reading("grok");
+        extra_only.windows = vec![win("Credits used", Role::Extra, 1.0, 100, 10_080)];
+        cache.insert("grok".to_string(), vec![extra_only]);
+        cache.insert("codex".to_string(), vec![stub_reading("codex")]);
+
+        let out = readings(&plugins, &cache);
+        assert!(
+            !out.iter().find(|r| r.id == "grok").unwrap().bare_when_sole,
+            "an extra-role window prints no title numbers, so it must not \
+             take the slot"
+        );
+        assert!(
+            out.iter().find(|r| r.id == "codex").unwrap().bare_when_sole,
+            "the slot goes to the first provider with a primary/secondary window"
         );
     }
 
@@ -10002,6 +10242,7 @@ mod title_tests {
             stated_percent: None,
             period_end: None,
             limit_reached: None,
+            unlimited: false,
         };
 
         let data = balance_data(NOW, &b, false).expect("used/cap alone is still something to draw");
@@ -10133,6 +10374,46 @@ mod title_tests {
         );
     }
 
+    /// The panel side of `Balance::unlimited`: drawn as its own caption, and
+    /// never as `0 / 0` — even when the manifest also read numeric fields
+    /// that happen to resolve to zero (the shape `engine_http::build_balance`
+    /// never actually produces, since it skips them for an unlimited bucket,
+    /// but this function has no way to see that and must not depend on it).
+    #[test]
+    fn an_unlimited_balance_draws_as_a_caption_never_as_a_zeroed_pair() {
+        let zero = tickover::model::BalanceAmount::Number {
+            value: 0.0,
+            unit: Some("interactions".into()),
+        };
+        let b = tickover::model::Balance {
+            cap: Some(zero.clone()),
+            remaining: Some(zero),
+            unlimited: true,
+            ..empty_balance("Premium")
+        };
+
+        let data = balance_data(NOW, &b, false).expect("unlimited is itself something to draw");
+
+        assert_eq!(data.amount_line, "Unlimited");
+        assert!(
+            data.percent_line.is_empty(),
+            "an unlimited bucket states no percentage of a ceiling it doesn't have"
+        );
+        for field in [
+            &data.label,
+            &data.amount_line,
+            &data.percent_line,
+            &data.period_line,
+            &data.notice,
+        ] {
+            assert!(
+                !field.contains('0'),
+                "the zeroed cap/remaining a manifest might still resolve must never reach any \
+                 line in the row: {field:?}"
+            );
+        }
+    }
+
     fn empty_balance(label: &str) -> tickover::model::Balance {
         tickover::model::Balance {
             key: format!("{label}:"),
@@ -10143,6 +10424,7 @@ mod title_tests {
             stated_percent: None,
             period_end: None,
             limit_reached: None,
+            unlimited: false,
         }
     }
 
@@ -12381,8 +12663,21 @@ mod title_tests {
         );
     }
 
-    /// The bound this follow-up exists for: a lapsed token that stays
-    /// lapsed must be pinged once, not once every floor forever.
+    /// A [`RenewalRecord`] standing for "already credited once and still
+    /// waiting to hear back, or already succeeded" — the shape most of the
+    /// tests below need to stand in for `stored`, without each spelling out
+    /// `attempts`/`last_run_failed` by hand.
+    fn renewed(renewal: TokenRenewal) -> RenewalRecord {
+        RenewalRecord {
+            renewal,
+            attempts: 1,
+            last_run_failed: false,
+        }
+    }
+
+    /// The bound the retry budget exists for: a lapsed token whose one
+    /// attempt is still standing (never reported failed) must be pinged
+    /// once, not once every floor forever.
     #[test]
     fn renewal_ping_due_fires_once_per_distinct_lapsed_expiry() {
         let first = TokenRenewal::Lapsed {
@@ -12396,15 +12691,16 @@ mod title_tests {
             "a new expiry, never pinged for: due (once the floor allows it)"
         );
         assert!(
-            !renewal_ping_due(NOW, NOW + 600, Some(first), Some(first)),
-            "the same expiry already pinged for: not due, whatever the floor says"
+            !renewal_ping_due(NOW, NOW + 600, Some(first), Some(renewed(first))),
+            "the same expiry, its one attempt still unreported: not due, \
+             whatever the floor says"
         );
         assert!(
-            !renewal_ping_due(NOW, NOW + 60, Some(first), Some(first)),
+            !renewal_ping_due(NOW, NOW + 60, Some(first), Some(renewed(first))),
             "still not due even well inside the floor — the dedup is checked first"
         );
         assert!(
-            renewal_ping_due(NOW, NOW + 600, Some(later), Some(first)),
+            renewal_ping_due(NOW, NOW + 600, Some(later), Some(renewed(first))),
             "a later, different expiry — the CLI renewed and then lapsed again: due"
         );
     }
@@ -12427,11 +12723,11 @@ mod title_tests {
             "a 401 never renewed for before: due (once the floor allows it)"
         );
         assert!(
-            !renewal_ping_due(NOW, NOW + 600, Some(seen), Some(seen)),
+            !renewal_ping_due(NOW, NOW + 600, Some(seen), Some(renewed(seen))),
             "the same token's 401 already pinged for: not due"
         );
         assert!(
-            renewal_ping_due(NOW, NOW + 600, Some(different), Some(seen)),
+            renewal_ping_due(NOW, NOW + 600, Some(different), Some(renewed(seen))),
             "a different token_hash — the credential changed: due again"
         );
         assert!(
@@ -12439,11 +12735,52 @@ mod title_tests {
                 NOW,
                 NOW + 600,
                 Some(TokenRenewal::Lapsed { expires_at: 42 }),
-                Some(seen),
+                Some(renewed(seen)),
             ),
             "a Lapsed expiry and an Unauthorized token_hash sharing the same \
              number are not the same value — never wrongly deduped against \
              each other"
+        );
+    }
+
+    /// The retry budget's own bound: a run that ended without success is
+    /// retried once the shared floor passes again — up to
+    /// [`RENEWAL_MAX_ATTEMPTS`] times for the same token, never past it.
+    #[test]
+    fn renewal_ping_due_allows_a_retry_after_a_failed_run() {
+        let lapsed = TokenRenewal::Lapsed {
+            expires_at: 1_700_000_000,
+        };
+        let failed_once = RenewalRecord {
+            renewal: lapsed,
+            attempts: 1,
+            last_run_failed: true,
+        };
+        assert!(
+            renewal_ping_due(NOW, NOW + 600, Some(lapsed), Some(failed_once)),
+            "the one attempt so far ended without success: a retry is due \
+             once the floor passes"
+        );
+        assert!(
+            !renewal_ping_due(NOW, NOW + 599, Some(lapsed), Some(failed_once)),
+            "still inside the floor, even though the run failed"
+        );
+    }
+
+    #[test]
+    fn renewal_ping_due_refuses_a_retry_once_the_budget_is_spent() {
+        let lapsed = TokenRenewal::Lapsed {
+            expires_at: 1_700_000_000,
+        };
+        let exhausted = RenewalRecord {
+            renewal: lapsed,
+            attempts: RENEWAL_MAX_ATTEMPTS,
+            last_run_failed: true,
+        };
+        assert!(
+            !renewal_ping_due(NOW, NOW + 600, Some(lapsed), Some(exhausted)),
+            "RENEWAL_MAX_ATTEMPTS already spent on this exact token: no more \
+             retries, however long past the floor"
         );
     }
 
@@ -12476,9 +12813,10 @@ mod title_tests {
             RenewalOutcome::Suppressed,
             "still inside PING_MIN_INTERVAL_SECS: suppressed, not not-wanted"
         );
-        // Past the floor, but already renewed for this exact expiry.
+        // Past the floor, but already renewed for this exact expiry, and
+        // that one attempt has not been reported failed.
         assert_eq!(
-            classify_renewal(Some(lapsed), NOW, NOW + 600, Some(lapsed)),
+            classify_renewal(Some(lapsed), NOW, NOW + 600, Some(renewed(lapsed))),
             RenewalOutcome::Suppressed
         );
         // Past the floor, never renewed for this key: due, carrying it.
@@ -12506,7 +12844,7 @@ mod title_tests {
         let surfaces = [("a".to_string(), Some(a)), ("b".to_string(), Some(b))];
         // A's own key is already recorded; B's key never has been.
         let outcome = classify_renewal_across_surfaces(surfaces, NOW, NOW + 600, |key| {
-            (key == "a").then_some(a)
+            (key == "a").then(|| renewed(a))
         });
         assert_eq!(
             outcome,
@@ -12527,7 +12865,7 @@ mod title_tests {
         // renewal to look up, so its own key must not be asked to agree.
         assert_eq!(
             classify_renewal_across_surfaces(surfaces, NOW, NOW + 600, |key| {
-                (key == "a").then_some(a)
+                (key == "a").then(|| renewed(a))
             }),
             None,
             "every surface either carries no signal or is already renewed \
@@ -12576,7 +12914,7 @@ mod title_tests {
         // the shared floor again: "claude-cli" now reads its own key back
         // and is suppressed, but "codex" was never recorded under *its* own
         // key, so it is due — "claude-cli"'s record never touches it.
-        let recorded_only_for_cli = |key: &str| (key == "claude-cli").then_some(a);
+        let recorded_only_for_cli = |key: &str| (key == "claude-cli").then(|| renewed(a));
         let second =
             classify_renewal_across_surfaces(surfaces(), NOW, NOW + 1200, recorded_only_for_cli);
         assert_eq!(
@@ -12588,13 +12926,67 @@ mod title_tests {
     }
 
     #[test]
+    fn credit_renewal_starts_a_fresh_token_at_one_attempt() {
+        let surface_key = format!("test-credit-fresh-{}", std::process::id());
+        let renewal = TokenRenewal::Lapsed { expires_at: 42 };
+        let (_, credited) = credit_renewal(&surface_key, renewal);
+        assert_eq!(
+            credited,
+            RenewalRecord {
+                renewal,
+                attempts: 1,
+                last_run_failed: false,
+            }
+        );
+        assert_eq!(last_renewed_for(&surface_key), Some(credited));
+    }
+
+    #[test]
+    fn credit_renewal_increments_attempts_for_a_retry_of_the_same_token() {
+        let surface_key = format!("test-credit-retry-{}", std::process::id());
+        let renewal = TokenRenewal::Lapsed { expires_at: 43 };
+        let (_, first_credit) = credit_renewal(&surface_key, renewal);
+        report_renewal_outcome(&surface_key, first_credit, RenewalPingOutcome::SpawnFailed);
+        let (_, credited) = credit_renewal(&surface_key, renewal);
+        assert_eq!(
+            credited,
+            RenewalRecord {
+                renewal,
+                attempts: 2,
+                last_run_failed: false,
+            },
+            "crediting a retry both adds to the count and clears the failed flag"
+        );
+    }
+
+    #[test]
+    fn credit_renewal_resets_attempts_for_a_different_token() {
+        let surface_key = format!("test-credit-reset-{}", std::process::id());
+        let first = TokenRenewal::Lapsed { expires_at: 44 };
+        let second = TokenRenewal::Lapsed { expires_at: 45 };
+        let (_, first_credit) = credit_renewal(&surface_key, first);
+        report_renewal_outcome(&surface_key, first_credit, RenewalPingOutcome::SpawnFailed);
+        let (_, credited) = credit_renewal(&surface_key, second);
+        assert_eq!(
+            credited,
+            RenewalRecord {
+                renewal: second,
+                attempts: 1,
+                last_run_failed: false,
+            },
+            "a lapse the CLI renewed and then lapsed again differently starts \
+             its own fresh budget rather than inheriting the earlier one's"
+        );
+    }
+
+    #[test]
     fn credit_and_uncredit_renewal_round_trip() {
         let surface_key = format!("test-credit-roundtrip-{}", std::process::id());
         let renewal = TokenRenewal::Lapsed { expires_at: 42 };
         assert_eq!(last_renewed_for(&surface_key), None);
-        credit_renewal(&surface_key, renewal);
-        assert_eq!(last_renewed_for(&surface_key), Some(renewal));
-        uncredit_renewal(&surface_key, renewal);
+        let (_, credited) = credit_renewal(&surface_key, renewal);
+        assert_eq!(last_renewed_for(&surface_key), Some(credited));
+        uncredit_renewal(&surface_key, credited, None);
         assert_eq!(last_renewed_for(&surface_key), None);
     }
 
@@ -12602,19 +12994,269 @@ mod title_tests {
     fn uncredit_renewal_only_clears_the_exact_value_it_was_given() {
         let surface_key = format!("test-uncredit-exact-{}", std::process::id());
         let renewal = TokenRenewal::Lapsed { expires_at: 42 };
-        let other = TokenRenewal::Lapsed { expires_at: 99 };
-        credit_renewal(&surface_key, renewal);
+        let other = renewed(TokenRenewal::Lapsed { expires_at: 99 });
+        let (_, credited) = credit_renewal(&surface_key, renewal);
         // A stale or unrelated uncredit report must never erase a credit it
         // does not name — the same guard that protects a newer, genuine
-        // renewal from a late failure report about an earlier attempt.
-        uncredit_renewal(&surface_key, other);
+        // renewal from an undo about an earlier attempt.
+        uncredit_renewal(&surface_key, other, None);
         assert_eq!(
             last_renewed_for(&surface_key),
-            Some(renewal),
+            Some(credited),
             "an uncredit naming a different value must leave the real one alone"
         );
-        uncredit_renewal(&surface_key, renewal);
+        uncredit_renewal(&surface_key, credited, None);
         assert_eq!(last_renewed_for(&surface_key), None);
+    }
+
+    /// `uncredit_renewal`'s `previous` argument, not just its `credited`
+    /// guard: undoing a retry's own credit must put the surface back exactly
+    /// where it stood — still failed, still short of the budget — not erase
+    /// the earlier failed attempt along with the retry that never ran.
+    #[test]
+    fn uncredit_renewal_restores_whatever_stood_there_before_this_credit() {
+        let surface_key = format!("test-uncredit-restores-previous-{}", std::process::id());
+        let renewal = TokenRenewal::Lapsed { expires_at: 46 };
+        let (_, first_credit) = credit_renewal(&surface_key, renewal);
+        report_renewal_outcome(&surface_key, first_credit, RenewalPingOutcome::SpawnFailed);
+
+        let (previous, credited) = credit_renewal(&surface_key, renewal);
+        assert_eq!(
+            previous,
+            Some(RenewalRecord {
+                renewal,
+                attempts: 1,
+                last_run_failed: true,
+            }),
+            "sanity: the setup above must leave exactly one failed attempt \
+             behind, or the restore assertion below proves nothing"
+        );
+        uncredit_renewal(&surface_key, credited, previous);
+        assert_eq!(
+            last_renewed_for(&surface_key),
+            previous,
+            "the retry never ran, so the record must read exactly as it did \
+             before this credit — one failed attempt, not zero and not two"
+        );
+    }
+
+    /// The three outcomes [`report_renewal_outcome`] treats as "not a
+    /// success" — each spends the attempt `credit_renewal` already counted,
+    /// rather than clearing it.
+    #[test]
+    fn report_renewal_outcome_marks_failed_for_every_non_success_outcome() {
+        let cases: [(&str, RenewalPingOutcome); 3] = [
+            ("spawn-failed", RenewalPingOutcome::SpawnFailed),
+            ("killed", RenewalPingOutcome::Killed),
+            ("unwaitable", RenewalPingOutcome::Unwaitable),
+        ];
+        for (label, outcome) in cases {
+            let surface_key = format!("test-report-failed-{label}-{}", std::process::id());
+            let renewal = TokenRenewal::Lapsed { expires_at: 47 };
+            let (_, credited) = credit_renewal(&surface_key, renewal);
+            report_renewal_outcome(&surface_key, credited, outcome);
+            assert_eq!(
+                last_renewed_for(&surface_key),
+                Some(RenewalRecord {
+                    last_run_failed: true,
+                    ..credited
+                }),
+                "{label}: attempts must stand, last_run_failed must flip"
+            );
+        }
+    }
+
+    /// [`RenewalPingOutcome::from`] is the conversion `spawn_hello`'s
+    /// background thread actually calls at its one call site — every case
+    /// above constructs a [`RenewalPingOutcome`] directly, which proves
+    /// [`report_renewal_outcome`]'s own logic but never proves this mapping
+    /// runs true. [`RunOutcome::Killed`] and [`RunOutcome::Unwaitable`] need
+    /// no process to exist first, so both are asserted here as pure
+    /// conversions; [`RunOutcome::Unwaitable`] in particular is not reached
+    /// by any other test in this file, since forcing an OS `wait` to fail
+    /// after a child has already been killed and reaped is not something
+    /// this suite can arrange.
+    #[test]
+    fn renewal_ping_outcome_from_run_outcome_maps_killed_and_unwaitable() {
+        assert!(matches!(
+            RenewalPingOutcome::from(&RunOutcome::Killed),
+            RenewalPingOutcome::Killed
+        ));
+        assert!(matches!(
+            RenewalPingOutcome::from(&RunOutcome::Unwaitable(std::io::Error::other(
+                "wait failed"
+            ))),
+            RenewalPingOutcome::Unwaitable
+        ));
+    }
+
+    /// The one [`RunOutcome`] arm that carries a value of its own
+    /// ([`std::process::ExitStatus`]) must come through
+    /// [`RenewalPingOutcome::from`] unchanged, not merely mapped to the
+    /// right variant.
+    #[cfg(unix)]
+    #[test]
+    fn renewal_ping_outcome_from_run_outcome_carries_the_exit_status_through() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = std::process::ExitStatus::from_raw(3 << 8);
+        match RenewalPingOutcome::from(&RunOutcome::Exited(status)) {
+            RenewalPingOutcome::Exited(s) => assert_eq!(s.code(), Some(3)),
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    /// A shell invocation that exits with `code`, run directly (not through
+    /// [`spawn_hello`]) to get a real [`std::process::ExitStatus`] off this
+    /// platform's own shell — `/bin/sh -c "exit <code>"` on Unix, `cmd /C
+    /// "exit <code>"` on Windows, the same `cmd` resolution
+    /// `engine_logfile::shell_on_path` already relies on for its own tests.
+    fn exiting_status(code: i32) -> std::process::ExitStatus {
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", &format!("exit {code}")]);
+            c
+        } else {
+            let mut c = std::process::Command::new("/bin/sh");
+            c.args(["-c", &format!("exit {code}")]);
+            c
+        };
+        cmd.status().expect("a shell on PATH")
+    }
+
+    #[test]
+    fn report_renewal_outcome_marks_failed_for_a_nonzero_exit_but_not_a_zero_one() {
+        let surface_key = format!("test-report-exit-{}", std::process::id());
+        let renewal = TokenRenewal::Lapsed { expires_at: 48 };
+
+        let (_, credited) = credit_renewal(&surface_key, renewal);
+        let failed_status = exiting_status(1);
+        report_renewal_outcome(
+            &surface_key,
+            credited,
+            RenewalPingOutcome::Exited(failed_status),
+        );
+        assert_eq!(
+            last_renewed_for(&surface_key),
+            Some(RenewalRecord {
+                last_run_failed: true,
+                ..credited
+            }),
+            "a non-zero exit must spend the attempt, not clear it"
+        );
+
+        let surface_key = format!("test-report-exit-success-{}", std::process::id());
+        let (_, credited) = credit_renewal(&surface_key, renewal);
+        let ok_status = exiting_status(0);
+        report_renewal_outcome(
+            &surface_key,
+            credited,
+            RenewalPingOutcome::Exited(ok_status),
+        );
+        assert_eq!(
+            last_renewed_for(&surface_key),
+            Some(credited),
+            "a run that exited 0 must be left exactly as credit_renewal left \
+             it — this is what keeps the once-per-token rule for a success"
+        );
+    }
+
+    #[test]
+    fn report_renewal_outcome_ignores_a_report_for_a_different_renewal() {
+        let surface_key = format!("test-report-different-{}", std::process::id());
+        let renewal = TokenRenewal::Lapsed { expires_at: 49 };
+        let other = TokenRenewal::Lapsed { expires_at: 50 };
+        let (_, credited) = credit_renewal(&surface_key, renewal);
+        let mismatched = RenewalRecord {
+            renewal: other,
+            ..credited
+        };
+        report_renewal_outcome(&surface_key, mismatched, RenewalPingOutcome::SpawnFailed);
+        assert_eq!(
+            last_renewed_for(&surface_key),
+            Some(credited),
+            "a report naming a record this key does not currently hold must \
+             never touch it"
+        );
+    }
+
+    /// The same whole-record guard, but for the case it actually exists to
+    /// catch — not a report naming a different `renewal` outright, but one
+    /// that still names the *same* `renewal`, just an earlier attempt at it:
+    /// a report [`spawn_hello`]'s background thread delivers after the tick
+    /// has already credited a retry of that exact token.
+    #[test]
+    fn an_earlier_attempts_report_never_marks_a_later_attempt() {
+        let surface_key = format!("test-report-earlier-attempt-{}", std::process::id());
+        let renewal = TokenRenewal::Lapsed { expires_at: 61 };
+        let (_, first_credit) = credit_renewal(&surface_key, renewal);
+        report_renewal_outcome(&surface_key, first_credit, RenewalPingOutcome::SpawnFailed);
+        let (_, credited) = credit_renewal(&surface_key, renewal);
+        report_renewal_outcome(&surface_key, first_credit, RenewalPingOutcome::SpawnFailed);
+        assert_eq!(
+            last_renewed_for(&surface_key),
+            Some(RenewalRecord {
+                renewal,
+                attempts: 2,
+                last_run_failed: false,
+            }),
+            "a report about the first attempt must never mark the second one failed"
+        );
+        assert_eq!(
+            credited.attempts, 2,
+            "sanity: the retry really is attempt 2"
+        );
+    }
+
+    /// The three scenarios the renewal retry budget exists for, end to end
+    /// through the pure functions: a failed run is retried past the floor,
+    /// three failed attempts exhaust the budget, and a successful run is not
+    /// retried at all.
+    #[test]
+    fn a_renewal_is_due_again_after_a_failed_run_once_the_floor_passes() {
+        let surface_key = format!("test-renewal-retry-e2e-{}", std::process::id());
+        let renewal = TokenRenewal::Lapsed { expires_at: 51 };
+        let (_, credited) = credit_renewal(&surface_key, renewal);
+        let status = exiting_status(1);
+        report_renewal_outcome(&surface_key, credited, RenewalPingOutcome::Exited(status));
+        let stored = last_renewed_for(&surface_key);
+        assert!(
+            renewal_ping_due(NOW, NOW + 600, Some(renewal), stored),
+            "the run exited non-zero: due again once the floor passes"
+        );
+        assert!(
+            !renewal_ping_due(NOW, NOW + 599, Some(renewal), stored),
+            "still inside the floor, even though the run failed"
+        );
+    }
+
+    #[test]
+    fn a_renewal_is_not_due_after_three_failed_attempts() {
+        let surface_key = format!("test-renewal-exhausted-e2e-{}", std::process::id());
+        let renewal = TokenRenewal::Lapsed { expires_at: 52 };
+        for _ in 0..RENEWAL_MAX_ATTEMPTS {
+            let (_, credited) = credit_renewal(&surface_key, renewal);
+            report_renewal_outcome(&surface_key, credited, RenewalPingOutcome::SpawnFailed);
+        }
+        let stored = last_renewed_for(&surface_key);
+        assert_eq!(stored.map(|r| r.attempts), Some(RENEWAL_MAX_ATTEMPTS));
+        assert!(
+            !renewal_ping_due(NOW, NOW + 600, Some(renewal), stored),
+            "three failed attempts is the whole budget: no more retries"
+        );
+    }
+
+    #[test]
+    fn a_successful_run_keeps_the_once_per_token_rule() {
+        let surface_key = format!("test-renewal-success-e2e-{}", std::process::id());
+        let renewal = TokenRenewal::Lapsed { expires_at: 53 };
+        let (_, credited) = credit_renewal(&surface_key, renewal);
+        let status = exiting_status(0);
+        report_renewal_outcome(&surface_key, credited, RenewalPingOutcome::Exited(status));
+        let stored = last_renewed_for(&surface_key);
+        assert!(
+            !renewal_ping_due(NOW, NOW + 600, Some(renewal), stored),
+            "a run that exited 0 must not be retried"
+        );
     }
 
     /// The sequence the tick actually runs, one layer below the tick loop
@@ -12632,13 +13274,13 @@ mod title_tests {
             renews_token: true,
         };
 
-        credit_renewal(&surface_key, renewal);
-        let spawned = send_ping(&ping, Some((surface_key.clone(), renewal)));
+        let (_, credited) = credit_renewal(&surface_key, renewal);
+        let spawned = send_ping(&ping, Some((surface_key.clone(), credited)));
         assert!(
             !spawned,
             "an unresolvable binary name must not read as spawned"
         );
-        uncredit_renewal(&surface_key, renewal);
+        uncredit_renewal(&surface_key, credited, None);
         assert_eq!(
             last_renewed_for(&surface_key),
             None,
@@ -12682,7 +13324,7 @@ mod title_tests {
     }
 
     #[test]
-    fn spawn_hello_clears_a_credited_renewal_when_command_spawn_itself_fails() {
+    fn spawn_hello_marks_a_credited_renewal_failed_when_command_spawn_itself_fails() {
         // A directory path stands in for "exists but cannot actually be
         // executed" (permission denied, wrong architecture) — every OS
         // refuses to `exec` a directory, so `Command::spawn` fails the same
@@ -12701,34 +13343,105 @@ mod title_tests {
         // all (see `credit_renewal`'s own doc for why) — set up directly
         // here since this test drives `spawn_hello` itself, one layer below
         // that call site.
-        credit_renewal(&surface_key, renewal);
+        let (_, credited) = credit_renewal(&surface_key, renewal);
 
         let spawned = spawn_hello(
             dir.clone(),
             Vec::new(),
-            Some((surface_key.clone(), renewal)),
+            Some((surface_key.clone(), credited)),
         );
         assert!(
             spawned,
             "the background thread itself starts; only Command::spawn inside it fails"
         );
 
-        // `Command::spawn` fails, and clears the credit, on that background
-        // thread — polled rather than asserted immediately, since nothing
-        // here waits on it directly.
+        // `Command::spawn` fails, and reports it, on that background thread
+        // — polled rather than asserted immediately, since nothing here
+        // waits on it directly.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while last_renewed_for(&surface_key) == Some(renewal)
+        while last_renewed_for(&surface_key).is_some_and(|r| !r.last_run_failed)
             && std::time::Instant::now() < deadline
         {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert_eq!(
             last_renewed_for(&surface_key),
-            None,
-            "a process that never actually started must not leave the renewal \
-             it was credited for permanently marked as already sent"
+            Some(RenewalRecord {
+                last_run_failed: true,
+                ..credited
+            }),
+            "a process that never actually started must spend part of the \
+             retry budget, not vanish or stay marked as still running"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `bin`/`args` for a shell invocation that exits with `code`, resolvable
+    /// by bare name the way [`Command::new`](std::process::Command::new)
+    /// searches `PATH` on every platform — `sh -c "exit <code>"` on Unix,
+    /// `cmd /C "exit <code>"` on Windows, run through [`spawn_hello`] itself
+    /// rather than synchronously (see [`exiting_status`] for that half).
+    fn spawn_hello_exiting_with(code: i32) -> (std::path::PathBuf, Vec<String>) {
+        if cfg!(windows) {
+            (
+                std::path::PathBuf::from("cmd"),
+                vec!["/C".to_string(), format!("exit {code}")],
+            )
+        } else {
+            (
+                std::path::PathBuf::from("sh"),
+                vec!["-c".to_string(), format!("exit {code}")],
+            )
+        }
+    }
+
+    #[test]
+    fn spawn_hello_marks_a_credited_renewal_failed_after_a_nonzero_exit() {
+        let surface_key = format!("test-spawn-hello-nonzero-{}", std::process::id());
+        let renewal = TokenRenewal::Lapsed { expires_at: 8 };
+        let (_, credited) = credit_renewal(&surface_key, renewal);
+
+        let (bin, args) = spawn_hello_exiting_with(1);
+        let spawned = spawn_hello(bin, args, Some((surface_key.clone(), credited)));
+        assert!(spawned, "the background thread starts and runs the shell");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while last_renewed_for(&surface_key).is_some_and(|r| !r.last_run_failed)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            last_renewed_for(&surface_key),
+            Some(RenewalRecord {
+                last_run_failed: true,
+                ..credited
+            }),
+            "a run that exits non-zero must be reported as failed, spending \
+             part of the retry budget rather than clearing the credit"
+        );
+    }
+
+    #[test]
+    fn spawn_hello_leaves_a_credited_renewal_unmarked_after_a_successful_exit() {
+        let surface_key = format!("test-spawn-hello-success-{}", std::process::id());
+        let renewal = TokenRenewal::Lapsed { expires_at: 9 };
+        let (_, credited) = credit_renewal(&surface_key, renewal);
+
+        let (bin, args) = spawn_hello_exiting_with(0);
+        let spawned = spawn_hello(bin, args, Some((surface_key.clone(), credited)));
+        assert!(spawned, "the background thread starts and runs the shell");
+
+        // Nothing observable changes on success, so there is no condition to
+        // poll for — a short, fixed wait well past a fast local shell exit is
+        // what the rest of this module's own async tests use too.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            last_renewed_for(&surface_key),
+            Some(credited),
+            "a successful exit must leave the record exactly as \
+             credit_renewal left it"
+        );
     }
 
     // ── plugin id dedup (fix 9) ────────────────────────────────────────────

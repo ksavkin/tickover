@@ -216,9 +216,12 @@ Two rules keep the key lists true:
 | `credentials-map` | **yes** | `[[surface.auth]]` `type = "credentials-map"` + `key_prefix` — a credential file that is a *map* of records keyed by a string no manifest can spell in advance |
 | `http-post` | **yes** | `[[http.request]]` `method` / `body` — an endpoint that answers only a POST, where every provider before it answered a plain GET |
 | `remaining-fraction` | **yes** | `[windows.source]` `remaining_fraction_path` — a provider that states what is *left* rather than what is spent |
-| `keychain-expiry` | **yes** | `[[surface.auth]]` `expiry_json_path` — a `keychain`/`credentials-file`/`win-credential` step that resolves Absent on a lapsed token, so a step behind it can fire (or, with `[ping] renews_token`, a renewal ping) |
+| `keychain-expiry` | **yes** | `[[surface.auth]]` `expiry_json_path` — a `keychain`/`credentials-file`/`win-credential`/`credentials-map` step that resolves Absent on a lapsed token, so a step behind it can fire (or, with `[ping] renews_token`, a renewal ping) |
 | `oauth-refresh` | **yes** | `[[surface.auth]]` `type = "oauth-refresh"` + `token_url` — the one auth step that *spends* a credential instead of only reading one |
 | `oauth-client-discovery` | **yes** | `[surface.auth.client]` — reads an `oauth-refresh` step's installed-app client id/secret back out of the credential's own installed client at run time, instead of shipping the pair in the manifest — see [`[surface.auth.client]`](#surfaceauthclient) |
+| `balance-unlimited` | **yes** | `[balances.unlimited]` — a bucket the response marks as having no ceiling draws "Unlimited" instead of a `used`/`cap`/`remaining` pair that would otherwise read `0 / 0` |
+| `balance-conditional` | **yes** | `[balances.when]` — a `[[balances]]` entry that draws no row at all unless a boolean the response states resolves `true` |
+| `credentials-file-path-env` | **yes** | `[[surface.auth]]` `path_env` / `path_env_join` on a `credentials-file` step — an env var override for where the credentials file lives, mirroring `[logfile] root_env`/`root_env_join` |
 
 `window-severity` is listed without being implemented, and that is the useful
 state, not an oversight: the name ships ahead of the semantics so the build
@@ -578,9 +581,9 @@ balance from, and the section is refused there rather than ignored.
 **A manifest needs at least one `[[windows]]` entry or at least one
 `[[balances]]` entry** — one that declares neither is still refused, because it
 still cannot draw a row. The second shape exists because a provider need not
-report a window at all: Grok's billing endpoint states a monthly period and no
-window key of any kind, and the old "at least one window" rule made that
-provider unwritable as a plugin.
+report a window at all: Copilot's quota endpoint states a monthly allowance
+against a calendar reset date and no window key of any kind, and the old "at
+least one window" rule made that provider unwritable as a plugin.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
@@ -590,8 +593,10 @@ provider unwritable as a plugin.
 | `[balances.cap]` | table | no | the ceiling, when the provider states one |
 | `[balances.remaining]` | table | no | what is left, for providers that report the remainder instead of a used/cap pair |
 | `[balances.source]` | table | no | the non-amount figures |
+| `[balances.unlimited]` | table | no | a boolean flag: when it names `true`, this entry draws as a single "Unlimited" caption instead of `used`/`cap`/`remaining` — see below. Needs `requires_reader = ["balance-unlimited"]` |
+| `[balances.when]` | table | no | a boolean gate on the whole entry: when it does not name `true`, the entry draws no row at all — see below. Needs `requires_reader = ["balance-conditional"]` |
 
-An entry must name at least one of `used`, `cap`, `remaining`,
+An entry must name at least one of `used`, `cap`, `remaining`, `unlimited`,
 `source.percent_path` or `source.limit_reached_path` — an entry that reads
 nothing is a caption beside empty space. A manifest may declare at most 16
 `[[balances]]` entries.
@@ -638,6 +643,29 @@ unless somebody stated it is what the rest of the panel's credibility rests on.
 The period is stored as the **date it ends**, never as a length: a billing month
 is 28–31 days, so a length would be a fiction and classifying by it — the way
 windows classify — would be meaningless.
+
+#### `[balances.unlimited]` / `[balances.when]`
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `[balances.unlimited] path` | string | yes, inside the table | dotted JSON path to a boolean |
+| `[balances.when] path` | string | yes, inside the table | dotted JSON path to a boolean |
+
+Both read a boolean the same fail-safe way every other boolean-gated figure in
+this schema does: missing, present but not a boolean, or present and `false`
+all read as "no". Neither is a computed figure — both name a fact the response
+states directly, the same rule `source.percent_path` follows.
+
+`unlimited` decides **how** an entry draws: `true` skips `used`/`cap`/`remaining`
+entirely (even when the manifest declares paths for them) and draws the row as
+the single word "Unlimited" instead — GitHub Copilot's premium bucket carries
+`unlimited = true` beside an `entitlement`/`remaining` pair that would
+otherwise read `0 / 0`, indistinguishable from an exhausted quota.
+
+`when` decides **whether** an entry draws at all: anything other than `true`
+drops the row, as if the entry named no figure — for a response that states a
+figure's fields only when a feature is switched on (Claude's `extra_usage`,
+whose four figures are `null` unless `extra_usage.is_enabled` is `true`).
 
 **Zero is not read as a ceiling.** No provider documents what a zero in a cap
 means, and none was found that distinguishes "no cap is set" from "the cap is
@@ -809,10 +837,12 @@ needs and ignores the rest.
 |---|---|---|---|
 | `type` | `"credentials-file"` \| `"credentials-map"` \| `"keychain"` \| `"env"` \| `"electron-safe-storage"` \| `"win-credential"` \| `"reject-when"` \| `"oauth-refresh"` | all | which credential store this step reads from (`reject-when` reads none, `oauth-refresh` reads one and spends it — see below) |
 | `path` | string | `credentials-file`, `credentials-map`, `oauth-refresh` | path to the JSON file |
+| `path_env` | string | `credentials-file` — refused on any other step kind | env var that, if set to an absolute path, overrides `path`'s directory — the credential variant of `[logfile] root_env`, additionally ignoring an env value that is empty or relative and falling back to `path` as if the variable were unset. Needs `requires_reader = ["credentials-file-path-env"]` |
+| `path_env_join` | string | `credentials-file` | filename appended onto the `path_env` override, if set (e.g. `".credentials.json"` so `$CLAUDE_CONFIG_DIR` resolves to `$CLAUDE_CONFIG_DIR/.credentials.json`); ignored when `path_env` is unset, the env var itself isn't, or its value is empty or not absolute. Must be relative with no `..` component — mirrors `[logfile] root_env_join` exactly |
 | `token_json_path` | string | `credentials-file`, `credentials-map`, `keychain`, `win-credential`, `oauth-refresh`; optional on `electron-safe-storage` (default `"claudeAiOauth.accessToken\|access_token"`) | `\|`-separated fallback JSON paths to the token (e.g. `"claudeAiOauth.accessToken\|access_token"` — try camelCase, then snake_case). For `credentials-map` it is read inside the *matched entry*; for `oauth-refresh` it names the **refresh** token |
 | `key_prefix` | string | `credentials-map` | prefix the entry's key in the top-level object at `path` must start with. Needs `requires_reader = ["credentials-map"]` |
 | `service` | string | `keychain` | Keychain service name to query |
-| `expiry_json_path` | string | `keychain`, `credentials-file`, `win-credential` — refused on any other step kind (the error names the step's own index and kind) | JSON path to an expiry beside the token — an RFC3339 string, or a JSON number/numeric string read as epoch seconds or milliseconds (told apart by magnitude); a lapsed one makes the step **Absent** instead of handing back a stale token. Needs `requires_reader = ["keychain-expiry"]` |
+| `expiry_json_path` | string | `keychain`, `credentials-file`, `win-credential`, `credentials-map` — refused on any other step kind (the error names the step's own index and kind) | JSON path to an expiry beside the token (for `credentials-map`, inside the *matched entry*) — an RFC3339 string, or a JSON number/numeric string read as epoch seconds or milliseconds (told apart by magnitude); a lapsed one makes the step **Absent** instead of handing back a stale token. Needs `requires_reader = ["keychain-expiry"]` |
 | `var` | string | `env` | environment variable name holding the token |
 | `config_path` | string | `electron-safe-storage` | path to the Electron config/state file holding the encrypted blob |
 | `blob_json_path` | string | `electron-safe-storage` | `\|`-separated fallback JSON paths to the blob inside `config_path` |
@@ -1048,7 +1078,7 @@ lapsed — see [Renewing a lapsed token](#renewing-a-lapsed-token) below.
 |---|---|---|---|
 | `bin` | string | — (required) | binary to run; a bare program name, not a path — no `/`, `\` or `:` (the last rules out a Windows prefixed-relative path like `C:evil`, which has neither of the other two) |
 | `args` | array of strings | empty | arguments; at most 32, each non-empty and at most 256 bytes — the install-time trust dialog renders the whole command line, and these bounds keep one argument from pushing its untrusted-host warning off the bottom |
-| `renews_token` | bool | `false` | whether running this command also renews the provider's token, as a side effect the provider's own CLI has and this app does not (it never spends a provider's refresh token). A surface whose auth chain ends "lapsed" (a credential found, past its `expiry_json_path`, with no working step behind it) runs this command instead of only waiting for the user to sign in again — bounded by the same ten-minute floor as the window ping above |
+| `renews_token` | bool | `false` | whether running this command also renews the provider's token, as a side effect the provider's own CLI has and this app does not (it never spends a provider's refresh token). A surface whose auth chain ends "lapsed" (a credential found, past its `expiry_json_path`, with no working step behind it) runs this command instead of only waiting for the user to sign in again — bounded by the same ten-minute floor as the window ping above, and by a fixed three attempts per token when a run keeps ending without success (see [Renewing a lapsed token](#renewing-a-lapsed-token)) |
 
 No argument, label, hostname, message, or other manifest-supplied string
 listed in this document may contain a control character (C0, DEL) or a
@@ -1407,10 +1437,13 @@ A `keychain`/`credentials-file`/`win-credential` step carrying
 `expiry_json_path` already resolves **Absent** on a lapsed token so a step
 behind it (an `oauth-refresh`, say) gets its turn. When nothing is behind it,
 the chain reports "lapsed" rather than "no credentials at all" — a fact
-distinct enough to act on — and, with `renews_token` set, the surface's row
-reads `token expired — renews on the next <bin> run` instead of "session
-expired — sign in again". The same rewrite happens on an HTTP 401 the token
-still managed to reach the network with — gated more precisely there, by
+distinct enough to act on, and one that keeps the surface's row on screen
+either way: with `renews_token` set, the row reads `token expired — renews
+on the next <bin> run`; without it, the row reads `token expired — sign in
+again`, a credential the user has and can fix themselves rather than the
+hidden state a genuinely absent one gets. The same rewrite (with
+`renews_token` set) happens on an HTTP 401 the token still managed to reach
+the network with — gated more precisely there, by
 *which step actually produced the token that 401'd*
 (`auth::resolve_token`'s own `from_expiring_step`), not by the surface as a
 whole: a surface whose chain mixes an expiry-declaring step with a plain
@@ -1437,30 +1470,43 @@ whether *this app* runs the command at all; the row text itself (above)
 appears either way, since it states what the next run of that command does,
 regardless of who starts it.
 
-**Bounded to once per token, not once per floor.** A lapsed auth chain
-carries the expiry it declared (`auth::token_expiry`, epoch seconds). A bare
-401 carries no such expiry — nothing here ever parsed the credential that
-produced it — so it is keyed on the token itself instead: a hash of the
-bearer token and the request's other credential-derived values
-(`plugin::throttle::fingerprint`, already computed for the throttle's own
-purposes and reused here rather than hashed twice; never the token itself,
-never persisted or logged). `main.rs` remembers, per *surface* (keyed by the
-same surface reading id the panel and the registry already use, e.g.
-`"claude-cli"`) and in memory only, which key the last renewal ping actually
-fired for, and a reading naming that same key again is not due again — only
-a *different* key (the CLI renewed, then the token lapsed again; or, after a
-401, the credential changed) is due. Keyed per surface rather than per
-plugin so that two renewal-eligible surfaces on one plugin, each lapsing on
-its own schedule, each get their own "once per token" bound instead of one
-surface's renewal overwriting — and so silently re-arming — the other's.
-Without this, a token the CLI cannot renew either — its own refresh token
-has expired too, say, and it now needs an interactive login — would
-otherwise be pinged every ten minutes forever, uselessly, for as long as the
-app runs. The credit is provisional until the command is actually running:
-recorded once the background thread that would run it starts, and undone if
-the OS then refuses to start the process itself (an existing but
-unexecutable binary — permission denied, wrong architecture) — a run that
-never happened must not read as "already tried".
+**Bounded to at most three attempts per token, once the run succeeds no
+more.** A lapsed auth chain carries the expiry it declared
+(`auth::token_expiry_at`, epoch seconds). A bare 401 carries no such expiry —
+nothing here ever parsed the credential that produced it — so it is keyed on
+the token itself instead: a hash of the bearer token and the request's other
+credential-derived values (`plugin::throttle::fingerprint`, already computed
+for the throttle's own purposes and reused here rather than hashed twice;
+never the token itself, never persisted or logged). `main.rs` remembers, per
+*surface* (keyed by the same surface reading id the panel and the registry
+already use, e.g. `"claude-cli"`) and in memory only, a small record for the
+key the last renewal ping actually fired for — the key itself, how many
+attempts have been credited against it, and whether the most recent one is
+known to have ended without success. A reading naming that same key again is
+due once more only once both hold: the shared floor has passed *and* the
+previous attempt's own run ended without success (a non-zero exit, a
+deadline kill, or a failure to spawn the CLI at all) — up to three attempts
+total, never a fourth. A run that exits `0` stops the retries outright: the
+key is not due again until a *different* one shows up (the CLI renewed, then
+the token lapsed again; or, after a 401, the credential changed). Keyed per
+surface rather than per plugin so that two renewal-eligible surfaces on one
+plugin, each lapsing on its own schedule, each get their own budget instead
+of one surface's renewal overwriting — and so silently re-arming — the
+other's. Three, not one, so a single run that fails for a reason unrelated
+to the token (a transient network error) does not condemn it to going
+unrenewed until it lapses differently; not unbounded, so a token the CLI
+genuinely cannot renew either — its own refresh token has expired too, say,
+and it now needs an interactive login — still stops being retried rather
+than spending a process every floor forever. The credit for an attempt is
+provisional only until the command is actually running: recorded once the
+background thread that would run it starts, and undone entirely (as if this
+attempt had never been credited at all) if the OS then refuses to even start
+the background thread or find the binary — a run that never happened must
+not spend part of the budget. Once the run does start, however it ends
+(`Command::spawn` itself failing inside the thread, a non-zero exit, or a
+deadline kill) is reported back and counted as a spent, not-yet-successful
+attempt rather than being undone — only a successful exit leaves the record
+as `credit_renewal` first left it.
 
 ### Where the ping's command runs
 
@@ -1559,19 +1605,21 @@ accounts *and* Google Antigravity, in Swift/SwiftUI over a Python engine
 (`engine/keyswitcher.py`, `engine/antigravity.py`). It reads the same Codex
 endpoint this app does, and reaches Antigravity through
 `cloudcode-pa.googleapis.com (loadCodeAssist)`, with tokens out of
-`~/.codex/accounts/auth_*.json`, the macOS Keychain and SQLite. Three things
-worth carrying over: `rate_limit.allowed` is the only hard "blocked" bit;
-a suspicious drop in `used_percent` deserves a second request; and the
-shape of the Antigravity credential problem — a token in a SQLite row,
-base64-wrapped — is what `[[surface.auth]]`'s planned
-`sqlite-row`/`base64`/`command` steps are for.
+`~/.codex/accounts/auth_*.json`, the macOS Keychain and SQLite. It reads
+`rate_limit.allowed` as its own hard "blocked" bit and rotates to the next of
+its managed accounts once an active one reports it — the multi-account case
+this app does not attempt (one login per surface, never several for the same
+provider). Two more things worth carrying over regardless: a suspicious drop
+in `used_percent` deserves a second request; and the shape of the Antigravity
+credential problem — a token in a SQLite row, base64-wrapped — is what
+`[[surface.auth]]`'s planned `sqlite-row`/`base64`/`command` steps are for.
 
 **[get-bb/bb](https://github.com/get-bb/bb)** — an agentic IDE (TypeScript,
-Electron) that deliberately owns none of this: it "uses the provider CLI you
-already have authenticated", names models by hand, and tracks no quotas at
-all. Useful as the opposite pole: it shows what is left when a tool declines
-to model limits — a fallback model and nothing to show the user about why the
-first one stopped answering.
+Electron) that started out owning none of this: it "uses the provider CLI you
+already have authenticated" and names models by hand. It has since grown its
+own quota tracking, which narrows what was the useful opposite pole here —
+a tool that declined to model limits at all, showing only a fallback model
+and nothing about why the first one stopped answering.
 
 ## Security
 
@@ -2026,10 +2074,13 @@ menu_label   = "Cl"
 order        = 20
 # `required` below needs a reader that knows a window can be absent rather than
 # blank; `keychain-expiry` is what lets the auth steps below tell a stale
-# token from a working one — see docs/PLUGIN-ARCHITECTURE.md, "Reader
+# token from a working one; `balance-conditional` is what lets the "Extra
+# usage" balance draw no row at all on an account that never turned it on;
+# `credentials-file-path-env` is what lets the credentials-file step below
+# honour `CLAUDE_CONFIG_DIR` — see docs/PLUGIN-ARCHITECTURE.md, "Reader
 # capabilities".
-requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry"]
-version      = "1.4.3"
+requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry", "reading-balances", "balance-conditional", "credentials-file-path-env"]
+version      = "1.4.4"
 engine       = "http-api"
 # Re-fetched every 60 s.
 refresh_secs = 60
@@ -2114,6 +2165,41 @@ used_percent_path = "percent"
 resets_at_path    = "resets_at"
 resets_at_format  = "iso8601"
 
+# Extra usage: a separate, pay-as-you-go pool beyond the plan's own windows
+# above, on the accounts that have turned it on. The only shape actually
+# measured is a disabled account, where `used_credits`/`monthly_limit`/
+# `currency`/`decimal_places` are all `null` — read as `money-minor` on the
+# strength of the field names alone (a `decimal_places` beside an integer
+# is what that shape means everywhere else in this file), not because an
+# enabled account's own response has been seen. A figure that turns out to
+# arrive in some other shape draws nothing rather than a wrong number: the
+# engine reads the triplet fail-safe, so a float `used_credits` or a missing
+# `decimal_places` yields no amount instead of one scaled by the wrong power
+# of ten.
+#
+# `extra_usage.is_enabled` gates the row: on an account that never turned
+# this on, every other field in the object is `null` (measured), so without
+# `[balances.when]` this would either draw nothing (silently correct, for
+# the wrong reason) or, the moment a provider response changes shape,
+# draw a stray `used 0 / cap 0` for a feature the account never had. Stating
+# the gate explicitly is what makes "off" a fact this app read, not an
+# absence it happened not to notice.
+[[balances]]
+id    = "extra-usage"
+label = "Extra usage"
+[balances.used]
+kind          = "money-minor"
+amount_path   = "extra_usage.used_credits"
+currency_path = "extra_usage.currency"
+exponent_path = "extra_usage.decimal_places"
+[balances.cap]
+kind          = "money-minor"
+amount_path   = "extra_usage.monthly_limit"
+currency_path = "extra_usage.currency"
+exponent_path = "extra_usage.decimal_places"
+[balances.when]
+path = "extra_usage.is_enabled"
+
 # GET .../oauth/usage with the OAuth bearer token, the `oauth-2025-04-20` beta
 # header, and a `claude-code/<version>` User-Agent (required — Anthropic 429s
 # aggressively without it).
@@ -2160,14 +2246,27 @@ opt_in        = false
 in_menu_bar   = true
 allowed_hosts = ["api.anthropic.com"]
 
-# Plaintext credentials file first, then the OS secure store per platform.
-# Every step decodes the same JSON shape, hence the same `token_json_path`
-# fallback throughout: nested
-# `claudeAiOauth.accessToken`/`claudeAiOauth.access_token`, else flat
+# Plaintext credentials file first, then the macOS Keychain item the CLI
+# also writes there. On Windows, `%USERPROFILE%\.claude\.credentials.json`
+# is the only store the CLI ever writes — there is no Credential Manager
+# step behind it, since the CLI has none to reach. Every step decodes the
+# same JSON shape, hence the same `token_json_path` fallback throughout:
+# nested `claudeAiOauth.accessToken`/`claudeAiOauth.access_token`, else flat
 # `accessToken`/`access_token` at the root.
+#
+# The CLI honours `CLAUDE_CONFIG_DIR` for where it keeps this file —
+# `$CLAUDE_CONFIG_DIR/.credentials.json` instead of the default
+# `~/.claude/.credentials.json` — so `path_env`/`path_env_join` read the same
+# override this app's own `path` above would otherwise miss entirely on an
+# account that has ever set it. Out of scope: the CLI also honours
+# `CLAUDE_CONFIG_DIR` for the name of the Keychain item it writes, and the
+# keychain step below still names the fixed default service — re-keying that
+# lookup needs its own manifest field this change does not add.
 [[surface.auth]]
 type             = "credentials-file"
 path             = "~/.claude/.credentials.json"
+path_env         = "CLAUDE_CONFIG_DIR"
+path_env_join    = ".credentials.json"
 token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
 # expiresAt is epoch milliseconds.
 expiry_json_path = "claudeAiOauth.expiresAt"
@@ -2175,13 +2274,6 @@ expiry_json_path = "claudeAiOauth.expiresAt"
 [[surface.auth]]
 type             = "keychain"
 service          = "Claude Code-credentials"
-token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
-# expiresAt is epoch milliseconds.
-expiry_json_path = "claudeAiOauth.expiresAt"
-
-[[surface.auth]]
-type             = "win-credential"
-targets          = ["Claude Code-credentials", "Claude Code"]
 token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
 # expiresAt is epoch milliseconds.
 expiry_json_path = "claudeAiOauth.expiresAt"
@@ -2207,12 +2299,19 @@ blob_json_path     = "oauth:tokenCacheV2|oauth:tokenCache"
 token_json_path    = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
 macos_keychain_key = "Claude Safe Storage"
 
-# `claude -p hello` — run while the 5-hour window sits empty, to start a
-# fresh one (src/main.rs `ping_due` / `send_ping`, gated by
-# `config::auto_ping_claude`).
+# `claude -p hello --model haiku` — run while the 5-hour window sits empty,
+# to start a fresh one (src/main.rs `ping_due` / `send_ping`, gated by
+# `config::auto_ping_claude`). The ping's only job is to start the window
+# and renew the token, and the cheapest model does both exactly as well as
+# the account's default one — every third-party renewal script observed
+# pins one for the same reason. `haiku` is the CLI's own alias for its
+# current cheapest model, not a dated snapshot id: a pinned id stops
+# working, silently, the day Anthropic retires that snapshot — taking both
+# the window ping and the token renewal with it — while the alias keeps
+# resolving to whatever model earns the name next.
 [ping]
 bin  = "claude"
-args = ["-p", "hello"]
+args = ["-p", "hello", "--model", "haiku"]
 # The CLI renews its own token only when it runs.
 renews_token = true
 ```

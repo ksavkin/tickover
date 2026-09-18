@@ -108,7 +108,7 @@ fn main() {
 
         // Balances, in the same register as the two lines above: which figures
         // the provider stated, not what they were. Without this a provider that
-        // reports no window at all — Grok, Copilot — probes as a row of dashes
+        // reports no window at all — Copilot — probes as a row of dashes
         // and there is no way to tell a manifest that read everything from one
         // that read nothing.
         if r.balances.is_empty() {

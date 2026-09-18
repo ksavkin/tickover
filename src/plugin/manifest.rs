@@ -122,10 +122,10 @@ pub struct PluginManifest {
     #[serde(default)]
     pub windows: Vec<WindowConfig>,
     /// `[[balances]]` — figures against a calendar period (credits left, spent
-    /// this month). Empty for a provider that reports only windows — two of
-    /// the five shipped manifests today (`claude`, `antigravity`); the other
-    /// three (`codex`, `copilot`, `grok`) declare at least one, and `copilot`
-    /// and `grok` declare no `[[windows]]` at all.
+    /// this month). Empty for a provider that reports only windows — one of
+    /// the five shipped manifests today (`antigravity`); the other four
+    /// (`claude`, `codex`, `copilot`, `grok`) declare at least one, and
+    /// `copilot` alone declares no `[[windows]]` at all.
     #[serde(default)]
     pub balances: Vec<BalanceConfig>,
     /// `[status]` — where the provider states the standing of the quota
@@ -699,11 +699,12 @@ impl PluginManifest {
 
     fn validate_windows(&self) -> Result<(), String> {
         // A provider has to report *something*. Windows were the only shape
-        // this could take until Grok, whose response carries no window key at
-        // all — only a monthly billing period — so "at least one [[windows]]"
-        // made a whole class of provider unwritable as a plugin. The rule is
-        // the same rule with the second shape added, not a weaker one: a
-        // manifest that declares neither still cannot draw a row.
+        // this could take until a provider whose response carries no window
+        // key at all — only a calendar billing period — made "at least one
+        // [[windows]]" a rule that left a whole class of provider unwritable
+        // as a plugin. The rule is the same rule with the second shape added,
+        // not a weaker one: a manifest that declares neither still cannot
+        // draw a row.
         if self.windows.is_empty() && self.balances.is_empty() {
             return Err("at least one [[windows]] or [[balances]] section is required".to_string());
         }
@@ -1094,6 +1095,24 @@ impl PluginManifest {
             let source_paths = source_paths.into_iter().map(|(f, p)| (f.to_string(), p));
             for (field, path) in source_paths.chain(amount_paths) {
                 if path.as_deref().is_some_and(|p| p.trim().is_empty()) {
+                    return Err(format!(
+                        "balances[label = \"{}\"]: `{field}` is present but blank — a path that \
+                         reads nothing is not a path",
+                        b.label
+                    ));
+                }
+            }
+            // Same blank-path gap, for `unlimited`/`when`'s own single
+            // required field — a plain `String`, not an `Option`, so it
+            // cannot be caught by the loop above.
+            for (field, cfg_path) in [
+                (
+                    "unlimited.path",
+                    b.unlimited.as_ref().map(|u| u.path.as_str()),
+                ),
+                ("when.path", b.when.as_ref().map(|w| w.path.as_str())),
+            ] {
+                if cfg_path.is_some_and(|p| p.trim().is_empty()) {
                     return Err(format!(
                         "balances[label = \"{}\"]: `{field}` is present but blank — a path that \
                          reads nothing is not a path",
@@ -2073,14 +2092,15 @@ impl PluginManifest {
                     }
                 }
             }
-            // `expiry_json_path` is honoured only by the three step kinds
-            // whose credential store hands back one JSON blob holding both
-            // the token and its expiry (`token_from_blob`, shared by
-            // `credentials_file_step`/`keychain_step`/`win_credential_step`)
-            // — `env`, `credentials-map`, `electron-safe-storage` and
-            // `oauth-refresh` never read the field at all. Unrefused, a
-            // manifest that set it there anyway would still trip
-            // `SurfaceConfig::declares_token_expiry` and
+            // `expiry_json_path` is honoured by the four step kinds whose
+            // credential store hands back an expiry alongside the token:
+            // `credentials-file`/`keychain`/`win-credential` share one JSON
+            // blob holding both (`token_from_blob`), and `credentials-map`
+            // reads it from the same matched entry its own token comes from
+            // (`credentials_map_step`, via `stale_expiry_at`) — `env`,
+            // `electron-safe-storage` and `oauth-refresh` never read the
+            // field at all. Unrefused, a manifest that set it there anyway
+            // would still trip `SurfaceConfig::declares_token_expiry` and
             // `auth::resolve_token`'s own `from_expiring_step` flag — both
             // just check the field's presence, not which step kind carries
             // it — so a `renews_token = true` surface could get a false
@@ -2091,12 +2111,16 @@ impl PluginManifest {
                 if step.expiry_json_path.is_some()
                     && !matches!(
                         step.kind,
-                        AuthType::CredentialsFile | AuthType::Keychain | AuthType::WinCredential
+                        AuthType::CredentialsFile
+                            | AuthType::Keychain
+                            | AuthType::WinCredential
+                            | AuthType::CredentialsMap
                     )
                 {
                     return Err(format!(
                         "surface \"{}\": auth step {i} (`{}`) sets `expiry_json_path`, which only \
-                         `credentials-file`, `keychain` and `win-credential` steps honour",
+                         `credentials-file`, `keychain`, `win-credential` and `credentials-map` \
+                         steps honour",
                         surface.id,
                         auth_type_name(step.kind)
                     ));
@@ -2127,6 +2151,47 @@ impl PluginManifest {
                         surface.id,
                         auth_type_name(step.kind)
                     ));
+                }
+                // `path_env`/`path_env_join` are `credentials_file_step`'s
+                // own fields (`auth::resolve_credentials_file_path`) —
+                // every other step kind never reads either, same silent-
+                // no-op reasoning as the three checks above.
+                if (step.path_env.is_some() || step.path_env_join.is_some())
+                    && step.kind != AuthType::CredentialsFile
+                {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `path_env`/`path_env_join`, \
+                         which only `credentials-file` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                // Same shape as `[logfile] root_env_join`, and the same
+                // reason: it is joined onto `path_env`'s *value*
+                // (`$CLAUDE_CONFIG_DIR` → `$CLAUDE_CONFIG_DIR/.credentials.json`),
+                // never onto `path` itself — an absolute value would
+                // silently discard whatever the environment named, and a
+                // `..` component would read a file outside the directory
+                // that env var pointed at.
+                if let Some(join) = &step.path_env_join {
+                    if is_absolute_on_any_platform(Path::new(join)) {
+                        return Err(format!(
+                            "surface \"{}\": auth step {i} (`{}`) `path_env_join = \"{join}\"` \
+                             must be a relative filename — it is appended to `path_env`'s value, \
+                             not used in its place",
+                            surface.id,
+                            auth_type_name(step.kind)
+                        ));
+                    }
+                    if has_dotdot_component(join) {
+                        return Err(format!(
+                            "surface \"{}\": auth step {i} (`{}`) `path_env_join = \"{join}\"` \
+                             must not contain a `..` component — it would read outside the \
+                             directory `path_env` named",
+                            surface.id,
+                            auth_type_name(step.kind)
+                        ));
+                    }
                 }
             }
             // `allowed_hosts` is an exact-match list — no wildcards, by design
@@ -3204,9 +3269,9 @@ impl WindowConfig {
     /// its weekly window in `primary_window` whenever the 5-hour one has
     /// nothing to report). A third-party manifest that wants its rows to keep
     /// their registry entries across edits declares `id`; of the five shipped
-    /// manifests, the three that declare any `[[windows]]` at all
-    /// (`antigravity`, `claude`, `codex`) declare `id` on every one — the
-    /// other two (`copilot`, `grok`) report only `[[balances]]` and have no
+    /// manifests, the four that declare any `[[windows]]` at all
+    /// (`antigravity`, `claude`, `codex`, `grok`) declare `id` on every one —
+    /// the remaining one (`copilot`) reports only `[[balances]]` and has no
     /// windows to give one to.
     pub fn entry_key(&self, index: usize) -> String {
         if self.id.is_empty() {
@@ -3357,9 +3422,12 @@ pub enum ResetsAtFormat {
 ///
 /// A separate section rather than a window with extra keys, for the reason
 /// [`crate::model::Balance`] is a separate type: a window's percent and length
-/// are its contract, and a balance has neither to give. Grok reports no window
-/// at all — only a monthly billing period — which is why a manifest carrying
-/// balances and no windows has to be legal (see [`PluginManifest::validate`]).
+/// are its contract, and a balance has neither to give. Copilot reports no
+/// window at all — only a monthly premium-request allowance against a
+/// calendar reset — which is why a manifest carrying balances and no windows
+/// has to be legal (see [`PluginManifest::validate`]). Grok carries both: a
+/// weekly usage-period window alongside two balances against the monthly
+/// billing cycle.
 ///
 /// Needs `requires_reader = ["reading-balances"]`: an older build has no notion
 /// of a balance, and would show such a provider as one that reported nothing.
@@ -3386,6 +3454,39 @@ pub struct BalanceConfig {
     /// period end, a "limit reached" flag.
     #[serde(default)]
     pub source: BalanceSourceConfig,
+    /// `[balances.unlimited]` — a boolean flag beside the amount paths above:
+    /// when the path it names resolves to `true`, this entry draws as a
+    /// single "Unlimited" caption instead of a used/cap/remaining pair (GitHub
+    /// Copilot's premium bucket carries `unlimited = true` beside an
+    /// `entitlement`/`remaining` pair that reads `0 / 0` for such an account —
+    /// indistinguishable, without this, from an exhausted one). `false`,
+    /// missing, or not a boolean falls through to the ordinary reading, the
+    /// same fail-safe every other boolean-gated figure in this schema uses.
+    /// Needs `requires_reader = ["balance-unlimited"]`.
+    pub unlimited: Option<BalanceUnlimitedConfig>,
+    /// `[balances.when]` — a boolean gate on the *whole entry*: when the path
+    /// it names does not resolve to `true` (`false`, missing, or not a
+    /// boolean), this entry draws no row at all, as if it named no figure —
+    /// the same "no claim about a size nobody stated" rule presence already
+    /// applies everywhere else. For a figure the response states only
+    /// conditionally (Claude's `extra_usage`, off on most accounts, still
+    /// sends the four fields this entry would otherwise read alongside its
+    /// own `is_enabled`). Needs `requires_reader = ["balance-conditional"]`.
+    pub when: Option<BalanceWhenConfig>,
+}
+
+/// `[balances.unlimited]` — see [`BalanceConfig::unlimited`]'s own doc.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct BalanceUnlimitedConfig {
+    /// JSON path to the boolean.
+    pub path: String,
+}
+
+/// `[balances.when]` — see [`BalanceConfig::when`]'s own doc.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct BalanceWhenConfig {
+    /// JSON path to the boolean.
+    pub path: String,
 }
 
 /// One figure inside a `[[balances]]` entry, and where to read it.
@@ -3475,13 +3576,16 @@ impl BalanceConfig {
     }
 
     /// Whether this entry reads anything at all. An entry that names no source
-    /// draws a label beside empty space.
+    /// draws a label beside empty space. `when` is not counted: it gates
+    /// whether the entry draws at all, but states no figure of its own, so an
+    /// entry naming only `when` still reads nothing to draw when it passes.
     fn reads_nothing(&self) -> bool {
         self.used.is_none()
             && self.cap.is_none()
             && self.remaining.is_none()
             && self.source.percent_path.is_none()
             && self.source.limit_reached_path.is_none()
+            && self.unlimited.is_none()
     }
 }
 
@@ -3876,6 +3980,28 @@ pub struct AuthStep {
 
     /// `credentials-file` / `credentials-map`: path to the JSON file.
     pub path: Option<String>,
+    /// `credentials-file` only: env var that, if set to an absolute path,
+    /// overrides `path`'s directory — the credential variant of
+    /// `[logfile] root_env` (see that field's own doc), additionally
+    /// ignoring an env value that is empty or relative, falling back to
+    /// `path` exactly as if the variable were unset (a credential must never
+    /// be read relative to this process's own working directory). For
+    /// Claude, whose CLI honours `CLAUDE_CONFIG_DIR` for both its
+    /// credentials file and its Keychain item name: this covers the file,
+    /// naming the keychain item is out of scope (see the comment on
+    /// claude.toml's own step). `false`/refused on any other step kind, the
+    /// same rule `expiry_json_path` is refused under above. Needs
+    /// `requires_reader = ["credentials-file-path-env"]`.
+    #[serde(default)]
+    pub path_env: Option<String>,
+    /// Filename appended onto the `path_env` override, if set (e.g.
+    /// `".credentials.json"` so `$CLAUDE_CONFIG_DIR` resolves to
+    /// `$CLAUDE_CONFIG_DIR/.credentials.json`). Ignored when `path_env` is
+    /// unset or the env var itself isn't; has no effect on the plain `path`
+    /// fallback, which is used verbatim — mirrors `[logfile] root_env_join`
+    /// exactly.
+    #[serde(default)]
+    pub path_env_join: Option<String>,
     /// `credentials-file` / `keychain` / `credentials-map`: JSON path(s) to
     /// the token inside the credential payload (for `credentials-map`, inside
     /// the *matched entry* — see `key_prefix`); `|`-separated fallback keys,
@@ -3883,15 +4009,16 @@ pub struct AuthStep {
     /// [`split_fallback_keys`].
     pub token_json_path: Option<String>,
 
-    /// `keychain`, `credentials-file`, `win-credential` only — `validate`
-    /// refuses it on any other step kind, naming the step's index and kind:
-    /// those three are the only ones whose credential store hands back one
-    /// JSON blob holding both the token and its expiry
-    /// (`auth::token_from_blob`), so they are the only ones that ever read
-    /// this field at all. Optional JSON path to an expiry beside the
-    /// token — an RFC3339 string, or a JSON number (or numeric string) read
-    /// as epoch seconds or milliseconds (told apart by magnitude; see
-    /// `auth::token_expiry`). When set and the moment it names is in the
+    /// `keychain`, `credentials-file`, `win-credential`, `credentials-map`
+    /// only — `validate` refuses it on any other step kind, naming the
+    /// step's index and kind: the first three read one JSON blob holding
+    /// both the token and its expiry directly (`auth::token_from_blob`);
+    /// `credentials-map` reads it from the same *matched entry* its own
+    /// token comes from (`auth::credentials_map_step`) — every other kind
+    /// never reads this field at all. Optional JSON path to an expiry beside
+    /// the token — an RFC3339 string, or a JSON number (or numeric string)
+    /// read as epoch seconds or milliseconds (told apart by magnitude; see
+    /// `auth::token_expiry_at`). When set and the moment it names is in the
     /// past (with a small margin), the step resolves **Absent** rather than
     /// handing back the stale token — so a chain can fall through to a
     /// refresh step behind it, or (with `[ping] renews_token`) let the
@@ -4329,12 +4456,16 @@ pub struct PingConfig {
     /// spends a provider's refresh token — see `plugin::throttle`'s module
     /// doc). A surface whose auth chain ends "lapsed" (see
     /// `plugin::auth::TOKEN_LAPSED`) is a token nothing here can renew on its
-    /// own, and a lapsed token behind `renews_token = false` reads no
-    /// differently than no credential at all — the same fetch that would
-    /// otherwise wait for the user to sign in again instead runs this
-    /// command, bounded by the same ten-minute floor the window ping shares.
-    /// Default `false`: without it, this field simply does not exist for a
-    /// manifest that predates it.
+    /// own. With `renews_token = false` (the default, and the whole story
+    /// for a manifest with no `[ping]` at all), a lapsed token still keeps
+    /// its row on screen — reading `engine_http::LAPSED`'s text, "token
+    /// expired — sign in again" — rather than being hidden the way an
+    /// absent credential is by default (a surface's `no_credentials_message`
+    /// keeps that row too); only the user's own next sign-in clears it.
+    /// `renews_token = true` runs this command in that same spot instead,
+    /// bounded by the same ten-minute floor the window ping shares. Default
+    /// `false`: without it, this field simply does not exist for a manifest
+    /// that predates it.
     #[serde(default)]
     pub renews_token: bool,
 }
@@ -5820,12 +5951,11 @@ mod tests {
 
     /// A provider that reports no window at all.
     ///
-    /// This is not a hypothetical: Grok's billing endpoint carries no window
-    /// key in either of the two shapes it answers with (measured against its
-    /// live response), only a monthly period. Until this test passed, such a
-    /// provider could not be written as a plugin — `validate` required a
-    /// window — which is the one thing "every AI arrives as a plugin" rules
-    /// out.
+    /// This is not a hypothetical: a provider's billing endpoint may carry no
+    /// window key in any shape it answers with, only a calendar period. Until
+    /// this test passed, such a provider could not be written as a plugin —
+    /// `validate` required a window — which is the one thing "every AI
+    /// arrives as a plugin" rules out.
     const BALANCES_ONLY: &str = r#"
         id           = "sample"
         name         = "Sample"
@@ -5888,6 +6018,87 @@ mod tests {
         let err = PluginManifest::from_str(&undeclared)
             .expect_err("a section this build reads has to be declared");
         assert!(err.contains("reading-balances"), "{err}");
+    }
+
+    #[test]
+    fn a_balance_unlimited_path_parses_and_needs_its_own_capability() {
+        let toml = BALANCES_ONLY.replace(
+            "[balances.source]",
+            "[balances.unlimited]\n        path = \"config.unlimited\"\n        [balances.source]",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("balances.unlimited.path without its own capability is refused");
+        assert!(err.contains("balance-unlimited"), "{err}");
+
+        let declared = toml.replace(
+            "requires_reader = [\"reading-balances\"]",
+            "requires_reader = [\"reading-balances\", \"balance-unlimited\"]",
+        );
+        let m = PluginManifest::from_str(&declared).expect("declared, the manifest parses");
+        assert_eq!(
+            m.balances[0].unlimited.as_ref().map(|u| u.path.as_str()),
+            Some("config.unlimited")
+        );
+    }
+
+    #[test]
+    fn a_balance_when_path_parses_and_needs_its_own_capability() {
+        let toml = BALANCES_ONLY.replace(
+            "[balances.source]",
+            "[balances.when]\n        path = \"config.enabled\"\n        [balances.source]",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("balances.when.path without its own capability is refused");
+        assert!(err.contains("balance-conditional"), "{err}");
+
+        let declared = toml.replace(
+            "requires_reader = [\"reading-balances\"]",
+            "requires_reader = [\"reading-balances\", \"balance-conditional\"]",
+        );
+        let m = PluginManifest::from_str(&declared).expect("declared, the manifest parses");
+        assert_eq!(
+            m.balances[0].when.as_ref().map(|w| w.path.as_str()),
+            Some("config.enabled")
+        );
+    }
+
+    /// `when` alone, with no `used`/`cap`/`remaining`/`source.*`, is not a
+    /// figure — `unlimited` alone is, since it is the figure itself. Pinned
+    /// together so `reads_nothing`'s asymmetry between the two is a decision,
+    /// not an accident.
+    #[test]
+    fn when_alone_reads_nothing_but_unlimited_alone_does() {
+        let base = BALANCES_ONLY.replace(
+            "[balances.used]\n        kind = \"number\"\n        path = \"config.used.val\"\n        \
+             unit_label = \"credits\"\n        [balances.cap]\n        kind = \"number\"\n        \
+             path = \"config.monthlyLimit.val\"\n        ",
+            "",
+        );
+
+        let when_only = base
+            .replace(
+                "[balances.source]",
+                "[balances.when]\n        path = \"config.enabled\"\n        [balances.source]",
+            )
+            .replace(
+                "requires_reader = [\"reading-balances\"]",
+                "requires_reader = [\"reading-balances\", \"balance-conditional\"]",
+            );
+        let err = PluginManifest::from_str(&when_only)
+            .expect_err("when names no figure of its own — the entry still reads nothing");
+        assert!(err.contains("names no figure"), "{err}");
+
+        let unlimited_only = base
+            .replace(
+                "[balances.source]",
+                "[balances.unlimited]\n        path = \"config.unlimited\"\n        [balances.source]",
+            )
+            .replace(
+                "requires_reader = [\"reading-balances\"]",
+                "requires_reader = [\"reading-balances\", \"balance-unlimited\"]",
+            );
+        PluginManifest::from_str(&unlimited_only)
+            .expect("unlimited is itself a figure worth an entry");
     }
 
     #[test]
@@ -6375,8 +6586,9 @@ mod tests {
 
     /// `expiry_json_path` is read only by `credentials_file_step`/
     /// `keychain_step`/`win_credential_step` (`auth::token_from_blob`,
-    /// shared by all three) — every other step kind never reads it at all,
-    /// so a manifest setting it there would still trip
+    /// shared by all three) and `credentials_map_step` (its own matched
+    /// entry, via `auth::stale_expiry_at`) — every other step kind never
+    /// reads it at all, so a manifest setting it there would still trip
     /// `SurfaceConfig::declares_token_expiry`/`auth::resolve_token`'s
     /// `from_expiring_step` over a field the engine never actually checks.
     #[test]
@@ -6399,13 +6611,13 @@ mod tests {
         );
     }
 
-    /// The mirror of the refusal above: each of the three step kinds that
+    /// The mirror of the refusal above: each of the four step kinds that
     /// actually read `expiry_json_path` is accepted with it set —
     /// `KEYCHAIN_EXPIRY_BASE` itself already covers `keychain`
     /// (`parses_a_keychain_step_with_an_expiry_path`); this covers the other
-    /// two.
+    /// three.
     #[test]
-    fn expiry_json_path_is_accepted_on_credentials_file_and_win_credential() {
+    fn expiry_json_path_is_accepted_on_credentials_file_win_credential_and_credentials_map() {
         let credentials_file = KEYCHAIN_EXPIRY_BASE.replace(
             "type            = \"keychain\"\n        service         = \"gemini\"\n        token_json_path = \"token.access_token\"",
             "type             = \"credentials-file\"\n        path             = \"~/.sample/auth.json\"\n        token_json_path  = \"token.access_token\"",
@@ -6419,6 +6631,96 @@ mod tests {
         );
         PluginManifest::from_str(&win_credential)
             .expect("expiry_json_path on a win-credential step is accepted");
+
+        let credentials_map = KEYCHAIN_EXPIRY_BASE
+            .replace(
+                "type            = \"keychain\"\n        service         = \"gemini\"\n        token_json_path = \"token.access_token\"",
+                "type             = \"credentials-map\"\n        path             = \"~/.sample/auth.json\"\n        key_prefix       = \"https://example.com::\"\n        token_json_path  = \"token.access_token\"",
+            )
+            .replace(
+                "requires_reader = [\"keychain-expiry\"]",
+                "requires_reader = [\"keychain-expiry\", \"credentials-map\"]",
+            );
+        PluginManifest::from_str(&credentials_map)
+            .expect("expiry_json_path on a credentials-map step is accepted");
+    }
+
+    #[test]
+    fn path_env_and_path_env_join_parse_on_a_credentials_file_step() {
+        let toml = KEYCHAIN_EXPIRY_BASE
+            .replace(
+                "type            = \"keychain\"\n        service         = \"gemini\"\n        token_json_path = \"token.access_token\"",
+                "type             = \"credentials-file\"\n        path             = \"~/.sample/.credentials.json\"\n        \
+                 path_env         = \"SAMPLE_CONFIG_DIR\"\n        path_env_join    = \".credentials.json\"\n        \
+                 token_json_path  = \"token.access_token\"",
+            )
+            .replace(
+                "requires_reader = [\"keychain-expiry\"]",
+                "requires_reader = [\"keychain-expiry\", \"credentials-file-path-env\"]",
+            );
+        let m = PluginManifest::from_str(&toml).expect("path_env/path_env_join are accepted");
+        let step = &m.surface[0].auth[0];
+        assert_eq!(step.path_env.as_deref(), Some("SAMPLE_CONFIG_DIR"));
+        assert_eq!(step.path_env_join.as_deref(), Some(".credentials.json"));
+    }
+
+    #[test]
+    fn path_env_needs_its_own_capability_declared() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "type            = \"keychain\"\n        service         = \"gemini\"\n        token_json_path = \"token.access_token\"",
+            "type             = \"credentials-file\"\n        path             = \"~/.sample/.credentials.json\"\n        \
+             path_env         = \"SAMPLE_CONFIG_DIR\"\n        token_json_path  = \"token.access_token\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("path_env without its own capability is refused");
+        assert!(err.contains("credentials-file-path-env"), "{err}");
+    }
+
+    #[test]
+    fn path_env_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE
+            .replace(
+                "expiry_json_path = \"token.expiry\"",
+                "path_env = \"SAMPLE_CONFIG_DIR\"",
+            )
+            .replace(
+                "requires_reader = [\"keychain-expiry\"]",
+                "requires_reader = [\"credentials-file-path-env\"]",
+            );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("path_env on a keychain step must be refused");
+        assert!(err.contains("path_env"), "{err}");
+        assert!(err.contains("keychain"), "{err}");
+    }
+
+    #[test]
+    fn path_env_join_must_be_a_relative_filename_with_no_dotdot_component() {
+        let base = KEYCHAIN_EXPIRY_BASE
+            .replace(
+                "type            = \"keychain\"\n        service         = \"gemini\"\n        token_json_path = \"token.access_token\"",
+                "type             = \"credentials-file\"\n        path             = \"~/.sample/.credentials.json\"\n        \
+                 path_env         = \"SAMPLE_CONFIG_DIR\"\n        token_json_path  = \"token.access_token\"",
+            )
+            .replace(
+                "requires_reader = [\"keychain-expiry\"]",
+                "requires_reader = [\"keychain-expiry\", \"credentials-file-path-env\"]",
+            );
+
+        let absolute = base.replace(
+            "path_env         = \"SAMPLE_CONFIG_DIR\"",
+            "path_env         = \"SAMPLE_CONFIG_DIR\"\n        path_env_join    = \"/etc/passwd\"",
+        );
+        let err = PluginManifest::from_str(&absolute)
+            .expect_err("an absolute path_env_join must be refused");
+        assert!(err.contains("relative"), "{err}");
+
+        let escaping = base.replace(
+            "path_env         = \"SAMPLE_CONFIG_DIR\"",
+            "path_env         = \"SAMPLE_CONFIG_DIR\"\n        path_env_join    = \"../escape\"",
+        );
+        let err = PluginManifest::from_str(&escaping)
+            .expect_err("a `..` component in path_env_join must be refused");
+        assert!(err.contains(".."), "{err}");
     }
 
     /// `macos_keychain_key` is `auth::electron_safe_storage_step`'s own

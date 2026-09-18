@@ -191,6 +191,22 @@ pub struct Balance {
     /// through. Not repeating a refusal the quota level already stated is a
     /// *rendering* rule, not a reason to drop the field.
     pub limit_reached: Option<bool>,
+    /// The provider stated this bucket has no ceiling at all
+    /// (`[balances.unlimited] path`, e.g. GitHub Copilot's `unlimited` flag
+    /// beside a premium bucket's `entitlement`/`remaining`). A plain `bool`,
+    /// not an `Option`: unlike every other field here, there is no third
+    /// state to keep apart from "the provider said no" — a manifest with no
+    /// `[balances.unlimited]` at all and a response that states `false` both
+    /// mean exactly the same thing to the renderer, so both are `false`
+    /// here.
+    ///
+    /// When `true`, `used`/`cap`/`remaining` are never populated from the
+    /// response even if the manifest also declares paths for them
+    /// (`plugin::engine_http::build_balance`) — an unlimited bucket's own
+    /// `entitlement`/`remaining` figures are not measurements of a ceiling
+    /// this app can draw a pair from, and printing `0 / 0` beside the word
+    /// "Unlimited" would contradict the one fact that matters.
+    pub unlimited: bool,
 }
 
 /// A figure in a balance, in whichever form the provider states it.
@@ -246,6 +262,11 @@ impl Balance {
             // matters elsewhere (it is a statement, and `None` is not), so the
             // field keeps all three states.
             || self.limit_reached == Some(true)
+            // "Unlimited" is itself the figure — the one this balance draws
+            // when every other field above is empty (an unlimited bucket's
+            // own `used`/`cap`/`remaining` are deliberately never populated;
+            // see this field's own doc).
+            || self.unlimited
     }
 
     /// Whether `used` and `cap` may be drawn as one "used / cap" pair — same
@@ -340,7 +361,7 @@ pub enum TokenRenewal {
     /// The auth chain ended with a credential past its own declared expiry
     /// (Unix seconds) and no working step behind it (`auth::TOKEN_LAPSED`).
     /// Named by that expiry, read from `expiry_json_path` by
-    /// `auth::token_expiry`, not just a bool.
+    /// `auth::token_expiry_at`, not just a bool.
     Lapsed { expires_at: u64 },
     /// An HTTP 401 arrived on a surface with no declared expiry to key a
     /// "once per token" ping on directly, so it is keyed on the token
@@ -520,6 +541,7 @@ mod tests {
             stated_percent: Some(12.0),
             period_end: Some(1_787_207_494),
             limit_reached: Some(false),
+            unlimited: false,
         }
     }
 
@@ -643,6 +665,7 @@ mod tests {
             stated_percent: None,
             period_end: Some(1_787_207_494),
             limit_reached: Some(false),
+            unlimited: false,
         };
         assert!(!quiet.is_stated());
         assert!(Balance {
@@ -668,6 +691,7 @@ mod tests {
             stated_percent: None,
             period_end: Some(1_787_207_494),
             limit_reached: None,
+            unlimited: false,
         };
         // A period end alone says nothing about the account: every month has
         // one. A row drawn from it would be a label and a date beside empty
@@ -682,6 +706,13 @@ mod tests {
         .is_stated());
         assert!(Balance {
             limit_reached: Some(true),
+            ..empty.clone()
+        }
+        .is_stated());
+        // "Unlimited" is the figure — a balance with every other field empty
+        // still draws a row once this is set.
+        assert!(Balance {
+            unlimited: true,
             ..empty
         }
         .is_stated());

@@ -10,10 +10,13 @@ menu_label   = "Cl"
 order        = 20
 # `required` below needs a reader that knows a window can be absent rather than
 # blank; `keychain-expiry` is what lets the auth steps below tell a stale
-# token from a working one — see docs/PLUGIN-ARCHITECTURE.md, "Reader
+# token from a working one; `balance-conditional` is what lets the "Extra
+# usage" balance draw no row at all on an account that never turned it on;
+# `credentials-file-path-env` is what lets the credentials-file step below
+# honour `CLAUDE_CONFIG_DIR` — see docs/PLUGIN-ARCHITECTURE.md, "Reader
 # capabilities".
-requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry"]
-version      = "1.4.3"
+requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry", "reading-balances", "balance-conditional", "credentials-file-path-env"]
+version      = "1.4.4"
 engine       = "http-api"
 # Re-fetched every 60 s.
 refresh_secs = 60
@@ -98,6 +101,41 @@ used_percent_path = "percent"
 resets_at_path    = "resets_at"
 resets_at_format  = "iso8601"
 
+# Extra usage: a separate, pay-as-you-go pool beyond the plan's own windows
+# above, on the accounts that have turned it on. The only shape actually
+# measured is a disabled account, where `used_credits`/`monthly_limit`/
+# `currency`/`decimal_places` are all `null` — read as `money-minor` on the
+# strength of the field names alone (a `decimal_places` beside an integer
+# is what that shape means everywhere else in this file), not because an
+# enabled account's own response has been seen. A figure that turns out to
+# arrive in some other shape draws nothing rather than a wrong number: the
+# engine reads the triplet fail-safe, so a float `used_credits` or a missing
+# `decimal_places` yields no amount instead of one scaled by the wrong power
+# of ten.
+#
+# `extra_usage.is_enabled` gates the row: on an account that never turned
+# this on, every other field in the object is `null` (measured), so without
+# `[balances.when]` this would either draw nothing (silently correct, for
+# the wrong reason) or, the moment a provider response changes shape,
+# draw a stray `used 0 / cap 0` for a feature the account never had. Stating
+# the gate explicitly is what makes "off" a fact this app read, not an
+# absence it happened not to notice.
+[[balances]]
+id    = "extra-usage"
+label = "Extra usage"
+[balances.used]
+kind          = "money-minor"
+amount_path   = "extra_usage.used_credits"
+currency_path = "extra_usage.currency"
+exponent_path = "extra_usage.decimal_places"
+[balances.cap]
+kind          = "money-minor"
+amount_path   = "extra_usage.monthly_limit"
+currency_path = "extra_usage.currency"
+exponent_path = "extra_usage.decimal_places"
+[balances.when]
+path = "extra_usage.is_enabled"
+
 # GET .../oauth/usage with the OAuth bearer token, the `oauth-2025-04-20` beta
 # header, and a `claude-code/<version>` User-Agent (required — Anthropic 429s
 # aggressively without it).
@@ -144,14 +182,27 @@ opt_in        = false
 in_menu_bar   = true
 allowed_hosts = ["api.anthropic.com"]
 
-# Plaintext credentials file first, then the OS secure store per platform.
-# Every step decodes the same JSON shape, hence the same `token_json_path`
-# fallback throughout: nested
-# `claudeAiOauth.accessToken`/`claudeAiOauth.access_token`, else flat
+# Plaintext credentials file first, then the macOS Keychain item the CLI
+# also writes there. On Windows, `%USERPROFILE%\.claude\.credentials.json`
+# is the only store the CLI ever writes — there is no Credential Manager
+# step behind it, since the CLI has none to reach. Every step decodes the
+# same JSON shape, hence the same `token_json_path` fallback throughout:
+# nested `claudeAiOauth.accessToken`/`claudeAiOauth.access_token`, else flat
 # `accessToken`/`access_token` at the root.
+#
+# The CLI honours `CLAUDE_CONFIG_DIR` for where it keeps this file —
+# `$CLAUDE_CONFIG_DIR/.credentials.json` instead of the default
+# `~/.claude/.credentials.json` — so `path_env`/`path_env_join` read the same
+# override this app's own `path` above would otherwise miss entirely on an
+# account that has ever set it. Out of scope: the CLI also honours
+# `CLAUDE_CONFIG_DIR` for the name of the Keychain item it writes, and the
+# keychain step below still names the fixed default service — re-keying that
+# lookup needs its own manifest field this change does not add.
 [[surface.auth]]
 type             = "credentials-file"
 path             = "~/.claude/.credentials.json"
+path_env         = "CLAUDE_CONFIG_DIR"
+path_env_join    = ".credentials.json"
 token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
 # expiresAt is epoch milliseconds.
 expiry_json_path = "claudeAiOauth.expiresAt"
@@ -159,13 +210,6 @@ expiry_json_path = "claudeAiOauth.expiresAt"
 [[surface.auth]]
 type             = "keychain"
 service          = "Claude Code-credentials"
-token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
-# expiresAt is epoch milliseconds.
-expiry_json_path = "claudeAiOauth.expiresAt"
-
-[[surface.auth]]
-type             = "win-credential"
-targets          = ["Claude Code-credentials", "Claude Code"]
 token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
 # expiresAt is epoch milliseconds.
 expiry_json_path = "claudeAiOauth.expiresAt"
@@ -191,11 +235,18 @@ blob_json_path     = "oauth:tokenCacheV2|oauth:tokenCache"
 token_json_path    = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
 macos_keychain_key = "Claude Safe Storage"
 
-# `claude -p hello` — run while the 5-hour window sits empty, to start a
-# fresh one (src/main.rs `ping_due` / `send_ping`, gated by
-# `config::auto_ping_claude`).
+# `claude -p hello --model haiku` — run while the 5-hour window sits empty,
+# to start a fresh one (src/main.rs `ping_due` / `send_ping`, gated by
+# `config::auto_ping_claude`). The ping's only job is to start the window
+# and renew the token, and the cheapest model does both exactly as well as
+# the account's default one — every third-party renewal script observed
+# pins one for the same reason. `haiku` is the CLI's own alias for its
+# current cheapest model, not a dated snapshot id: a pinned id stops
+# working, silently, the day Anthropic retires that snapshot — taking both
+# the window ping and the token renewal with it — while the alias keeps
+# resolving to whatever model earns the name next.
 [ping]
 bin  = "claude"
-args = ["-p", "hello"]
+args = ["-p", "hello", "--model", "haiku"]
 # The CLI renews its own token only when it runs.
 renews_token = true

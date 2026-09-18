@@ -26,7 +26,7 @@ name         = "Antigravity"
 menu_label   = "Ag"
 order        = 40
 requires_reader = ["http-post", "remaining-fraction", "window-identity", "keychain-expiry", "oauth-refresh", "oauth-client-discovery"]
-version      = "1.1.2"
+version      = "1.1.3"
 engine       = "http-api"
 refresh_secs = 60
 
@@ -136,6 +136,20 @@ service          = "gemini"
 token_json_path  = "token.access_token"
 expiry_json_path = "token.expiry"
 
+# Windows' own native store, the same role the keychain step above plays on
+# macOS: the CLI keeps its token fresh through the same `zalando/go-keyring`
+# library either way, and that library's Windows backend names a Credential
+# Manager target `<service>:<account>` — the pair it writes on macOS is
+# service `gemini`, account `antigravity`, hence `gemini:antigravity` here.
+# No-op on macOS the way the keychain step is a no-op on Windows, so
+# declaring both costs nothing on either platform — each resolves Absent
+# where it does not apply, and the chain moves on.
+[[surface.auth]]
+type              = "win-credential"
+targets           = ["gemini:antigravity"]
+token_json_path   = "token.access_token"
+expiry_json_path  = "token.expiry"
+
 # The fallback, when the keychain token has lapsed (Antigravity not running for a
 # while): read the refresh token from the CLI's own token file and exchange it for
 # a fresh access token at Google's OAuth endpoint. The fresh token is never
@@ -154,8 +168,10 @@ expiry_json_path = "token.expiry"
 #   * `id_env`/`secret_env` — an operator's own override, checked first;
 #   * failing that, each of `files` (Antigravity's `language_server`, wherever
 #     it landed — the app path or, once in a while, an unsandboxed install
-#     under the home directory) and then `bins` (`agy`, the CLI, resolved on
-#     `PATH`), scanned in order for the first match of `id_pattern` and
+#     under the home directory, and under either of the two names the app
+#     bundle has shipped as — plain `Antigravity.app` and, on a later
+#     release, `Antigravity IDE.app`) and then `bins` (`agy`, the CLI,
+#     resolved on `PATH`), scanned in order for the first match of `id_pattern` and
 #     `secret_pattern` in the *same* file, each independently — the first
 #     match of one is not required to be anywhere near the first match of
 #     the other, only in the same candidate;
@@ -211,5 +227,7 @@ secret_pattern = "GOCSPX-[A-Za-z0-9_-]{28}"
 files = [
   "/Applications/Antigravity.app/Contents/Resources/bin/language_server",
   "~/Applications/Antigravity.app/Contents/Resources/bin/language_server",
+  "/Applications/Antigravity IDE.app/Contents/Resources/bin/language_server",
+  "~/Applications/Antigravity IDE.app/Contents/Resources/bin/language_server",
 ]
 bins  = ["agy"]

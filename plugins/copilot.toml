@@ -21,8 +21,8 @@ id           = "copilot"
 name         = "Copilot"
 menu_label   = "Cp"
 order        = 50
-requires_reader = ["reading-balances", "credentials-map"]
-version      = "1.0.1"
+requires_reader = ["reading-balances", "credentials-map", "balance-unlimited"]
+version      = "1.0.2"
 engine       = "http-api"
 # A monthly counter, not a rolling window, and the number is picked rather than
 # copied from the other manifests — none of which is measuring a month.
@@ -44,24 +44,19 @@ refresh_secs = 300
 # The response carries three quota buckets — `chat`, `completions` and
 # `premium_interactions` — and only the last one is metered on a paid plan: the
 # other two arrive `unlimited = true` with `entitlement` and `remaining` both
-# zero (measured on an `individual` plan). A row for them would draw a
-# 0-of-0 that means "no ceiling", the one reading `Balance::cap` documents it
-# will never conclude. So one row here, for the bucket that has a number in it —
-# and two more at the bottom of this file for the free plan, which meters those
-# same two buckets through entirely different fields.
+# zero (measured on an `individual` plan). A row for `chat`/`completions`
+# would draw a 0-of-0 with nothing behind it to say why, so this file still
+# reads only the one bucket that has a number in it on that plan — and two
+# more at the bottom of this file for the free plan, which meters those same
+# two buckets through entirely different fields.
 #
-# `unlimited` has no home in the balance grammar and is not being given one
-# here: nothing on this account reads it (see the "no mechanism without a
-# consumer" rule), and the honest alternative — a row that says "unlimited" —
-# is a caption this app would be inventing, not a figure the provider stated.
-#
-# The known weakness that leaves, written down rather than left to be found: an
-# account where *premium* itself arrives unlimited draws `cap 0 / remaining 0`,
-# which reads like an exhausted quota and is not one. Nothing here concludes
-# "exhausted" from a zero (`Balance::cap` is explicit about that), but nothing
-# distinguishes the two either. The flagship test over this manifest in
-# `src/plugin/engine_http.rs` pins that behaviour on purpose, so a later stage
-# that wants to fix it can see exactly what it is changing.
+# `premium_interactions` itself can arrive `unlimited = true` too (not
+# observed on this account, but the same field the other two buckets carry,
+# on the one bucket this manifest actually reads) — without
+# `[balances.unlimited]` below, that reads as `cap 0 / remaining 0`,
+# indistinguishable from an exhausted quota. With it, the row draws
+# "Unlimited" instead: a provider-stated fact translated into one word, not a
+# figure this app invented.
 [[balances]]
 id    = "premium"
 label = "Premium"
@@ -85,6 +80,13 @@ unit_label = "interactions"
 kind       = "number"
 path       = "quota_snapshots.premium_interactions.entitlement"
 unit_label = "interactions"
+
+# `true` on this bucket makes `remaining`/`cap` above unread — an unlimited
+# account's own `entitlement`/`quota_remaining` are `0`, not "no ceiling",
+# and reading them anyway would draw the exact `0 / 0` this field exists to
+# stop.
+[balances.unlimited]
+path = "quota_snapshots.premium_interactions.unlimited"
 
 # The end of the calendar period. `quota_reset_date_utc` (RFC3339 Z, midnight)
 # rather than the `quota_reset_date` beside it, which is a bare `YYYY-MM-DD`

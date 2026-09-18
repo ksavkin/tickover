@@ -11,9 +11,9 @@ reuses, and the rough edges. The manifest format itself is specified in
 | Provider | What the panel shows | The login it reuses | Refresh | Host pinned in the manifest |
 |---|---|---|---|---|
 | **OpenAI Codex CLI** | 5-hour and weekly windows; model-specific windows as extra rows; the account's credit balance, email and plan; a "limit reached" notice when Codex says so | `~/.codex/auth.json` — the access token and account id, sent to the same usage endpoint the CLI calls | 60 s | `chatgpt.com` (`/backend-api/wham/usage`) |
-| **Claude** | 5-hour and weekly windows per login found — Claude Code CLI / VS Code, and (opt-in) the desktop app, which may be a different account; per-model weekly limits as extra rows | `~/.claude/.credentials.json`, else the Keychain item `Claude Code-credentials`, else Windows Credential Manager; the desktop app's token from Electron Safe Storage | 60 s | `api.anthropic.com` (`/api/oauth/usage`, `/api/oauth/profile` for the address) |
-| **Grok** | prepaid credit balance and pay-as-you-go spend for the current billing period | the record in `~/.grok/auth.json` whose key starts with the x.ai auth host (the rest of the key is a per-install id, so it is matched by prefix) | 60 s | `cli-chat-proxy.grok.com` |
-| **Antigravity** | 5-hour and weekly allowances for Gemini and for third-party models | the access token in the Keychain item its CLI writes; once that has lapsed, the refresh token in `~/.gemini/antigravity-cli/antigravity-oauth-token`, exchanged with the OAuth client pair read from the installed Antigravity app or `agy` binary (never shipped with this app; `TICKOVER_ANTIGRAVITY_CLIENT_ID`/`_SECRET` override) | 60 s | `daily-cloudcode-pa.googleapis.com`; `oauth2.googleapis.com` for the token exchange |
+| **Claude** | 5-hour and weekly windows per login found — Claude Code CLI / VS Code, and (opt-in) the desktop app, which may be a different account; per-model weekly limits as extra rows | `~/.claude/.credentials.json`, else the Keychain item `Claude Code-credentials` on macOS — on Windows that same file is the only store the CLI writes; the desktop app's token from Electron Safe Storage | 60 s | `api.anthropic.com` (`/api/oauth/usage`, `/api/oauth/profile` for the address) |
+| **Grok** | credits used in the current weekly usage period, plus a prepaid credit balance and pay-as-you-go spend | the record in `~/.grok/auth.json` whose key starts with the x.ai auth host (the rest of the key is xAI's own OAuth client id — fixed, not one that varies by install — matched by prefix rather than spelled out in full) | 60 s | `cli-chat-proxy.grok.com` |
+| **Antigravity** | 5-hour and weekly allowances for Gemini and for third-party models | the access token in the Keychain item its CLI writes, or the same token from Windows Credential Manager (`gemini:antigravity`); once that has lapsed, the refresh token in `~/.gemini/antigravity-cli/antigravity-oauth-token`, exchanged with the OAuth client pair read from the installed Antigravity app or `agy` binary (never shipped with this app; `TICKOVER_ANTIGRAVITY_CLIENT_ID`/`_SECRET` override) | 60 s | `daily-cloudcode-pa.googleapis.com`; `oauth2.googleapis.com` for the token exchange |
 | **GitHub Copilot** | the month's premium-request allowance and its reset; chat and completion rows on the free tier | the `github.com` entry of `~/.config/github-copilot/apps.json` | 300 s | `api.github.com` |
 
 Every one of these endpoints is the provider's own — undocumented and
@@ -30,11 +30,24 @@ firing a request.
 
 Two of the five manifests declare a `[ping]` — Codex
 (`codex exec --skip-git-repo-check --sandbox read-only hello`) and Claude
-(`claude -p hello`). When that provider's 5-hour window sits empty, the
-command runs once so the new window starts counting immediately. Copilot
-and Grok have no rolling window to start — a monthly allowance and a
-balance — and Antigravity, which does have one, has no `[ping]` in its
-manifest yet. The mechanism, its bounds and where the command runs are in
+(`claude -p hello --model haiku` — the CLI's own alias for its current
+cheapest model, not a dated snapshot id, does the same job of starting the
+window and renewing the token). When that provider's 5-hour window sits
+empty, the command runs once so the new window starts counting
+immediately. Copilot and Grok have no rolling window a ping could start — a
+monthly allowance, and a weekly credit period with balances.
+
+Antigravity, which does have a rolling window, deliberately has no `[ping]`.
+Google has confirmed banning accounts over third-party tools and proxies
+driving Antigravity's underlying quota, with reports of the ban cascading to
+Gemini CLI / Code Assist on the same account — see this
+[gemini-cli discussion](https://github.com/google-gemini/gemini-cli/discussions/20632).
+[`leonidlouis/antigravity-quota-refresher`](https://github.com/leonidlouis/antigravity-quota-refresher),
+a tool built for exactly the job `[ping]` does for Codex and Claude, is marked deprecated for this reason —
+its users got banned. Nothing here second-guesses that: Antigravity stays
+read-only, however tempting an empty window is to nudge.
+
+The mechanism, its bounds and where the command runs are in
 the README and in
 [`PLUGIN-ARCHITECTURE.md`](PLUGIN-ARCHITECTURE.md#ping-auto-refresh-nudge).
 
@@ -71,6 +84,12 @@ the README and in
   it, it renews the token — but *this app* only runs it for you when
   auto-ping is switched on for that plugin: per-plugin opt-in, off by
   default.
+- **Grok checks its own token's expiry before ever asking the endpoint.**
+  `~/.grok/auth.json` states an `expires_at` beside the matched entry's key,
+  and past it the row reads "token expired — sign in again" without a
+  request going out — Grok declares no `[ping]`, so there is no renewal to
+  key the "token expired — renews on the next `<bin>` run" text on the way
+  Claude's row does above; only the user's own next `grok` login clears it.
 
 ## Claude: two surfaces
 
@@ -81,7 +100,11 @@ own.
 - **CLI / VS Code** reads `~/.claude/.credentials.json` first; only when
   that file is absent does it ask the Keychain, which is when macOS shows
   its prompt. *Don't Allow* leaves the section empty until you relaunch and
-  allow it.
+  allow it. An account with `CLAUDE_CONFIG_DIR` set reads
+  `$CLAUDE_CONFIG_DIR/.credentials.json` instead — this app follows the same
+  override for the file. It does not follow it for the Keychain item name,
+  which the CLI also renames under `CLAUDE_CONFIG_DIR`; an account relying on
+  that falls through to the plaintext file check above instead.
 - **Desktop app** is an opt-in in Settings. The desktop app locks its
   Safe-Storage key to itself, so the first read shows a Keychain prompt for
   `Claude Safe Storage` — *Always Allow* and the account populates. On
@@ -89,15 +112,15 @@ own.
 - **A lapsed CLI access token renews itself the next time the CLI runs —
   including a run this app triggers itself, if auto-ping is on for Claude**
   (off by default, like every plugin's ping). `claudeAiOauth.expiresAt`
-  (epoch milliseconds) is checked on the credentials-file, Keychain and
-  Credential Manager steps — three, not two; past it, the chain reports the
-  token lapsed rather than handing back one that will 401. Because `[ping] renews_token = true`, the
+  (epoch milliseconds) is checked on both the credentials-file and Keychain
+  steps; past it, the chain reports the token lapsed rather than handing
+  back one that will 401. Because `[ping] renews_token = true`, the
   row reads "token expired — renews on the next claude run" regardless of
   whether auto-ping is on — that text names what the *next* `claude` run
   does, by whoever runs it. With auto-ping on, the app also runs
-  `claude -p hello` itself, on the same ten-minute floor as the window ping,
-  so the CLI renews its own token sooner than the next window boundary would
-  otherwise trigger it.
+  `claude -p hello --model haiku` itself, on the same ten-minute floor as
+  the window ping, so the CLI renews its own token sooner than the next
+  window boundary would otherwise trigger it.
   **This is the CLI row's behavior only.** The Desktop row's own chain
   (`electron-safe-storage`) declares no expiry, so a lapsed or 401'd Desktop
   token is never rewritten and never pings — it keeps the plain "session
@@ -106,6 +129,12 @@ own.
 
 The weekly bucket is reported as `seven_day` but in practice resets sooner;
 the countdown follows the reset time the provider states, not the name.
+
+**Extra usage** — a separate, pay-as-you-go pool beyond the plan's own
+windows — draws its own "Extra usage" row, but only for an account that has
+turned it on: the response states `extra_usage.is_enabled` directly, and an
+account without it carries every other field in that object as `null`, so
+the row simply does not appear rather than showing an empty pair.
 
 ## Codex: why it stopped reading logs
 
@@ -126,17 +155,16 @@ The header comment of [`plugins/codex.toml`](../plugins/codex.toml) carries
 the same reasoning. The `log-file` engine itself is still shipped and fully
 specified for any third-party manifest that wants it.
 
-## Copilot: two caveats
+## Copilot: one caveat
 
-- **An unlimited premium allowance draws `cap 0 / remaining 0`**, which reads
-  like an exhausted quota and is not one. The response distinguishes the two
-  (`unlimited`, a zero `entitlement`), but the manifest grammar cannot yet
-  express "this figure is absent when that flag is set", and no account here
-  reports it, so it is documented instead of guessed at.
 - **The free-tier rows are the one thing written from a client's source
   rather than from an observed response.** With no free account to check
   against, they are either right or draw nothing; they cannot be wrong
   loudly.
+
+An unlimited premium allowance draws "Unlimited", not `cap 0 / remaining 0`:
+the response's own `unlimited` flag (a zero `entitlement` beside it) is read
+through `[balances.unlimited]`.
 
 ## Adding a provider
 

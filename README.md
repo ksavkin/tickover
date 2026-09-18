@@ -5,9 +5,9 @@ provider's 5-hour window has reset and is sitting empty, Tickover — once you
 switch it on for that provider; Codex and Claude today — sends one tiny
 prompt so the new window starts counting now, not at your first real
 request hours later. It also meters what is left: the 5-hour and weekly
-windows of Codex, Claude and Antigravity, the balances of Grok, GitHub
-Copilot and Codex credits, in the macOS menu bar or the Windows system tray, with a countdown
-that ticks every second.
+windows of Codex, Claude and Antigravity, Grok's weekly credit usage, the
+balances of Grok, GitHub Copilot and Codex credits, in the macOS menu bar or
+the Windows system tray, with a countdown that ticks every second.
 
 Rust + [Slint](https://slint.dev). One small native binary (about 8 MB per
 architecture), no runtime, no account to create, no telemetry. **Every
@@ -54,9 +54,10 @@ to set up.
 A 5-hour window starts at your first request, not at the reset. Reset at
 03:00, first prompt at 09:00: six hours of quota went nowhere. Tickover
 watches each provider's primary window and, when it sees it sitting
-**empty** — reset, nothing used — runs one small command: `codex exec … hello`,
-`claude -p hello`. That window starts counting now — and because a window
-starts at the first request, a weekly window that had reset starts with it.
+**empty** — reset, nothing used — runs one small command: `codex exec …
+hello`, `claude -p hello --model haiku`. That window starts counting now —
+and because a window starts at the first request, a weekly window that had
+reset starts with it.
 
 The test is "empty", not "the reset just happened", so a machine asleep at
 the boundary pings when it wakes instead of losing the window for good — but
@@ -110,10 +111,10 @@ popover still lists all of them.
   `~/.codex/auth.json`.
 - **Claude** — 5-hour and weekly windows per login found (Claude Code CLI /
   VS Code, and the desktop app as an opt-in), per-model weekly limits;
-  reuses `~/.claude/.credentials.json`, else the Keychain or Credential
-  Manager.
-- **Grok** — prepaid credit and pay-as-you-go spend for the billing period;
-  `~/.grok/auth.json`.
+  reuses `~/.claude/.credentials.json`, else the macOS Keychain item, or on
+  Windows the same file, the only store the CLI writes there.
+- **Grok** — credits used in the current weekly usage period, plus prepaid
+  credit and pay-as-you-go spend; `~/.grok/auth.json`.
 - **Antigravity** — 5-hour and weekly allowances for Gemini and third-party
   models; the Keychain item its CLI writes.
 - **GitHub Copilot** — the month's premium-request allowance and its reset;
