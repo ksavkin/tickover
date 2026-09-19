@@ -35,7 +35,9 @@ cheapest model, not a dated snapshot id, does the same job of starting the
 window and renewing the token). When that provider's 5-hour window sits
 empty, the command runs once so the new window starts counting
 immediately. Copilot and Grok have no rolling window a ping could start — a
-monthly allowance, and a weekly credit period with balances.
+monthly allowance, and a weekly credit period with balances. Neither this
+ping nor a renewal one (below) is ever launched while the provider's own
+host does not resolve — the tick simply tries again once it does.
 
 Antigravity, which does have a rolling window, deliberately has no `[ping]`.
 Google has confirmed banning accounts over third-party tools and proxies

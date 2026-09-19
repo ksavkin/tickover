@@ -1072,13 +1072,15 @@ declared twice is refused too. A manifest may declare at most 32
 Optional command run shortly after the **primary** window resets, to start a
 fresh window (consumes a little quota — opt-in per plugin/user). With
 `renews_token`, the same command also runs whenever a surface's token has
-lapsed — see [Renewing a lapsed token](#renewing-a-lapsed-token) below.
+lapsed — see [Renewing a lapsed token](#renewing-a-lapsed-token) below. A
+ping — window or renewal — is not launched while the provider's own host
+does not resolve; the tick simply tries again once it does.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `bin` | string | — (required) | binary to run; a bare program name, not a path — no `/`, `\` or `:` (the last rules out a Windows prefixed-relative path like `C:evil`, which has neither of the other two) |
 | `args` | array of strings | empty | arguments; at most 32, each non-empty and at most 256 bytes — the install-time trust dialog renders the whole command line, and these bounds keep one argument from pushing its untrusted-host warning off the bottom |
-| `renews_token` | bool | `false` | whether running this command also renews the provider's token, as a side effect the provider's own CLI has and this app does not (it never spends a provider's refresh token). A surface whose auth chain ends "lapsed" (a credential found, past its `expiry_json_path`, with no working step behind it) runs this command instead of only waiting for the user to sign in again — bounded by the same ten-minute floor as the window ping above, and by a fixed three attempts per token when a run keeps ending without success (see [Renewing a lapsed token](#renewing-a-lapsed-token)) |
+| `renews_token` | bool | `false` | whether running this command also renews the provider's token, as a side effect the provider's own CLI has and this app does not (it never spends a provider's refresh token). A surface whose auth chain ends "lapsed" (a credential found, past its `expiry_json_path`, with no working step behind it) runs this command instead of only waiting for the user to sign in again — bounded by the same ten-minute floor as the window ping above, backing off to an hour apart once three attempts per token have ended without success, and never abandoned (see [Renewing a lapsed token](#renewing-a-lapsed-token)) |
 
 No argument, label, hostname, message, or other manifest-supplied string
 listed in this document may contain a control character (C0, DEL) or a
@@ -1461,52 +1463,73 @@ first one found due is offered the same treatment [`ping_due`] gives the
 window ping: no more than once every ten minutes
 (`PING_MIN_INTERVAL_SECS`), the floor shared with the window ping — a
 renewal spends this tick's one allowed ping, same as a window ping would.
+That floor, and the hourly cadence past it, are both measured from the same
+per-plugin `pinged_at` the window ping itself writes — so a window ping on
+this plugin can postpone a renewal retry by up to one whole interval (ten
+minutes in the fast phase, an hour in the slow one), never more, since the
+window ping fires at most once per window.
 A renewal merely on cooldown never blocks a *later* eligible surface's own
 renewal from being checked, nor that tick's ordinary window ping — only a
-renewal that actually spawned a run skips the window ping. It is otherwise
+renewal that actually spawned a run, or one that was due but the network
+gate did not clear (see below — Pending on a first ask, or a confirmed
+Unreachable, read the same way here), skips the window ping; the two target
+the same host, so whatever blocks one blocks the other too. It is otherwise
 the same command, the same auto-ping toggle, and the same sandboxed working
 directory as the window ping below — and that toggle is what decides
 whether *this app* runs the command at all; the row text itself (above)
 appears either way, since it states what the next run of that command does,
 regardless of who starts it.
 
-**Bounded to at most three attempts per token, once the run succeeds no
-more.** A lapsed auth chain carries the expiry it declared
-(`auth::token_expiry_at`, epoch seconds). A bare 401 carries no such expiry —
-nothing here ever parsed the credential that produced it — so it is keyed on
-the token itself instead: a hash of the bearer token and the request's other
-credential-derived values (`plugin::throttle::fingerprint`, already computed
-for the throttle's own purposes and reused here rather than hashed twice;
-never the token itself, never persisted or logged). `main.rs` remembers, per
-*surface* (keyed by the same surface reading id the panel and the registry
-already use, e.g. `"claude-cli"`) and in memory only, a small record for the
-key the last renewal ping actually fired for — the key itself, how many
-attempts have been credited against it, and whether the most recent one is
-known to have ended without success. A reading naming that same key again is
-due once more only once both hold: the shared floor has passed *and* the
-previous attempt's own run ended without success (a non-zero exit, a
-deadline kill, or a failure to spawn the CLI at all) — up to three attempts
-total, never a fourth. A run that exits `0` stops the retries outright: the
-key is not due again until a *different* one shows up (the CLI renewed, then
-the token lapsed again; or, after a 401, the credential changed). Keyed per
-surface rather than per plugin so that two renewal-eligible surfaces on one
-plugin, each lapsing on its own schedule, each get their own budget instead
-of one surface's renewal overwriting — and so silently re-arming — the
-other's. Three, not one, so a single run that fails for a reason unrelated
-to the token (a transient network error) does not condemn it to going
-unrenewed until it lapses differently; not unbounded, so a token the CLI
-genuinely cannot renew either — its own refresh token has expired too, say,
-and it now needs an interactive login — still stops being retried rather
-than spending a process every floor forever. The credit for an attempt is
-provisional only until the command is actually running: recorded once the
-background thread that would run it starts, and undone entirely (as if this
-attempt had never been credited at all) if the OS then refuses to even start
-the background thread or find the binary — a run that never happened must
-not spend part of the budget. Once the run does start, however it ends
-(`Command::spawn` itself failing inside the thread, a non-zero exit, or a
-deadline kill) is reported back and counted as a spent, not-yet-successful
-attempt rather than being undone — only a successful exit leaves the record
-as `credit_renewal` first left it.
+**Backed off rather than capped: ten minutes apart for the first three
+attempts per token, an hour apart after that, for as long as the token
+stays unrenewed — and once the run succeeds, no more.** A lapsed auth chain
+carries the expiry it declared (`auth::token_expiry_at`, epoch seconds). A
+bare 401 carries no such expiry — nothing here ever parsed the credential
+that produced it — so it is keyed on the token itself instead: a hash of
+the bearer token and the request's other credential-derived values
+(`plugin::throttle::fingerprint`, already computed for the throttle's own
+purposes and reused here rather than hashed twice; never the token itself,
+never persisted or logged). `main.rs` remembers, per *surface* (keyed by the
+same surface reading id the panel and the registry already use, e.g.
+`"claude-cli"`) and in memory only, a small record for the key the last
+renewal ping actually fired for — the key itself, how many attempts have
+been credited against it, and whether the most recent one is known to have
+ended without success. A reading naming that same key again is due once
+more only once both hold: the previous attempt's own run ended without
+success (a non-zero exit, a deadline kill, or a failure to spawn the CLI at
+all) *and* the cadence its attempt count has earned has passed — ten
+minutes for the first three attempts, an hour for every one after that.
+Retries never stop on their own: a token this app genuinely cannot renew
+either — its own refresh token has expired too, say, and it now needs an
+interactive login — keeps being retried, just an hour apart instead of ten
+minutes, rather than being left to sit unrenewed until a person happens to
+run the CLI by hand. A run that exits `0` stops the retries outright: the
+key is not due again until a *different* one shows up (the CLI renewed,
+then the token lapsed again; or, after a 401, the credential changed).
+Keyed per surface rather than per plugin so that two renewal-eligible
+surfaces on one plugin, each lapsing on its own schedule, each run their
+own schedule instead of one surface's renewal overwriting — and so
+silently re-arming — the other's. Three fast attempts, not one, so a single
+run that fails for a reason unrelated to the token (a transient network
+error) does not slow its retries to an hour apart over one bad roll. The
+credit for an attempt is provisional only until the command is actually
+running: recorded once the background thread that would run it starts, and
+undone entirely (as if this attempt had never been credited at all) if the
+OS then refuses to even start that thread — a run that never happened must
+not count against the attempt total. A missing `[ping]` binary never
+reaches that far at all: it is resolved before any credit is made, so there
+is nothing to undo — the same shape the host-resolution check above gives a
+network that is not there. Once the run does start, however it ends
+(`Command::spawn` itself failing inside the
+thread, a non-zero exit, or a deadline kill) is reported back and counted
+as a spent, not-yet-successful attempt rather than being undone — only a
+successful exit leaves the record as `credit_renewal` first left it.
+
+For a renewal specifically, that host check (see `[ping]` above) means an
+outage spends neither the shared floor nor one of the attempts counted here
+— a run that could not have succeeded is not credited at all, and the same
+renewal is due exactly as it was once that check reports the host reachable
+again.
 
 ### Where the ping's command runs
 

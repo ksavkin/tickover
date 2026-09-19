@@ -14,6 +14,7 @@ mod platform;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::ToSocketAddrs;
 use std::rc::Rc;
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -30,8 +31,8 @@ use tickover::plugin::registry::{
 };
 use tickover::plugin::signature;
 use tickover::plugin::{
-    engine_http, engine_logfile, is_invisible_or_directional, push_host, scheduler, seed,
-    surface_reading_id, throttle, time as plugin_time, write_via_temp,
+    engine_http, engine_logfile, https_host, is_invisible_or_directional, push_host, scheduler,
+    seed, substitute_options, surface_reading_id, throttle, time as plugin_time, write_via_temp,
 };
 
 use tray_icon::{
@@ -1823,35 +1824,39 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                                 (id, renewal)
                             });
                     // Shares `PING_MIN_INTERVAL_SECS`'s floor with the
-                    // window ping below, plus its own bound on top: at
-                    // most `RENEWAL_MAX_ATTEMPTS` pings per distinct token
-                    // *per surface* (`LAST_RENEWED_FOR` is keyed by surface
-                    // reading id, not by plugin — two renewal-eligible
-                    // surfaces on one plugin lapsing independently each get
-                    // their own budget rather than overwriting one
-                    // another's), and only that many when a run keeps
-                    // ending without success — a run that exits 0 stops at
+                    // window ping below, plus its own backoff on top: ten
+                    // minutes apart for the first `RENEWAL_FAST_ATTEMPTS`
+                    // failed attempts at one distinct token *per surface*
+                    // (`LAST_RENEWED_FOR` is keyed by surface reading id, not
+                    // by plugin — two renewal-eligible surfaces on one
+                    // plugin lapsing independently each run their own
+                    // schedule rather than overwriting one another's), an
+                    // hour apart past that — and only while a run keeps
+                    // ending without success; a run that exits 0 stops at
                     // one, the same once-per-token bound as before. Never
-                    // one every ten minutes forever, for as long as a token
-                    // the CLI genuinely cannot renew stays unrenewed. Silent
-                    // when suppressed — logging it would repeat every tick
-                    // for exactly the token this exists to stop pinging
-                    // about.
+                    // abandoned: a token the CLI genuinely cannot renew is
+                    // still retried, an hour apart, for as long as it stays
+                    // unrenewed. Silent when suppressed — logging it would
+                    // repeat every tick for exactly the token this exists to
+                    // stop pinging about.
                     //
-                    // `credit_renewal` runs *before* `send_ping`, not
+                    // `credit_renewal` runs *before* `spawn_hello`, not
                     // after: `Command::spawn`'s own failure is reported
                     // asynchronously, on a background thread, and can
                     // otherwise land before this thread gets around to
                     // crediting anything — see `credit_renewal`'s own
                     // doc for why crediting first is the one ordering
-                    // that can't lose the retry. `send_ping` returning
-                    // `false` means nothing will ever run to notice that
-                    // credit on this attempt's behalf, so the tick
-                    // undoes it itself; `continue` (skipping the
-                    // window-ping path below) only follows an actual
-                    // spawn — a renewal merely on cooldown, or one that
-                    // failed to even start, must never suppress the one
-                    // ping that plugin can still fire this tick.
+                    // that can't lose the retry. A missing `[ping]` binary
+                    // (`ping_binary` returning `None`) is caught before any
+                    // of that runs at all, so there is nothing to undo;
+                    // `spawn_hello` returning `false` once the binary *is*
+                    // resolved means nothing will ever run to notice the
+                    // credit already made, so `run_renewal_ping` undoes it
+                    // itself; `continue` (skipping the window-ping path
+                    // below) only follows an actual spawn — a renewal
+                    // merely on cooldown, one whose binary is missing, or
+                    // one that failed to even start, must never suppress
+                    // the one ping that plugin can still fire this tick.
                     // Read once for this whole iteration, not once per use
                     // below: nothing between here and `set_plugin_pinged_at`
                     // moves it, and `config`'s own cache makes a second ask
@@ -1864,6 +1869,19 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                     };
                     if let Some((surface_key, renewal)) = due {
                         let ping = m.ping.as_ref().expect("filtered by ping.is_some() above");
+                        // This gate is asked every tick a renewal stays due —
+                        // see `ping_network_gate`'s own doc for why that is
+                        // fine (the resolve, not the ask, is what's cached).
+                        // Neither `pinged_at` nor `LAST_RENEWED_FOR` has been
+                        // touched yet, so `Pending` or `Unreachable` cost
+                        // nothing here: this renewal is still due exactly as
+                        // it is now, and fires on whichever later tick
+                        // finally sees the host resolve.
+                        if ping_network_gate(&m.id, ping_host(m).as_deref())
+                            != PingNetwork::Reachable
+                        {
+                            continue;
+                        }
                         if run_renewal_ping(&m.id, ping, surface_key, renewal, now) {
                             continue;
                         }
@@ -1907,15 +1925,33 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                     ) {
                         continue;
                     }
+                    // This gate is asked every tick the window stays due —
+                    // see `ping_network_gate`'s own doc for why that is fine
+                    // (the resolve, not the ask, is what's cached).
+                    // `pinged_at` is still untouched at this point, so
+                    // `Pending` or `Unreachable` cost nothing: this window is
+                    // still due, and fires on whichever later tick finally
+                    // sees the host resolve.
+                    if ping_network_gate(&m.id, ping_host(m).as_deref()) != PingNetwork::Reachable {
+                        continue;
+                    }
+                    let ping = m.ping.as_ref().expect("filtered by ping.is_some() above");
+                    // Resolved before `set_plugin_pinged_at` below — see
+                    // `ping_binary`'s own doc for the window ping's half of
+                    // its reasoning: writing `pinged_at` for a run that
+                    // never happened would spend this window's one ping on
+                    // nothing, silencing it until the window ends. Checking
+                    // first means a binary that reappears mid-window still
+                    // gets pinged before it does, not only at the next one.
+                    let Some(bin) = ping_binary(&m.id, ping) else {
+                        continue;
+                    };
                     // Recorded first, and the command run on this same tick. There
                     // is deliberately no delay between the two: a gap is a window
                     // in which the app can be quit with the ping recorded and never
                     // sent, which on-disk state would then remember for good.
                     config::set_plugin_pinged_at(&m.id, now);
-                    send_ping(
-                        m.ping.as_ref().expect("filtered by ping.is_some() above"),
-                        None,
-                    );
+                    spawn_hello(bin, ping.args.clone(), None);
                 }
             }
         },
@@ -3970,19 +4006,31 @@ fn ping_due(
         .is_some_and(|start| pinged_at.saturating_add(PING_GRACE_SECS) < start)
 }
 
-/// How many renewal attempts one distinct `TokenRenewal` value may spend —
-/// see [`renewal_ping_due`]. A run that exits `0` never spends one of these
-/// at all (it keeps the older, once-per-token rule below this bound); only a
-/// run that ends without success (a non-zero exit, a deadline kill, or a
-/// failure to spawn the CLI in the first place — see [`RenewalPingOutcome`])
-/// counts against it. Three, not one, because a run can fail for a reason
-/// that has nothing to do with the token itself (a transient network error,
-/// the CLI momentarily unable to reach its own auth endpoint) and a single
-/// bad run must not condemn a token to going unrenewed until it lapses
-/// differently; not unbounded, because a token this app genuinely cannot
-/// renew (the CLI itself needs an interactive login) must still stop being
-/// retried rather than spend a process every floor forever.
-const RENEWAL_MAX_ATTEMPTS: u8 = 3;
+/// How many renewal attempts one distinct `TokenRenewal` value spends at the
+/// fast, ten-minute cadence before [`renewal_ping_due`] drops to the slow one
+/// ([`RENEWAL_SLOW_INTERVAL_SECS`]) instead of giving up on it — see that
+/// function's own doc. A run that exits `0` never spends one of these at all
+/// (it keeps the older, once-per-token rule below this bound); only a run
+/// that ends without success (a non-zero exit, a deadline kill, or a failure
+/// to spawn the CLI in the first place — see [`RenewalPingOutcome`]) counts
+/// against it. Three, not one, because a run can fail for a reason that has
+/// nothing to do with the token itself (a transient network error, the CLI
+/// momentarily unable to reach its own auth endpoint) and a single bad run
+/// must not slow a token's retries to an hour apart over one bad roll.
+/// Retries never stop, past it or otherwise: a token this app genuinely
+/// cannot renew (the CLI itself needs an interactive login) still gets
+/// retried, just an hour apart instead of ten minutes, for as long as it
+/// stays unrenewed — the price of never leaving a renewable token to sit
+/// lapsed until someone happens to run the CLI by hand.
+const RENEWAL_FAST_ATTEMPTS: u8 = 3;
+
+/// How often a renewal is retried once [`RENEWAL_FAST_ATTEMPTS`] failed runs
+/// have been spent on one token — see [`renewal_ping_due`]. An hour, not ten
+/// minutes: a token the CLI cannot renew at all (its own refresh has expired
+/// too and it now needs an interactive login) costs one short run an hour,
+/// indefinitely, rather than either going unrenewed until a person happens
+/// to run the CLI by hand, or spending a process every floor forever.
+const RENEWAL_SLOW_INTERVAL_SECS: u64 = 3600;
 
 /// [`LAST_RENEWED_FOR`]'s per-surface memory of one `TokenRenewal`'s renewal
 /// attempts — replaces a bare `TokenRenewal` now that a lapsed token may be
@@ -3990,8 +4038,10 @@ const RENEWAL_MAX_ATTEMPTS: u8 = 3;
 /// once-per-token dedup still compares (a different value always resets
 /// `attempts`/`last_run_failed`, the same as the old bare-value memory did);
 /// `attempts` counts how many runs [`credit_renewal`] has started for this
-/// exact `renewal`, capped in practice at [`RENEWAL_MAX_ATTEMPTS`] by
-/// [`renewal_ping_due`] refusing anything past it; `last_run_failed` is set
+/// exact `renewal`, never capped — it only decides which of
+/// [`renewal_ping_due`]'s two cadences a retry falls under, the fast one
+/// below [`RENEWAL_FAST_ATTEMPTS`] and the slow one past it;
+/// `last_run_failed` is set
 /// by [`report_renewal_outcome`] once the most recent attempt's fate is
 /// known, and is what tells [`renewal_ping_due`] a retry is wanted at all —
 /// a run that is still in flight, or that exited `0`, leaves it `false`
@@ -4008,27 +4058,31 @@ struct RenewalRecord {
 
 /// Whether a renewal ping (see `[ping] renews_token`,
 /// `model::TokenRenewal`) is due — the floor it shares with [`ping_due`]
-/// ([`PING_MIN_INTERVAL_SECS`]), *and* a bound `ping_due` has no equivalent
+/// ([`PING_MIN_INTERVAL_SECS`]), *and* a backoff `ping_due` has no equivalent
 /// of: neither a lapsed auth chain nor a bare 401 names a window to be empty
-/// or a boundary to have passed, so left at the floor alone this would fire
-/// every ten minutes for as long as the token stayed unrenewed — forever, if
-/// the CLI cannot renew it either (its own refresh token has expired too,
-/// say, and it now needs an interactive login). `renewal` (the *current*
-/// reading's own `TokenRenewal`) and `stored` (this reading's own
-/// [`RenewalRecord`] in `main.rs`'s in-memory memory of it — see
-/// [`LAST_RENEWED_FOR`]) answer that: due once per distinct reading — or,
-/// once `stored.last_run_failed` says the one attempt already spent on it
-/// did not succeed, due again for as long as `stored.attempts` has not yet
-/// reached [`RENEWAL_MAX_ATTEMPTS`]. `renewal` is compared against
-/// `stored.renewal` as the whole `TokenRenewal` value (it is `Copy`/`Eq`)
-/// rather than an extracted `u64`, so `Lapsed { expires_at: 42 }` and
-/// `Unauthorized { token_hash: 42 }` can never be mistaken for the same key
-/// merely because the numbers inside them happen to collide.
+/// or a boundary to have passed, so left at the floor alone this would spend
+/// a process every ten minutes for as long as the token stayed unrenewed —
+/// including for a token the CLI cannot renew either (its own refresh token
+/// has expired too, say, and it now needs an interactive login), for as long
+/// as nobody happens to run it by hand. `renewal` (the *current* reading's
+/// own `TokenRenewal`) and `stored` (this reading's own [`RenewalRecord`] in
+/// `main.rs`'s in-memory memory of it — see [`LAST_RENEWED_FOR`]) answer
+/// that: due once per distinct reading — or, once `stored.last_run_failed`
+/// says the one attempt already spent on it did not succeed, due again once
+/// the cadence `stored.attempts` has earned passes: [`PING_MIN_INTERVAL_SECS`]
+/// while it is below [`RENEWAL_FAST_ATTEMPTS`], [`RENEWAL_SLOW_INTERVAL_SECS`]
+/// past it — never refused outright, so a token this app genuinely cannot
+/// renew is retried an hour apart, indefinitely, rather than left to sit
+/// unrenewed until a person happens to run the CLI. `renewal` is compared
+/// against `stored.renewal` as the whole `TokenRenewal` value (it is
+/// `Copy`/`Eq`) rather than an extracted `u64`, so `Lapsed { expires_at: 42
+/// }` and `Unauthorized { token_hash: 42 }` can never be mistaken for the
+/// same key merely because the numbers inside them happen to collide.
 ///
 /// A different `renewal` than `stored.renewal` is always due (subject to the
 /// floor) regardless of `stored`'s own attempt count — a token that lapsed
 /// again after being renewed, or renewed a different way, starts its own
-/// budget rather than inheriting what an unrelated earlier lapse spent.
+/// schedule rather than inheriting what an unrelated earlier lapse spent.
 ///
 /// `pinged_at` is clamped to `now` first for the same reason `ping_due`
 /// clamps it: a `config.json` hand-edited into the future must not read as
@@ -4039,13 +4093,20 @@ fn renewal_ping_due(
     renewal: Option<TokenRenewal>,
     stored: Option<RenewalRecord>,
 ) -> bool {
-    if let (Some(renewal), Some(stored)) = (renewal, stored) {
-        let retry_allowed = stored.last_run_failed && stored.attempts < RENEWAL_MAX_ATTEMPTS;
-        if renewal == stored.renewal && !retry_allowed {
-            return false;
+    let interval = match (renewal, stored) {
+        (Some(renewal), Some(stored)) if renewal == stored.renewal => {
+            if !stored.last_run_failed {
+                return false;
+            }
+            if stored.attempts < RENEWAL_FAST_ATTEMPTS {
+                PING_MIN_INTERVAL_SECS
+            } else {
+                RENEWAL_SLOW_INTERVAL_SECS
+            }
         }
-    }
-    now.saturating_sub(pinged_at.min(now)) >= PING_MIN_INTERVAL_SECS
+        _ => PING_MIN_INTERVAL_SECS,
+    };
+    now.saturating_sub(pinged_at.min(now)) >= interval
 }
 
 /// Per-surface memory of the [`RenewalRecord`] a renewal ping was last
@@ -4063,12 +4124,15 @@ fn renewal_ping_due(
 /// surface's renewal silently overwrite — and so re-arm — the other's, even
 /// though its own token never changed.
 /// In-memory only, unlike `config::plugin_pinged_at`: it exists purely to
-/// bound how many times a token that stays unrenewed gets retried (see
-/// [`renewal_ping_due`]'s own doc). Losing it on restart costs at most
-/// [`RENEWAL_MAX_ATTEMPTS`] extra pings, never a missing one — once the CLI
-/// does renew the token, its declared expiry (or, after a 401, the token
-/// itself) changes, and a later lapse is a different value that starts a
-/// fresh budget regardless of what this remembers.
+/// pick which cadence a token that stays unrenewed gets retried at (see
+/// [`renewal_ping_due`]'s own doc). Losing it on restart resets `attempts`
+/// to zero, so the retries that follow run at the fast, ten-minute cadence
+/// again for a while rather than picking up the slow one where they left
+/// off — never fewer retries than before, only possibly a few extra ones in
+/// the following hour, never a missing one — and once the CLI does renew
+/// the token, its declared expiry (or, after a 401, the token itself)
+/// changes, and a later lapse is a different value that starts its own
+/// fresh schedule regardless of what this remembers.
 static LAST_RENEWED_FOR: Mutex<Option<HashMap<String, RenewalRecord>>> = Mutex::new(None);
 
 /// The [`RenewalRecord`] [`LAST_RENEWED_FOR`] remembers for one surface
@@ -4095,7 +4159,7 @@ fn last_renewed_for(surface_key: &str) -> Option<RenewalRecord> {
 /// a retry [`renewal_ping_due`] only allowed because the previous attempt
 /// had ended without success.
 ///
-/// Called *before* [`send_ping`] is even asked to attempt anything (right
+/// Called *before* [`spawn_hello`] is even asked to attempt anything (right
 /// after `config::set_plugin_pinged_at`, at the tick's one call site that
 /// credits a renewal at all), never after: `Command::spawn`'s own failure
 /// happens asynchronously, on [`spawn_hello`]'s background thread, and can
@@ -4169,15 +4233,19 @@ fn report_renewal_outcome(surface_key: &str, credited: RenewalRecord, outcome: R
 /// count, even for the same `renewal`) is never erased by an undo about a
 /// wholly earlier one.
 ///
-/// Called from exactly one place — the tick's own thread, when `send_ping`
-/// returns `false` (no working directory, `find_bin` came up empty, or the
-/// background thread itself failed to start, so nothing will ever run to
-/// report an outcome on this attempt's behalf at all). A `Command::spawn`
+/// Called from exactly one place — the tick's own thread, inside
+/// [`run_renewal_ping`], when [`spawn_hello`] returns `false` (no working
+/// directory available, or the background thread itself failed to start,
+/// so nothing will ever run to report an outcome on this attempt's behalf
+/// at all). A missing `[ping]` binary is caught earlier, by
+/// [`ping_binary`], before [`credit_renewal`] is ever called — so it never
+/// reaches this function at all, having nothing to undo. A `Command::spawn`
 /// failure *inside* [`spawn_hello`]'s background thread is not this case any
 /// more — a binary that exists but can't actually be executed (permission
 /// denied, wrong architecture) is a real attempt that ended without
 /// success, reported through [`report_renewal_outcome`] instead so it still
-/// spends part of the retry budget rather than being retried forever.
+/// counts as a spent attempt — what steers [`renewal_ping_due`] from its fast
+/// cadence to its slow one, rather than retrying every ten minutes forever.
 fn uncredit_renewal(surface_key: &str, credited: RenewalRecord, previous: Option<RenewalRecord>) {
     let mut guard = LAST_RENEWED_FOR.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = guard.as_mut() {
@@ -4218,7 +4286,7 @@ enum RenewalOutcome {
     /// suppress that too.
     Suppressed,
     /// Due: the caller should [`credit_renewal`] *before* attempting
-    /// [`send_ping`], then [`uncredit_renewal`] if that attempt turns out
+    /// [`spawn_hello`], then [`uncredit_renewal`] if that attempt turns out
     /// not to have actually run (see both functions' own docs for why that
     /// order, not the reverse). Carried here (rather than re-derived after
     /// the fact) since the classification already had it in hand to ask
@@ -4269,9 +4337,10 @@ fn classify_renewal(
 /// `TokenRenewal` of the first one [`classify_renewal`] finds
 /// [`RenewalOutcome::Due`], if any — `None` otherwise, whether because
 /// nothing was wanted or because every surface that wanted a renewal is
-/// still on cooldown, whether for the shared floor or for having just spent
-/// its own [`RENEWAL_MAX_ATTEMPTS`] budget (the tick's own caller treats
-/// every reason the same: nothing to do). At most one ping fires per tick
+/// still on cooldown — the shared floor, or the slower hourly cadence
+/// [`renewal_ping_due`] drops to once its own [`RENEWAL_FAST_ATTEMPTS`]
+/// failed attempts are spent (the tick's own caller treats every reason the
+/// same: nothing to do). At most one ping fires per tick
 /// regardless of how many surfaces are eligible, the same floor
 /// `renewal_ping_due` already enforces per surface.
 ///
@@ -6255,7 +6324,9 @@ enum RunOutcome {
 /// erroring inside [`spawn_hello`]'s background thread, which never produces
 /// a child to wait on at all. Only [`Self::Exited`] can be a success — a
 /// non-zero status, same as [`Self::Killed`]/[`Self::Unwaitable`]/
-/// [`Self::SpawnFailed`], counts against [`RENEWAL_MAX_ATTEMPTS`].
+/// [`Self::SpawnFailed`], counts as a spent attempt — past
+/// [`RENEWAL_FAST_ATTEMPTS`] of them, [`renewal_ping_due`] retries hourly
+/// instead of every ten minutes, never fewer.
 #[derive(Debug, Clone, Copy)]
 enum RenewalPingOutcome {
     /// `Command::spawn` failed inside [`spawn_hello`]'s background thread —
@@ -6477,9 +6548,9 @@ fn run_with_deadline(mut child: std::process::Child, deadline: Duration) -> (Run
 /// that (no working directory, the thread itself failing to start). Not
 /// whether the command inside it successfully *starts*: `Command::spawn`
 /// itself runs on that background thread, so its own outcome is not known
-/// synchronously either — the same uncertainty [`send_ping`]'s own caller
-/// already tolerates for the window ping (`config::set_plugin_pinged_at` is
-/// recorded before a run that might not start either). For the renewal call
+/// synchronously either — the same uncertainty the window-ping call site
+/// already tolerates (`config::set_plugin_pinged_at` is recorded before a
+/// run that might not start either). For the renewal call
 /// site, which credits [`LAST_RENEWED_FOR`] *before* calling this (see
 /// [`credit_renewal`]'s own doc for why), this return is what tells it
 /// whether that credit needs undoing itself: `false` means nothing else will
@@ -6489,8 +6560,10 @@ fn run_with_deadline(mut child: std::process::Child, deadline: Duration) -> (Run
 /// exit, a deadline kill, a wait that failed — `on_renewal_outcome`, when
 /// given, is reported through [`report_renewal_outcome`] from inside the
 /// thread at the point each becomes known, so a run that started but did not
-/// succeed still spends part of [`RENEWAL_MAX_ATTEMPTS`] rather than being
-/// retried forever. Carries the exact [`RenewalRecord`] [`credit_renewal`]
+/// succeed still counts as a spent attempt — what steers [`renewal_ping_due`]
+/// from every ten minutes to every hour once [`RENEWAL_FAST_ATTEMPTS`] of
+/// them have failed, rather than either cadence stopping outright. Carries
+/// the exact [`RenewalRecord`] [`credit_renewal`]
 /// returned for this attempt, not just its `renewal` value —
 /// `report_renewal_outcome` guards on the whole record, so this is what it
 /// has to be handed back with, `attempts` and all. `None` for the window
@@ -6610,49 +6683,431 @@ fn spawn_hello(
     }
 }
 
-/// Run a plugin's `[ping]` command (e.g. `codex exec hello` / `claude -p
-/// hello`) — fired on the tick that finds its first surface's 5-hour window
-/// empty and not yet pinged since it began (see [`ping_due`]: a state, not an
-/// edge), if the user opted in (gated by `config::plugin_ping`).
+/// The mapping [`ping_host_reachable`] makes from a resolve attempt to its
+/// own boolean answer, factored out so a test can drive that mapping with a
+/// canned `resolve` instead of a real DNS lookup. Production supplies the
+/// real `ToSocketAddrs` check as the closure, called with `host`; a test
+/// supplies one that returns `true`/`false` outright. What this proves is
+/// the *forwarding* — that whatever `resolve` decides for `host` is what
+/// [`ping_host_reachable`] reports, unchanged — not that any particular
+/// hostname actually fails to resolve, which nothing in this suite
+/// exercises against a real resolver (a resolver that synthesises an
+/// answer for anything, wildcard DNS or a captive portal, would make that
+/// a flaky thing to assert on anyway).
+fn ping_host_reachable_with<F: FnOnce(&str) -> bool>(host: &str, resolve: F) -> bool {
+    resolve(host)
+}
+
+/// Whether `host` resolves at all — the cheapest available proxy for "the
+/// network is up" before a ping (and, for a renewal, one of its attempts) is
+/// spent on a machine that just woke from sleep or whose DNS resolver is
+/// still down. A ping launched against a host that does not even resolve
+/// cannot succeed, and the CLI's own first request would fail exactly the
+/// same way a moment later — this just finds that out before a process, a
+/// temp directory, and (for a renewal) an attempt are spent learning it the
+/// slow way.
 ///
-/// Returns whether a run was actually attempted — `false` when `ping.bin`
-/// cannot be found at all, otherwise [`spawn_hello`]'s own result. The
-/// window-ping call site ignores it (`config::set_plugin_pinged_at` is
-/// already recorded before this runs, by design — see that call site's own
-/// comment) and passes `on_renewal_outcome = None`; the renewal call site
-/// does not ignore the return — it has already [`credit_renewal`]-ed this
-/// exact `(surface_key, credited)` pair before calling this at all, and a
-/// `false` here means nothing else will ever run to notice that credit, so
-/// the caller undoes it itself. It also passes the same pair on as
-/// `on_renewal_outcome`, so [`spawn_hello`] can report how the run actually
-/// ended once it does start — see that parameter's own doc.
-fn send_ping(
-    ping: &manifest::PingConfig,
-    on_renewal_outcome: Option<(String, RenewalRecord)>,
-) -> bool {
+/// Blocking, with no timeout of its own. This runs on [`ping_network_gate`]'s
+/// own probe thread — never the tick thread, which would otherwise stall for
+/// as long as the resolver takes — and at most one such thread exists per
+/// plugin at any time ([`PingProbe::in_flight`]), so a resolver that never
+/// returns leaves exactly one thread blocked here, forever, rather than a
+/// fresh one racing it every [`PING_PROBE_TTL`]. [`ping_probe_decision`]'s
+/// own [`PING_PROBE_DEADLINE`] is what bounds how long a *caller* waits on
+/// that thread's eventual answer; it is not enforced here.
+fn ping_host_reachable(host: &str) -> bool {
+    ping_host_reachable_with(host, |host| {
+        (host, 443)
+            .to_socket_addrs()
+            .is_ok_and(|mut addrs| addrs.next().is_some())
+    })
+}
+
+/// The `[http]` host a plugin's ping should be seen resolving before it
+/// runs — the first (and only) `[[http.request]]`'s URL, substituted with
+/// the plugin's *current* `[[option]]` values ([`plugin_options`],
+/// [`substitute_options`]) exactly as `engine_http::resolve_request_url`
+/// substitutes it before the request is ever dialled, then read through the
+/// same [`https_host`] every credential-disclosure check in this app already
+/// trusts to read a URL's authority the way the request actually will.
+///
+/// Substituting first is not optional: a manifest whose host reads
+/// `https://{option.beta}.example.com/x` still validates (`{`/`}` are not
+/// forbidden host code points — the identical shape `registry.rs`'s own
+/// trust-dialog disclosure substitutes for, in `push_dest_host_for_disclosure`),
+/// and reading `https_host` off the raw template would probe the literal
+/// placeholder text — a host nothing can ever resolve — rather than whatever
+/// host the option's current value actually names, which would read this
+/// plugin's ping as unreachable forever.
+///
+/// A plugin with no `[http]` section at all (the log-file engine reads
+/// local files, not a network endpoint) has no host to check, so [`None`]
+/// here is what tells [`ping_network_gate`] to treat it as always reachable.
+fn ping_host(m: &PluginManifest) -> Option<String> {
+    m.http
+        .as_ref()
+        .and_then(|h| h.request.first())
+        .and_then(|r| https_host(&substitute_options(&r.url, &plugin_options(m))))
+}
+
+/// Plugin ids the background probe thread ([`ping_network_gate`]'s own
+/// `(plugin_id, host)` pairs logged as unreachable, so an outage is logged
+/// once, not every time it is asked about — keyed on both, not `plugin_id`
+/// alone, because [`ping_host`] can name a different host for the same
+/// plugin from one tick to the next (an `{option.<key>}` host whose option
+/// flips), and a changed host is a new outage worth its own line, not
+/// silence because the *old* one was already logged. [`ping_network_gate`]
+/// itself is entered every one-second tick for as long as a ping stays
+/// due — neither call site advances `pinged_at` on a skip, so nothing here
+/// waits for the shared floor or the renewal backoff to come back around
+/// before asking again — but [`PING_PROBE`]'s cache, and the in-flight
+/// check ahead of it, answer almost every one of those asks without a
+/// fresh probe, and this set is what keeps even a probe that resolves
+/// quickly every 30 seconds from repeating the same log line once for
+/// every one it runs. Written from two places: [`note_unreachable`], which
+/// both the probe thread (once it actually finishes with a negative
+/// answer) and [`ping_network_gate`] itself (the moment an in-flight probe
+/// crosses [`PING_PROBE_DEADLINE`] without ever finishing) call through —
+/// sharing one set between them is what keeps a probe that eventually does
+/// finish from logging the same outage a second time. Cleared silently by
+/// the probe thread the moment a later probe for the same pair finds the
+/// host reachable again — the interesting event is the outage starting and
+/// ending, not this app noticing the network came back.
+/// [`PingNetwork::Pending`] from a probe still comfortably inside the
+/// deadline is not itself a finding about the network and is never logged.
+static PING_NET_DOWN: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
+
+/// How long one [`PING_PROBE`] answer is trusted before [`ping_network_gate`]
+/// spawns a fresh probe for it — long enough that a plugin with a ping due
+/// every tick is not re-resolving its host every second, short enough that a
+/// genuine recovery is still noticed well inside the ten-minute floor either
+/// kind of ping already imposes.
+const PING_PROBE_TTL: Duration = Duration::from_secs(30);
+
+/// How long a probe may stay `in_flight` before [`ping_probe_decision`]
+/// stops waiting on it and answers [`PingNetwork::Unreachable`] instead of
+/// [`PingNetwork::Pending`], without spawning a second thread to race the
+/// one already running: a resolver that never returns then costs exactly
+/// one thread, however long the outage lasts, rather than one every
+/// [`PING_PROBE_TTL`].
+const PING_PROBE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// What [`ping_network_gate`] answers for one plugin on a given call — see
+/// that function's own doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PingNetwork {
+    /// The host resolved, within [`PING_PROBE_TTL`]: the ping may run.
+    Reachable,
+    /// The host did not resolve, within [`PING_PROBE_TTL`] — or a probe has
+    /// been running longer than [`PING_PROBE_DEADLINE`] without answering:
+    /// the ping must not run this tick.
+    Unreachable,
+    /// No trustworthy answer yet — the first ask for this plugin and host,
+    /// or a probe still `in_flight` for less than [`PING_PROBE_DEADLINE`].
+    /// Read exactly like [`Self::Unreachable`] at both call sites: the ping
+    /// must not run this tick, but this is never logged as an outage on its
+    /// own — only an actual failed resolve is.
+    Pending,
+}
+
+/// One plugin's [`ping_network_gate`] polling state — see [`PING_PROBE`].
+#[derive(Debug, Clone, Default)]
+struct PingProbe {
+    /// The host this state describes — compared against the host being
+    /// asked about on every call, so a cached answer or an in-flight probe
+    /// for a host this plugin no longer names (an `{option.<key>}` value
+    /// changed) is treated as if nothing were known at all, rather than
+    /// being trusted or ridden by mistake. The default, an empty string,
+    /// never matches a real host, which is exactly right for a plugin
+    /// never asked about before.
+    host: String,
+    /// A background thread is currently resolving `host`; cleared by that
+    /// thread once it has an answer, whatever the answer is.
+    in_flight: bool,
+    /// When the current probe (`in_flight == true`) was spawned — read
+    /// against [`PING_PROBE_DEADLINE`] to tell a probe merely still running
+    /// from one that has run long enough to answer
+    /// [`PingNetwork::Unreachable`] without waiting on it any further.
+    /// Meaningless while `in_flight` is `false`.
+    started: Option<Instant>,
+    /// The most recent answer for `host` and when it was recorded, if any —
+    /// read against [`PING_PROBE_TTL`] to tell a still-trusted answer from a
+    /// stale one a fresh probe is owed for.
+    last: Option<(Instant, bool)>,
+}
+
+/// Per-plugin [`PingProbe`] state — see [`ping_network_gate`]'s own doc for
+/// why this exists as a cache with a background refresh rather than asking
+/// [`ping_host_reachable`] directly: the tick thread that would otherwise
+/// block on it also drives the Slint event loop, and a resolver hung by the
+/// exact dark-wake / no-network state this whole mechanism exists to detect
+/// can stall far longer than any one tick should ever take.
+static PING_PROBE: Mutex<Option<HashMap<String, PingProbe>>> = Mutex::new(None);
+
+/// The pure half of [`ping_network_gate`]: given one plugin's [`PingProbe`],
+/// the host it is currently being asked about, and the current instant,
+/// what to answer and whether the caller should go on to spawn a fresh
+/// probe. Split out — the same way [`renewal_ping_due`] is split from
+/// [`credit_renewal`] — so the state machine itself (which of three answers
+/// a given state produces, and when a new probe is owed) can be tested
+/// without a real thread or a real DNS lookup.
+///
+/// `state.host != host` reads exactly like a plugin never asked about
+/// before — whatever `last` or `in_flight` says belongs to a host nobody is
+/// asking about any more, so it is never trusted and never ridden, only
+/// ever overwritten by a fresh probe the caller spawns for the *new* host.
+///
+/// Otherwise: a `last` answer younger than [`PING_PROBE_TTL`] is trusted
+/// outright, whatever `in_flight` says (it can only be left over from a
+/// probe already superseded by this one). Past that, or with no `last` at
+/// all: a probe already `in_flight` for less than [`PING_PROBE_DEADLINE`]
+/// is ridden rather than duplicated ([`PingNetwork::Pending`], no spawn);
+/// one running longer than that answers [`PingNetwork::Unreachable`]
+/// instead — still without spawning a second thread to race the one still
+/// out there, which is what keeps a genuinely hung resolver to exactly one
+/// thread no matter how long the outage lasts. No probe in flight at all is
+/// the only case that asks its caller to spawn one, meanwhile answering
+/// [`PingNetwork::Pending`].
+fn ping_probe_decision(state: &PingProbe, host: &str, now: Instant) -> (PingNetwork, bool) {
+    if state.host == host {
+        if let Some((at, reachable)) = state.last {
+            if now.saturating_duration_since(at) < PING_PROBE_TTL {
+                let answer = if reachable {
+                    PingNetwork::Reachable
+                } else {
+                    PingNetwork::Unreachable
+                };
+                return (answer, false);
+            }
+        }
+        if state.in_flight {
+            let age = state.started.map_or(Duration::ZERO, |started| {
+                now.saturating_duration_since(started)
+            });
+            let answer = if age < PING_PROBE_DEADLINE {
+                PingNetwork::Pending
+            } else {
+                PingNetwork::Unreachable
+            };
+            return (answer, false);
+        }
+    }
+    (PingNetwork::Pending, true)
+}
+
+/// Insert `key` into `set`, returning whether it was not already
+/// there — the shared shape behind every "log this once, not on every
+/// check" dedupe in this file ([`PING_NET_DOWN`] via [`note_unreachable`],
+/// [`PING_BIN_MISSING`] via [`ping_binary`]): a caller logs exactly when
+/// this returns `true`. Pulled out as its own pure function, rather than a
+/// bare `set.insert(key)` repeated at each call site, so the dedupe
+/// state machine itself — insert once, log; insert again unchanged, don't;
+/// clear; insert once more, log again — can be tested without a global
+/// `Mutex` or a real [`diag::line`] call standing in the way. Clearing needs
+/// no helper of its own: a plain `set.remove(&key)` already reads as
+/// intended at each of its own call sites.
+fn note_missing<K: Eq + std::hash::Hash>(set: &mut HashSet<K>, key: K) -> bool {
+    set.insert(key)
+}
+
+/// Logs `(plugin_id, host)` as unreachable in [`PING_NET_DOWN`], once per
+/// outage — called both by the probe thread once it actually finishes with
+/// a negative answer, and by [`ping_network_gate`] itself the moment an
+/// in-flight probe crosses [`PING_PROBE_DEADLINE`] without having finished
+/// at all (see [`ping_probe_decision`]'s own doc for that branch), so a
+/// resolver that never returns is not silent forever. Sharing one set
+/// between the two, through [`note_missing`], is what keeps a probe that
+/// eventually does finish from logging the same outage a second time.
+fn note_unreachable(plugin_id: &str, host: &str) {
+    let mut down = PING_NET_DOWN.lock().unwrap_or_else(|e| e.into_inner());
+    let down = down.get_or_insert_with(HashSet::new);
+    if note_missing(down, (plugin_id.to_string(), host.to_string())) {
+        diag::line(format!(
+            "auto-ping: {plugin_id} — {host} does not resolve, not pinging until it does"
+        ));
+    }
+}
+
+/// Whether a ping for `plugin_id` may run this tick, given `host` — the
+/// plugin's own `[http]` host from [`ping_host`], or `None` for a plugin
+/// that names no network endpoint at all, which is always [`PingNetwork::
+/// Reachable`].
+///
+/// Never blocks. The tick thread that calls this also drives the Slint
+/// event loop, so a DNS lookup — which can hang for as long as a machine's
+/// resolver is stuck, exactly the dark-wake state this exists to detect —
+/// must never run on it directly. Instead, [`ping_probe_decision`] answers
+/// from [`PING_PROBE`]'s cached answer for `plugin_id` and `host` when one
+/// is still fresh, and a stale or absent one — with no probe already
+/// running for this exact host — spawns [`ping_host_reachable`] on a
+/// detached background thread; every call before that thread reports back,
+/// including the one that spawned it, reads [`PingNetwork::Pending`] until
+/// [`PING_PROBE_DEADLINE`] passes, then [`PingNetwork::Unreachable`]
+/// without a second thread ever being spawned to race the first. At most
+/// one resolver thread per plugin exists at any time, so a resolver that
+/// never returns costs exactly one thread for as long as the outage lasts,
+/// not one every [`PING_PROBE_TTL`]. [`PingNetwork::Unreachable`], however
+/// it was reached, logs through [`note_unreachable`] before returning.
+///
+/// This is called every one-second tick for as long as a ping stays due —
+/// neither call site advances `pinged_at` on a skip, so the state that would
+/// normally suppress asking again (the shared floor, the renewal backoff)
+/// never gets the chance to. What is *not* repeated every tick is the
+/// resolve itself: the cache and the in-flight check above answer nearly
+/// every one of those asks without spawning anything.
+///
+/// If the OS refuses the probe thread outright, this reads
+/// [`PingNetwork::Reachable`] rather than leaving the plugin stuck — a
+/// machine too starved of threads to spare one for this has bigger problems
+/// than one skipped auto-ping — and `in_flight` is rolled back first so a
+/// later call retries the spawn rather than reading `Pending` forever with
+/// nothing left to clear it.
+///
+/// Both [`PingNetwork::Pending`] and [`PingNetwork::Unreachable`] read the
+/// same way at both call sites: skip this plugin's ping for this tick,
+/// touching neither `pinged_at` nor `LAST_RENEWED_FOR` — a ping that was due
+/// stays due, and fires on whichever later tick finally sees
+/// [`PingNetwork::Reachable`].
+fn ping_network_gate(plugin_id: &str, host: Option<&str>) -> PingNetwork {
+    let Some(host) = host else {
+        return PingNetwork::Reachable;
+    };
+    let (answer, should_spawn) = {
+        let mut guard = PING_PROBE.lock().unwrap_or_else(|e| e.into_inner());
+        let state = guard
+            .get_or_insert_with(HashMap::new)
+            .entry(plugin_id.to_string())
+            .or_default();
+        let (answer, spawn) = ping_probe_decision(state, host, Instant::now());
+        if spawn {
+            state.host = host.to_string();
+            state.in_flight = true;
+            state.started = Some(Instant::now());
+        }
+        (answer, spawn)
+    };
+    if answer == PingNetwork::Unreachable {
+        note_unreachable(plugin_id, host);
+    }
+    if answer != PingNetwork::Pending {
+        return answer;
+    }
+    if !should_spawn {
+        return PingNetwork::Pending;
+    }
+    let probe_plugin_id = plugin_id.to_string();
+    let probe_host = host.to_string();
+    let spawned = std::thread::Builder::new().spawn(move || {
+        let reachable = ping_host_reachable(&probe_host);
+        {
+            let mut guard = PING_PROBE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(state) = guard
+                .get_or_insert_with(HashMap::new)
+                .get_mut(&probe_plugin_id)
+            {
+                // Only if this state still describes the host this probe
+                // resolved — an `{option.<key>}` flip while the probe ran
+                // means a newer probe, for the new host, may already have
+                // overwritten it, and this stale answer must not clobber
+                // that one.
+                if state.host == probe_host {
+                    state.in_flight = false;
+                    state.started = None;
+                    state.last = Some((Instant::now(), reachable));
+                }
+            }
+        }
+        if reachable {
+            let mut down = PING_NET_DOWN.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(down) = down.as_mut() {
+                down.remove(&(probe_plugin_id.clone(), probe_host.clone()));
+            }
+        } else {
+            note_unreachable(&probe_plugin_id, &probe_host);
+        }
+    });
+    if spawned.is_err() {
+        let mut guard = PING_PROBE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = guard.get_or_insert_with(HashMap::new).get_mut(plugin_id) {
+            state.in_flight = false;
+            state.started = None;
+        }
+        return PingNetwork::Reachable;
+    }
+    PingNetwork::Pending
+}
+
+/// `(plugin_id, bin)` pairs [`ping_binary`] has already logged as having no
+/// resolvable `[ping]` binary, so a manifest whose `bin` has vanished from
+/// `PATH` gets one log line, not one every time it is asked about — the
+/// same once-per-outage shape [`PING_NET_DOWN`] gives a host that does not
+/// resolve, and keyed on the binary name for the identical reason: a
+/// manifest that changes which binary it runs starts a new outage, not a
+/// continuation of whatever the old name's absence already logged. Cleared
+/// silently the next time [`find_bin`] finds that exact binary again.
+static PING_BIN_MISSING: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
+
+/// Resolve `ping.bin` for `plugin_id`, deduping "binary not found" the same
+/// once-per-outage way [`PING_NET_DOWN`] dedupes a host that does not
+/// resolve. Called *before* either ping path changes any state at all.
+///
+/// For a renewal, that means before crediting it, recording `pinged_at`, or
+/// logging that a lapsed token is about to be renewed — checking first,
+/// rather than trying and undoing, is what keeps a manifest whose `bin` has
+/// vanished from `PATH` from costing the "token has lapsed" log line and
+/// two `config.json` writes on every one-second tick for as long as the
+/// token stays lapsed (crediting and immediately undoing a credit, or
+/// recording `pinged_at` and immediately restoring it, leaves no lasting
+/// trace, but pays the same cost every single time regardless).
+///
+/// For the window ping, the state at stake is different — `pinged_at` there
+/// is never restored, only ever set once per window (see that call site's
+/// own comment) — so checking first is what stops a missing binary from
+/// spending the window's one ping on a run that never happened, silencing
+/// it until the window ends: a binary that reappears mid-window still gets
+/// pinged before it does, not only at the next one.
+fn ping_binary(plugin_id: &str, ping: &manifest::PingConfig) -> Option<std::path::PathBuf> {
+    let key = (plugin_id.to_string(), ping.bin.clone());
+    let mut guard = PING_BIN_MISSING.lock().unwrap_or_else(|e| e.into_inner());
+    let missing = guard.get_or_insert_with(HashSet::new);
     match find_bin(&ping.bin) {
-        Some(bin) => spawn_hello(bin, ping.args.clone(), on_renewal_outcome),
+        Some(bin) => {
+            missing.remove(&key);
+            Some(bin)
+        }
         None => {
-            diag::line(format!("auto-ping: {} binary not found", ping.bin));
-            false
+            if note_missing(missing, key) {
+                diag::line(format!("auto-ping: {} binary not found", ping.bin));
+            }
+            None
         }
     }
 }
 
-/// One attempt at a renewal ping: credit the surface, record `now` as the
-/// plugin's last-pinged time, and ask [`send_ping`] to run its binary.
+/// One attempt at a renewal ping: resolve the binary, credit the surface,
+/// record `now` as the plugin's last-pinged time, and ask [`spawn_hello`] to
+/// run it.
 ///
-/// If the attempt never actually starts (`send_ping` returns `false`, e.g. an
-/// unresolvable binary or a thread the OS refused to hand out), both are
-/// undone — the credit via [`uncredit_renewal`] (restoring whatever
-/// [`RenewalRecord`] stood for this surface before [`credit_renewal`] ran a
-/// moment ago), and `plugin_pinged_at` restored to whatever it held on
-/// entry. Leaving it at `now` would silence the *window* ping the tick loop
-/// tries right after this for a full `PING_MIN_INTERVAL_SECS`, over a
-/// renewal attempt that never ran anything. A run that *does* start and
-/// later fails is not undone here at all — [`spawn_hello`] reports that
-/// outcome itself, asynchronously, through [`report_renewal_outcome`], which
-/// spends part of the attempt's own budget instead of erasing it.
+/// [`ping_binary`] runs first, before anything else changes — see its own
+/// doc for why: a lapsed token whose `[ping]` binary cannot be found must
+/// cost one deduped log line total, not the "token has lapsed" line and two
+/// `config.json` writes on every one-second tick for as long as it stays
+/// missing. Returning `false` here, with nothing else touched, reads
+/// exactly like the unreachable-host case the tick's own network gate
+/// already handles the same way.
+///
+/// If the binary resolves but the attempt still never actually starts
+/// (`spawn_hello` returns `false`, e.g. a thread the OS refused to hand
+/// out), both are undone — the credit via [`uncredit_renewal`] (restoring
+/// whatever [`RenewalRecord`] stood for this surface before
+/// [`credit_renewal`] ran a moment ago), and `plugin_pinged_at` restored to
+/// whatever it held on entry. Leaving it at `now` would silence the
+/// *window* ping the tick loop tries right after this for a full
+/// `PING_MIN_INTERVAL_SECS`, over a renewal attempt that never ran
+/// anything. A run that *does* start and later fails is not undone here at
+/// all — [`spawn_hello`] reports that outcome itself, asynchronously,
+/// through [`report_renewal_outcome`], which spends part of the attempt's
+/// own budget instead of erasing it.
 ///
 /// `previous` — what [`uncredit_renewal`] restores if this attempt turns
 /// out not to have started — comes from [`credit_renewal`]'s own return,
@@ -6667,11 +7122,11 @@ fn send_ping(
 /// to run this inline; pulled out so a test can drive it without a live
 /// `[ping]` process.
 ///
-/// `send_ping` is handed `credited` itself, not `renewal` — `spawn_hello`'s
-/// eventual [`report_renewal_outcome`] call guards on the whole
-/// [`RenewalRecord`], `attempts` included, so it has to be given back the
-/// exact value this attempt was credited under, the same one passed to
-/// [`uncredit_renewal`] on the line below.
+/// `spawn_hello` is handed `credited` itself, not `renewal` — its eventual
+/// [`report_renewal_outcome`] call guards on the whole [`RenewalRecord`],
+/// `attempts` included, so it has to be given back the exact value this
+/// attempt was credited under, the same one passed to [`uncredit_renewal`]
+/// on the line below.
 fn run_renewal_ping(
     plugin_id: &str,
     ping: &manifest::PingConfig,
@@ -6679,14 +7134,21 @@ fn run_renewal_ping(
     renewal: TokenRenewal,
     now: u64,
 ) -> bool {
+    let Some(bin) = ping_binary(plugin_id, ping) else {
+        return false;
+    };
     let pinged_at_before = config::plugin_pinged_at(plugin_id);
     config::set_plugin_pinged_at(plugin_id, now);
     let (previous, credited) = credit_renewal(&surface_key, renewal);
     diag::line(format!(
-        "auto-ping: {plugin_id} token has lapsed, running {} to renew it",
-        ping.bin
+        "auto-ping: {plugin_id} token has lapsed, running {} to renew it (attempt {})",
+        ping.bin, credited.attempts
     ));
-    let spawned = send_ping(ping, Some((surface_key.clone(), credited)));
+    let spawned = spawn_hello(
+        bin,
+        ping.args.clone(),
+        Some((surface_key.clone(), credited)),
+    );
     if !spawned {
         uncredit_renewal(&surface_key, credited, previous);
         config::set_plugin_pinged_at(plugin_id, pinged_at_before);
@@ -12743,9 +13205,9 @@ mod title_tests {
         );
     }
 
-    /// The retry budget's own bound: a run that ended without success is
-    /// retried once the shared floor passes again — up to
-    /// [`RENEWAL_MAX_ATTEMPTS`] times for the same token, never past it.
+    /// The retry cadence's fast half: a run that ended without success is
+    /// retried once the shared ten-minute floor passes again, for the first
+    /// [`RENEWAL_FAST_ATTEMPTS`] attempts at one token.
     #[test]
     fn renewal_ping_due_allows_a_retry_after_a_failed_run() {
         let lapsed = TokenRenewal::Lapsed {
@@ -12767,20 +13229,71 @@ mod title_tests {
         );
     }
 
+    /// The backoff's own shape: ten minutes apart for the first
+    /// [`RENEWAL_FAST_ATTEMPTS`] failed attempts at one token, an hour apart
+    /// past it — never refused outright, however many have piled up; only
+    /// slowed.
     #[test]
-    fn renewal_ping_due_refuses_a_retry_once_the_budget_is_spent() {
+    fn renewal_ping_due_slows_to_hourly_once_the_fast_attempts_are_spent() {
         let lapsed = TokenRenewal::Lapsed {
             expires_at: 1_700_000_000,
         };
-        let exhausted = RenewalRecord {
+        let after = |attempts: u8| RenewalRecord {
             renewal: lapsed,
-            attempts: RENEWAL_MAX_ATTEMPTS,
+            attempts,
             last_run_failed: true,
         };
         assert!(
-            !renewal_ping_due(NOW, NOW + 600, Some(lapsed), Some(exhausted)),
-            "RENEWAL_MAX_ATTEMPTS already spent on this exact token: no more \
-             retries, however long past the floor"
+            renewal_ping_due(NOW, NOW + 600, Some(lapsed), Some(after(1))),
+            "attempt 1 failed: the fast, ten-minute cadence still applies"
+        );
+        assert!(
+            renewal_ping_due(NOW, NOW + 600, Some(lapsed), Some(after(2))),
+            "attempt 2 failed: still fast"
+        );
+        assert!(
+            !renewal_ping_due(
+                NOW,
+                NOW + 600,
+                Some(lapsed),
+                Some(after(RENEWAL_FAST_ATTEMPTS))
+            ),
+            "attempt 3 failed: the fast attempts are spent, ten minutes is no \
+             longer enough"
+        );
+        assert!(
+            renewal_ping_due(
+                NOW,
+                NOW + 3600,
+                Some(lapsed),
+                Some(after(RENEWAL_FAST_ATTEMPTS))
+            ),
+            "attempt 3 failed: due again once the slow, hourly cadence passes"
+        );
+        assert!(
+            renewal_ping_due(NOW, NOW + 3600, Some(lapsed), Some(after(7))),
+            "seven failed attempts: still the hourly cadence, never refused \
+             outright"
+        );
+    }
+
+    /// A run still in flight — or one whose outcome this app never heard
+    /// back from — is never due again no matter how many attempts have
+    /// piled up: `last_run_failed` alone gates a retry, `attempts` only
+    /// picks its pace.
+    #[test]
+    fn renewal_ping_due_never_retries_a_run_still_in_flight_regardless_of_attempts() {
+        let lapsed = TokenRenewal::Lapsed {
+            expires_at: 1_700_000_000,
+        };
+        let in_flight = RenewalRecord {
+            renewal: lapsed,
+            attempts: 7,
+            last_run_failed: false,
+        };
+        assert!(
+            !renewal_ping_due(NOW, NOW + 3600, Some(lapsed), Some(in_flight)),
+            "not reported failed: not due, however far past any floor"
         );
     }
 
@@ -13207,10 +13720,10 @@ mod title_tests {
         );
     }
 
-    /// The three scenarios the renewal retry budget exists for, end to end
-    /// through the pure functions: a failed run is retried past the floor,
-    /// three failed attempts exhaust the budget, and a successful run is not
-    /// retried at all.
+    /// The three scenarios the renewal backoff exists for, end to end through
+    /// the pure functions: a failed run is retried past the floor, three
+    /// failed attempts slow the retries to hourly rather than stopping them,
+    /// and a successful run is not retried at all.
     #[test]
     fn a_renewal_is_due_again_after_a_failed_run_once_the_floor_passes() {
         let surface_key = format!("test-renewal-retry-e2e-{}", std::process::id());
@@ -13230,18 +13743,22 @@ mod title_tests {
     }
 
     #[test]
-    fn a_renewal_is_not_due_after_three_failed_attempts() {
-        let surface_key = format!("test-renewal-exhausted-e2e-{}", std::process::id());
+    fn a_renewal_slows_to_hourly_after_three_failed_attempts() {
+        let surface_key = format!("test-renewal-slow-e2e-{}", std::process::id());
         let renewal = TokenRenewal::Lapsed { expires_at: 52 };
-        for _ in 0..RENEWAL_MAX_ATTEMPTS {
+        for _ in 0..RENEWAL_FAST_ATTEMPTS {
             let (_, credited) = credit_renewal(&surface_key, renewal);
             report_renewal_outcome(&surface_key, credited, RenewalPingOutcome::SpawnFailed);
         }
         let stored = last_renewed_for(&surface_key);
-        assert_eq!(stored.map(|r| r.attempts), Some(RENEWAL_MAX_ATTEMPTS));
+        assert_eq!(stored.map(|r| r.attempts), Some(RENEWAL_FAST_ATTEMPTS));
         assert!(
             !renewal_ping_due(NOW, NOW + 600, Some(renewal), stored),
-            "three failed attempts is the whole budget: no more retries"
+            "the fast attempts are spent: ten minutes is no longer enough"
+        );
+        assert!(
+            renewal_ping_due(NOW, NOW + 3600, Some(renewal), stored),
+            "but an hour is: the retries slow down, they never stop"
         );
     }
 
@@ -13259,43 +13776,59 @@ mod title_tests {
         );
     }
 
-    /// The sequence the tick actually runs, one layer below the tick loop
-    /// itself: credit *before* the attempt (as production always does — see
-    /// `credit_renewal`'s own doc for why that order, not the reverse, is
-    /// the one that can't lose the retry), then uncredit once `send_ping`
-    /// reports nothing was ever attempted.
+    /// The dedupe state machine every once-per-outage log in this file
+    /// shares: the first sighting of a missing key is reported (returns
+    /// `true`), every one after it while still missing is not, and clearing
+    /// it (as `ping_binary`/the probe thread do on success, with a plain
+    /// `set.remove`) re-arms the next sighting. Tested as a pure function
+    /// with no `Mutex`, no `diag::line`, and no filesystem or DNS involved —
+    /// [`ping_binary`]'s own test below covers the effectful call site this
+    /// backs.
     #[test]
-    fn a_credit_is_undone_when_send_ping_never_attempts_a_run() {
-        let surface_key = format!("test-send-ping-not-found-{}", std::process::id());
-        let renewal = TokenRenewal::Lapsed { expires_at: 1 };
+    fn note_missing_reports_true_once_then_false_until_cleared() {
+        let mut set = HashSet::new();
+        assert!(
+            note_missing(&mut set, "a"),
+            "first sighting: this is what a caller logs"
+        );
+        assert!(
+            !note_missing(&mut set, "a"),
+            "still missing: already logged, no repeat"
+        );
+        set.remove("a");
+        assert!(
+            note_missing(&mut set, "a"),
+            "missing again after clearing: a fresh outage, logged once more"
+        );
+    }
+
+    /// `find_bin` failing is exactly what [`ping_binary`] exists to catch
+    /// before anything else changes — see its own doc. Proven here as a
+    /// small, direct unit test of the extracted resolver itself, rather than
+    /// only through `run_renewal_ping`'s end-to-end behaviour below.
+    #[test]
+    fn ping_binary_returns_none_for_a_name_not_on_path() {
+        let plugin_id = format!("test-ping-binary-missing-{}", std::process::id());
         let ping = manifest::PingConfig {
             bin: format!("tickover-test-nonexistent-binary-{}", std::process::id()),
             args: Vec::new(),
             renews_token: true,
         };
-
-        let (_, credited) = credit_renewal(&surface_key, renewal);
-        let spawned = send_ping(&ping, Some((surface_key.clone(), credited)));
-        assert!(
-            !spawned,
-            "an unresolvable binary name must not read as spawned"
-        );
-        uncredit_renewal(&surface_key, credited, None);
-        assert_eq!(
-            last_renewed_for(&surface_key),
-            None,
-            "a ping that never found its binary must not leave its credit standing"
-        );
+        assert_eq!(ping_binary(&plugin_id, &ping), None);
     }
 
-    /// A renewal attempt that never starts must not glue `plugin_pinged_at` to
-    /// `now`: the window ping right after it in the tick loop reads that same
-    /// key, and a stuck `now` silenced it for a full `PING_MIN_INTERVAL_SECS`
-    /// over an attempt that ran nothing at all.
+    /// A missing `[ping]` binary is caught by `ping_binary` before
+    /// `run_renewal_ping` runs any of its own state changes. What this test
+    /// can observe is only the end state — `plugin_pinged_at` unchanged, no
+    /// credit recorded — which reads the same whether nothing was ever
+    /// touched or something was touched and perfectly restored;
+    /// `run_renewal_ping`'s own `let Some(bin) = ping_binary(..) else {
+    /// return false; }`, ahead of every write, is what the code itself
+    /// guarantees the former.
     #[test]
-    fn run_renewal_ping_restores_plugin_pinged_at_when_the_attempt_never_starts() {
-        let plugin_id = format!("test-renewal-restore-{}", std::process::id());
-        let surface_key = format!("test-renewal-restore-surface-{}", std::process::id());
+    fn run_renewal_ping_touches_nothing_when_the_binary_cannot_be_found() {
+        let plugin_id = format!("test-renewal-missing-bin-{}", std::process::id());
+        let surface_key = format!("test-renewal-missing-bin-surface-{}", std::process::id());
         let renewal = TokenRenewal::Lapsed { expires_at: 1 };
         let ping = manifest::PingConfig {
             bin: format!("tickover-test-nonexistent-binary-{}", std::process::id()),
@@ -13314,12 +13847,220 @@ mod title_tests {
         assert_eq!(
             config::plugin_pinged_at(&plugin_id),
             before,
-            "restored to what it held before this attempt, not left at `now`"
+            "unchanged by an attempt whose binary could not be found"
         );
         assert_eq!(
             last_renewed_for(&surface_key),
             None,
-            "the credit is undone alongside it"
+            "no credit recorded for an attempt whose binary could not be found"
+        );
+    }
+
+    /// `localhost` always resolves without touching a real network — every
+    /// platform this app ships on answers it from `/etc/hosts` or the
+    /// equivalent, so this is free of the flakiness a real hostname lookup
+    /// would bring into the suite.
+    #[test]
+    fn ping_host_reachable_resolves_localhost() {
+        assert!(ping_host_reachable("localhost"));
+    }
+
+    /// `ping_host_reachable_with` forwards whatever its injected resolver
+    /// answers for `host`, unchanged — see its own doc for what this does
+    /// and does not prove: the mapping is tested here without a real DNS
+    /// lookup, not that any hostname actually fails to resolve.
+    #[test]
+    fn ping_host_reachable_with_forwards_whatever_the_injected_resolver_answers() {
+        assert!(ping_host_reachable_with("irrelevant", |_| true));
+        assert!(!ping_host_reachable_with("irrelevant", |_| false));
+    }
+
+    /// A plugin declaring no `[http]` section at all (the log-file engine
+    /// reads local files, not a network endpoint) has no host to check —
+    /// always `Reachable`, the compatibility guarantee every log-file-backed
+    /// manifest relies on.
+    #[test]
+    fn ping_network_gate_with_no_host_is_always_reachable() {
+        let plugin_id = format!("test-ping-gate-no-host-{}", std::process::id());
+        assert_eq!(ping_network_gate(&plugin_id, None), PingNetwork::Reachable);
+    }
+
+    /// A manifest whose `[[http.request]] url` spells `{option.<key>}`
+    /// inside the host — the same shape `registry.rs`'s own trust-dialog
+    /// disclosure test covers for `push_dest_host_for_disclosure`.
+    fn option_host_manifest() -> PluginManifest {
+        let toml = r#"
+            id         = "ping-host-option-test"
+            name       = "X"
+            menu_label = "X"
+            order      = 1
+            engine     = "http-api"
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [http]
+            [[http.request]]
+            url = "https://{option.region}.example.com/usage"
+            [[option]]
+            key     = "region"
+            label   = "Region"
+            default = false
+        "#;
+        PluginManifest::from_str(toml).expect("valid manifest with an option in its request host")
+    }
+
+    /// A host spelling `{option.<key>}` must resolve to the *substituted*
+    /// host — the one `engine_http` actually dials — never the literal
+    /// placeholder text, which nothing can ever resolve and would read this
+    /// plugin's ping as unreachable forever.
+    #[test]
+    fn ping_host_substitutes_option_placeholders_before_reading_the_host() {
+        let m = option_host_manifest();
+        assert_eq!(
+            ping_host(&m).as_deref(),
+            Some("false.example.com"),
+            "the manifest's own default (`region = false`) is what the request would actually dial"
+        );
+    }
+
+    /// The first ask for a plugin `ping_network_gate` has never probed
+    /// before: no cached answer to trust, no probe in flight, so the state
+    /// machine reports `Pending` and tells its caller to spawn one.
+    #[test]
+    fn ping_probe_decision_on_first_ask_is_pending_and_asks_to_spawn() {
+        assert_eq!(
+            ping_probe_decision(&PingProbe::default(), "example.com", Instant::now()),
+            (PingNetwork::Pending, true)
+        );
+    }
+
+    /// A cached answer younger than `PING_PROBE_TTL` is trusted outright —
+    /// no probe spawned, whichever way it went.
+    #[test]
+    fn ping_probe_decision_reuses_a_fresh_result_without_spawning() {
+        let at = Instant::now();
+        let reachable = PingProbe {
+            host: "example.com".to_string(),
+            in_flight: false,
+            started: None,
+            last: Some((at, true)),
+        };
+        assert_eq!(
+            ping_probe_decision(&reachable, "example.com", at),
+            (PingNetwork::Reachable, false)
+        );
+        let unreachable = PingProbe {
+            host: "example.com".to_string(),
+            in_flight: false,
+            started: None,
+            last: Some((at, false)),
+        };
+        assert_eq!(
+            ping_probe_decision(&unreachable, "example.com", at),
+            (PingNetwork::Unreachable, false)
+        );
+    }
+
+    /// Once a cached answer ages past `PING_PROBE_TTL`, it is no longer
+    /// trusted — the state machine reports `Pending` and asks for a fresh
+    /// probe exactly as it would for a plugin never asked about before.
+    /// `now` is built by *adding* to the instant the answer was recorded at,
+    /// never by subtracting from `Instant::now()` — `Instant - Duration`
+    /// panics if the result would precede the monotonic clock's own epoch, a
+    /// real risk on a fresh process with well under a minute of uptime.
+    #[test]
+    fn ping_probe_decision_spawns_again_once_the_cached_result_goes_stale() {
+        let at = Instant::now();
+        let stale = PingProbe {
+            host: "example.com".to_string(),
+            in_flight: false,
+            started: None,
+            last: Some((at, true)),
+        };
+        let later = at + PING_PROBE_TTL + Duration::from_secs(1);
+        assert_eq!(
+            ping_probe_decision(&stale, "example.com", later),
+            (PingNetwork::Pending, true)
+        );
+    }
+
+    /// A probe already `in_flight` for less than `PING_PROBE_DEADLINE` is
+    /// ridden, not duplicated — `Pending`, same as a fresh cache miss, but
+    /// telling its caller not to spawn a second one.
+    #[test]
+    fn ping_probe_decision_rides_a_probe_in_flight_for_less_than_the_deadline() {
+        let started = Instant::now();
+        let state = PingProbe {
+            host: "example.com".to_string(),
+            in_flight: true,
+            started: Some(started),
+            last: None,
+        };
+        let still_within = started + PING_PROBE_DEADLINE - Duration::from_secs(1);
+        assert_eq!(
+            ping_probe_decision(&state, "example.com", still_within),
+            (PingNetwork::Pending, false)
+        );
+    }
+
+    /// Past `PING_PROBE_DEADLINE`, a probe still `in_flight` answers
+    /// `Unreachable` instead of `Pending` — but still without spawning a
+    /// second thread to race the one still out there, which is what bounds
+    /// a genuinely hung resolver to exactly one thread no matter how long
+    /// the outage lasts.
+    #[test]
+    fn ping_probe_decision_answers_unreachable_once_an_in_flight_probe_outlives_the_deadline() {
+        let started = Instant::now();
+        let state = PingProbe {
+            host: "example.com".to_string(),
+            in_flight: true,
+            started: Some(started),
+            last: None,
+        };
+        let past_deadline = started + PING_PROBE_DEADLINE + Duration::from_secs(1);
+        assert_eq!(
+            ping_probe_decision(&state, "example.com", past_deadline),
+            (PingNetwork::Unreachable, false)
+        );
+    }
+
+    /// A cached answer (or an in-flight probe) for a *different* host — an
+    /// `{option.<key>}` value flipped since it was recorded — is trusted for
+    /// nothing: read exactly like a plugin never asked about before,
+    /// regardless of how fresh the old answer is or whether a probe for the
+    /// old host is still running.
+    #[test]
+    fn ping_probe_decision_treats_a_stored_answer_for_a_different_host_as_absent() {
+        let at = Instant::now();
+        let reachable_for_old_host = PingProbe {
+            host: "old.example.com".to_string(),
+            in_flight: false,
+            started: None,
+            last: Some((at, true)),
+        };
+        assert_eq!(
+            ping_probe_decision(&reachable_for_old_host, "new.example.com", at),
+            (PingNetwork::Pending, true),
+            "a fresh, reachable answer for the old host must not be reused for the new one"
+        );
+
+        let in_flight_for_old_host = PingProbe {
+            host: "old.example.com".to_string(),
+            in_flight: true,
+            started: Some(at),
+            last: None,
+        };
+        assert_eq!(
+            ping_probe_decision(&in_flight_for_old_host, "new.example.com", at),
+            (PingNetwork::Pending, true),
+            "a probe still running for the old host must not be ridden for the new one \
+             — the caller spawns its own"
         );
     }
 
@@ -13339,10 +14080,10 @@ mod title_tests {
 
         let surface_key = format!("test-spawn-hello-unexecutable-{}", std::process::id());
         let renewal = TokenRenewal::Lapsed { expires_at: 7 };
-        // Production credits *before* calling `send_ping`/`spawn_hello` at
-        // all (see `credit_renewal`'s own doc for why) — set up directly
-        // here since this test drives `spawn_hello` itself, one layer below
-        // that call site.
+        // Production credits *before* calling `spawn_hello` at all (see
+        // `credit_renewal`'s own doc for why) — set up directly here since
+        // this test drives `spawn_hello` itself, one layer below that call
+        // site.
         let (_, credited) = credit_renewal(&surface_key, renewal);
 
         let spawned = spawn_hello(

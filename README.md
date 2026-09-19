@@ -74,9 +74,12 @@ Codex and Claude manifests declare one today.
 A manifest can also set `[ping] renews_token = true` — Claude's does — which
 arms a second trigger for that same command: a surface whose auth chain
 declares a token expiry finding its token lapsed, or the provider flatly
-refusing it. That runs under the same ten-minute floor, at most once per
-distinct token per surface, and a renewal spends that tick's one allowed
-ping — the window check above does not also fire.
+refusing it. Once per distinct token per surface when the run succeeds; ten
+minutes apart for the first three attempts if it keeps failing, an hour
+apart after that, never fewer — a token this app cannot renew still gets
+retried, just slower. A renewal spends that tick's one allowed ping — the
+window check above does not also fire — and neither trigger runs at all
+while the provider's host does not resolve.
 
 ## What the meter shows
 

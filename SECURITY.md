@@ -150,9 +150,11 @@ command with your user's privileges. Four things bound it: the toggle is
 **off unless you turn it on**, per plugin, in Settings; the window trigger
 never fires before the window it targets has actually started, and neither
 trigger fires more than once every ten minutes regardless of what a
-manifest's own numbers claim — a renewal is bound tighter still: once per
-distinct token per surface when the run succeeds, up to three attempts,
-ten minutes apart, when it keeps failing — which is what stops a
+manifest's own numbers claim, nor at all while the provider's own host does
+not resolve — a renewal is bound tighter still: once per distinct token per
+surface when the run succeeds, ten minutes apart for the first three
+attempts that keep failing, backing off to an hour apart after that rather
+than ever running unattended more often — which is what stops a
 misconfigured or malicious manifest from turning this into a loop; it runs
 in a directory created fresh for that one command, normally under the OS
 temp directory and removed once the command exits, so there is nothing

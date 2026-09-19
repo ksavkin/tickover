@@ -17,6 +17,12 @@
 # because macOS is the half that can be verified before pushing; turning it on
 # for Windows would mean a red build nobody here can reproduce, which is how a
 # gate stops being read.
+#
+# Docs run on macOS only too, and as two steps rather than one: the lib and
+# the bin share the crate name `tickover`, so a single `cargo doc` silently
+# drops the bin target from the build (a filename-collision warning, nothing
+# louder) and never once documents `src/main.rs`. `cargo rustdoc --bin` is
+# the command that actually does.
 
 name: CI
 
@@ -116,6 +122,22 @@ jobs:
       - name: Clippy (macOS only — see the note at the top)
         if: matrix.os == 'macos-latest'
         run: cargo clippy --all-targets --locked -- -D warnings
+
+      # Two invocations, not one: the lib and the bin both carry the crate
+      # name `tickover`, so a plain `cargo doc` silently drops the bin target
+      # (a filename-collision warning, no error) and never documents a single
+      # line of `src/main.rs`. `cargo rustdoc --bin` is what actually rebuilds
+      # that target's docs and enforces its own intra-doc links. Same
+      # reasoning as clippy for running only here.
+      - name: Docs — lib (macOS only — see the note at the top)
+        if: matrix.os == 'macos-latest'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --document-private-items --locked
+
+      - name: Docs — bin (macOS only — see the note at the top)
+        if: matrix.os == 'macos-latest'
+        run: cargo rustdoc --locked --bin tickover -- --document-private-items -D warnings
 
       - name: Build (release)
         run: cargo build --release --locked

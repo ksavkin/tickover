@@ -30,7 +30,7 @@ const KEEP_BYTES: usize = 32 * 1024;
 
 /// Only [`append_to_log`] resolves this, and that is compiled out under
 /// `cargo test` — the whole point being that a test run must not find, let
-/// alone append to, the real log (see [`line`]).
+/// alone append to, the real log (see [`line`](fn@line)).
 #[cfg(not(test))]
 fn path() -> Option<std::path::PathBuf> {
     Some(crate::config::dir()?.join("tickover.log"))
@@ -83,7 +83,7 @@ pub fn line(message: String) {
 const HEX_NIBBLES: [u8; 16] = *b"0123456789abcdef";
 
 /// Escape every C0 control character (`\n`/`\r` spelled out, everything else
-/// `\xHH`) in `message` — see [`line`]'s own doc for why. DEL (`\u{7F}`) is
+/// `\xHH`) in `message` — see [`line`](fn@line)'s own doc for why. DEL (`\u{7F}`) is
 /// folded in with C0 for the same reason: neither is printable, and a stray
 /// one is exactly as capable of confusing a line-oriented reader.
 fn escape_control_chars(message: &str) -> String {

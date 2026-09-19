@@ -153,11 +153,17 @@ chain declares a token expiry finds that token lapsed or refused. That
 decision is `renewal_ping_due`, and `classify_renewal_across_surfaces`
 applies it across every renewal-eligible surface a plugin reports, since two
 surfaces on one plugin can lapse on independent schedules. It shares the
-window trigger's ten-minute floor, plus a bound of its own: a
-per-surface `LAST_RENEWED_FOR` table stops a token the CLI cannot itself
-renew from being pinged again every ten minutes forever, so a renewal fires
-once per distinct token per surface when the run succeeds, and up to three
-attempts, ten minutes apart, when it keeps ending without success.
+window trigger's ten-minute floor, plus a backoff of its own: a
+per-surface `LAST_RENEWED_FOR` table fires a renewal once per distinct token
+per surface when the run succeeds, ten minutes apart for the first three
+attempts when it keeps ending without success, and an hour apart past
+that — a token the CLI cannot itself renew is never abandoned, only slowed
+down. Neither trigger is spent while its plugin's host does not resolve: the
+tick's own thread never blocks on that check (`ping_network_gate`) — it
+answers from a small per-plugin cache, refreshed by a detached background
+probe rather than a lookup on the tick itself — and a ping already due is
+simply skipped, without touching any of the state above, until that cache
+reports the host reachable again.
 
 ## Keeping the folder honest
 
