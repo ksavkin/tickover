@@ -284,6 +284,20 @@ pub(crate) const CAPABILITIES: &[Capability] = &[
         implemented: true,
         keys: &["windows.source.remaining_fraction_path"],
     },
+    // Grok. A window's own length read off the response's stated bounds
+    // (`start_path`/`end_path`, an RFC3339 pair) rather than a number typed
+    // into the manifest or read directly out of one field — for a provider
+    // that states its period as "from here to there" instead of a duration.
+    // What a build without this capability actually does is the same shape
+    // `credentials-map`'s own comment walks through: `PeriodMode` is a closed
+    // enum, so `mode = "from_bounds"` fails the whole document's typed parse
+    // rather than being ignored field-by-field, and the declaration only
+    // changes which message that build gives for it.
+    Capability {
+        name: "window-period-bounds",
+        implemented: true,
+        keys: &["windows.period.start_path", "windows.period.end_path"],
+    },
     // Antigravity's hybrid auth. A `keychain`/`credentials-file`/
     // `win-credential` step that names an expiry resolves Absent when the
     // token has lapsed, so a refresh step behind it fires (or, with
@@ -307,6 +321,21 @@ pub(crate) const CAPABILITIES: &[Capability] = &[
         name: "credentials-file-path-env",
         implemented: true,
         keys: &["surface.auth.path_env", "surface.auth.path_env_join"],
+    },
+    // Claude's CLI, continued: `CLAUDE_CONFIG_DIR` also renames the Keychain
+    // item it writes, not only the credentials file `credentials-file-path-env`
+    // above covers — a `keychain` step that always queries the fixed default
+    // service reads nothing on an account that has ever set the variable. An
+    // older build has no notion of `service_env`/`service_env_suffix` at all,
+    // so it would keep querying the un-rekeyed service name and report the
+    // surface as signed out.
+    Capability {
+        name: "keychain-service-env",
+        implemented: true,
+        keys: &[
+            "surface.auth.service_env",
+            "surface.auth.service_env_suffix",
+        ],
     },
     // Antigravity's hybrid, continued. `oauth-refresh` is the one auth step
     // that spends a credential instead of only reading one; an older build has

@@ -374,19 +374,62 @@ fn credentials_map_step(
 
 // ── Step: keychain (macOS) ────────────────────────────────────────────────
 
+/// The Keychain service name a `keychain` step actually queries: `base`
+/// itself, unless `step.service_env` names a set, non-empty environment
+/// variable — mirroring Claude Code's own
+/// `getMacOsKeychainStorageServiceName`: an unset or empty `CLAUDE_CONFIG_DIR`
+/// names the plain default service (`!process.env.CLAUDE_CONFIG_DIR` treats
+/// empty the same as unset), while a set one appends `-` and the first eight
+/// hex characters of `sha256(NFC(value))` — the digit count `validate`
+/// already pinned `service_env_suffix` to (`"sha256:8"`, the only recipe
+/// this reads). NFC first, not the raw bytes: the CLI normalises before it
+/// hashes, so a decomposed and a precomposed spelling of the same path must
+/// derive the same item name here too, or an account whose shell expands one
+/// form and whose terminal types the other silently reads two different
+/// Keychain items for one variable.
+///
+/// Reads one environment variable (`std::env::var`) and touches no Keychain
+/// itself, so it is tested directly, the same way `resolve_credentials_file_path`
+/// is.
+/// `#[cfg(any(target_os = "macos", test))]`: its only real caller,
+/// `keychain_step`, exists solely inside that same `cfg` block, so a non-macOS
+/// build would otherwise warn this dead code — the same shape `unwrap_go_keyring`
+/// above is gated for and for the same reason.
+#[cfg(any(target_os = "macos", test))]
+fn resolve_keychain_service(step: &AuthStep, base: &str) -> String {
+    let Some(env_name) = &step.service_env else {
+        return base.to_string();
+    };
+    let Ok(value) = std::env::var(env_name) else {
+        return base.to_string();
+    };
+    if value.is_empty() {
+        return base.to_string();
+    }
+    use unicode_normalization::UnicodeNormalization;
+    let normalized: String = value.nfc().collect();
+    let digest = super::registry::sha256_hex(normalized.as_bytes());
+    format!("{base}-{}", &digest[..8])
+}
+
 fn keychain_step(
     step: &AuthStep,
     lapsed_expiry: &mut Option<u64>,
 ) -> Result<Option<String>, String> {
     #[cfg(target_os = "macos")]
     {
-        let service = require_str("keychain", "service", step.service.as_deref())?;
+        let base = require_str("keychain", "service", step.service.as_deref())?;
+        // The derived name, not `base`, is what gets memoised below — two
+        // surfaces re-keyed to the same `CLAUDE_CONFIG_DIR` value collapse
+        // into one Keychain read, and one re-keyed to a different value never
+        // shares the other's memo entry.
+        let service = resolve_keychain_service(step, base);
         let token_json_path = require_str(
             "keychain",
             "token_json_path",
             step.token_json_path.as_deref(),
         )?;
-        match keychain_password(service)? {
+        match keychain_password(&service)? {
             Some(raw) => {
                 let json = unwrap_go_keyring(&raw)?;
                 token_from_blob(
@@ -3409,6 +3452,8 @@ mod tests {
             expiry_json_path: None,
             key_prefix: None,
             service: None,
+            service_env: None,
+            service_env_suffix: None,
             var: None,
             config_path: None,
             blob_json_path: None,
@@ -3543,6 +3588,144 @@ mod tests {
         assert!(
             unwrap_go_keyring("go-keyring-encoded:€€").is_err(),
             "a non-ASCII hex payload must error, not panic"
+        );
+    }
+
+    // ── resolve_keychain_service ───────────────────────────────────────────
+
+    #[test]
+    fn resolve_keychain_service_uses_the_base_when_service_env_is_unset() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let unset_env = format!(
+            "TICKOVER_TEST_AUTH_SERVICE_ENV_UNSET_{}",
+            std::process::id()
+        );
+        std::env::remove_var(&unset_env);
+        let step = AuthStep {
+            service: Some("Claude Code-credentials".to_string()),
+            service_env: Some(unset_env),
+            service_env_suffix: Some("sha256:8".to_string()),
+            ..auth_step(AuthType::Keychain)
+        };
+        assert_eq!(
+            resolve_keychain_service(&step, "Claude Code-credentials"),
+            "Claude Code-credentials",
+            "an unset service_env must not rename the service"
+        );
+    }
+
+    #[test]
+    fn resolve_keychain_service_appends_a_hash_of_the_env_value_when_set() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env_name = format!("TICKOVER_TEST_AUTH_SERVICE_ENV_{}", std::process::id());
+        std::env::set_var(&env_name, "/Users/test/.config/claude");
+        let step = AuthStep {
+            service: Some("Claude Code-credentials".to_string()),
+            service_env: Some(env_name.clone()),
+            service_env_suffix: Some("sha256:8".to_string()),
+            ..auth_step(AuthType::Keychain)
+        };
+        let result = resolve_keychain_service(&step, "Claude Code-credentials");
+        std::env::remove_var(&env_name);
+
+        // Computed independently of `resolve_keychain_service`'s own call
+        // into `registry::sha256_hex` — a bug shared by both would otherwise
+        // pass this test.
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"/Users/test/.config/claude");
+        let hex: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(result, format!("Claude Code-credentials-{}", &hex[..8]));
+    }
+
+    #[test]
+    fn resolve_keychain_service_uses_the_base_when_service_env_is_set_empty() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env_name = format!(
+            "TICKOVER_TEST_AUTH_SERVICE_ENV_EMPTY_{}",
+            std::process::id()
+        );
+        // Exported but empty — one stray shell line is enough to produce
+        // this, the same shape `credentials_file_step`'s own `path_env` test
+        // covers for the credentials-file side of the same override.
+        std::env::set_var(&env_name, "");
+        let step = AuthStep {
+            service: Some("Claude Code-credentials".to_string()),
+            service_env: Some(env_name.clone()),
+            service_env_suffix: Some("sha256:8".to_string()),
+            ..auth_step(AuthType::Keychain)
+        };
+        let result = resolve_keychain_service(&step, "Claude Code-credentials");
+        std::env::remove_var(&env_name);
+        assert_eq!(
+            result, "Claude Code-credentials",
+            "an empty service_env must be treated exactly as if it were unset — matching the \
+             CLI's own !process.env.CLAUDE_CONFIG_DIR check"
+        );
+    }
+
+    #[test]
+    fn resolve_keychain_service_normalises_to_nfc_before_hashing() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // "é" written as "e" + a combining acute accent (U+0301) must hash
+        // exactly like its single-codepoint precomposed form — otherwise a
+        // shell that expands one spelling and a terminal that types the
+        // other would silently name two different Keychain items for what a
+        // user considers one path.
+        let decomposed_env = format!(
+            "TICKOVER_TEST_AUTH_SERVICE_ENV_NFC_D_{}",
+            std::process::id()
+        );
+        let precomposed_env = format!(
+            "TICKOVER_TEST_AUTH_SERVICE_ENV_NFC_C_{}",
+            std::process::id()
+        );
+        std::env::set_var(&decomposed_env, "/Users/cafe\u{0301}");
+        std::env::set_var(&precomposed_env, "/Users/caf\u{e9}");
+        let base = "Claude Code-credentials";
+        let decomposed_step = AuthStep {
+            service: Some(base.to_string()),
+            service_env: Some(decomposed_env.clone()),
+            service_env_suffix: Some("sha256:8".to_string()),
+            ..auth_step(AuthType::Keychain)
+        };
+        let precomposed_step = AuthStep {
+            service_env: Some(precomposed_env.clone()),
+            ..decomposed_step.clone()
+        };
+        let decomposed = resolve_keychain_service(&decomposed_step, base);
+        let precomposed = resolve_keychain_service(&precomposed_step, base);
+        std::env::remove_var(&decomposed_env);
+        std::env::remove_var(&precomposed_env);
+        assert_eq!(
+            decomposed, precomposed,
+            "a decomposed and a precomposed spelling of the same path must hash the same"
+        );
+        assert_ne!(
+            decomposed, base,
+            "the two must actually have re-keyed the service, not both fallen back to it"
+        );
+        // The equality above alone would also pass a decomposing (NFD)
+        // implementation, which agrees with itself on both inputs just as
+        // readily as an NFC one does — so pin the actual normal form by
+        // hashing the *precomposed* bytes independently and checking the
+        // derived name against that, not against the other branch's output.
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update("/Users/caf\u{e9}".as_bytes());
+        let hex: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            decomposed,
+            format!("{base}-{}", &hex[..8]),
+            "the derived name must match a hash of the precomposed form, not a decomposed one"
         );
     }
 

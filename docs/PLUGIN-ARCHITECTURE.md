@@ -84,9 +84,9 @@ credential source and calling whatever host it declares. See
 
 Values for enum-typed fields (`engine`, `role`, `from`, `transform`, `type`,
 `mode`, `resets_at_format`) are lower-case, hyphenated (`"log-file"`,
-`"credentials-file"`) — **except** `[windows.period].mode`, whose two values
-are `"assumed"` and `"from_field"` (underscore, not hyphen). Get that one
-wrong and the manifest fails to parse.
+`"credentials-file"`) — **except** `[windows.period].mode`, whose three values
+are `"assumed"`, `"from_field"` and `"from_bounds"` (underscore, not hyphen).
+Get that one wrong and the manifest fails to parse.
 
 **Unknown fields are ignored, not rejected.** The manifest type deliberately
 does not use `#[serde(deny_unknown_fields)]`: a manifest written for (or by) a
@@ -216,12 +216,14 @@ Two rules keep the key lists true:
 | `credentials-map` | **yes** | `[[surface.auth]]` `type = "credentials-map"` + `key_prefix` — a credential file that is a *map* of records keyed by a string no manifest can spell in advance |
 | `http-post` | **yes** | `[[http.request]]` `method` / `body` — an endpoint that answers only a POST, where every provider before it answered a plain GET |
 | `remaining-fraction` | **yes** | `[windows.source]` `remaining_fraction_path` — a provider that states what is *left* rather than what is spent |
+| `window-period-bounds` | **yes** | `[windows.period]` `mode = "from_bounds"` + `start_path` / `end_path` — a window's length read off the response's own stated bounds (two RFC3339 timestamps) rather than a number typed into the manifest or read directly out of one field |
 | `keychain-expiry` | **yes** | `[[surface.auth]]` `expiry_json_path` — a `keychain`/`credentials-file`/`win-credential`/`credentials-map` step that resolves Absent on a lapsed token, so a step behind it can fire (or, with `[ping] renews_token`, a renewal ping) |
 | `oauth-refresh` | **yes** | `[[surface.auth]]` `type = "oauth-refresh"` + `token_url` — the one auth step that *spends* a credential instead of only reading one |
 | `oauth-client-discovery` | **yes** | `[surface.auth.client]` — reads an `oauth-refresh` step's installed-app client id/secret back out of the credential's own installed client at run time, instead of shipping the pair in the manifest — see [`[surface.auth.client]`](#surfaceauthclient) |
 | `balance-unlimited` | **yes** | `[balances.unlimited]` — a bucket the response marks as having no ceiling draws "Unlimited" instead of a `used`/`cap`/`remaining` pair that would otherwise read `0 / 0` |
 | `balance-conditional` | **yes** | `[balances.when]` — a `[[balances]]` entry that draws no row at all unless a boolean the response states resolves `true` |
 | `credentials-file-path-env` | **yes** | `[[surface.auth]]` `path_env` / `path_env_join` on a `credentials-file` step — an env var override for where the credentials file lives, mirroring `[logfile] root_env`/`root_env_join` |
+| `keychain-service-env` | **yes** | `[[surface.auth]]` `service_env` / `service_env_suffix` on a `keychain` step — re-keys `service` from an env var's value, mirroring `credentials-file-path-env` for the Keychain item name Claude's CLI also renames under `CLAUDE_CONFIG_DIR` |
 
 `window-severity` is listed without being implemented, and that is the useful
 state, not an oversight: the name ships ahead of the semantics so the build
@@ -288,10 +290,12 @@ manifest fails validation with 2+. A manifest may declare at most 32
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `mode` | `"assumed"` \| `"from_field"` | yes | how the period length is determined |
-| `assumed` | integer (minutes) | when `mode = "assumed"` | fixed period length; at least 5 — a manifest-stated period shorter than that reaches `main.rs`'s auto-ping arithmetic as a window that has effectively always just started |
-| `field` | string | when `mode = "from_field"` | dotted JSON path to the period length, read from the reading itself |
-| `unit` | `"minutes"` \| `"seconds"` | no (default `"minutes"`) | unit of the value at `field`; the stored length is always minutes (seconds round down). Codex states `window_minutes` in its logs and `limit_window_seconds` in its API |
+| `mode` | `"assumed"` \| `"from_field"` \| `"from_bounds"` | yes | how the period length is determined |
+| `assumed` | integer (minutes) | when `mode = "assumed"`; optional (fallback) when `mode = "from_bounds"` | fixed period length; at least 5 — a manifest-stated period shorter than that reaches `main.rs`'s auto-ping arithmetic as a window that has effectively always just started. Under `mode = "from_bounds"`, read only when `start_path`/`end_path` don't both resolve to a usable length (a response can state `end` without a usable `start`) |
+| `field` | string | when `mode = "from_field"` | dotted JSON path to the period length, read from the reading itself. Refused beside `mode = "from_bounds"` |
+| `unit` | `"minutes"` \| `"seconds"` | no (default `"minutes"`) | unit of the value at `field`; the stored length is always minutes (seconds round down). Codex states `window_minutes` in its logs and `limit_window_seconds` in its API. Refused (non-default) beside `mode = "from_bounds"`, which never reads it |
+| `start_path` | string | when `mode = "from_bounds"` | dotted JSON path to the period's own start, an RFC3339 string. Refused beside `mode = "assumed"`/`"from_field"`. Declaring it does not guarantee every response resolves it — see `assumed`, above. Needs `requires_reader = ["window-period-bounds"]` |
+| `end_path` | string | when `mode = "from_bounds"` | dotted JSON path to the period's own end, an RFC3339 string; the length is `end − start` in whole minutes, only when `end` is strictly after `start`, the result is at least a minute, and it is [`plausible_period_minutes`](#windows--period-classification) — otherwise `assumed` is read instead. Refused beside `mode = "assumed"`/`"from_field"`. Needs `requires_reader = ["window-period-bounds"]` |
 
 #### Presence: a window that isn't there
 
@@ -505,7 +509,7 @@ No escaping is offered rather than invented. No wildcards.
 | `remaining_fraction_path` | string | — (the other) | dotted JSON path to a **remaining** fraction, 0..1, for a provider that states what is left rather than what is spent (Antigravity's `remainingFraction`). Mutually exclusive with `used_percent_path`; needs `requires_reader = ["remaining-fraction"]` |
 | `resets_at_path` | string | — (required) | dotted JSON path to the absolute reset timestamp |
 | `resets_at_format` | `"unix"` \| `"iso8601"` | `"unix"` | format of the value at `resets_at_path` |
-| `max_period_minutes` | integer | — (optional) | classification bound: this slot only if the period is ≤ this many minutes. On `http-api`, needs `period.mode = "from_field"` — refused alongside `mode = "assumed"`, which already states the length and leaves the bound nothing to classify; [`log-file`'s own classification](#engine--log-file) applies it either way |
+| `max_period_minutes` | integer | — (optional) | classification bound: this slot only if the period is ≤ this many minutes. On `http-api`, needs `period.mode = "from_field"` — refused alongside `mode = "assumed"` or `"from_bounds"`, neither of which classifies a candidate by length at all; [`log-file`'s own classification](#engine--log-file) applies it either way |
 | `min_period_minutes` | integer | — (optional) | classification bound: this slot only if the period is ≥ this many minutes. Same `http-api`-only `period.mode = "from_field"` requirement as `max_period_minutes` |
 
 An `http-api` window states its figure through **exactly one** of
@@ -532,13 +536,15 @@ length (`period.field`, converted by `period.unit`) falls inside its
 also legal with several candidates: the first one that resolves to a value at
 all (skipping `null`) wins, in the order `containers` names them. On this
 engine, either bound only means something once `period.mode = "from_field"`
-gives a length to measure it against — `mode = "assumed"` states the
-window's length outright, so a bound declared beside it would never be read
-here, and `validate` refuses that combination on `http-api`. The same
-manifest is legal on `log-file`: its own [classification](#engine--log-file)
-applies a bound to a candidate's length regardless of `period.mode`, and a
-`role = "extra"` log-file window needs one — with neither bound set, it
-classifies to nothing and never draws.
+gives a length, per candidate, to measure it against — `mode = "assumed"`
+states the window's length outright and `mode = "from_bounds"` reads its
+length off the container's own stated bounds (or falls back to `assumed`)
+rather than classifying a candidate by length at all, so a bound declared
+beside either would never be read here, and `validate` refuses both
+combinations on `http-api`. The same manifest is legal on `log-file`: its own
+[classification](#engine--log-file) applies a bound to a candidate's length
+regardless of `period.mode`, and a `role = "extra"` log-file window needs
+one — with neither bound set, it classifies to nothing and never draws.
 
 #### `role = "extra"`
 
@@ -559,13 +565,16 @@ families, and a reader that took the newest one showed a model-specific 0%
 where the subscription's weekly window stood at 69%. Keeping the two in
 different roles is what makes showing both safe.
 
-One rule covers every shape: a length the **response states** is checked
-against the bounds the manifest declares, and nothing else is checked. So a
-declared bound holds over several candidates (what it is for), over a single
-one, and over the response root — a window declared to be at least a week long
-never shows a five-hour figure, however few objects were on offer. A window
-whose period is `assumed` has no stated length to check, so it classifies
-nothing and takes its candidate as declared. A window that matches no
+One rule covers every shape: a length the **response states, per candidate**,
+is checked against the bounds the manifest declares, and nothing else is
+checked. So a declared bound holds over several candidates (what it is for),
+over a single one, and over the response root — a window declared to be at
+least a week long never shows a five-hour figure, however few objects were on
+offer. A window whose period is `assumed` or `from_bounds` has no
+per-candidate stated length to check (an `assumed` one states none at all; a
+`from_bounds` one reads its own bounds off the container, not off the
+candidate that classified it), so it classifies nothing and takes its
+candidate as declared. A window that matches no
 candidate is still emitted, with every field blank; a manifest listing more
 than one candidate without `period.mode = "from_field"` fails validation,
 since nothing would tell the candidates apart.
@@ -842,6 +851,8 @@ needs and ignores the rest.
 | `token_json_path` | string | `credentials-file`, `credentials-map`, `keychain`, `win-credential`, `oauth-refresh`; optional on `electron-safe-storage` (default `"claudeAiOauth.accessToken\|access_token"`) | `\|`-separated fallback JSON paths to the token (e.g. `"claudeAiOauth.accessToken\|access_token"` — try camelCase, then snake_case). For `credentials-map` it is read inside the *matched entry*; for `oauth-refresh` it names the **refresh** token |
 | `key_prefix` | string | `credentials-map` | prefix the entry's key in the top-level object at `path` must start with. Needs `requires_reader = ["credentials-map"]` |
 | `service` | string | `keychain` | Keychain service name to query |
+| `service_env` | string | `keychain` — refused on any other step kind | env var that, if set and non-empty, re-keys `service`: the value is Unicode-NFC-normalised, hashed with sha256, and the first N hex characters (per `service_env_suffix`) are appended after a `-`, mirroring the credential variant of `[logfile] root_env`. Empty is treated as unset. Needs `requires_reader = ["keychain-service-env"]` |
+| `service_env_suffix` | string | `keychain`, and only beside `service_env` | how many leading hex characters of the sha256 to append; the only supported value is `"sha256:8"` |
 | `expiry_json_path` | string | `keychain`, `credentials-file`, `win-credential`, `credentials-map` — refused on any other step kind (the error names the step's own index and kind) | JSON path to an expiry beside the token (for `credentials-map`, inside the *matched entry*) — an RFC3339 string, or a JSON number/numeric string read as epoch seconds or milliseconds (told apart by magnitude); a lapsed one makes the step **Absent** instead of handing back a stale token. Needs `requires_reader = ["keychain-expiry"]` |
 | `var` | string | `env` | environment variable name holding the token |
 | `config_path` | string | `electron-safe-storage` | path to the Electron config/state file holding the encrypted blob |
@@ -1342,12 +1353,16 @@ with two or more `primary` windows fails validation — there's exactly one
 
 `period.mode` says whether a window's nominal length is a fixed constant
 (`"assumed"`, e.g. Claude's 5-hour/weekly windows, which the API doesn't
-report a length for) or read out of the reading itself (`"from_field"`,
-e.g. Codex's `window_minutes`, since Codex can and does report a window
-whose stated period differs from the "usual" 5h/weekly split). See
-[log-file classification](#engine--log-file) for how a read period length
-maps back to a declared window when the raw data doesn't name its windows
-positionally.
+report a length for), read out of the reading itself as a duration
+(`"from_field"`, e.g. Codex's `window_minutes`, since Codex can and does
+report a window whose stated period differs from the "usual" 5h/weekly
+split), or read off the reading's own start/end bounds (`"from_bounds"`,
+e.g. Grok's `currentPeriod.start`/`.end`, for a provider that states a
+period as two timestamps rather than a duration — with `assumed` as the
+fallback for the half-stated case, a response that carries one bound but
+not the other). See [log-file classification](#engine--log-file) for how a
+read period length maps back to a declared window when the raw data doesn't
+name its windows positionally.
 
 ## Ping (auto-refresh nudge)
 
@@ -1807,7 +1822,7 @@ order        = 10
 # by position; `[status]` needs one that reads the quota's own standing. See
 # docs/PLUGIN-ARCHITECTURE.md, "Reader capabilities".
 requires_reader = ["window-presence", "window-identity", "reading-status", "reading-balances"]
-version      = "2.5.1"
+version      = "2.5.2"
 engine       = "http-api"
 # One request a minute, matching Claude. The log-file reader polled every 15s
 # because re-reading a local file is free; four requests a minute at somebody
@@ -2040,7 +2055,7 @@ path            = "~/.codex/auth.json"
 token_json_path = "tokens.access_token"
 
 # `codex exec hello` — run while the 5-hour window sits empty, to start a
-# fresh one (src/main.rs `ping_due` / `send_ping`, gated by
+# fresh one (src/main.rs `ping_due` / `spawn_hello`, gated by
 # `config::auto_ping_codex`).
 #
 # `--skip-git-repo-check` is not optional here. Without it `codex exec` refuses
@@ -2100,10 +2115,12 @@ order        = 20
 # token from a working one; `balance-conditional` is what lets the "Extra
 # usage" balance draw no row at all on an account that never turned it on;
 # `credentials-file-path-env` is what lets the credentials-file step below
-# honour `CLAUDE_CONFIG_DIR` — see docs/PLUGIN-ARCHITECTURE.md, "Reader
+# honour `CLAUDE_CONFIG_DIR`; `keychain-service-env` is what lets the
+# keychain step below honour the same variable, for the Keychain item name
+# the CLI renames under it — see docs/PLUGIN-ARCHITECTURE.md, "Reader
 # capabilities".
-requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry", "reading-balances", "balance-conditional", "credentials-file-path-env"]
-version      = "1.4.4"
+requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry", "reading-balances", "balance-conditional", "credentials-file-path-env", "keychain-service-env"]
+version      = "1.4.5"
 engine       = "http-api"
 # Re-fetched every 60 s.
 refresh_secs = 60
@@ -2281,10 +2298,9 @@ allowed_hosts = ["api.anthropic.com"]
 # `$CLAUDE_CONFIG_DIR/.credentials.json` instead of the default
 # `~/.claude/.credentials.json` — so `path_env`/`path_env_join` read the same
 # override this app's own `path` above would otherwise miss entirely on an
-# account that has ever set it. Out of scope: the CLI also honours
-# `CLAUDE_CONFIG_DIR` for the name of the Keychain item it writes, and the
-# keychain step below still names the fixed default service — re-keying that
-# lookup needs its own manifest field this change does not add.
+# account that has ever set it. The CLI also honours `CLAUDE_CONFIG_DIR` for
+# the name of the Keychain item it writes, which the keychain step below
+# honours through its own pair, `service_env`/`service_env_suffix`.
 [[surface.auth]]
 type             = "credentials-file"
 path             = "~/.claude/.credentials.json"
@@ -2295,11 +2311,13 @@ token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessT
 expiry_json_path = "claudeAiOauth.expiresAt"
 
 [[surface.auth]]
-type             = "keychain"
-service          = "Claude Code-credentials"
-token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
+type               = "keychain"
+service            = "Claude Code-credentials"
+service_env        = "CLAUDE_CONFIG_DIR"
+service_env_suffix = "sha256:8"
+token_json_path    = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
 # expiresAt is epoch milliseconds.
-expiry_json_path = "claudeAiOauth.expiresAt"
+expiry_json_path   = "claudeAiOauth.expiresAt"
 
 # Desktop surface — opt-in (its token needs a one-time Keychain/DPAPI grant),
 # popup-only (`in_menu_bar = false`).
@@ -2323,7 +2341,7 @@ token_json_path    = "claudeAiOauth.accessToken|claudeAiOauth.access_token|acces
 macos_keychain_key = "Claude Safe Storage"
 
 # `claude -p hello --model haiku` — run while the 5-hour window sits empty,
-# to start a fresh one (src/main.rs `ping_due` / `send_ping`, gated by
+# to start a fresh one (src/main.rs `ping_due` / `spawn_hello`, gated by
 # `config::auto_ping_claude`). The ping's only job is to start the window
 # and renew the token, and the cheapest model does both exactly as well as
 # the account's default one — every third-party renewal script observed

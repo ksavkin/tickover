@@ -729,6 +729,14 @@ fn build_window(index: usize, w: &WindowConfig, slot: Option<&RawSlot>) -> Optio
         period_minutes: match w.period.mode {
             PeriodMode::Assumed => w.period.assumed,
             PeriodMode::FromField => slot.window_minutes,
+            // Refused at load (`manifest::validate_window_period_mode`): a
+            // `RawSlot` carries only an already-classified `window_minutes`,
+            // with no raw start/end pair behind it to read a length from, so
+            // no manifest that parses ever reaches this arm on this engine.
+            // Kept exhaustive rather than a catch-all `_`, so a third mode
+            // added later fails this match rather than silently falling
+            // through to it.
+            PeriodMode::FromBounds => None,
         },
     })
 }
@@ -1453,6 +1461,8 @@ mod tests {
                 field: None,
                 assumed: Some(0),
                 unit: PeriodUnit::Minutes,
+                start_path: None,
+                end_path: None,
             },
             source: SourceConfig {
                 containers: Vec::new(),

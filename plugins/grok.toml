@@ -35,15 +35,17 @@ order        = 30
 # balance instead of a window at all; `credentials-map`, because the
 # credential lives in a JSON object keyed by a string the plain dotted-path
 # auth grammar cannot select; `keychain-expiry` is what lets the auth step
-# below tell a stale token from a working one. See
+# below tell a stale token from a working one; `window-period-bounds` is
+# what lets the window below read its own length off `currentPeriod`'s
+# stated start/end instead of a number typed into this file. See
 # docs/PLUGIN-ARCHITECTURE.md, "Reader capabilities".
-requires_reader = ["window-identity", "reading-balances", "credentials-map", "keychain-expiry"]
-version      = "1.0.1"
+requires_reader = ["window-identity", "reading-balances", "credentials-map", "keychain-expiry", "window-period-bounds"]
+version      = "1.0.2"
 engine       = "http-api"
 refresh_secs = 60
 
-# The account's current weekly usage period, read directly rather than derived
-# from the two balances below. Not `required`: an account still served only the
+# The account's current usage period, read directly rather than derived from
+# the two balances below. Not `required`: an account still served only the
 # deprecated `monthlyLimit`/`used`/`billingPeriodStart`/`billingPeriodEnd` pair
 # reports none of `creditUsagePercent`/`currentPeriod` at all, and the two
 # `[[balances]]` below still draw for it either way.
@@ -55,31 +57,28 @@ refresh_secs = 60
 # bar's 5H/WK slots, which are for a subscription's rolling window, not a
 # credit period's spend.
 #
-# `[windows.period]` is `assumed`, not `from_field`: `currentPeriod` states
-# its own start and end as two absolute timestamps, and this grammar has no
-# way to turn a pair of those into a length the way `from_field` reads one
-# stated directly (Codex's `limit_window_seconds`, say) — computing one from
-# `start`/`end` would be exactly the kind of derived figure this schema
-# otherwise refuses to invent. `10080` (a week) is read off `currentPeriod`'s
-# own `type` field on the one response measured
-# (`"USAGE_PERIOD_TYPE_WEEKLY"`), not off a stated duration — an account
-# billed monthly instead would draw a correct percent against a wrong
-# elapsed-tick, until this is switched to whatever field states the period's
-# own kind, if xAI ever exposes it in `[[windows]]`-readable form.
+# `[windows.period]` reads `mode = "from_bounds"`: `currentPeriod` states its
+# own length as two absolute timestamps rather than a duration, so a
+# week-long account gets its week and a monthly one gets its month, read off
+# the bounds themselves rather than assumed by this file. `assumed` below is
+# the fallback for a response that states `currentPeriod.end` without a
+# usable `start` — the week, not a claim about every account's own period.
 [[windows]]
 id    = "grok-period"
 label = "Credits used"
 role  = "extra"
 [windows.period]
-mode    = "assumed"
-assumed = 10080
+mode       = "from_bounds"
+start_path = "config.currentPeriod.start"
+end_path   = "config.currentPeriod.end"
+assumed    = 10080
 [windows.source]
 used_percent_path = "config.creditUsagePercent"
 resets_at_path    = "config.currentPeriod.end"
 resets_at_format  = "iso8601"
 
 # The two dollar figures below run against the account's monthly billing
-# cycle (`history[].billingCycle` is a year/month pair), not the weekly
+# cycle (`history[].billingCycle` is a year/month pair), not the
 # `currentPeriod` the window above reads — so the period end they show is
 # the cycle's own, even though xAI's client marks `billingPeriodEnd` itself
 # as superseded for the *limit* figures `currentPeriod` now carries.

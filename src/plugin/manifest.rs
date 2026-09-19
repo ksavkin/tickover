@@ -33,7 +33,7 @@
 //! label = "5H"
 //! role  = "primary"                 # | "secondary" | "extra"
 //! [windows.period]
-//! mode  = "from_field"              # "assumed" | "from_field"
+//! mode  = "from_field"              # "assumed" | "from_field" | "from_bounds"
 //! field = "window_minutes"
 //! [windows.source]
 //! used_percent_path = "used_percent"
@@ -1251,7 +1251,68 @@ impl PluginManifest {
                         w.label
                     ));
                 }
+                // `container_period_minutes`'s own `from_bounds` arm reads
+                // both paths straight off the container the http engine
+                // resolved; the log-file engine's `RawSlot` carries only an
+                // already-classified `window_minutes`, with no raw start/end
+                // pair left in it to read one from — so a manifest naming
+                // this mode there is refused rather than silently drawing no
+                // period, ever, on every fetch.
+                PeriodMode::FromBounds if self.engine != EngineKind::HttpApi => {
+                    return Err(format!(
+                        "windows[label = \"{}\"]: period.mode = \"from_bounds\" needs engine = \
+                         \"http-api\" — the log-file engine's own reading carries no start/end \
+                         timestamps to read a length from",
+                        w.label
+                    ));
+                }
+                PeriodMode::FromBounds => {
+                    let missing = [
+                        ("start_path", &w.period.start_path),
+                        ("end_path", &w.period.end_path),
+                    ]
+                    .into_iter()
+                    .find(|(_, p)| p.as_deref().is_none_or(|s| s.trim().is_empty()));
+                    if let Some((field, _)) = missing {
+                        return Err(format!(
+                            "windows[label = \"{}\"]: period.mode = \"from_bounds\" requires \
+                             period.{field}, non-blank",
+                            w.label
+                        ));
+                    }
+                }
                 _ => {}
+            }
+            // `field`/`unit` are `from_field`'s own — `from_bounds` never
+            // reads either (its own arm of `container_period_minutes` reads
+            // `start_path`/`end_path` only), so naming them beside it loads
+            // clean and has half of what was written silently ignored, the
+            // same "present but pointless" shape the `[[balances]]`
+            // amount-kind checks above refuse for `path` vs. `amount_path`/
+            // `currency_path`/`exponent_path`. `assumed` is not in this list:
+            // `from_bounds` reads it too, as the fallback for a response that
+            // states `end` without a usable `start` (xAI's own `currentPeriod`
+            // can) — see `container_period_minutes`'s own doc.
+            if w.period.mode == PeriodMode::FromBounds {
+                let irrelevant: &[(&str, bool)] = &[
+                    ("field", w.period.field.is_some()),
+                    ("unit", w.period.unit != PeriodUnit::default()),
+                ];
+                if let Some((name, _)) = irrelevant.iter().find(|(_, present)| *present) {
+                    return Err(format!(
+                        "windows[label = \"{}\"]: `period.{name}` belongs to \
+                         `mode = \"from_field\"` only — `mode = \"from_bounds\"` reads \
+                         `period.start_path`/`period.end_path` (and falls back to \
+                         `period.assumed`) instead",
+                        w.label
+                    ));
+                }
+            } else if w.period.start_path.is_some() || w.period.end_path.is_some() {
+                return Err(format!(
+                    "windows[label = \"{}\"]: `period.start_path`/`period.end_path` belong to \
+                     `mode = \"from_bounds\"` only",
+                    w.label
+                ));
             }
         }
         Ok(())
@@ -1287,9 +1348,15 @@ impl PluginManifest {
         // the shortest one shipped (Claude/Antigravity's five-hour window,
         // at 300), not a tight fit around it. `period.mode = "from_field"`
         // is exempt — that length comes from the provider's own response,
-        // not from a number the manifest author picked.
+        // not from a number the manifest author picked. `from_bounds` is not
+        // exempt: its own `assumed` is the same manifest-author-picked
+        // fallback as `mode = "assumed"`'s, read whenever the bounds
+        // themselves don't resolve, so a sub-floor value there is exactly as
+        // able to fire the same storm.
         for w in &self.windows {
-            if let (PeriodMode::Assumed, Some(assumed)) = (w.period.mode, w.period.assumed) {
+            if let (PeriodMode::Assumed | PeriodMode::FromBounds, Some(assumed)) =
+                (w.period.mode, w.period.assumed)
+            {
                 if assumed < MIN_ASSUMED_PERIOD_MINUTES {
                     return Err(format!(
                         "windows[label = \"{}\"]: period.assumed = {assumed} minutes is shorter \
@@ -1324,32 +1391,35 @@ impl PluginManifest {
         }
 
         // A classification bound only means something once there is a
-        // length, read from the response, to measure it against — and on
-        // `engine = "http-api"`, `period.mode = "assumed"` states the
-        // window's own length outright (`period.assumed`), leaving nothing
-        // for a bound to classify. `engine_http::select_container` treats a
-        // bound exactly this way: it only ever consults
-        // `min_period_minutes`/`max_period_minutes` when
-        // `mode = "from_field"`, so on this engine a bound declared beside
-        // `assumed` is not a stricter rule, it is dead weight — a number
-        // nothing ever reads, which a manifest author would have every
-        // reason to believe does something. The log-file engine is not the
-        // same: `engine_logfile::classify_slot`/`effective_bounds` apply a
-        // bound to a log record regardless of `period.mode`, and a
-        // `role = "extra"` log-file window *needs* one (with neither bound
-        // set it classifies to nothing and never draws — see
-        // `classify_slot`'s own early return). So this refusal is scoped to
-        // `http-api` only; the same manifest is legal for `log-file`.
+        // *candidate's own stated length*, read from the response, to
+        // measure it against — and `engine_http::select_container` only
+        // ever consults `min_period_minutes`/`max_period_minutes` when
+        // `mode = "from_field"` (the one mode whose length is read per
+        // candidate, off the container being classified). Every other mode
+        // on `http-api` is exempt from needing a bound, not a candidate for
+        // one: `assumed` states the window's own length outright, and
+        // `from_bounds` reads its length off the container's own
+        // `start_path`/`end_path` (or `assumed`, its own fallback) rather
+        // than classifying a container by length in the first place — a
+        // bound declared beside either is dead weight, a number nothing
+        // ever reads, which a manifest author would have every reason to
+        // believe does something. The log-file engine is not the same:
+        // `engine_logfile::classify_slot`/`effective_bounds` apply a bound
+        // to a log record regardless of `period.mode`, and a `role = "extra"`
+        // log-file window *needs* one (with neither bound set it classifies
+        // to nothing and never draws — see `classify_slot`'s own early
+        // return). So this refusal is scoped to `http-api` only; the same
+        // manifest is legal for `log-file`.
         if self.engine == EngineKind::HttpApi {
             for w in &self.windows {
-                if w.period.mode == PeriodMode::Assumed
+                if w.period.mode != PeriodMode::FromField
                     && (w.source.min_period_minutes.is_some()
                         || w.source.max_period_minutes.is_some())
                 {
                     return Err(format!(
                         "windows[label = \"{}\"]: min_period_minutes/max_period_minutes classify \
-                         a candidate by length on engine = \"http-api\" — meaningless when \
-                         period.mode = \"assumed\" already states the length outright",
+                         a candidate by length on engine = \"http-api\" — meaningless unless \
+                         period.mode = \"from_field\" gives a length to classify each candidate by",
                         w.label
                     ));
                 }
@@ -2188,6 +2258,65 @@ impl PluginManifest {
                             "surface \"{}\": auth step {i} (`{}`) `path_env_join = \"{join}\"` \
                              must not contain a `..` component — it would read outside the \
                              directory `path_env` named",
+                            surface.id,
+                            auth_type_name(step.kind)
+                        ));
+                    }
+                }
+                // `service_env`/`service_env_suffix` are `keychain_step`'s own
+                // fields (`auth::resolve_keychain_service`) — every other step
+                // kind never reads either, same silent-no-op reasoning as
+                // `path_env`/`path_env_join` above.
+                if (step.service_env.is_some() || step.service_env_suffix.is_some())
+                    && step.kind != AuthType::Keychain
+                {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `service_env`/\
+                         `service_env_suffix`, which only `keychain` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                // `service_env_suffix` names the recipe for turning
+                // `service_env`'s value into a suffix; without a variable to
+                // hash, it loads clean and is never consulted. Stricter than
+                // `path_env`/`path_env_join` above, which only refuses this
+                // direction — `path_env_join` alone is accepted and ignored
+                // (see its own doc) — because there is exactly one recipe to
+                // silently default to here, where `path_env_join` has no
+                // default worth guessing at all.
+                if step.service_env_suffix.is_some() && step.service_env.is_none() {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `service_env_suffix` without \
+                         `service_env` — there is no value to hash",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                // The reverse gap: `service_env` without `service_env_suffix`
+                // loads clean and picks the one recipe `resolve_keychain_service`
+                // knows silently, rather than the manifest having asked for
+                // it — a pairing this schema states as required (see
+                // `AuthStep::service_env`'s own doc), not merely conventional.
+                if step.service_env.is_some() && step.service_env_suffix.is_none() {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `service_env` without \
+                         `service_env_suffix` — there is no recipe to hash it with",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                // The only recipe `resolve_keychain_service` implements today:
+                // sha256, truncated to a fixed number of leading hex
+                // characters. Anything else is refused rather than silently
+                // read as this one, or as "no suffix" — a manifest asking for
+                // a hash this build cannot produce must say so, not name an
+                // item nothing ever writes.
+                if let Some(suffix) = &step.service_env_suffix {
+                    if suffix != "sha256:8" {
+                        return Err(format!(
+                            "surface \"{}\": auth step {i} (`{}`) `service_env_suffix = \"{suffix}\"` \
+                             — the only supported recipe is `\"sha256:8\"`",
                             surface.id,
                             auth_type_name(step.kind)
                         ));
@@ -3303,16 +3432,37 @@ pub struct PeriodConfig {
     /// How to determine the period length.
     pub mode: PeriodMode,
     /// JSON path to the period length; required when `mode = "from_field"`.
-    /// Read in `unit`, stored in minutes.
+    /// Read in `unit`, stored in minutes. Refused beside `mode = "from_bounds"`,
+    /// which never reads it.
     pub field: Option<String>,
-    /// Fixed period length in minutes; required when `mode = "assumed"`.
+    /// Fixed period length in minutes; required when `mode = "assumed"`, and
+    /// optional beside `mode = "from_bounds"` — there, it is the fallback
+    /// `engine_http::container_period_minutes` reads when `start_path`/
+    /// `end_path` do not both resolve to a usable length (xAI's own
+    /// `currentPeriod` can state `end` without a usable `start`).
     pub assumed: Option<u64>,
     /// Unit the value at `field` is expressed in. Defaults to minutes, which
     /// is what Codex's rollout logs report (`window_minutes`); its usage API
     /// reports the same window as `limit_window_seconds`, hence the knob.
-    /// Ignored when `mode = "assumed"` (`assumed` is always minutes).
+    /// Ignored when `mode = "assumed"` (`assumed` is always minutes), and
+    /// refused (non-default) beside `mode = "from_bounds"`, which never reads
+    /// it either.
     #[serde(default)]
     pub unit: PeriodUnit,
+    /// Dotted JSON path to the period's own start, an RFC3339 string; required
+    /// when `mode = "from_bounds"`. Read the same way `resets_at_format =
+    /// "iso8601"` parses a timestamp (`crate::plugin::time::parse_iso8601`),
+    /// since this is the same shape — a moment in time, not a number of
+    /// minutes. Declaring it does not guarantee every response resolves it;
+    /// see `assumed`'s own doc for what stands in when it doesn't.
+    pub start_path: Option<String>,
+    /// Dotted JSON path to the period's own end, an RFC3339 string; required
+    /// when `mode = "from_bounds"`. The length is `end − start`, in whole
+    /// minutes, read straight off what the response itself states rather
+    /// than assumed or read as a length directly (see [`PeriodMode::FromBounds`]) —
+    /// when it resolves and `start_path` doesn't, `assumed` is what the window
+    /// draws instead.
+    pub end_path: Option<String>,
 }
 
 /// Unit of the value at [`PeriodConfig::field`].
@@ -3343,6 +3493,13 @@ pub enum PeriodMode {
     Assumed,
     /// The period length is read from the reading itself (`field`).
     FromField,
+    /// The period length is the reading's own bounds (`start_path`/
+    /// `end_path`), an RFC3339 pair rather than a duration a provider states
+    /// directly — Grok's `currentPeriod.start`/`.end`, which lets an account
+    /// billed monthly draw its own month instead of a week assumed off one
+    /// account's own response. `assumed` still applies here, as the fallback
+    /// for a response that states one bound but not the other.
+    FromBounds,
 }
 
 /// `[windows.source]` — where a window's numbers live in the provider's raw
@@ -4041,6 +4198,21 @@ pub struct AuthStep {
 
     /// `keychain`: service name to query.
     pub service: Option<String>,
+    /// `keychain` only: env var that, if set and non-empty, re-keys `service`
+    /// — some clients append a hash of the variable's own value to their
+    /// Keychain item name when it is set, the same way `path_env` re-keys a
+    /// credentials-file path. Refused on any other step kind, the same rule
+    /// `path_env` is refused under above. Needs `service_env_suffix` beside
+    /// it to say how; needs `requires_reader = ["keychain-service-env"]`.
+    #[serde(default)]
+    pub service_env: Option<String>,
+    /// `keychain` only, and only beside `service_env`: how to turn that env
+    /// var's value into the suffix appended to `service`. The only supported
+    /// recipe today is `"sha256:8"` — the algorithm, a `:`, and the number of
+    /// leading hex characters kept — refused if it names anything else, and
+    /// refused without `service_env` (nothing to hash).
+    #[serde(default)]
+    pub service_env_suffix: Option<String>,
 
     /// `env`: environment variable name holding the token.
     pub var: Option<String>,
@@ -5384,6 +5556,140 @@ mod tests {
         let from_field_with_field =
             base("[windows.period]\nmode = \"from_field\"\nfield = \"window_minutes\"");
         assert!(PluginManifest::from_str(&from_field_with_field).is_ok());
+    }
+
+    #[test]
+    fn rejects_period_mode_from_bounds_misuse() {
+        // `from_bounds` needs `engine = "http-api"` (`container_period_minutes`'s
+        // `from_bounds` arm reads the container the http engine resolved; the
+        // log-file engine's `RawSlot` never carries a raw start/end pair).
+        let base = |period: &str| {
+            format!(
+                r#"
+                id              = "x"
+                name            = "X"
+                menu_label      = "X"
+                order           = 1
+                engine          = "http-api"
+                requires_reader = ["window-period-bounds"]
+                [[windows]]
+                label = "5H"
+                role  = "primary"
+                {period}
+                [windows.source]
+                used_percent_path = "p"
+                resets_at_path = "r"
+                [http]
+                [[http.request]]
+                url = "https://example.com/usage"
+                "#
+            )
+        };
+
+        // Both paths required, and a blank one refused exactly like a missing
+        // one — the same "present but blank is not a declaration" rule
+        // `resets_at_path` and `[[balances]]`'s own paths already carry.
+        let missing_start = base("[windows.period]\nmode = \"from_bounds\"\nend_path = \"b.end\"");
+        let err = PluginManifest::from_str(&missing_start).expect_err("start_path is required");
+        assert!(err.contains("start_path"), "{err}");
+
+        let missing_end =
+            base("[windows.period]\nmode = \"from_bounds\"\nstart_path = \"b.start\"");
+        let err = PluginManifest::from_str(&missing_end).expect_err("end_path is required");
+        assert!(err.contains("end_path"), "{err}");
+
+        let blank_start = base(
+            "[windows.period]\nmode = \"from_bounds\"\nstart_path = \"   \"\n\
+             end_path = \"b.end\"",
+        );
+        assert!(
+            PluginManifest::from_str(&blank_start).is_err(),
+            "a blank start_path is not a declaration"
+        );
+
+        let ok = base(
+            "[windows.period]\nmode = \"from_bounds\"\nstart_path = \"b.start\"\n\
+             end_path = \"b.end\"",
+        );
+        assert!(PluginManifest::from_str(&ok).is_ok());
+
+        // `assumed` is accepted beside `from_bounds` — it is the fallback
+        // `container_period_minutes` reads when the bounds don't both
+        // resolve, not another mode's dead weight.
+        let with_assumed = base(
+            "[windows.period]\nmode = \"from_bounds\"\nstart_path = \"b.start\"\n\
+             end_path = \"b.end\"\nassumed = 10080",
+        );
+        assert!(
+            PluginManifest::from_str(&with_assumed).is_ok(),
+            "assumed is from_bounds's own fallback, not a foreign field"
+        );
+
+        // The same floor applies here too: `from_bounds`'s own fallback is
+        // exactly as manifest-author-picked as an assumed window's own
+        // length, and a sub-floor one fires the same `ping_due` storm once
+        // the bounds themselves stop resolving.
+        let sub_floor_assumed = base(
+            "[windows.period]\nmode = \"from_bounds\"\nstart_path = \"b.start\"\n\
+             end_path = \"b.end\"\nassumed = 1",
+        );
+        let err = PluginManifest::from_str(&sub_floor_assumed)
+            .expect_err("a sub-floor fallback is refused the same way an assumed one is");
+        assert!(err.contains("minute floor"), "{err}");
+
+        // Mixing: `field`/`unit` are `from_field`'s idea of dead weight —
+        // read by no engine arm once this window's own mode has settled on
+        // `from_bounds` — and refused rather than silently ignored.
+        let with_field = base(
+            "[windows.period]\nmode = \"from_bounds\"\nstart_path = \"b.start\"\n\
+             end_path = \"b.end\"\nfield = \"window_minutes\"",
+        );
+        assert!(PluginManifest::from_str(&with_field).is_err());
+
+        let with_unit = base(
+            "[windows.period]\nmode = \"from_bounds\"\nstart_path = \"b.start\"\n\
+             end_path = \"b.end\"\nunit = \"seconds\"",
+        );
+        assert!(
+            PluginManifest::from_str(&with_unit).is_err(),
+            "unit only ever converts field's value, which from_bounds never reads"
+        );
+
+        // And the other direction: `start_path`/`end_path` beside `assumed` or
+        // `from_field` are refused the same way.
+        let assumed_with_bounds =
+            base("[windows.period]\nmode = \"assumed\"\nassumed = 300\nstart_path = \"b.start\"");
+        let err = PluginManifest::from_str(&assumed_with_bounds)
+            .expect_err("start_path belongs to from_bounds only");
+        assert!(err.contains("start_path"), "{err}");
+
+        // And the engine mismatch itself, on an otherwise-valid log-file
+        // manifest.
+        let logfile_from_bounds = r#"
+            id              = "x"
+            name            = "X"
+            menu_label      = "X"
+            order           = 1
+            engine          = "log-file"
+            requires_reader = ["window-period-bounds"]
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode       = "from_bounds"
+            start_path = "b.start"
+            end_path   = "b.end"
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [logfile]
+            root          = "~/.x"
+            glob          = "*.jsonl"
+            container_key = "rate_limits"
+            "#;
+        let err = PluginManifest::from_str(logfile_from_bounds)
+            .expect_err("from_bounds needs the http-api engine");
+        assert!(err.contains("http-api"), "{err}");
     }
 
     // ── [[option]] ───────────────────────────────────────────────────────

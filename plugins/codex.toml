@@ -35,7 +35,7 @@ order        = 10
 # by position; `[status]` needs one that reads the quota's own standing. See
 # docs/PLUGIN-ARCHITECTURE.md, "Reader capabilities".
 requires_reader = ["window-presence", "window-identity", "reading-status", "reading-balances"]
-version      = "2.5.1"
+version      = "2.5.2"
 engine       = "http-api"
 # One request a minute, matching Claude. The log-file reader polled every 15s
 # because re-reading a local file is free; four requests a minute at somebody
@@ -268,7 +268,7 @@ path            = "~/.codex/auth.json"
 token_json_path = "tokens.access_token"
 
 # `codex exec hello` — run while the 5-hour window sits empty, to start a
-# fresh one (src/main.rs `ping_due` / `send_ping`, gated by
+# fresh one (src/main.rs `ping_due` / `spawn_hello`, gated by
 # `config::auto_ping_codex`).
 #
 # `--skip-git-repo-check` is not optional here. Without it `codex exec` refuses

@@ -1235,22 +1235,28 @@ fn parse_quota(value: &Value, m: &PluginManifest) -> Option<crate::model::QuotaS
 /// reported yet").
 ///
 /// Without a bound to check against — no bound declared, or the window's
-/// length is `assumed` rather than `from_field` (a bound declared there is
-/// never consulted; there is nothing in the response to compare it to, and
-/// `validate` refuses that combination at load, so no manifest that actually
-/// parses reaches this arm — the check stays as this function's own defence
-/// in depth) — no classification happens at all: candidates are scanned in
-/// declared order and the first one that isn't null wins, whatever length it
-/// actually carries. A manifest with several containers and no bound is
-/// relying on that order rather than on content to tell its windows apart.
+/// length is not `from_field` — no classification happens at all: candidates
+/// are scanned in declared order and the first one that isn't null wins,
+/// whatever length it actually carries. `assumed` states its length outright,
+/// so a bound declared there truly has nothing in the response to compare it
+/// to; `from_bounds` reads a length too, off the container's own stated
+/// bounds (or falls back to `assumed`), but is exempt by design rather than
+/// by absence of data — classifying candidates by *bound-derived* length
+/// instead of `from_field`'s own is a feature this schema does not offer, so
+/// the same refusal at load covers both. Either way `validate` refuses the
+/// combination, so no manifest that actually parses reaches this arm — the
+/// check stays as this function's own defence in depth. A manifest with
+/// several containers and no bound is relying on order rather than on
+/// content to tell its windows apart.
 fn select_container<'v>(w: &WindowConfig, value: &'v Value) -> Option<&'v Value> {
-    // One rule, whatever the shape: a length the *response* states is checked
-    // against the bounds the manifest declares, and nothing else is checked at
-    // all. So bounds hold wherever they appear — over several candidates
-    // (which is what they are for), over a single one, over the response root
-    // — and a window whose length is `assumed` has nothing to check them
-    // against, so it classifies nothing rather than silently matching
-    // everything or nothing.
+    // One rule, whatever the shape: a length the *response* states, per
+    // candidate, is checked against the bounds the manifest declares, and
+    // nothing else is checked at all. So bounds hold wherever they appear —
+    // over several candidates (which is what they are for), over a single
+    // one, over the response root — and a window whose length is not
+    // `from_field` has nothing per-candidate to check them against, so it
+    // classifies nothing rather than silently matching everything or
+    // nothing.
     let classify = (w.source.min_period_minutes.is_some() || w.source.max_period_minutes.is_some())
         && w.period.mode == PeriodMode::FromField;
     let min_bound = w.source.min_period_minutes.unwrap_or(0);
@@ -1276,8 +1282,8 @@ fn select_container<'v>(w: &WindowConfig, value: &'v Value) -> Option<&'v Value>
 
 /// This window's declared length as read out of `container`, in minutes.
 /// `None` for `period.mode = "assumed"` (the length is a constant, not
-/// something the response states), when the field is missing, when the value
-/// is not a JSON integer, or when it is not
+/// something the response states); for `"from_field"`, when the field is
+/// missing, when the value is not a JSON integer, or when it is not
 /// [`crate::plugin::time::plausible_period_minutes`] — a field a provider
 /// fills in a different unit than declared is a length nothing here should
 /// draw a window from.
@@ -1288,17 +1294,59 @@ fn select_container<'v>(w: &WindowConfig, value: &'v Value) -> Option<&'v Value>
 /// reaching the plausibility check — unlike `engine_logfile`'s own reader
 /// (`first_u64`), which does accept that shape via a saturating `as u64`.
 ///
+/// `"from_bounds"` reads `start_path`/`end_path` instead of `field`, each an
+/// RFC3339 timestamp parsed the same way `resets_at_format = "iso8601"` is
+/// ([`crate::plugin::time::parse_iso8601`]), and the length is `end − start`
+/// in whole minutes, only when: both bounds resolve and parse, `end` is
+/// strictly after `start` (never a response caught between two ticks, or one
+/// that states its bounds the other way round), the result is at least a
+/// minute (a sub-minute pair is a clock artefact, not a window), and it is
+/// `plausible_period_minutes` — the same fail-safe `"from_field"` gets.
+/// `unit` plays no part here — the two paths are timestamps, not a number
+/// `PeriodUnit` would convert.
+///
+/// Any failure of the above falls back to `period.assumed` rather than
+/// answering `None` outright — xAI's own `currentPeriod` states `end`
+/// alongside a `type` naming the period's own kind, and `start` is a
+/// separate field its client library allows to go unset, so a response
+/// stating half its own bounds is not the same claim as one stating nothing:
+/// the account still has a nominal length, it is just not this response's to
+/// give a shorter route to. The
+/// fallback is itself optional (`Option<u64>`), so a manifest declaring
+/// neither an `assumed` nor a resolvable pair still answers `None`, exactly
+/// like an unreadable `"from_field"`.
+///
 /// The one implementation both [`select_container`]'s classification and
 /// [`build_window`]'s own `period_minutes` field call, rather than each
 /// carrying its own copy — exactly the kind of place a bound like this is
 /// easy to add to one and forget on the other.
 fn container_period_minutes(w: &WindowConfig, container: &Value) -> Option<u64> {
-    if w.period.mode != PeriodMode::FromField {
-        return None;
+    match w.period.mode {
+        PeriodMode::Assumed => None,
+        PeriodMode::FromField => {
+            let raw =
+                json_path_get(container, w.period.field.as_deref()?).and_then(Value::as_u64)?;
+            let minutes = w.period.unit.to_minutes(raw);
+            crate::plugin::time::plausible_period_minutes(minutes).then_some(minutes)
+        }
+        PeriodMode::FromBounds => {
+            let from_bounds = (|| {
+                let start = json_path_get(container, w.period.start_path.as_deref()?)
+                    .and_then(Value::as_str)
+                    .and_then(crate::plugin::time::parse_iso8601)?;
+                let end = json_path_get(container, w.period.end_path.as_deref()?)
+                    .and_then(Value::as_str)
+                    .and_then(crate::plugin::time::parse_iso8601)?;
+                if end <= start {
+                    return None;
+                }
+                let minutes = (end - start) / 60;
+                (minutes > 0 && crate::plugin::time::plausible_period_minutes(minutes))
+                    .then_some(minutes)
+            })();
+            from_bounds.or(w.period.assumed)
+        }
     }
-    let raw = json_path_get(container, w.period.field.as_deref()?).and_then(Value::as_u64)?;
-    let minutes = w.period.unit.to_minutes(raw);
-    crate::plugin::time::plausible_period_minutes(minutes).then_some(minutes)
 }
 
 /// This window as the response reports it, or `None` when the response does
@@ -1344,7 +1392,7 @@ fn build_window(index: usize, w: &WindowConfig, value: &Value) -> Option<Window>
         .and_then(|v| crate::plugin::time::resets_at(v, w.source.resets_at_format));
     let period_minutes = match w.period.mode {
         PeriodMode::Assumed => w.period.assumed,
-        PeriodMode::FromField => container_period_minutes(w, value),
+        PeriodMode::FromField | PeriodMode::FromBounds => container_period_minutes(w, value),
     };
     Some(Window {
         // The declared entry, never the container this window resolved to: at
@@ -2359,6 +2407,8 @@ mod tests {
                 field: field.map(str::to_string),
                 assumed,
                 unit: PeriodUnit::Minutes,
+                start_path: None,
+                end_path: None,
             },
             source: SourceConfig {
                 containers: Vec::new(),
@@ -2372,6 +2422,28 @@ mod tests {
             for_each: None,
             for_each_where: None,
             element_id_path: None,
+        }
+    }
+
+    /// Like [`win`], for `mode = "from_bounds"` — the two paths are its own
+    /// fields rather than `win`'s shared `field`/`assumed` pair. `assumed` is
+    /// still `from_bounds`'s own fallback (see `container_period_minutes`'s
+    /// doc), hence the extra parameter here rather than `win`'s.
+    fn win_from_bounds(
+        role: ManifestRole,
+        start_path: &str,
+        end_path: &str,
+        assumed: Option<u64>,
+    ) -> WindowConfig {
+        WindowConfig {
+            period: PeriodConfig {
+                mode: PeriodMode::FromBounds,
+                start_path: Some(start_path.to_string()),
+                end_path: Some(end_path.to_string()),
+                assumed,
+                ..win(role, PeriodMode::FromBounds, None, None).period
+            },
+            ..win(role, PeriodMode::FromBounds, None, None)
         }
     }
 
@@ -3391,6 +3463,140 @@ mod tests {
         assert_eq!(
             build_window(0, &w, &body).expect("reported").period_minutes,
             Some(45)
+        );
+    }
+
+    #[test]
+    fn build_window_period_from_bounds_reads_the_response_bodys_own_length() {
+        // Grok's own shape: one window, whichever length its account's bounds
+        // actually state — a week for one account, a month for another —
+        // with `assumed` as the fallback for the half-stated case xAI's own
+        // `currentPeriod` can send (`end` without a usable `start`).
+        let w = win_from_bounds(
+            ManifestRole::Extra,
+            "period.start",
+            "period.end",
+            Some(10_080),
+        );
+
+        // Both bounds present: their own length wins over the fallback — 8
+        // days apart, not exactly the fallback's own 10 080, so an
+        // implementation that dropped the `from_bounds` arithmetic entirely
+        // and always answered `assumed` would fail this one specifically.
+        let eight_days = json!({
+            "used_percent": 10.0,
+            "period": { "start": "2026-01-01T00:00:00Z", "end": "2026-01-09T00:00:00Z" },
+        });
+        assert_eq!(
+            build_window(0, &w, &eight_days)
+                .expect("reported")
+                .period_minutes,
+            Some(11_520)
+        );
+
+        // A 31-day month — the same window definition, a different account's
+        // own bounds.
+        let monthly = json!({
+            "used_percent": 10.0,
+            "period": { "start": "2026-01-01T00:00:00Z", "end": "2026-02-01T00:00:00Z" },
+        });
+        assert_eq!(
+            build_window(0, &w, &monthly)
+                .expect("reported")
+                .period_minutes,
+            Some(44_640)
+        );
+
+        // Only `end` — a shape xAI's own `currentPeriod` can send — falls
+        // back to `assumed` rather than answering no length at all.
+        let end_only = json!({
+            "used_percent": 10.0,
+            "period": { "end": "2026-01-08T00:00:00Z" },
+        });
+        assert_eq!(
+            build_window(0, &w, &end_only)
+                .expect("reported")
+                .period_minutes,
+            Some(10_080),
+            "a half-stated pair falls back to assumed, not to no length at all"
+        );
+
+        // Only `start` — the other half-stated shape, and a distinct code
+        // path: `start_path` resolves first, so this exercises the second
+        // `?` rather than the first `end_only` already did.
+        let start_only = json!({
+            "used_percent": 10.0,
+            "period": { "start": "2026-01-01T00:00:00Z" },
+        });
+        assert_eq!(
+            build_window(0, &w, &start_only)
+                .expect("reported")
+                .period_minutes,
+            Some(10_080)
+        );
+
+        // Neither bound at all falls back the same way.
+        let neither = json!({ "used_percent": 10.0 });
+        assert_eq!(
+            build_window(0, &w, &neither)
+                .expect("reported")
+                .period_minutes,
+            Some(10_080)
+        );
+
+        // End before start — a response caught between two ticks, or one
+        // that states its bounds the other way round — falls back too,
+        // exactly like a bound that never resolved.
+        let backwards = json!({
+            "used_percent": 10.0,
+            "period": { "start": "2026-01-08T00:00:00Z", "end": "2026-01-01T00:00:00Z" },
+        });
+        assert_eq!(
+            build_window(0, &w, &backwards)
+                .expect("reported")
+                .period_minutes,
+            Some(10_080)
+        );
+
+        // The same ten-year ceiling `from_field` is held to
+        // (`crate::plugin::time::plausible_period_minutes`) applies here too:
+        // a pair of bounds over eleven years apart falls back rather than
+        // stating a length that has lost its shape.
+        let implausible = json!({
+            "used_percent": 10.0,
+            "period": { "start": "2015-01-01T00:00:00Z", "end": "2026-01-01T00:00:00Z" },
+        });
+        assert_eq!(
+            build_window(0, &w, &implausible)
+                .expect("reported")
+                .period_minutes,
+            Some(10_080)
+        );
+
+        // A sub-minute pair is a clock artefact, not a window — it falls
+        // back rather than reporting `Some(0)`.
+        let sub_minute = json!({
+            "used_percent": 10.0,
+            "period": { "start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:00:30Z" },
+        });
+        assert_eq!(
+            build_window(0, &w, &sub_minute)
+                .expect("reported")
+                .period_minutes,
+            Some(10_080)
+        );
+
+        // With no fallback declared, the same "neither bound resolves" shape
+        // answers `None` instead of a fallback — exactly like an unreadable
+        // `from_field` — since `.or(w.period.assumed)` has nothing to fall
+        // through to.
+        let w_no_fallback =
+            win_from_bounds(ManifestRole::Extra, "period.start", "period.end", None);
+        assert_eq!(
+            build_window(0, &w_no_fallback, &neither)
+                .expect("reported")
+                .period_minutes,
+            None
         );
     }
 

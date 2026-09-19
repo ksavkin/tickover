@@ -75,8 +75,17 @@ sha1 = "0.10"
 # naming it here as a direct dependency compiles no new parser.
 url = "2"
 
-# Plugin registry: sha256 verification of downloaded manifests.
+# Plugin registry: sha256 verification of downloaded manifests. Also used to
+# re-key a `keychain` auth step's service name from an env var's value
+# (`plugin::auth::resolve_keychain_service`), the same way Claude's own CLI
+# derives its Keychain item name from `CLAUDE_CONFIG_DIR`.
 sha2 = "0.10"
+# Unicode NFC normalisation of that same env var's value before hashing —
+# Claude Code's CLI normalises before it hashes (`macOsKeychainHelpers.ts`),
+# so a decomposed and a precomposed spelling of one path must hash the same
+# way this app derives the item name, or an account that types (or a shell
+# that expands) the other form silently names a different Keychain item.
+unicode-normalization = "0.1"
 # ed25519 verification of the registry index's minisign signature. Already in
 # the binary — rustls reaches it through `ureq` — so naming it here as a direct
 # dependency compiles no new cryptographic code, which is the argument the

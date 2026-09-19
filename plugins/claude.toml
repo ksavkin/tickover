@@ -13,10 +13,12 @@ order        = 20
 # token from a working one; `balance-conditional` is what lets the "Extra
 # usage" balance draw no row at all on an account that never turned it on;
 # `credentials-file-path-env` is what lets the credentials-file step below
-# honour `CLAUDE_CONFIG_DIR` — see docs/PLUGIN-ARCHITECTURE.md, "Reader
+# honour `CLAUDE_CONFIG_DIR`; `keychain-service-env` is what lets the
+# keychain step below honour the same variable, for the Keychain item name
+# the CLI renames under it — see docs/PLUGIN-ARCHITECTURE.md, "Reader
 # capabilities".
-requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry", "reading-balances", "balance-conditional", "credentials-file-path-env"]
-version      = "1.4.4"
+requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry", "reading-balances", "balance-conditional", "credentials-file-path-env", "keychain-service-env"]
+version      = "1.4.5"
 engine       = "http-api"
 # Re-fetched every 60 s.
 refresh_secs = 60
@@ -194,10 +196,9 @@ allowed_hosts = ["api.anthropic.com"]
 # `$CLAUDE_CONFIG_DIR/.credentials.json` instead of the default
 # `~/.claude/.credentials.json` — so `path_env`/`path_env_join` read the same
 # override this app's own `path` above would otherwise miss entirely on an
-# account that has ever set it. Out of scope: the CLI also honours
-# `CLAUDE_CONFIG_DIR` for the name of the Keychain item it writes, and the
-# keychain step below still names the fixed default service — re-keying that
-# lookup needs its own manifest field this change does not add.
+# account that has ever set it. The CLI also honours `CLAUDE_CONFIG_DIR` for
+# the name of the Keychain item it writes, which the keychain step below
+# honours through its own pair, `service_env`/`service_env_suffix`.
 [[surface.auth]]
 type             = "credentials-file"
 path             = "~/.claude/.credentials.json"
@@ -208,11 +209,13 @@ token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessT
 expiry_json_path = "claudeAiOauth.expiresAt"
 
 [[surface.auth]]
-type             = "keychain"
-service          = "Claude Code-credentials"
-token_json_path  = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
+type               = "keychain"
+service            = "Claude Code-credentials"
+service_env        = "CLAUDE_CONFIG_DIR"
+service_env_suffix = "sha256:8"
+token_json_path    = "claudeAiOauth.accessToken|claudeAiOauth.access_token|accessToken|access_token"
 # expiresAt is epoch milliseconds.
-expiry_json_path = "claudeAiOauth.expiresAt"
+expiry_json_path   = "claudeAiOauth.expiresAt"
 
 # Desktop surface — opt-in (its token needs a one-time Keychain/DPAPI grant),
 # popup-only (`in_menu_bar = false`).
@@ -236,7 +239,7 @@ token_json_path    = "claudeAiOauth.accessToken|claudeAiOauth.access_token|acces
 macos_keychain_key = "Claude Safe Storage"
 
 # `claude -p hello --model haiku` — run while the 5-hour window sits empty,
-# to start a fresh one (src/main.rs `ping_due` / `send_ping`, gated by
+# to start a fresh one (src/main.rs `ping_due` / `spawn_hello`, gated by
 # `config::auto_ping_claude`). The ping's only job is to start the window
 # and renew the token, and the cheapest model does both exactly as well as
 # the account's default one — every third-party renewal script observed

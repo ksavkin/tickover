@@ -3493,18 +3493,24 @@ fn ping_window(
             resets_at: w.resets_at,
             period_minutes: w.period_minutes,
         },
-        // Nothing reported. The length has to come from somewhere else, and
-        // for the provider this matters for (Codex, whose period is read out
-        // of the response) the manifest itself declares none for `from_field`
-        // — `remembered_period_minutes` is what stands in for it now;
-        // `ping_due`'s `ASSUMED_WINDOW_SECS` remains the fallback for a
-        // window that has never yet been seen at all.
+        // Nothing reported. The length has to come from somewhere else.
+        // `from_field` declares none of its own (Codex's period is read out
+        // of the response) — `remembered_period_minutes` is what stands in
+        // for it now; `ping_due`'s `ASSUMED_WINDOW_SECS` remains the fallback
+        // for a window that has never yet been seen at all. `from_bounds`
+        // does declare one, its own `assumed` fallback, which wins over the
+        // registry's memory when both exist — a manifest-stated number for a
+        // window the account has never yet reported a value for beats a
+        // remembered one from before this reading went quiet.
         None => PingWindow {
             used_percent: None,
             resets_at: None,
             period_minutes: match declared.period.mode {
                 manifest::PeriodMode::Assumed => declared.period.assumed,
                 manifest::PeriodMode::FromField => remembered_period_minutes,
+                manifest::PeriodMode::FromBounds => {
+                    declared.period.assumed.or(remembered_period_minutes)
+                }
             },
         },
     })
@@ -3596,9 +3602,10 @@ fn seen_records<'a>(
                 role: w.role,
                 key,
                 // The manifest is the fallback, never the source: only a
-                // manifest whose window declares `period.mode = "assumed"` has
-                // a length to give, and the windows that vanish read theirs out
-                // of the response (see `config::SeenWindow::period_minutes`).
+                // manifest whose window declares `period.mode = "assumed"` or
+                // `"from_bounds"` has a length of its own to give, and the
+                // windows that vanish read theirs out of the response (see
+                // `config::SeenWindow::period_minutes`).
                 seen: config::SeenWindow {
                     at,
                     period_minutes: w
@@ -3619,7 +3626,7 @@ fn declared_period_minutes(m: &PluginManifest, role: Role) -> Option<u64> {
         .iter()
         .find(|w| tickover::plugin::map_role(w.role) == role)?;
     match declared.period.mode {
-        manifest::PeriodMode::Assumed => declared.period.assumed,
+        manifest::PeriodMode::Assumed | manifest::PeriodMode::FromBounds => declared.period.assumed,
         manifest::PeriodMode::FromField => None,
     }
 }

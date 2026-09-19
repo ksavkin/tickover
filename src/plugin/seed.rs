@@ -272,7 +272,7 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "codex.toml",
         id: "codex",
-        to_version: "2.5.1",
+        to_version: "2.5.2",
         // Every codex.toml this app has shipped, so an untouched copy of any of
         // them is recognised as one rather than mistaken for the user's own work.
         // A version that is missing from this list is a version whose installs
@@ -316,6 +316,10 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
             // reading is refused.
             // sha256 of codex.toml as shipped at manifest version 2.5.0.
             "bba283eb7e22d52d8b6aa4b2cf50e28a7485a9dd6d067217d7caf4fd54d6ee3f",
+            // 2.5.1 — the ping comment still named `send_ping`, a `main.rs`
+            // function that no longer exists under that name.
+            // sha256 of codex.toml as shipped at manifest version 2.5.1.
+            "5c1a73cfc3df978684a08a6061a2a1733576159adb1bc5fb9d98ad7d25701de9",
         ],
         // Shipped since the first release: an install without it deleted it.
         deliver_if_absent: false,
@@ -329,8 +333,14 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "claude.toml",
         id: "claude",
-        to_version: "1.4.4",
+        to_version: "1.4.5",
         previous_sha256: &[
+            // 1.4.4 — before the keychain step could be re-keyed to
+            // `CLAUDE_CONFIG_DIR`'s own item name, so an account that set the
+            // variable and fell through the credentials-file step to the
+            // Keychain read nothing there either.
+            // sha256 of claude.toml as shipped at manifest version 1.4.4.
+            "06f586b0395c831f3dd2039c14ab49c61d82cac72141712abfae1def61e01924",
             // 1.4.3 — before the ping pinned a model, before the `extra_usage`
             // balance, and before `[surface.auth] path_env` — the default
             // model paid for a renewal ping's own tokens, a disabled
@@ -404,8 +414,16 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "grok.toml",
         id: "grok",
-        to_version: "1.0.1",
+        to_version: "1.0.2",
         previous_sha256: &[
+            // 1.0.1 — before `[windows.period]` read the response's own
+            // `currentPeriod.start`/`.end` bounds, `mode = "assumed"` typed a
+            // week into the file outright — right for the one response this
+            // was measured against, wrong the day an account billed monthly
+            // draws a correct percent against a week-long countdown that
+            // never matches its actual reset.
+            // sha256 of grok.toml as shipped at manifest version 1.0.1.
+            "70cdf1cf2b133c8a8e9845a350a1ba086618a68c48b708c3bdbb1219c761b2d0",
             // 1.0.0 — balances only, no [[windows]] and no expiry on the
             // credentials-map step.
             // sha256 of grok.toml as shipped at manifest version 1.0.0.
@@ -758,7 +776,7 @@ mod tests {
         assert_eq!(m.order, 10);
         assert_eq!(m.refresh_secs, 60, "one request a minute, matching Claude");
         assert_eq!(
-            m.version, "2.5.1",
+            m.version, "2.5.2",
             "the version BUILTIN_UPGRADES migrates to"
         );
 
@@ -1256,10 +1274,26 @@ mod tests {
         assert_eq!(m.id, "claude");
         assert_eq!(m.engine, EngineKind::HttpApi);
         assert_eq!(
-            m.version, "1.4.4",
+            m.version, "1.4.5",
             "the version BUILTIN_UPGRADES migrates to"
         );
         assert_eq!(m.surface.len(), 2, "cli + desktop surfaces");
+        for capability in [
+            "window-presence",
+            "window-identity",
+            "for-each-windows",
+            "keychain-expiry",
+            "reading-balances",
+            "balance-conditional",
+            "credentials-file-path-env",
+            "keychain-service-env",
+        ] {
+            assert!(
+                m.requires_reader.iter().any(|c| c == capability),
+                "{capability} is load-bearing here"
+            );
+        }
+        assert_eq!(m.requires_reader.len(), 8, "and nothing else is claimed");
 
         assert_eq!(
             m.windows.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(),
@@ -1324,6 +1358,14 @@ mod tests {
             cli.auth[0].path_env_join.as_deref(),
             Some(".credentials.json")
         );
+        assert_eq!(cli.auth[1].kind, AuthType::Keychain);
+        assert_eq!(
+            cli.auth[1].service_env.as_deref(),
+            Some("CLAUDE_CONFIG_DIR"),
+            "the keychain step honours the CLI's own override too, for the \
+             item name it renames under the same variable"
+        );
+        assert_eq!(cli.auth[1].service_env_suffix.as_deref(), Some("sha256:8"));
 
         for w in &m.windows {
             assert_eq!(

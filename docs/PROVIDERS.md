@@ -12,7 +12,7 @@ reuses, and the rough edges. The manifest format itself is specified in
 |---|---|---|---|---|
 | **OpenAI Codex CLI** | 5-hour and weekly windows; model-specific windows as extra rows; the account's credit balance, email and plan; a "limit reached" notice when Codex says so | `~/.codex/auth.json` — the access token and account id, sent to the same usage endpoint the CLI calls | 60 s | `chatgpt.com` (`/backend-api/wham/usage`) |
 | **Claude** | 5-hour and weekly windows per login found — Claude Code CLI / VS Code, and (opt-in) the desktop app, which may be a different account; per-model weekly limits as extra rows | `~/.claude/.credentials.json`, else the Keychain item `Claude Code-credentials` on macOS — on Windows that same file is the only store the CLI writes; the desktop app's token from Electron Safe Storage | 60 s | `api.anthropic.com` (`/api/oauth/usage`, `/api/oauth/profile` for the address) |
-| **Grok** | credits used in the current weekly usage period, plus a prepaid credit balance and pay-as-you-go spend | the record in `~/.grok/auth.json` whose key starts with the x.ai auth host (the rest of the key is xAI's own OAuth client id — fixed, not one that varies by install — matched by prefix rather than spelled out in full) | 60 s | `cli-chat-proxy.grok.com` |
+| **Grok** | credits used in the current usage period, plus a prepaid credit balance and pay-as-you-go spend | the record in `~/.grok/auth.json` whose key starts with the x.ai auth host (the rest of the key is xAI's own OAuth client id — fixed, not one that varies by install — matched by prefix rather than spelled out in full) | 60 s | `cli-chat-proxy.grok.com` |
 | **Antigravity** | 5-hour and weekly allowances for Gemini and for third-party models | the access token in the Keychain item its CLI writes, or the same token from Windows Credential Manager (`gemini:antigravity`); once that has lapsed, the refresh token in `~/.gemini/antigravity-cli/antigravity-oauth-token`, exchanged with the OAuth client pair read from the installed Antigravity app or `agy` binary (never shipped with this app; `TICKOVER_ANTIGRAVITY_CLIENT_ID`/`_SECRET` override) | 60 s | `daily-cloudcode-pa.googleapis.com`; `oauth2.googleapis.com` for the token exchange |
 | **GitHub Copilot** | the month's premium-request allowance and its reset; chat and completion rows on the free tier | the `github.com` entry of `~/.config/github-copilot/apps.json` | 300 s | `api.github.com` |
 
@@ -35,7 +35,7 @@ cheapest model, not a dated snapshot id, does the same job of starting the
 window and renewing the token). When that provider's 5-hour window sits
 empty, the command runs once so the new window starts counting
 immediately. Copilot and Grok have no rolling window a ping could start — a
-monthly allowance, and a weekly credit period with balances. Neither this
+monthly allowance, and a credit period with balances. Neither this
 ping nor a renewal one (below) is ever launched while the provider's own
 host does not resolve — the tick simply tries again once it does.
 
@@ -104,9 +104,8 @@ own.
   its prompt. *Don't Allow* leaves the section empty until you relaunch and
   allow it. An account with `CLAUDE_CONFIG_DIR` set reads
   `$CLAUDE_CONFIG_DIR/.credentials.json` instead — this app follows the same
-  override for the file. It does not follow it for the Keychain item name,
-  which the CLI also renames under `CLAUDE_CONFIG_DIR`; an account relying on
-  that falls through to the plaintext file check above instead.
+  override for the file, and for the Keychain item name the CLI also renames
+  under that variable.
 - **Desktop app** is an opt-in in Settings. The desktop app locks its
   Safe-Storage key to itself, so the first read shows a Keychain prompt for
   `Claude Safe Storage` — *Always Allow* and the account populates. On

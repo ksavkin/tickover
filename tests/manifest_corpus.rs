@@ -22,7 +22,7 @@
 //! which is the way a list like this rots.
 
 use tickover::plugin::manifest::{
-    AmountKind, AuthType, EngineKind, HttpMethod, PluginManifest, ResetsAtFormat, Role,
+    AmountKind, AuthType, EngineKind, HttpMethod, PeriodMode, PluginManifest, ResetsAtFormat, Role,
 };
 use tickover::plugin::seed::DEFAULT_TEMPLATES;
 
@@ -807,6 +807,57 @@ fn rules() -> Vec<Rule> {
             names: "period.field",
         },
         Rule {
+            // The one refusal covers both shapes of "no start" — absent
+            // entirely, and present but blank (`resets_at_path`'s own blank
+            // check states the same rule above): a path that reads nothing
+            // is not a path either way.
+            says: "a period read from the response's own bounds has to say where the start is",
+            broken_by: changed(
+                &http_declaring(r#"["window-period-bounds"]"#),
+                "mode    = \"assumed\"\nassumed = 300",
+                "mode = \"from_bounds\"\nend_path = \"period.end\"",
+            ),
+            names: "period.start_path",
+        },
+        Rule {
+            // `field`/`unit` are `from_field`'s own — `container_period_minutes`'s
+            // `from_bounds` arm never reads either, so a window naming them
+            // has half of what it wrote silently ignored. `assumed` is not
+            // this shape: `from_bounds` reads it too, as the fallback for a
+            // response that states `end` without a usable `start`.
+            says: "from_bounds ignores field/unit (but not assumed), so naming them beside it is refused",
+            broken_by: changed(
+                &http_declaring(r#"["window-period-bounds"]"#),
+                "mode    = \"assumed\"\nassumed = 300",
+                "mode = \"from_bounds\"\nstart_path = \"period.start\"\nend_path = \"period.end\"\n\
+                 field = \"window_minutes\"",
+            ),
+            names: "period.field",
+        },
+        Rule {
+            says: "start_path/end_path belong to from_bounds, not assumed or from_field",
+            broken_by: changed(
+                &http_declaring(r#"["window-period-bounds"]"#),
+                "assumed = 300",
+                "assumed = 300\nstart_path = \"period.start\"",
+            ),
+            names: "period.start_path",
+        },
+        Rule {
+            // `RawSlot` carries only an already-classified `window_minutes`,
+            // with no raw start/end pair left in it for `from_bounds` to
+            // read one from — so this mode is refused on the log-file
+            // engine rather than silently drawing no period, ever, on every
+            // fetch.
+            says: "from_bounds needs engine = http-api",
+            broken_by: changed(
+                &declaring(r#"["window-period-bounds"]"#),
+                "mode    = \"assumed\"\nassumed = 300",
+                "mode = \"from_bounds\"\nstart_path = \"period.start\"\nend_path = \"period.end\"",
+            ),
+            names: "http-api",
+        },
+        Rule {
             // The same shape as `period.field` just above, for `[tag]`:
             // `resolve_tag` reads `value` only on `from = "static"`, so a
             // manifest that named the mode and not the value loads clean
@@ -849,16 +900,24 @@ fn rules() -> Vec<Rule> {
             names: "from_field",
         },
         Rule {
-            // `mode = "assumed"` already states the window's length outright
-            // — there is no candidate left for a bound to measure, so
-            // `engine_http::select_container` never even asks it whether a
-            // candidate fits. `http-api` only: the log-file engine's own
-            // `classify_slot` applies a bound to a record regardless of
-            // `period.mode`, and a `role = "extra"` log-file window needs
-            // one — so the same manifest, on `engine = "log-file"`, is
-            // legal (see `CODEX_LIKE` in `src/plugin/manifest.rs`, which
-            // pairs `mode = "assumed"` with `min_period_minutes` on purpose).
-            says: "a classification bound on a window whose length is assumed reads air on http-api",
+            // `select_container` only ever consults a classification bound
+            // when `mode = "from_field"` — the one mode whose length comes
+            // off the candidate being classified. `mode = "assumed"` already
+            // states the window's length outright, and `mode = "from_bounds"`
+            // reads its length off the container's own `start_path`/
+            // `end_path` (or falls back to `assumed`) rather than classifying
+            // a candidate by length at all — either way there is no
+            // candidate left for a bound to measure, so a declared one reads
+            // air. `http-api` only: the log-file engine's own `classify_slot`
+            // applies a bound to a record regardless of `period.mode`, and a
+            // `role = "extra"` log-file window needs one — so the same
+            // manifest, on `engine = "log-file"`, is legal (see `CODEX_LIKE`
+            // in `src/plugin/manifest.rs`, which pairs `mode = "assumed"`
+            // with `min_period_minutes` on purpose). `HTTP`'s own base is
+            // `mode = "assumed"`, which already exercises the refusal;
+            // `mode = "from_bounds"` trips the identical `return Err` and so
+            // is not a second corpus row of its own.
+            says: "a classification bound on http-api is air unless mode = \"from_field\" gives a length to classify by",
             broken_by: changed(
                 HTTP,
                 "used_percent_path = \"used_percent\"",
@@ -1341,6 +1400,58 @@ fn rules() -> Vec<Rule> {
             names: "..",
         },
         Rule {
+            // `service_env`/`service_env_suffix` are `keychain_step`'s own
+            // fields (`auth::resolve_keychain_service`) — every other step
+            // kind never reads either, the same silent-no-op reasoning
+            // `path_env`/`path_env_join` are refused under above.
+            says: "service_env/service_env_suffix only mean something on a keychain step",
+            broken_by: changed(
+                &http_declaring(r#"["keychain-service-env"]"#),
+                "type            = \"credentials-file\"\npath            = \"~/.sample/auth.json\"\ntoken_json_path = \"token\"",
+                "type        = \"env\"\nvar         = \"SAMPLE_TOKEN\"\nservice_env = \"SAMPLE_CONFIG_DIR\"",
+            ),
+            names: "service_env",
+        },
+        Rule {
+            // `service_env_suffix` names the recipe for turning
+            // `service_env`'s value into a suffix; without a variable to
+            // hash, it loads clean and is never consulted, the same gap
+            // `path_env_join` closes for `path_env` above.
+            says: "service_env_suffix without service_env has nothing to hash",
+            broken_by: changed(
+                &http_declaring(r#"["keychain-service-env"]"#),
+                "type            = \"credentials-file\"\npath            = \"~/.sample/auth.json\"\ntoken_json_path = \"token\"",
+                "type               = \"keychain\"\nservice            = \"Sample\"\ntoken_json_path    = \"token\"\n\
+                 service_env_suffix = \"sha256:8\"",
+            ),
+            names: "service_env_suffix",
+        },
+        Rule {
+            // The reverse gap: `service_env` without `service_env_suffix`
+            // loads clean and picks the one recipe `resolve_keychain_service`
+            // knows silently, rather than the manifest having asked for it.
+            says: "service_env without service_env_suffix has no recipe to hash it with",
+            broken_by: changed(
+                &http_declaring(r#"["keychain-service-env"]"#),
+                "type            = \"credentials-file\"\npath            = \"~/.sample/auth.json\"\ntoken_json_path = \"token\"",
+                "type            = \"keychain\"\nservice         = \"Sample\"\ntoken_json_path = \"token\"\n\
+                 service_env     = \"SAMPLE_CONFIG_DIR\"",
+            ),
+            names: "service_env_suffix",
+        },
+        Rule {
+            // The only recipe `resolve_keychain_service` implements today —
+            // anything else is refused rather than silently read as this one.
+            says: "the only supported service_env_suffix recipe is sha256:8",
+            broken_by: changed(
+                &http_declaring(r#"["keychain-service-env"]"#),
+                "type            = \"credentials-file\"\npath            = \"~/.sample/auth.json\"\ntoken_json_path = \"token\"",
+                "type               = \"keychain\"\nservice            = \"Sample\"\ntoken_json_path    = \"token\"\n\
+                 service_env        = \"SAMPLE_CONFIG_DIR\"\nservice_env_suffix = \"sha1:8\"",
+            ),
+            names: "sha256:8",
+        },
+        Rule {
             // `[surface.auth.client]` is `oauth-refresh`'s own sub-table; a
             // manifest that wrote it under a `credentials-file` step is not
             // asking for anything this app knows how to do with it.
@@ -1718,22 +1829,37 @@ fn the_shipped_grok_manifest_is_accepted() {
     let m =
         PluginManifest::from_str(text).unwrap_or_else(|e| panic!("grok.toml must be valid: {e}"));
     assert_eq!(m.id, "grok");
-    // One window — the account's current weekly usage period, read straight
-    // off `creditUsagePercent`/`currentPeriod` — beside the two
-    // absolute-dollar balances the deprecated fields still back.
+    // One window — the account's current usage period, read straight off
+    // `creditUsagePercent`/`currentPeriod` — beside the two absolute-dollar
+    // balances the deprecated fields still back.
     assert_eq!(m.windows.len(), 1);
     let window = &m.windows[0];
     assert_eq!(window.id, "grok-period");
     assert_eq!(
         window.role,
         Role::Extra,
-        "a weekly credit-spend figure, not a subscription window — extra \
-         keeps its own label and stays out of the 5H/WK slots"
+        "a credit-spend figure, not a subscription window — extra keeps its \
+         own label and stays out of the 5H/WK slots"
     );
     assert!(
         !window.required,
         "an account on the deprecated fields alone reports none of these"
     );
+    // The length is the period's own stated bounds, not a number this
+    // manifest assumes — a weekly account and a monthly one each draw their
+    // own length off the same two paths. `assumed` is still declared, as the
+    // fallback for the shape xAI's own `currentPeriod` can send: `end`
+    // without a usable `start`.
+    assert_eq!(window.period.mode, PeriodMode::FromBounds);
+    assert_eq!(
+        window.period.start_path.as_deref(),
+        Some("config.currentPeriod.start")
+    );
+    assert_eq!(
+        window.period.end_path.as_deref(),
+        Some("config.currentPeriod.end")
+    );
+    assert_eq!(window.period.assumed, Some(10_080));
     assert_eq!(
         window.source.used_percent_path.as_deref(),
         Some("config.creditUsagePercent")
@@ -1744,6 +1870,19 @@ fn the_shipped_grok_manifest_is_accepted() {
         m.status.is_none(),
         "Grok states nothing about the quota as a whole"
     );
+    for capability in [
+        "window-identity",
+        "reading-balances",
+        "credentials-map",
+        "keychain-expiry",
+        "window-period-bounds",
+    ] {
+        assert!(
+            m.requires_reader.iter().any(|c| c == capability),
+            "{capability} is load-bearing here"
+        );
+    }
+    assert_eq!(m.requires_reader.len(), 5, "and nothing else is claimed");
 
     // The golden half: a manifest that parses is not a manifest that reads the
     // right fields. Every path this provider depends on is asserted, because a

@@ -17,26 +17,26 @@ schema_version = 1
 [[plugin]]
 id          = "codex"
 name        = "Codex"
-version     = "2.5.1"
+version     = "2.5.2"
 description = "OpenAI Codex CLI usage: 5h/weekly windows plus a credits balance."
 manifest    = "codex.toml"
-sha256      = "5c1a73cfc3df978684a08a6061a2a1733576159adb1bc5fb9d98ad7d25701de9"
+sha256      = "6cd4176d09b4352fe930780ff3a1a2ab10cfab97f7af9a4813625199f4ac558a"
 
 [[plugin]]
 id          = "claude"
 name        = "Claude"
-version     = "1.4.4"
+version     = "1.4.5"
 description = "Claude Code CLI and desktop app usage: 5h/weekly windows, per model."
 manifest    = "claude.toml"
-sha256      = "06f586b0395c831f3dd2039c14ab49c61d82cac72141712abfae1def61e01924"
+sha256      = "73c4aa13914f57c3e8fce990f55bb49a10cf43b31fd3dc4d63fb4cc68765850d"
 
 [[plugin]]
 id          = "grok"
 name        = "Grok"
-version     = "1.0.1"
+version     = "1.0.2"
 description = "Grok CLI billing: credit usage window, prepaid balance and pay-as-you-go allowance."
 manifest    = "grok.toml"
-sha256      = "70cdf1cf2b133c8a8e9845a350a1ba086618a68c48b708c3bdbb1219c761b2d0"
+sha256      = "b9f945f87b6e8df8b14e20be750da637e9dfccde2bb5db71b54282accb68de34"
 
 [[plugin]]
 id          = "antigravity"
