@@ -362,6 +362,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ),
                 );
             }
+            // A tray app is launched from Finder/Dock/Explorer, not a
+            // terminal — stderr above is for whoever captures a log, and the
+            // marker lands only where the same permission failure may also
+            // have blocked it. Without something on screen this whole path
+            // reads as "the app silently does not start". `show_alert` is
+            // osascript/MessageBoxW — neither needs the Slint loop that
+            // never gets reached.
+            show_alert(
+                "Tickover could not start",
+                &format!(
+                    "The old `codex-limits` config directory could not be moved to `tickover`:\n\n\
+                     {e}\n\nFix whatever blocked the move — the directory's permissions are the \
+                     usual reason — and launch the app again. The move is retried on every start; \
+                     see MIGRATION-FAILED.txt inside the old directory."
+                ),
+            );
             std::process::exit(1);
         }
     };
@@ -865,6 +881,63 @@ fn setup_tray(
     ))
 }
 
+/// Clear `<id>.toml` from `dir` when it is this plugin's *unparsable*
+/// remnant — a file `find_plugin_manifest_path` can never match (it keys by
+/// parsed id, and this one does not parse) but `install_write` still refuses
+/// to clobber, dead-ending a later Install with no row left to remove it
+/// from. A file at the conventional name that parses as a *different* id is
+/// another plugin's manifest squatting on it — that one stays, and `true` is
+/// still answered: nothing here was this plugin's to remove.
+///
+/// Returns whether the conventional-name slot is free of such a remnant:
+/// `false` only when a removal was attempted and failed (a `NotFound` on the
+/// removal attempt itself is a scan→remove race, already free). Callers use
+/// that to decide whether the rest of the removal bookkeeping may run —
+/// wiping `plugin.<id>.*` config while a broken `<id>.toml` survives would
+/// resurrect the plugin with its settings reset if the file ever parses
+/// again.
+///
+/// `symlink_metadata`, not `exists()`: a dangling symlink at the name blocks
+/// `install_write` just as surely, and `remove_file` on it removes the link,
+/// never a target. A *directory* at the name blocks install the same way —
+/// `remove_dir` takes an empty one (a populated one fails and stays the
+/// user's to clear).
+fn remove_unparsable_remnant(dir: &std::path::Path, id: &str) -> bool {
+    let remnant = dir.join(format!("{id}.toml"));
+    let foreign =
+        tickover::plugin::read_regular_file(&remnant, tickover::plugin::SMALL_FILE_MAX_BYTES)
+            .and_then(|text| PluginManifest::from_str(&text).ok())
+            .is_some_and(|m| m.id != id);
+    if foreign {
+        return true;
+    }
+    let Ok(meta) = remnant.symlink_metadata() else {
+        return true;
+    };
+    let gone = if meta.file_type().is_dir() {
+        std::fs::remove_dir(&remnant)
+    } else {
+        std::fs::remove_file(&remnant)
+    };
+    match gone {
+        Ok(()) => {
+            diag::line(format!(
+                "remove-plugin: removed {} — unparsable remnant of id \"{id}\"",
+                remnant.display()
+            ));
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            diag::line(format!(
+                "remove-plugin: could not remove remnant {}: {e}",
+                remnant.display()
+            ));
+            false
+        }
+    }
+}
+
 /// The settings sheet's plugin manager. Each toggle persists to `config` by
 /// plugin/surface id, then rebuilds the plugin-manager model (so
 /// sub-toggles dim with their parent) and — where the change affects what
@@ -1238,25 +1311,42 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
             }
             let dir = seed::plugins_dir();
             match find_plugin_manifest_path(&dir, &id) {
-                Some(path) => match std::fs::remove_file(&path) {
-                    // `NotFound` lands in the same place as `Ok`: the file
-                    // removed by hand between `find` and `remove` is gone
-                    // either way, and the cleanup below is owed to both.
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    // Any other failure means the file is still there —
-                    // the plugin is not removed, so its config keys, cache
-                    // and lockfile record must all stay. Wiping them while
-                    // the manifest remains would resurrect the plugin on
-                    // the next reload with its config reset.
-                    Err(e) => {
-                        diag::line(format!(
-                            "could not remove plugin manifest {}: {e}",
-                            path.display()
-                        ));
+                Some(path) => {
+                    match std::fs::remove_file(&path) {
+                        // `NotFound` lands in the same place as `Ok`: the
+                        // file removed by hand between `find` and `remove` is
+                        // gone either way, and the cleanup below is owed to
+                        // both.
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        // Any other failure means the file is still there —
+                        // the plugin is not removed, so its config keys,
+                        // cache and lockfile record must all stay. Wiping
+                        // them while the manifest remains would resurrect the
+                        // plugin on the next reload with its config reset.
+                        Err(e) => {
+                            diag::line(format!(
+                                "could not remove plugin manifest {}: {e}",
+                                path.display()
+                            ));
+                            return;
+                        }
+                    }
+                    // The parseable manifest is gone — but `find` matches by
+                    // *parsed id*, not by name, so it may have lived under a
+                    // filename other than `<id>.toml` and left a broken file
+                    // at the conventional name behind. That remnant dead-ends
+                    // a later Install of this id (`install_write` refuses to
+                    // clobber, and no plugin row is left to remove it from) —
+                    // sweep it too. And a remnant that *cannot* be removed
+                    // keeps the record the same way the `None` arm rules:
+                    // the file might yet parse as this id, and wiping the
+                    // config while it survives would resurrect the plugin
+                    // with its settings reset.
+                    if !remove_unparsable_remnant(&dir, &id) {
                         return;
                     }
-                },
+                }
                 // No *parseable* file carries this id — but
                 // `find_plugin_manifest_path` matches by parsed id, so a
                 // manifest left under `<id>.toml` that no longer parses (a
@@ -1264,48 +1354,14 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                 // the same as a genuinely deleted one. Left behind, that
                 // file dead-ends a later Install of this id —
                 // `install_write` refuses to clobber — with no row left to
-                // remove it from. The conventional name is this plugin's
-                // remnant unless it parses as a *different* id (another
-                // plugin's manifest squatting on the name — that one stays).
+                // remove it from. And a remnant that *cannot* be removed
+                // keeps the whole record: wiping config keys while the file
+                // stays would resurrect the plugin with its settings reset
+                // if the file ever parses again — the same rule the `Some`
+                // arm's early return already applies to a manifest.
                 None => {
-                    let remnant = dir.join(format!("{id}.toml"));
-                    let foreign = tickover::plugin::read_regular_file(
-                        &remnant,
-                        tickover::plugin::SMALL_FILE_MAX_BYTES,
-                    )
-                    .and_then(|text| PluginManifest::from_str(&text).ok())
-                    .is_some_and(|m| m.id != id);
-                    // `symlink_metadata`, not `exists()`: a dangling symlink
-                    // at this name blocks `install_write` just as surely and
-                    // `remove_file` on it removes the link, never a target.
-                    // A *directory* at the name blocks install the same way —
-                    // `remove_dir` takes an empty one (a populated one fails
-                    // and stays the user's to clear).
-                    if !foreign && remnant.symlink_metadata().is_ok() {
-                        let is_dir = remnant
-                            .symlink_metadata()
-                            .map(|m| m.file_type().is_dir())
-                            .unwrap_or(false);
-                        let gone = if is_dir {
-                            std::fs::remove_dir(&remnant)
-                        } else {
-                            std::fs::remove_file(&remnant)
-                        };
-                        match gone {
-                            Ok(()) => diag::line(format!(
-                                "remove-plugin: removed {} — unparsable remnant of id \"{id}\"",
-                                remnant.display()
-                            )),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            // The remnant stays — the plugin is still gone
-                            // (it did not parse), so the cleanup below is
-                            // owed either way; the install-blocking file is
-                            // the user's to clear once it cannot be ours.
-                            Err(e) => diag::line(format!(
-                                "remove-plugin: could not remove remnant {}: {e}",
-                                remnant.display()
-                            )),
-                        }
+                    if !remove_unparsable_remnant(&dir, &id) {
+                        return;
                     }
                     diag::line(format!(
                         "remove-plugin: no manifest file found for id \"{id}\" — already gone"

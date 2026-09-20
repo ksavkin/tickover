@@ -536,11 +536,23 @@ fn parse_file_groups(
     field: &str,
 ) -> BTreeMap<String, (u64, RawReading)> {
     let mut out: BTreeMap<String, (u64, RawReading)> = BTreeMap::new();
-    let Ok(file) = File::open(path) else {
-        return out;
+    let file = match File::open(path) {
+        Ok(file) => file,
+        // `NotFound` alone stays silent: a file the glob matched can vanish
+        // between the scan and this open, and a file that is simply gone is
+        // not a read failure.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out,
+        Err(e) => {
+            note_read_error(plugin_id, path, &e);
+            return out;
+        }
     };
-    let Ok(mut reader) = tail_reader(file) else {
-        return out;
+    let mut reader = match tail_reader(file) {
+        Ok(reader) => reader,
+        Err(e) => {
+            note_read_error(plugin_id, path, &e);
+            return out;
+        }
     };
     let needle = format!("\"{container_key}\"");
     let mut buf = Vec::new();
@@ -1051,18 +1063,16 @@ fn might_carry_container(line: &str, needle: &str) -> bool {
     line.contains(needle) || line.contains("\"primary\"") || line.contains("\"secondary\"")
 }
 
-/// What a mid-file read failure should say. Breaking the scan loop on `Err`
-/// used to look exactly like `Eof` — the file half-scanned, no note anywhere
-/// — while whatever a missing line held might have been a newer reading than
-/// the ones already collected. Say so, then let the caller keep what earlier
-/// lines yielded and move on to the next file. Queued once per plugin (see
-/// [`queue_diag_once`]), not once per refresh the failure keeps repeating on.
+/// What a log-file read failure should say — whether it broke mid-file (a
+/// half-scanned file used to look exactly like `Eof`, with whatever the
+/// missing lines held possibly newer than everything collected) or at the
+/// very first byte (`open`/`seek` errors used to read as "no data", which a
+/// permission failure is not). Say so once per plugin (see
+/// [`queue_diag_once`]), not once per refresh the failure keeps repeating
+/// on, then let the caller keep what earlier lines or files yielded.
 fn note_read_error(plugin_id: &str, path: &Path, e: &std::io::Error) {
     queue_diag_once(plugin_id, "read-error", || {
-        format!(
-            "{plugin_id}: a log read failed partway through {}: {e}",
-            path.display()
-        )
+        format!("{plugin_id}: could not read {}: {e}", path.display())
     });
 }
 
@@ -1077,8 +1087,23 @@ fn parse_file(
     format: LogFileFormat,
     select: LogFileSelect,
 ) -> Option<RawReading> {
-    let file = File::open(path).ok()?;
-    let mut reader = tail_reader(file).ok()?;
+    // Same contract as `parse_file_groups`' opening: `NotFound` is a
+    // scan→open race, anything else is a failure worth a diag line.
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            note_read_error(plugin_id, path, &e);
+            return None;
+        }
+    };
+    let mut reader = match tail_reader(file) {
+        Ok(reader) => reader,
+        Err(e) => {
+            note_read_error(plugin_id, path, &e);
+            return None;
+        }
+    };
     // Cheap pre-filter: skip lines that can't possibly contain the container.
     let needle = format!("\"{container_key}\"");
     let mut latest: Option<RawReading> = None;
@@ -1602,6 +1627,42 @@ mod tests {
         )
         .expect("the tail's reading is found");
         assert_eq!(reading.primary.as_ref().map(|s| s.used_percent), Some(42.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A matched file that cannot even be *opened* (permission denied, not
+    /// missing — `NotFound` stays silent as a scan→open race) used to read
+    /// exactly like "no data": `None` back, nothing logged. The diagnostic
+    /// the mid-read error gets is owed to this failure too.
+    #[cfg(unix)]
+    #[test]
+    fn an_unopenable_matched_file_queues_a_read_error_diagnostic() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("open-error");
+        let path = write_file(
+            &dir,
+            "rollout-x.jsonl",
+            &[json!({ "rate_limits": { "primary": { "used_percent": 42.0 } } }).to_string()],
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+
+        assert!(parse_file(
+            &path,
+            "open-error-plugin",
+            "rate_limits",
+            None,
+            LogFileFormat::Jsonl,
+            LogFileSelect::Last,
+        )
+        .is_none());
+        let diag = take_pending_diagnostics();
+        assert!(
+            diag.iter()
+                .any(|l| l.contains("open-error-plugin") && l.contains("could not read")),
+            "the open failure is reported once: {diag:?}"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 

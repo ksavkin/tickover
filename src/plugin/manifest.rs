@@ -608,6 +608,17 @@ impl PluginManifest {
                 );
             }
             if let Some(join) = &lf.root_env_join {
+                // A blank join survives both checks below (it is neither
+                // absolute nor a `..`) while `base.join("")` resolves to the
+                // env var's own directory — the search then reads a dir as
+                // a file and silently finds nothing.
+                if join.trim().is_empty() {
+                    return Err(
+                        "`[logfile] root_env_join` must not be empty — an empty join \
+                         resolves to the directory `root_env` names, not a file in it"
+                            .to_string(),
+                    );
+                }
                 if is_absolute_on_any_platform(Path::new(join)) {
                     return Err(format!(
                         "`[logfile] root_env_join = \"{join}\"` must be a relative subdirectory \
@@ -1863,6 +1874,14 @@ impl PluginManifest {
                     ));
                 }
                 if let Some(join) = &v.path_env_join {
+                    if join.trim().is_empty() {
+                        return Err(format!(
+                            "`[[http.value]] name = \"{}\"` `path_env_join` must not be empty — \
+                             an empty join resolves to the directory `path_env` names, not a \
+                             file in it",
+                            v.name
+                        ));
+                    }
                     if is_absolute_on_any_platform(Path::new(join)) {
                         return Err(format!(
                             "`[[http.value]] name = \"{}\"` `path_env_join = \"{join}\"` must be \
@@ -2554,6 +2573,15 @@ impl PluginManifest {
                     ));
                 }
                 if let Some(join) = &step.path_env_join {
+                    if join.trim().is_empty() {
+                        return Err(format!(
+                            "surface \"{}\": auth step {i} (`{}`) `path_env_join` must not be \
+                             empty — an empty join resolves to the directory `path_env` names, \
+                             not a file in it",
+                            surface.id,
+                            auth_type_name(step.kind)
+                        ));
+                    }
                     if is_absolute_on_any_platform(Path::new(join)) {
                         return Err(format!(
                             "surface \"{}\": auth step {i} (`{}`) `path_env_join = \"{join}\"` \

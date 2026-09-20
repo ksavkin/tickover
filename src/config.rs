@@ -188,7 +188,24 @@ pub fn migrate_legacy_dir() -> Result<bool, std::io::Error> {
 /// itself is never called from a test, only this half of it, which never
 /// resolves `dirs::config_dir()` at all.
 fn migrate_legacy_dir_at(old: &Path, new: &Path) -> Result<bool, std::io::Error> {
-    if new.exists() || !old.exists() {
+    if new.exists() {
+        // An *empty* `new` standing in the way is safe to fold in — a sync
+        // tool or a user probing permissions after reading MIGRATION-FAILED
+        // leaves exactly that, and treating it as a hard stop would abandon
+        // `old` forever. A populated `new` is a different fact entirely:
+        // whatever is in it wins, and `old` stays where it is.
+        let foldable = old.exists()
+            && new.is_dir()
+            && new
+                .read_dir()
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(false)
+            && std::fs::remove_dir(new).is_ok();
+        if !foldable || !old.exists() {
+            return Ok(false);
+        }
+        // `remove_dir` succeeded; fall through to the rename.
+    } else if !old.exists() {
         return Ok(false);
     }
     std::fs::rename(old, new)?;
@@ -1727,6 +1744,43 @@ mod tests {
             "{\"live\":true}",
             "the live directory is untouched too"
         );
+
+        std::fs::remove_dir_all(new.parent().unwrap()).ok();
+    }
+
+    /// An *empty* `new` — a sync tool's stray creation, or a `mkdir` a user
+    /// ran probing permissions after reading MIGRATION-FAILED — is folded
+    /// into the migration rather than standing in its way forever.
+    #[test]
+    fn migrate_legacy_dir_folds_an_empty_new_directory_and_still_migrates() {
+        let (old, new) = temp_legacy_pair("empty-new");
+        std::fs::create_dir_all(&old).expect("seed old dir");
+        std::fs::write(old.join("config.json"), "{}").expect("seed config");
+        std::fs::create_dir_all(&new).expect("seed an empty new dir");
+
+        let migrated = migrate_legacy_dir_at(&old, &new).expect("migration succeeds");
+        assert!(migrated, "an empty new directory folds into the move");
+        assert!(!old.exists());
+        assert_eq!(
+            std::fs::read_to_string(new.join("config.json")).unwrap(),
+            "{}"
+        );
+
+        std::fs::remove_dir_all(new.parent().unwrap()).ok();
+    }
+
+    /// …but only an *empty* one: anything already inside `new` belongs to a
+    /// live install and `old` must not swallow it.
+    #[test]
+    fn migrate_legacy_dir_still_refuses_a_new_directory_with_anything_in_it() {
+        let (old, new) = temp_legacy_pair("nonempty-new");
+        std::fs::create_dir_all(&old).expect("seed old dir");
+        std::fs::create_dir_all(&new).expect("seed new dir");
+        std::fs::write(new.join("anything"), "x").expect("populate new");
+
+        let migrated = migrate_legacy_dir_at(&old, &new).expect("no error");
+        assert!(!migrated, "a populated new directory wins over the rename");
+        assert!(old.exists() && new.join("anything").exists());
 
         std::fs::remove_dir_all(new.parent().unwrap()).ok();
     }

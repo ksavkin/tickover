@@ -1239,6 +1239,17 @@ fn rules() -> Vec<Rule> {
             names: "must not contain a `..`",
         },
         Rule {
+            // A blank join is neither absolute nor a `..`, so it slips past
+            // both checks below — and `base.join("")` resolves to the env
+            // var's own directory, read as a file, silently empty.
+            says: "a blank root_env_join resolves to the directory root_env names",
+            broken_by: plus(
+                LOGFILE,
+                "root_env = \"SAMPLE_DIR\"\nroot_env_join = \"  \"",
+            ),
+            names: "root_env_join` must not be empty",
+        },
+        Rule {
             // A blank `container_field` compares against no field of any
             // container, ever — `[logfile] account_match`'s own doc calls
             // both halves required, but only this one is a plain `String`
@@ -1448,6 +1459,16 @@ fn rules() -> Vec<Rule> {
                  path_env_join    = \"../escape\"",
             ),
             names: "..",
+        },
+        Rule {
+            says: "a blank path_env_join resolves to the directory path_env names",
+            broken_by: changed(
+                &http_declaring(r#"["credentials-file-path-env"]"#),
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\npath_env         = \"SAMPLE_CONFIG_DIR\"\n\
+                 path_env_join    = \"  \"",
+            ),
+            names: "path_env_join` must not be empty",
         },
         Rule {
             // `service_env`/`service_env_suffix` are `keychain_step`'s own
@@ -1872,6 +1893,15 @@ fn rules() -> Vec<Rule> {
                  json_path = \"a\"\npath_env = \"SAMPLE_DIR\"\npath_env_join = \"../x.json\"",
             ),
             names: "must not contain a `..`",
+        },
+        Rule {
+            says: "a blank http.value path_env_join resolves to the directory path_env names",
+            broken_by: plus(
+                &http_declaring(r#"["http-value-path-env"]"#),
+                "[[http.value]]\nname = \"a\"\ntype = \"json-file\"\npath = \"~/x.json\"\n\
+                 json_path = \"a\"\npath_env = \"SAMPLE_DIR\"\npath_env_join = \"\"",
+            ),
+            names: "path_env_join` must not be empty",
         },
         Rule {
             // The app matches `NO_CREDENTIALS` literally to hide a row with

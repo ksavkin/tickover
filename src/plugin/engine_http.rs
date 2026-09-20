@@ -1748,15 +1748,22 @@ fn read_json_body(response: ureq::Response) -> Result<Value, String> {
     serde_json::from_slice(&buf).map_err(|e| format!("bad response: {e}"))
 }
 
-/// The shortest `body` worth comparing whole against an error message —
+/// The shortest value worth comparing whole against an error message —
 /// below this, checking containment stops discriminating a real leak from
-/// coincidence. The one poverty-line case this app ships (`{}`, Antigravity's
-/// literal, unsubstituted body) is 2 bytes; a `Display` impl that happens to
-/// print an empty object *anywhere* in an unrelated error would otherwise
-/// have this function replace a genuine transport error with a redaction
-/// message for no reason connected to a credential at all. A real
-/// substituted secret (`{token}`, `{value.<name>}`) is always well past this.
-const MIN_LEAK_CHECK_BODY_LEN: usize = 16;
+/// coincidence. The poverty-line cases this app ships: a `"{}"` body literal
+/// (Antigravity's, unsubstituted — 2 bytes) and a flagged header resolving
+/// to something like `"1"` or `"on"` (a short `{value.<name>}` — the value
+/// is a credential *source*'s content, not necessarily a long one). A
+/// `Display` impl that happens to print either *anywhere* in an unrelated
+/// error would otherwise have this function replace a genuine transport
+/// error with a redaction message for no reason connected to a credential
+/// at all. The line sits at 8, not higher, because a short-but-real secret
+/// — an 8-to-15-character API key — is still worth catching, while
+/// single-digit values (`"1"` inside `"HTTP/1.1"`, `"on"`, `"true"`) are the
+/// coincidence class. A credential shorter than this echoed in an error is
+/// the accepted residual: below it, substring matching cannot tell leak
+/// from noise at all.
+const MIN_LEAK_CHECK_LEN: usize = 8;
 
 /// `message`, verbatim, unless it happens to quote one of this request's own
 /// header values, or its body — which would mean a credential (the bearer
@@ -1766,13 +1773,13 @@ const MIN_LEAK_CHECK_BODY_LEN: usize = 16;
 /// exactly the same rules `build_request` uses for `headers` — checking one
 /// and not the other would leave a credential a manifest chose to place in
 /// its body able to reach this message unredacted, so both are scanned here.
-/// `body` is gated on [`MIN_LEAK_CHECK_BODY_LEN`] where a header value is
-/// only gated on non-empty: a header this engine builds is a name paired
-/// with a credential or a manifest literal meant to be read as a whole
-/// (`Authorization: Bearer <token>`), where a manifest's own `body` literal
-/// can legitimately be as short as `"{}"` — checking a 2-byte string for
-/// whole containment in an arbitrary message is a coincidence generator, not
-/// a credential detector.
+/// Both scans are gated on [`MIN_LEAK_CHECK_LEN`]: a flagged header is a
+/// credential-bearing template, but what it *resolved* to can still be a
+/// short string (an `account_id` of `"1"`), and a 1-byte needle found in
+/// "HTTP 401" or "os error 61" is a coincidence, not a leak — swallowing the
+/// real error in favour of "a header value could not be sent" hides exactly
+/// the cause someone is reading the panel for. The same reasoning the body
+/// gate was built for applies verbatim.
 ///
 /// The replacement names which of the two matched — a body match saying "a
 /// header value could not be sent" would blame the wrong part of the
@@ -1794,11 +1801,10 @@ fn redact_header_values(
     // string, or a literal: scanning for "true" or a version number would
     // redact ordinary transport errors that carry nothing secret, hiding
     // the cause of a failure in the name of hiding the token.
-    let header_leaked = headers
-        .iter()
-        .any(|(_, v, credential)| *credential && !v.is_empty() && message.contains(v.as_str()));
-    let body_leaked =
-        body.is_some_and(|b| b.len() >= MIN_LEAK_CHECK_BODY_LEN && message.contains(b));
+    let header_leaked = headers.iter().any(|(_, v, credential)| {
+        *credential && v.len() >= MIN_LEAK_CHECK_LEN && message.contains(v.as_str())
+    });
+    let body_leaked = body.is_some_and(|b| b.len() >= MIN_LEAK_CHECK_LEN && message.contains(b));
     // Headers win when both leak — the message is advisory and what matters
     // is that the answer is deterministic, not which channel gets named.
     if header_leaked {
@@ -4741,7 +4747,7 @@ mod tests {
     /// The shipped Antigravity body is the literal `"{}"` — two bytes, and a
     /// coincidence away from appearing in a message that has nothing to do
     /// with it (a `Display` impl printing an empty object of its own). Below
-    /// `MIN_LEAK_CHECK_BODY_LEN`, this must never fire, or a genuine
+    /// `MIN_LEAK_CHECK_LEN`, this must never fire, or a genuine
     /// transport error would routinely be swapped for a redaction message
     /// with no credential actually involved.
     #[test]
@@ -4755,6 +4761,32 @@ mod tests {
             ),
             "some unrelated error printing {} in passing",
             "a body this short must never be enough to redact a whole message"
+        );
+    }
+
+    /// The header side of the same floor: a *flagged* header whose resolved
+    /// value is short (`{value.account_id}` → `"1"`) would otherwise redact
+    /// every error containing that byte — "HTTP 401", "os error 61",
+    /// "HTTP/1.1" — replacing the real cause with a redaction message that
+    /// names no real leak.
+    #[test]
+    fn redact_header_values_does_not_treat_a_short_flagged_value_as_a_leak() {
+        let headers = vec![("X-Account".to_string(), "1".to_string(), true)];
+        assert_eq!(
+            redact_header_values("HTTP/1.1 503 Service Unavailable", &headers, None),
+            "HTTP/1.1 503 Service Unavailable",
+            "a 1-byte needle in an unrelated error is coincidence, not a leak"
+        );
+        // …and a flagged value at the floor still redacts — the gate is on
+        // length, not on whether the value came from a credential source.
+        let headers = vec![(
+            "X-Account".to_string(),
+            "0123456789abcdef".to_string(),
+            true,
+        )];
+        assert_eq!(
+            redact_header_values("upstream saw 0123456789abcdef and refused", &headers, None),
+            "a header value could not be sent"
         );
     }
 

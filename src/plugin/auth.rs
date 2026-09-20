@@ -3172,11 +3172,12 @@ fn kill_and_wait(child: &mut std::process::Child) {
 /// Killed and reported (`Err`) on timeout, never left running: the whole
 /// point is that a caller waiting on this gets an answer inside `deadline`,
 /// one way or another. Stdout/stderr are drained on threads of their own
-/// while this waits rather than read after the fact, the same "shared, not
-/// joined" reasoning `main.rs`'s own version documents for its stderr drain
-/// — a killed command's pipe can still be held open by a grandchild it
-/// spawned, and joining the drain thread here would reinstate, inside this
-/// function's own cleanup, the exact hang the deadline exists to end.
+/// while this waits rather than read after the fact — and after a *clean*
+/// exit they get a bounded moment to finish copying, because a killed
+/// command's pipe can still be held open by a grandchild it spawned, so the
+/// wait is a short deadline rather than a `join` that would reinstate,
+/// inside this function's own cleanup, the exact hang `deadline` exists to
+/// end.
 #[cfg(any(target_os = "macos", test))]
 fn run_command_with_deadline(
     program: &str,
@@ -3206,10 +3207,10 @@ fn run_command_with_deadline(
         kill_and_wait(&mut child);
         return Err(msg);
     }
-    let (stdout_buf, stderr_buf) = (
-        stdout_buf.expect("checked by pipe_drain_failure_message above"),
-        stderr_buf.expect("checked by pipe_drain_failure_message above"),
-    );
+    let (stdout_drain, stdout_buf) =
+        stdout_buf.expect("checked by pipe_drain_failure_message above");
+    let (stderr_drain, stderr_buf) =
+        stderr_buf.expect("checked by pipe_drain_failure_message above");
 
     let expiry = Instant::now() + deadline;
     let status = loop {
@@ -3253,6 +3254,28 @@ fn run_command_with_deadline(
         }
     };
     let status = status?;
+    // The child is gone, but its last bytes may still be in flight between
+    // the OS pipe and `stdout_buf`/`stderr_buf` — a drain thread scheduled a
+    // beat late would leave them there, and cloning now would read a
+    // partial buffer as the command's whole answer (an empty stdout
+    // classifies as "item not found" — Absent, not an error). Give the
+    // drains a bounded moment to finish: a detached *grandchild* can keep
+    // its inherited write end open past the parent's exit, so this is a
+    // short spin, not a `join` — waiting one out forever would reinstate the
+    // very hang `deadline` exists to end. This wait sits *outside* the
+    // deadline's promise (which bounds the child, not this settling) and in
+    // the worst case — a grandchild holding the pipe — adds its length on
+    // top; the ordinary case costs a few microseconds.
+    let drain_deadline = Instant::now() + std::time::Duration::from_millis(250);
+    loop {
+        let drained = [&stdout_drain, &stderr_drain]
+            .iter()
+            .all(|d| d.as_ref().is_none_or(|h| h.is_finished()));
+        if drained || Instant::now() >= drain_deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     // Bound to a local rather than returned in tail position: the
     // `MutexGuard` temporaries inside the struct literal would otherwise
     // outlive `stdout_buf`/`stderr_buf` in drop order and not compile.
@@ -3268,10 +3291,11 @@ fn run_command_with_deadline(
     Ok(output)
 }
 
-/// Drain `pipe` into a buffer on a thread of its own, handing back the other
-/// end of that same buffer rather than the thread's `JoinHandle` — see
-/// [`run_command_with_deadline`]'s own doc for why that thread is never
-/// joined. `None` (no pipe at all) reads back as an empty buffer, the same as
+/// Drain `pipe` into a buffer on a thread of its own, handing back that
+/// thread's `JoinHandle` alongside the shared buffer — see
+/// [`run_command_with_deadline`]'s success path for why the handle is
+/// awaited on a bounded spin rather than `join`ed outright. `None` (no pipe
+/// at all) reads back as an empty buffer, the same as
 /// a command that wrote nothing on this stream — but the OS refusing to hand
 /// out a thread is `Err`, not that: the closure this never runs is dropped
 /// right along with the pipe it moved, closing this process's read end, and
@@ -3302,17 +3326,27 @@ fn drain_into(mut source: impl std::io::Read, sink: &std::sync::Mutex<Vec<u8>>) 
     }
 }
 
+/// One drain thread's outcome: its `JoinHandle` (awaited on a bounded spin
+/// once the child has exited — see [`run_command_with_deadline`]) plus the
+/// shared buffer it fills. `Err` means the OS refused the thread itself.
 #[cfg(any(target_os = "macos", test))]
-fn drain_pipe(
-    pipe: Option<impl std::io::Read + Send + 'static>,
-) -> Result<std::sync::Arc<std::sync::Mutex<Vec<u8>>>, std::io::Error> {
+type PipeDrain = Result<
+    (
+        Option<std::thread::JoinHandle<()>>,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ),
+    std::io::Error,
+>;
+
+#[cfg(any(target_os = "macos", test))]
+fn drain_pipe(pipe: Option<impl std::io::Read + Send + 'static>) -> PipeDrain {
     let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let Some(pipe) = pipe else {
-        return Ok(buf);
+        return Ok((None, buf));
     };
     let sink = std::sync::Arc::clone(&buf);
-    std::thread::Builder::new().spawn(move || drain_into(pipe, &sink))?;
-    Ok(buf)
+    let handle = std::thread::Builder::new().spawn(move || drain_into(pipe, &sink))?;
+    Ok((Some(handle), buf))
 }
 
 /// Whether either [`drain_pipe`] call failed to even start, and if so, the
@@ -3324,8 +3358,8 @@ fn drain_pipe(
 #[cfg(any(target_os = "macos", test))]
 fn pipe_drain_failure_message(
     program: &str,
-    stdout: &Result<std::sync::Arc<std::sync::Mutex<Vec<u8>>>, std::io::Error>,
-    stderr: &Result<std::sync::Arc<std::sync::Mutex<Vec<u8>>>, std::io::Error>,
+    stdout: &PipeDrain,
+    stderr: &PipeDrain,
 ) -> Option<String> {
     let e = stdout.as_ref().err().or(stderr.as_ref().err())?;
     Some(format!(
@@ -7317,7 +7351,12 @@ mod tests {
     /// nothing here can trigger on demand.
     #[test]
     fn pipe_drain_failure_message_reports_whichever_drain_failed_to_start() {
-        let ok = || Ok(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let ok = || {
+            Ok((
+                None::<std::thread::JoinHandle<()>>,
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            ))
+        };
         let stdout_err = Err(std::io::Error::other("boom-stdout"));
         let stderr_err = Err(std::io::Error::other("boom-stderr"));
 
