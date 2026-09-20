@@ -1817,12 +1817,14 @@ id           = "codex"
 name         = "Codex"
 menu_label   = "Cx"
 order        = 10
-# `required` below needs a reader that knows a window can be absent rather than
-# blank; `[[windows]] id` needs one that keys a window by identity rather than
-# by position; `[status]` needs one that reads the quota's own standing. See
-# docs/PLUGIN-ARCHITECTURE.md, "Reader capabilities".
-requires_reader = ["window-presence", "window-identity", "reading-status", "reading-balances"]
-version      = "2.5.2"
+# `window-presence` needs a reader that knows a window can be absent rather
+# than blank — no window below sets `required`, and a plan without one must
+# draw no row rather than an empty one; `[[windows]] id` needs one that keys
+# a window by identity rather than by position; `[status]` needs one that
+# reads the quota's own standing. See docs/PLUGIN-ARCHITECTURE.md, "Reader
+# capabilities".
+requires_reader = ["window-presence", "window-identity", "reading-status", "reading-balances", "credentials-file-path-env", "http-value-path-env"]
+version      = "2.5.3"
 engine       = "http-api"
 # One request a minute, matching Claude. The log-file reader polled every 15s
 # because re-reading a local file is free; four requests a minute at somebody
@@ -1929,8 +1931,9 @@ min_period_minutes = 721
 # this is safe to show: reading a model-specific quota as *the* Codex quota is
 # the bug that had the panel saying 0% while the real weekly window sat at 69%.
 #
-# The response also carries `code_review_rate_limit`, `credits` and
-# `spend_control`. Same mechanism if they are ever worth a row.
+# The response also carries `code_review_rate_limit` and `spend_control` —
+# same mechanism if they are ever worth a row (`credits` already is one:
+# `[balances.remaining]` below).
 [[windows]]
 id    = "codex-spark"
 label = "GPT-5.3-Codex-Spark"
@@ -1986,9 +1989,11 @@ path = "credits.balance"
 [http]
 # Pacing. `refresh_secs` above only paces the timer; the panel opening, the
 # Refresh button, "Refresh now" and app start all fetch too. 55s sits just
-# below the 60s cadence so a scheduled refresh is never the thing that gets
-# throttled, while a user clicking Refresh repeatedly gets the cached reading.
-# See `src/plugin/throttle.rs`.
+# below the 60s cadence so the *timer* is never what trips the interval — a
+# scheduled refresh inside 55s of a manual click does get held off (the
+# interval counts every fetch, whoever asked), but a manual click inside 55s
+# of a scheduled one gets the cached reading instead. See
+# `src/plugin/throttle.rs`.
 min_interval_secs  = 55
 backoff_start_secs = 60
 backoff_max_secs   = 900
@@ -2011,11 +2016,16 @@ Accept               = "application/json"
 # file. `tokens.account_id` is written there in plain sight; the same value is
 # also a claim inside `tokens.id_token`, but reading the plain field means one
 # less thing that breaks if the CLI stops storing an id token it does not need.
+# `CODEX_HOME` relocates the CLI's whole config directory — `$CODEX_HOME/auth.json`
+# instead of the default `~/.codex/auth.json` — so `path_env`/`path_env_join`
+# read the same override on an account that has ever set it.
 [[http.value]]
-name      = "account_id"
-type      = "json-file"
-path      = "~/.codex/auth.json"
-json_path = "tokens.account_id"
+name          = "account_id"
+type          = "json-file"
+path          = "~/.codex/auth.json"
+path_env      = "CODEX_HOME"
+path_env_join = "auth.json"
+json_path     = "tokens.account_id"
 
 # One surface, deliberately named "default": that keeps this provider's reading
 # id "codex" (rather than "codex-cli"), which is what config keys, the menu-bar
@@ -2040,6 +2050,8 @@ no_credentials_message = "Not signed in — run: codex login"
 [[surface.auth]]
 type             = "reject-when"
 path             = "~/.codex/auth.json"
+path_env         = "CODEX_HOME"
+path_env_join    = "auth.json"
 json_path        = "OPENAI_API_KEY"
 unless_json_path = "tokens.access_token"
 message          = "API-key sign-in has no subscription limits"
@@ -2049,9 +2061,13 @@ message          = "API-key sign-in has no subscription limits"
 # Codex CLI is holding — this app would be logging the user's CLI out to draw a
 # progress bar. An expired token stops the polling until the user signs in
 # again (see `src/plugin/throttle.rs`).
+# `CODEX_HOME` again: the credentials-file step honours the same override the
+# `[[http.value]]` and `reject-when` steps above do.
 [[surface.auth]]
 type            = "credentials-file"
 path            = "~/.codex/auth.json"
+path_env        = "CODEX_HOME"
+path_env_join   = "auth.json"
 token_json_path = "tokens.access_token"
 
 # `codex exec hello` — run while the 5-hour window sits empty, to start a
@@ -2120,14 +2136,14 @@ order        = 20
 # the CLI renames under it — see docs/PLUGIN-ARCHITECTURE.md, "Reader
 # capabilities".
 requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry", "reading-balances", "balance-conditional", "credentials-file-path-env", "keychain-service-env"]
-version      = "1.4.5"
+version      = "1.4.6"
 engine       = "http-api"
 # Re-fetched every 60 s.
 refresh_secs = 60
 
 # Claude reports no window lengths of its own, so the nominal periods (5h =
 # 300 min, weekly = 10080 min) are assumed here. This is the mirror image of
-# Codex, whose windows carry their own `window_minutes`.
+# Codex, whose windows carry their own `limit_window_seconds`.
 # Both windows are `required`: Anthropic reports both for every account, so a
 # response missing one has changed shape under us. That is worth saying out
 # loud — the alternative is a panel drawing whichever half still parsed, where

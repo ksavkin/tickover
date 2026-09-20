@@ -421,7 +421,7 @@ fn collect_plan_groups(
             break;
         }
         budget -= cost;
-        for (value, (ts, raw)) in parse_file_groups(path, container_key, field) {
+        for (value, (ts, raw)) in parse_file_groups(path, plugin_id, container_key, field) {
             let newer = groups.get(&value).is_none_or(|g| ts > g.ts);
             if newer {
                 groups.insert(value, PlanGroup { ts, raw });
@@ -463,8 +463,18 @@ fn tail_reader(mut file: File) -> std::io::Result<BufReader<File>> {
     if len <= TAIL_BYTES {
         return Ok(BufReader::new(file));
     }
-    file.seek(std::io::SeekFrom::Start(len - TAIL_BYTES))?;
+    let cut = len - TAIL_BYTES;
+    // `cut` is ≥ 1 — the early return above guarantees `len > TAIL_BYTES` —
+    // so `cut - 1` always exists. If the byte just before the window is a
+    // newline, the seek landed exactly on a line boundary and the first
+    // line inside the window is whole: skipping it would drop the oldest
+    // reading the window still covers.
+    file.seek(std::io::SeekFrom::Start(cut - 1))?;
     let mut reader = BufReader::new(file);
+    let mut byte = [0u8; 1];
+    if reader.read_exact(&mut byte).is_ok() && byte[0] == b'\n' {
+        return Ok(reader);
+    }
     // Whatever line the seek landed inside of is half a line; skip it.
     let mut partial = Vec::new();
     let _ = read_line_capped(&mut reader, &mut partial)?;
@@ -521,6 +531,7 @@ fn read_line_capped(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Re
 /// `timestamp` is skipped.
 fn parse_file_groups(
     path: &Path,
+    plugin_id: &str,
     container_key: &str,
     field: &str,
 ) -> BTreeMap<String, (u64, RawReading)> {
@@ -535,14 +546,18 @@ fn parse_file_groups(
     let mut buf = Vec::new();
     loop {
         match read_line_capped(&mut reader, &mut buf) {
-            Ok(CappedLine::Eof) | Err(_) => break,
+            Ok(CappedLine::Eof) => break,
+            Err(e) => {
+                note_read_error(plugin_id, path, &e);
+                break;
+            }
             Ok(CappedLine::TooLong) => continue,
             Ok(CappedLine::Read) => {}
         }
         let Ok(line) = std::str::from_utf8(&buf) else {
             continue;
         };
-        if !line.contains(&needle) {
+        if !might_carry_container(line, &needle) {
             continue;
         }
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -799,7 +814,14 @@ fn latest_reading(
             break;
         }
         budget -= cost;
-        if let Some(found) = parse_file(path, container_key, account_match, format, select) {
+        if let Some(found) = parse_file(
+            path,
+            plugin_id,
+            container_key,
+            account_match,
+            format,
+            select,
+        ) {
             return Some(found);
         }
     }
@@ -1020,11 +1042,36 @@ fn match_wildcard(pattern: &str, text: &str) -> bool {
     true
 }
 
+/// The cheap pre-filter both file readers apply before parsing a line: the
+/// line must at least name the container key — or carry the inline
+/// `primary`/`secondary` shape [`find_container`] also accepts (see its doc);
+/// a line matching neither can hold no container, and parsing it anyway
+/// would only cost a serde pass per garbage line in the tail.
+fn might_carry_container(line: &str, needle: &str) -> bool {
+    line.contains(needle) || line.contains("\"primary\"") || line.contains("\"secondary\"")
+}
+
+/// What a mid-file read failure should say. Breaking the scan loop on `Err`
+/// used to look exactly like `Eof` — the file half-scanned, no note anywhere
+/// — while whatever a missing line held might have been a newer reading than
+/// the ones already collected. Say so, then let the caller keep what earlier
+/// lines yielded and move on to the next file. Queued once per plugin (see
+/// [`queue_diag_once`]), not once per refresh the failure keeps repeating on.
+fn note_read_error(plugin_id: &str, path: &Path, e: &std::io::Error) {
+    queue_diag_once(plugin_id, "read-error", || {
+        format!(
+            "{plugin_id}: a log read failed partway through {}: {e}",
+            path.display()
+        )
+    });
+}
+
 /// Parse one log file, returning a container reading in it that satisfies
 /// `account_match` (every reading, when `account_match` is `None`) —
 /// `select` decides which one when more than one qualifies.
 fn parse_file(
     path: &Path,
+    plugin_id: &str,
     container_key: &str,
     account_match: Option<&(String, String)>,
     format: LogFileFormat,
@@ -1038,14 +1085,18 @@ fn parse_file(
     let mut buf = Vec::new();
     loop {
         match read_line_capped(&mut reader, &mut buf) {
-            Ok(CappedLine::Eof) | Err(_) => break,
+            Ok(CappedLine::Eof) => break,
+            Err(e) => {
+                note_read_error(plugin_id, path, &e);
+                break;
+            }
             Ok(CappedLine::TooLong) => continue,
             Ok(CappedLine::Read) => {}
         }
         let Ok(line) = std::str::from_utf8(&buf) else {
             continue;
         };
-        if !line.contains(&needle) {
+        if !might_carry_container(line, &needle) {
             continue;
         }
         let value = match format {
@@ -1524,6 +1575,7 @@ mod tests {
         assert!(
             parse_file(
                 &path,
+                "test-plugin",
                 "rate_limits",
                 None,
                 LogFileFormat::Jsonl,
@@ -1542,6 +1594,7 @@ mod tests {
 
         let reading = parse_file(
             &path,
+            "test-plugin",
             "rate_limits",
             None,
             LogFileFormat::Jsonl,
@@ -1549,6 +1602,75 @@ mod tests {
         )
         .expect("the tail's reading is found");
         assert_eq!(reading.primary.as_ref().map(|s| s.used_percent), Some(42.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_reading_starting_exactly_at_the_tail_boundary_is_kept() {
+        // The seek used to discard its first line unconditionally, so a cut
+        // landing exactly on a line boundary lost that line — the oldest
+        // reading the window still covered — silently. The file below is
+        // built so `len - TAIL_BYTES` is exactly the reading's first byte.
+        let dir = temp_dir("tail-boundary");
+        let path = dir.join("rollout-boundary.jsonl");
+        let mut reading = String::from(
+            r#"{"rate_limits":{"primary":{"used_percent":42.0,"window_minutes":300,"resets_at":200}}}"#,
+        );
+        // Pad with trailing spaces (legal inside a JSON document's
+        // whitespace, invisible to the parse) until `reading` + its
+        // newline leaves a tail that is a whole number of 3-byte `{}`
+        // filler lines.
+        while (reading.len() + 1) % 3 != TAIL_BYTES as usize % 3 {
+            reading.push(' ');
+        }
+        reading.push('\n');
+        let tail = "{}\n".repeat((TAIL_BYTES as usize - reading.len()) / 3);
+        let text = format!("{{\"noise\":\"head\"}}\n{reading}{tail}");
+        debug_assert_eq!(
+            text.len(),
+            TAIL_BYTES as usize + "{\"noise\":\"head\"}\n".len()
+        );
+        std::fs::write(&path, &text).unwrap();
+
+        let found = parse_file(
+            &path,
+            "test-plugin",
+            "rate_limits",
+            None,
+            LogFileFormat::Jsonl,
+            LogFileSelect::Last,
+        )
+        .expect("a cut landing on a line boundary must not drop that line");
+        assert_eq!(found.primary.as_ref().map(|s| s.used_percent), Some(42.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_line_with_no_container_key_but_the_inline_shape_is_read() {
+        // `find_container` has always recognised a bare `primary`/
+        // `secondary` object with no `"rate_limits"` wrapper — but the
+        // pre-filter used to demand the literal key string, so the
+        // documented inline shape could never survive long enough to reach
+        // it. The filter now passes the inline markers through too.
+        let dir = temp_dir("inline-shape");
+        let path = write_file(
+            &dir,
+            "rollout-inline.jsonl",
+            &[json!({
+                "primary": { "used_percent": 55.0, "window_minutes": 300, "resets_at": 111 }
+            })
+            .to_string()],
+        );
+        let raw = parse_file(
+            &path,
+            "test-plugin",
+            "rate_limits",
+            None,
+            LogFileFormat::Jsonl,
+            LogFileSelect::Last,
+        )
+        .expect("the documented inline shape must survive the pre-filter");
+        assert_eq!(raw.primary.unwrap().used_percent, 55.0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1675,6 +1797,7 @@ mod tests {
 
         let reading = parse_file(
             &path,
+            "test-plugin",
             "rate_limits",
             None,
             LogFileFormat::Jsonl,
@@ -1842,6 +1965,7 @@ mod tests {
         );
         let raw = parse_file(
             &path,
+            "test-plugin",
             "rate_limits",
             None,
             LogFileFormat::Jsonl,

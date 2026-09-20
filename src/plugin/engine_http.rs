@@ -129,7 +129,7 @@ fn fetch_surface(
         bare_when_sole: false,
     };
 
-    let (token, from_expiring_step) = match auth::resolve_token(surface) {
+    let (token, from_expiring_step) = match auth::resolve_token(surface, &m.name) {
         Ok(t) => t,
         // A genuinely broken credential store — the message names it — is
         // never eligible for the `NO_CREDENTIALS` rewrite below: unlike the
@@ -445,9 +445,12 @@ fn surface_reading_id(m: &PluginManifest, surface: &SurfaceConfig) -> String {
 /// Whether the manifest declares its own `[[surface]]` entries, as opposed to
 /// relying on the single `"default"` surface `PluginManifest::apply_defaults`
 /// synthesizes for a manifest that omits `[[surface]]` entirely (see its
-/// module docs). Drives the tag precedence in [`resolve_tag`].
+/// module docs). Drives the tag precedence in [`resolve_tag`]. Read off the
+/// flag `apply_defaults` sets, not the shape — a hand-written
+/// `[[surface]] id = "default"` satisfies the old sniff test too, and would
+/// have its own `label` silently swallowed by the `[tag]` fallback.
 fn has_explicit_surfaces(m: &PluginManifest) -> bool {
-    !(m.surface.len() == 1 && m.surface[0].id == "default")
+    !m.surface_synthesized
 }
 
 /// `[tag]` resolution, with one addition over
@@ -543,7 +546,12 @@ fn resolve_account(
             sanitized_account(json_path_get(&value, json_path)?.as_str()?)
         }
         Err(_) => {
-            record_account_lookup_failure(&key, now);
+            // Stamped *now*, not with the `now` the gate was asked with:
+            // `perform` may have spent up to `timeout` reaching this arm,
+            // and a stamp taken before it would silently spend that whole
+            // timeout out of `min_interval` — the main request's own pacing
+            // stamps at the end of the attempt for the same reason.
+            record_account_lookup_failure(&key, Instant::now());
             None
         }
     }
@@ -646,7 +654,14 @@ fn resolve_values(values: &[HttpValueConfig]) -> Result<BTreeMap<String, String>
 /// header value that isn't a string in the source file is more likely a
 /// changed file format than an intended value.
 fn resolve_json_file_value(v: &HttpValueConfig) -> Option<String> {
-    let path = crate::plugin::expand_home(v.path.as_deref()?);
+    // `path_env`/`path_env_join` honoured exactly as an auth step's —
+    // Codex's `CODEX_HOME` relocates the same `auth.json` the credentials
+    // steps read, and this value has to come from that relocated file.
+    let path = crate::plugin::resolve_env_overridden_path(
+        v.path_env.as_deref(),
+        v.path_env_join.as_deref(),
+        v.path.as_deref()?,
+    );
     let text = crate::plugin::read_regular_file(&path, crate::plugin::SMALL_FILE_MAX_BYTES)?;
     let json: Value = serde_json::from_str(&text).ok()?;
     let found = json_path_get(&json, v.json_path.as_deref()?)?
@@ -701,7 +716,7 @@ fn build_request(
     version: &str,
     options: &BTreeMap<String, bool>,
     values: &BTreeMap<String, String>,
-) -> (Vec<(String, String)>, Duration) {
+) -> (Vec<(String, String, bool)>, Duration) {
     (
         substitute_headers(&req.headers, token, version, options, values),
         Duration::from_secs(req.timeout_secs),
@@ -733,16 +748,28 @@ fn build_body(
 /// Substitute `{token}`/`{version}`/`{option.<key>}`/`{value.<name>}` into
 /// every value of a header map, returning a sorted (for determinism) `Vec` —
 /// `ureq`'s header API takes key/value pairs one at a time, not a map.
+///
+/// Each entry is `(name, value, credential)`: the flag marks the headers
+/// whose template actually drew from a credential source (`{token}` or a
+/// resolved `{value.<name>}` — see [`substitute_flagged`]), which is what
+/// [`redact_header_values`] scans an error message against. Headers built
+/// only from `{option.*}` echoes, `{version}`, or literals carry no
+/// credential no matter how the substitution came out, so scanning for them
+/// would redact a genuine transport error that happens to contain the word
+/// "true" — hiding the cause in the name of hiding the token.
 fn substitute_headers(
     headers: &HashMap<String, String>,
     token: &str,
     version: &str,
     options: &BTreeMap<String, bool>,
     values: &BTreeMap<String, String>,
-) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = headers
+) -> Vec<(String, String, bool)> {
+    let mut out: Vec<(String, String, bool)> = headers
         .iter()
-        .map(|(k, v)| (k.clone(), substitute(v, token, version, options, values)))
+        .map(|(k, v)| {
+            let (value, credential) = substitute_flagged(v, token, version, options, values);
+            (k.clone(), value, credential)
+        })
         .collect();
     out.sort();
     out
@@ -767,8 +794,8 @@ const BAD_HEADER_MESSAGE: &str = "a header value is not valid ASCII";
 /// then is a live credential's own bytes, not a manifest mistake — which is
 /// exactly why the message below names the header, never the value. That
 /// byte must not appear in anything this app writes to the panel or the log.
-fn refuse_unsafe_header_values(headers: &[(String, String)]) -> Result<(), String> {
-    for (name, value) in headers {
+fn refuse_unsafe_header_values(headers: &[(String, String, bool)]) -> Result<(), String> {
+    for (name, value, _) in headers {
         let safe = value
             .bytes()
             .all(|b| b == b'\t' || b == b' ' || (0x21..=0x7E).contains(&b));
@@ -790,12 +817,31 @@ fn substitute(
     options: &BTreeMap<String, bool>,
     values: &BTreeMap<String, String>,
 ) -> String {
+    substitute_flagged(template, token, version, options, values).0
+}
+
+/// [`substitute`], plus whether the template actually drew from a credential
+/// source: `{token}` always counts, and `{value.<name>}` counts when it
+/// resolved — an unresolved one stays literal text and carried nothing.
+/// `{version}` and `{option.<key>}` never count: a version string and a
+/// `"true"`/`"false"` echo read the same whether or not any credential
+/// exists, so flagging them would mark nearly every header as secret — and
+/// `redact_header_values` would then keep swallowing ordinary transport
+/// errors that happen to contain the word.
+fn substitute_flagged(
+    template: &str,
+    token: &str,
+    version: &str,
+    options: &BTreeMap<String, bool>,
+    values: &BTreeMap<String, String>,
+) -> (String, bool) {
     // One pass over the template, never a chain of `replace` calls: with a
     // chain, whatever the first substitution inserts is itself searched by the
     // next one, so a token or a file-read value that happens to contain
     // `{version}` or `{option.x}` would come out mangled — and the request
     // would fail as an auth error rather than as the nonsense it is.
     let mut out = String::with_capacity(template.len());
+    let mut credential = false;
     let mut rest = template;
     while let Some(open) = rest.find('{') {
         out.push_str(&rest[..open]);
@@ -813,11 +859,14 @@ fn substitute(
         };
         let name = &after[1..close];
         let replacement = match name {
-            "token" => Some(token.to_string()),
+            "token" => {
+                credential = true;
+                Some(token.to_string())
+            }
             "version" => Some(version.to_string()),
             _ => name
                 .strip_prefix("value.")
-                .and_then(|key| values.get(key).cloned())
+                .and_then(|key| values.get(key).cloned().inspect(|_| credential = true))
                 .or_else(|| {
                     name.strip_prefix("option.")
                         .and_then(|key| options.get(key))
@@ -840,7 +889,7 @@ fn substitute(
         rest = &after[close + 1..];
     }
     out.push_str(rest);
-    out
+    (out, credential)
 }
 
 /// Resolve the `{version}` placeholder value: read `files` in order, parse
@@ -1141,17 +1190,22 @@ fn element_text(element: &Value, path: &str) -> Option<String> {
 /// specification does not have.
 fn element_identity(element: &Value, path: &str) -> Option<String> {
     let raw = element_text(element, path)?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    // `trim` decides emptiness and nothing else: the identity itself is
+    // built from `raw` verbatim — `"gpt-4"` and `"gpt-4 "` are two different
+    // names a provider chose to send, and folding them into one would let
+    // `build_windows`' dedup drop a real row. (The identity ends up
+    // percent-encoded by `window_element_key`, so whitespace in it is safe;
+    // it is only *meaning* that must not be altered.)
+    if raw.trim().is_empty() {
         return None;
     }
     let cap = crate::plugin::PROVIDER_TEXT_MAX_CHARS;
-    if trimmed.chars().count() <= cap {
-        return Some(trimmed.to_string());
+    if raw.chars().count() <= cap {
+        return Some(raw);
     }
-    let digest = Sha256::digest(trimmed.as_bytes());
+    let digest = Sha256::digest(raw.as_bytes());
     let suffix = format!("#{}", crate::plugin::hex(&digest[..8]));
-    let head: String = trimmed
+    let head: String = raw
         .chars()
         .take(cap.saturating_sub(suffix.chars().count()))
         .collect();
@@ -1602,7 +1656,7 @@ fn perform(
     url: &str,
     method: HttpMethod,
     body: Option<&str>,
-    headers: &[(String, String)],
+    headers: &[(String, String, bool)],
     timeout: Duration,
 ) -> Result<Value, Failure> {
     if super::https_host(url).is_none() {
@@ -1618,7 +1672,7 @@ fn perform(
         HttpMethod::Post => agent.post(url),
     }
     .timeout(timeout);
-    for (k, v) in headers {
+    for (k, v, _) in headers {
         req = req.set(k, v);
     }
     let result = match method {
@@ -1729,12 +1783,24 @@ const MIN_LEAK_CHECK_BODY_LEN: usize = 16;
 /// source, because by this point the message can come from anywhere: some
 /// other `Display` impl this engine did not write, quoting text it was never
 /// told was sensitive.
-fn redact_header_values(message: &str, headers: &[(String, String)], body: Option<&str>) -> String {
+fn redact_header_values(
+    message: &str,
+    headers: &[(String, String, bool)],
+    body: Option<&str>,
+) -> String {
+    // Only headers `substitute_headers` flagged as credential-bearing —
+    // `{token}` or a resolved `{value.<name>}` in the template — are
+    // scanned. An unflagged header is an `{option.*}` echo, a `{version}`
+    // string, or a literal: scanning for "true" or a version number would
+    // redact ordinary transport errors that carry nothing secret, hiding
+    // the cause of a failure in the name of hiding the token.
     let header_leaked = headers
         .iter()
-        .any(|(_, v)| !v.is_empty() && message.contains(v.as_str()));
+        .any(|(_, v, credential)| *credential && !v.is_empty() && message.contains(v.as_str()));
     let body_leaked =
         body.is_some_and(|b| b.len() >= MIN_LEAK_CHECK_BODY_LEN && message.contains(b));
+    // Headers win when both leak — the message is advisory and what matters
+    // is that the answer is deterministic, not which channel gets named.
     if header_leaked {
         "a header value could not be sent".to_string()
     } else if body_leaked {
@@ -2349,7 +2415,7 @@ mod tests {
         let dir = temp_dir("two-step-lapsed-then-env");
         let surface = claude_like_two_step_cli_surface(&dir, true);
         std::env::set_var("TICKOVER_TEST_ENGINE_HTTP_TWO_STEP_ENV_FALLBACK", "tok-env");
-        let resolved = auth::resolve_token(&surface);
+        let resolved = auth::resolve_token(&surface, "test provider");
         std::env::remove_var("TICKOVER_TEST_ENGINE_HTTP_TWO_STEP_ENV_FALLBACK");
         let (token, from_expiring_step) =
             resolved.expect("the env fallback must still yield a token");
@@ -2375,8 +2441,8 @@ mod tests {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = temp_dir("two-step-fresh-file");
         let surface = claude_like_two_step_cli_surface(&dir, false);
-        let (token, from_expiring_step) =
-            auth::resolve_token(&surface).expect("the file step yields its own token");
+        let (token, from_expiring_step) = auth::resolve_token(&surface, "test provider")
+            .expect("the file step yields its own token");
         assert_eq!(token, "tok-file");
         assert!(from_expiring_step);
 
@@ -2560,8 +2626,8 @@ mod tests {
         let get = |k: &str| {
             headers
                 .iter()
-                .find(|(hk, _)| hk == k)
-                .map(|(_, v)| v.as_str())
+                .find(|(hk, _, _)| hk == k)
+                .map(|(_, v, _)| v.as_str())
         };
         assert_eq!(get("Authorization"), Some("Bearer tok-1"));
         assert_eq!(get("anthropic-beta"), Some("oauth-2025-04-20"));
@@ -4025,6 +4091,8 @@ mod tests {
             name: "account_id".to_string(),
             kind: HttpValueType::JsonFile,
             path: Some(file.to_string_lossy().into_owned()),
+            path_env: None,
+            path_env_join: None,
             json_path: Some("tokens.account_id".to_string()),
         };
         let resolved = resolve_values(std::slice::from_ref(&ok)).expect("resolves");
@@ -4585,7 +4653,7 @@ mod tests {
             "https://example.com/usage",
             HttpMethod::Get,
             None,
-            &[("X-Test".to_string(), "value\u{0001}".to_string())],
+            &[("X-Test".to_string(), "value\u{0001}".to_string(), false)],
             Duration::from_secs(1),
         )
         .expect_err("an invalid header byte must refuse, not connect");
@@ -4602,6 +4670,7 @@ mod tests {
         let headers = vec![(
             "Authorization".to_string(),
             "Bearer secret-token".to_string(),
+            true,
         )];
         assert_eq!(
             redact_header_values("network error: Bearer secret-token", &headers, None),
@@ -4614,6 +4683,36 @@ mod tests {
         );
     }
 
+    /// The scoped exemption: a header whose template never named `{token}`
+    /// or a `{value.<name>}` that resolved carries no credential no matter
+    /// what its value happens to be. Without the flag, an `X-Flag:
+    /// {option.beta}` header substituting to `"true"` would redact any
+    /// transport error containing that word — swapping a diagnosable
+    /// failure for a redaction message that names no real leak.
+    #[test]
+    fn redact_header_values_leaves_an_unflagged_headers_echo_in_the_message() {
+        let headers = vec![
+            ("X-Flag".to_string(), "true".to_string(), false),
+            (
+                "Authorization".to_string(),
+                "Bearer secret-token".to_string(),
+                true,
+            ),
+        ];
+        assert_eq!(
+            redact_header_values("network error: true, retrying", &headers, None),
+            "network error: true, retrying",
+            "an unflagged header's value must never redact a message"
+        );
+        // …and the flagged header still catches a genuine leak in the
+        // same message — the flag narrows what is scanned, not whether
+        // the scan works.
+        assert_eq!(
+            redact_header_values("network error: true, Bearer secret-token", &headers, None),
+            "a header value could not be sent"
+        );
+    }
+
     /// `build_body` substitutes `{token}` into `body` by exactly the same
     /// rules `build_request` uses for a header value — a credential a
     /// manifest chose to place in its body must be redacted the same way one
@@ -4623,7 +4722,7 @@ mod tests {
     /// the request actually leaked.
     #[test]
     fn redact_header_values_also_hides_a_leaked_body() {
-        let headers: Vec<(String, String)> = Vec::new();
+        let headers: Vec<(String, String, bool)> = Vec::new();
         assert_eq!(
             redact_header_values(
                 "network error: {\"auth\":\"secret-token\"}",
@@ -4647,7 +4746,7 @@ mod tests {
     /// with no credential actually involved.
     #[test]
     fn redact_header_values_does_not_treat_a_short_body_like_antigravitys_own_as_a_leak() {
-        let headers: Vec<(String, String)> = Vec::new();
+        let headers: Vec<(String, String, bool)> = Vec::new();
         assert_eq!(
             redact_header_values(
                 "some unrelated error printing {} in passing",
@@ -5849,16 +5948,21 @@ mod tests {
         let headers = vec![(
             "Authorization".to_string(),
             "Bearer tok\u{00A0}".to_string(),
+            true,
         )];
         let err = refuse_unsafe_header_values(&headers).expect_err("must refuse");
         assert!(err.contains("Authorization"));
         assert!(!err.contains("tok"), "the value must never appear: {err}");
 
-        let ok = vec![("Authorization".to_string(), "Bearer tok-1".to_string())];
+        let ok = vec![(
+            "Authorization".to_string(),
+            "Bearer tok-1".to_string(),
+            true,
+        )];
         assert!(refuse_unsafe_header_values(&ok).is_ok());
 
         // Tab and space are both legal inside a header value.
-        let with_space = vec![("User-Agent".to_string(), "app/1.0 (mac)".to_string())];
+        let with_space = vec![("User-Agent".to_string(), "app/1.0 (mac)".to_string(), false)];
         assert!(refuse_unsafe_header_values(&with_space).is_ok());
     }
 }

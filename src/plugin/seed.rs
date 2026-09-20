@@ -86,11 +86,14 @@ fn write_templates(dir: &Path, templates: &[(&str, &str)]) -> std::io::Result<Ve
     // destination changed kind between the two phases), templates already
     // renamed keep their new, valid content — this call has no business
     // deleting a file it just correctly wrote — and only the not-yet-renamed
-    // temp files are cleaned up.
+    // temp files are cleaned up: the failing one *and* every sibling still
+    // staged behind it, which the previous shape left on disk.
     let mut written = Vec::with_capacity(staged.len());
-    for (tmp, target) in &staged {
+    for (i, (tmp, target)) in staged.iter().enumerate() {
         if let Err(e) = std::fs::rename(tmp, target) {
-            let _ = std::fs::remove_file(tmp);
+            for (tmp, _) in &staged[i..] {
+                let _ = std::fs::remove_file(tmp);
+            }
             return Err(e);
         }
         written.push(target.clone());
@@ -116,63 +119,41 @@ fn check_replaceable(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Write `contents` to a fresh temp file beside `target`
-/// (`<name>.tmp<pid>`, the same shape `main.rs`'s `update_write` uses),
-/// returning its path. `create_new` refuses to follow a symlink a previous,
-/// interrupted run might have left at this predictable name; whatever is
-/// already there is removed first (removing a symlink removes the link, not
-/// its target), so the create is what actually makes the file.
+/// Write `contents` to a fresh temp file beside `target`, returning its
+/// path. Delegates to the shared [`crate::plugin::stage_temp_file`] — this
+/// function exists only to pass `contents` as bytes; the temp-name shape,
+/// `create_new` symlink refusal and failure cleanup are all documented
+/// there.
 fn write_temp(target: &Path, contents: &str) -> std::io::Result<PathBuf> {
-    let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(format!(".tmp{}", std::process::id()));
-    let tmp = target.with_file_name(tmp_name);
-    let _ = std::fs::remove_file(&tmp);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)?;
-    std::io::Write::write_all(&mut file, contents.as_bytes()).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })?;
-    Ok(tmp)
+    crate::plugin::stage_temp_file(target, contents.as_bytes())
 }
 
 /// Write `contents` to `path`, replacing whatever is there — but never
-/// *through* it, and never something its caller hasn't already decided is
-/// safe to delete. The plugins directory is writable by anything running as
-/// this user, and `fs::write` follows a symlink: a link left at
-/// `plugins/codex.toml` would send a manifest into whatever it points at,
-/// truncating that file.
+/// *through* it, and never something that isn't a plain file or nothing at
+/// all. The plugins directory is writable by anything running as this user,
+/// and a symlink left at `plugins/codex.toml` must never send a manifest
+/// into whatever it points at.
 ///
-/// `symlink_metadata` — the directory entry itself, never following — is
-/// what decides, not `classify_builtin`'s own (symlink-following) read of
-/// the *content* behind it: a plain file is unlinked and then created fresh
-/// in its place, so nothing here ever writes *through* whatever was there;
-/// anything else found at `path` — a symlink (live or dangling), a
-/// directory, a FIFO — is left exactly as it is and this returns `Err`
-/// instead. That refusal is deliberate even when the symlink's target is a
-/// byte-identical earlier build a caller has every right to call `Replace`:
-/// `classify_builtin` answers "is the content behind this path safe to
-/// overwrite", not "is this path itself safe to delete", and only the
-/// latter question is this function's to answer — a user who symlinked a
-/// manifest into place put it there on purpose, and an automatic upgrade is
-/// not the moment to silently turn their symlink into a plain file.
+/// Goes through [`crate::plugin::write_via_temp`] like every other write in
+/// this app: content is staged in a sibling temp file and *renamed* over the
+/// destination, so a crash or a failed write can leave the old file or the
+/// temp, never a half-written manifest — which the previous remove-then-
+/// create shape could: between `remove_file` and `create_new` the path was
+/// gone entirely, and a failed `write_all` deleted what it had just written,
+/// either way leaving `has_any_toml`/`classify_builtin` to read the built-in
+/// as absent — permanently, for a manifest `deliver_if_absent` says never to
+/// redeliver.
+///
+/// [`check_replaceable`] runs as `write_via_temp`'s `pre_rename` hook, which
+/// is also what keeps the check honest: it runs once the temp file holds
+/// every byte, immediately before the rename — not up front, where a file
+/// planted in between could make the check and the rename disagree. And a
+/// rename *replaces* the destination directory entry rather than writing
+/// through it, so even a symlink slipped into the gap is unlinked, not
+/// followed — the guarantee the old remove-then-create shape existed to
+/// give, now given without the remove.
 fn write_new(path: &Path, contents: &str) -> std::io::Result<()> {
-    check_replaceable(path)?;
-    if std::fs::symlink_metadata(path).is_ok() {
-        std::fs::remove_file(path)?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    std::io::Write::write_all(&mut file, contents.as_bytes()).inspect_err(|_| {
-        // A write that fails partway through leaves a manifest on disk that
-        // is neither the built-in nor nothing — and `has_any_toml`/
-        // `classify_builtin` would then read it as present, so it never gets
-        // a second chance to be written correctly.
-        let _ = std::fs::remove_file(path);
-    })
+    crate::plugin::write_via_temp(path, contents.as_bytes(), check_replaceable)
 }
 
 /// Whether `dir` (already known to exist) contains at least one `*.toml`
@@ -272,7 +253,7 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "codex.toml",
         id: "codex",
-        to_version: "2.5.2",
+        to_version: "2.5.3",
         // Every codex.toml this app has shipped, so an untouched copy of any of
         // them is recognised as one rather than mistaken for the user's own work.
         // A version that is missing from this list is a version whose installs
@@ -320,6 +301,11 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
             // function that no longer exists under that name.
             // sha256 of codex.toml as shipped at manifest version 2.5.1.
             "5c1a73cfc3df978684a08a6061a2a1733576159adb1bc5fb9d98ad7d25701de9",
+            // 2.5.2 — before the auth steps honoured `CODEX_HOME`, so an
+            // account that relocates the CLI's config directory read a
+            // `~/.codex/auth.json` the CLI never writes.
+            // sha256 of codex.toml as shipped at manifest version 2.5.2.
+            "6cd4176d09b4352fe930780ff3a1a2ab10cfab97f7af9a4813625199f4ac558a",
         ],
         // Shipped since the first release: an install without it deleted it.
         deliver_if_absent: false,
@@ -333,8 +319,12 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "claude.toml",
         id: "claude",
-        to_version: "1.4.5",
+        to_version: "1.4.6",
         previous_sha256: &[
+            // 1.4.5 — comments only: the comparison to Codex named a field
+            // (`window_minutes`) that manifest has never read.
+            // sha256 of claude.toml as shipped at manifest version 1.4.5.
+            "73c4aa13914f57c3e8fce990f55bb49a10cf43b31fd3dc4d63fb4cc68765850d",
             // 1.4.4 — before the keychain step could be re-keyed to
             // `CLAUDE_CONFIG_DIR`'s own item name, so an account that set the
             // variable and fell through the credentials-file step to the
@@ -414,8 +404,13 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "grok.toml",
         id: "grok",
-        to_version: "1.0.2",
+        to_version: "1.0.3",
         previous_sha256: &[
+            // 1.0.2 — comments only: the header still called the window
+            // "the weekly one above" when it sits below and reads its
+            // period from the response's own `currentPeriod` bounds.
+            // sha256 of grok.toml as shipped at manifest version 1.0.2.
+            "b9f945f87b6e8df8b14e20be750da637e9dfccde2bb5db71b54282accb68de34",
             // 1.0.1 — before `[windows.period]` read the response's own
             // `currentPeriod.start`/`.end` bounds, `mode = "assumed"` typed a
             // week into the file outright — right for the one response this
@@ -452,8 +447,13 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "antigravity.toml",
         id: "antigravity",
-        to_version: "1.1.3",
+        to_version: "1.1.4",
         previous_sha256: &[
+            // 1.1.3 — the quota groups were addressed by array position,
+            // so a Google-side reorder of `groups` silently zeroed every
+            // row; 1.1.4 addresses them by `displayName` instead.
+            // sha256 of antigravity.toml as shipped at manifest version 1.1.3.
+            "b98b48c4b6b48c0492ac45a9febfd2338d2580996564db3d7f3a2d0d7ddef0f2",
             // 1.1.2 — before the win-credential step and the `Antigravity
             // IDE.app` discovery paths, so a Windows install never read the
             // token the CLI stored, and a rename of the app bundle stopped
@@ -483,8 +483,13 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "copilot.toml",
         id: "copilot",
-        to_version: "1.0.2",
+        to_version: "1.0.3",
         previous_sha256: &[
+            // 1.0.2 — comments only: the header still claimed no reader
+            // mechanism was new while `balance-unlimited` sat in
+            // `requires_reader`.
+            // sha256 of copilot.toml as shipped at manifest version 1.0.2.
+            "d4cc44c5bfeba9d8364ed7863fec4f0ba8527537f805b0ad89ccd069cb69c707",
             // 1.0.1 — before `[balances.unlimited]`, so an unlimited
             // premium bucket still drew `cap 0 / remaining 0`.
             // sha256 of copilot.toml as shipped at manifest version 1.0.1.
@@ -776,7 +781,7 @@ mod tests {
         assert_eq!(m.order, 10);
         assert_eq!(m.refresh_secs, 60, "one request a minute, matching Claude");
         assert_eq!(
-            m.version, "2.5.2",
+            m.version, "2.5.3",
             "the version BUILTIN_UPGRADES migrates to"
         );
 
@@ -1274,7 +1279,7 @@ mod tests {
         assert_eq!(m.id, "claude");
         assert_eq!(m.engine, EngineKind::HttpApi);
         assert_eq!(
-            m.version, "1.4.5",
+            m.version, "1.4.6",
             "the version BUILTIN_UPGRADES migrates to"
         );
         assert_eq!(m.surface.len(), 2, "cli + desktop surfaces");

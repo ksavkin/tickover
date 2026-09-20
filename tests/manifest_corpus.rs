@@ -382,8 +382,28 @@ fn rules() -> Vec<Rule> {
         },
         Rule {
             says: "the http engine needs an [http] section to call",
-            broken_by: changed(LOGFILE, r#"engine     = "log-file""#, r#"engine = "http-api""#),
+            // The `[logfile]` section has to go too: a `log-file` section on
+            // an `http-api` manifest is its own refusal (the mirror row
+            // below), and it is checked before this one.
+            broken_by: changed(
+                &changed(LOGFILE, "[logfile]", "[unused]"),
+                r#"engine     = "log-file""#,
+                r#"engine = "http-api""#,
+            ),
             names: "[http]",
+        },
+        Rule {
+            // The mirror of the row above the previous one: `root`/`glob`/
+            // `container_key` parsed, validated and then never walked by
+            // anything — a whole section of dead configuration reading as
+            // if it did something.
+            says: "the http engine has no use for a [logfile] section, so it may not declare one",
+            broken_by: plus(
+                HTTP,
+                "[logfile]\nroot = \"~/.sample/sessions\"\nglob = \"*.jsonl\"\n\
+                 container_key = \"rate_limits\"",
+            ),
+            names: "does not read a [logfile] section",
         },
         Rule {
             // The log-file engine has nowhere to send the request `[http]`
@@ -1190,13 +1210,32 @@ fn rules() -> Vec<Rule> {
             names: "bidirectional override",
         },
         Rule {
+            says: "root_env_join with no root_env has nothing to join onto",
+            broken_by: plus(LOGFILE, "root_env_join = \"sessions\""),
+            names: "needs `root_env`",
+        },
+        Rule {
+            // `env::var_os("")` can never return a value — a blank `root_env`
+            // reads as "set" while the override silently never applies, and
+            // a `root_env_join` beside it is dead with it.
+            says: "a blank root_env names no environment variable",
+            broken_by: plus(LOGFILE, "root_env = \"  \""),
+            names: "names no environment variable",
+        },
+        Rule {
             says: "root_env_join is appended to root_env's value, not used in its place",
-            broken_by: plus(LOGFILE, "root_env_join = \"/absolute\""),
+            broken_by: plus(
+                LOGFILE,
+                "root_env = \"SAMPLE_DIR\"\nroot_env_join = \"/absolute\"",
+            ),
             names: "must be a relative subdirectory",
         },
         Rule {
             says: "root_env_join must not walk outside the directory root_env named",
-            broken_by: plus(LOGFILE, "root_env_join = \"../escape\""),
+            broken_by: plus(
+                LOGFILE,
+                "root_env = \"SAMPLE_DIR\"\nroot_env_join = \"../escape\"",
+            ),
             names: "must not contain a `..`",
         },
         Rule {
@@ -1378,6 +1417,17 @@ fn rules() -> Vec<Rule> {
             names: "path_env",
         },
         Rule {
+            // With no `path_env` there is no variable whose value the join
+            // could be appended onto — it would load clean and never be read.
+            says: "path_env_join with no path_env has nothing to join onto",
+            broken_by: changed(
+                &http_declaring(r#"["credentials-file-path-env"]"#),
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\npath_env_join    = \"auth.json\"",
+            ),
+            names: "needs `path_env`",
+        },
+        Rule {
             // Same shape as `[logfile] root_env_join`, and the same reason:
             // it is joined onto `path_env`'s value, never used in its place.
             says: "path_env_join is appended to path_env's value, not used in its place",
@@ -1411,6 +1461,19 @@ fn rules() -> Vec<Rule> {
                 "type        = \"env\"\nvar         = \"SAMPLE_TOKEN\"\nservice_env = \"SAMPLE_CONFIG_DIR\"",
             ),
             names: "service_env",
+        },
+        Rule {
+            // A blank `service_env` reads as "set" while `env::var("")`
+            // always misses — the keychain item is silently queried under
+            // its un-rekeyed name, the same dead config `path_env` gets.
+            says: "a blank service_env names no environment variable",
+            broken_by: changed(
+                &http_declaring(r#"["keychain-service-env"]"#),
+                "type            = \"credentials-file\"\npath            = \"~/.sample/auth.json\"\ntoken_json_path = \"token\"",
+                "type               = \"keychain\"\nservice            = \"Sample\"\ntoken_json_path    = \"token\"\n\
+                 service_env        = \"  \"\nservice_env_suffix = \"sha256:8\"",
+            ),
+            names: "names no environment variable",
         },
         Rule {
             // `service_env_suffix` names the recipe for turning
@@ -1704,6 +1767,159 @@ fn rules() -> Vec<Rule> {
                 "role  = \"primary\"\nrequired = true",
             ),
             names: "`windows.required`",
+        },
+
+        // ── Present-but-blank / present-but-pointless (R3) ───────────────
+        //
+        // The rules below all close the same shape: a key the author set,
+        // which this app then reads exactly as if it were absent — or never
+        // reads at all. The refusal names the field, because "accepted and
+        // ignored" is the failure mode no row can report.
+        Rule {
+            says: "a window with no label draws a row named after nothing",
+            broken_by: changed(LOGFILE, "label = \"5H\"", "label = \"\""),
+            names: "`[[windows]] label`",
+        },
+        Rule {
+            says: "a blank for_each enumerates nothing and reads as \"not set\"",
+            broken_by: plus(
+                &http_declaring(r#"["for-each-windows"]"#),
+                "[[windows]]\nlabel = \"WK\"\nrole = \"secondary\"\nfor_each = \"   \"\n\
+                 [windows.period]\nmode = \"assumed\"\nassumed = 10080\n\
+                 [windows.source]\nused_percent_path = \"p\"\nresets_at_path = \"r\"",
+            ),
+            names: "`for_each` is present but blank",
+        },
+        Rule {
+            says: "an assumed period reads its own number, not a response field",
+            broken_by: changed(
+                LOGFILE,
+                "mode    = \"assumed\"\nassumed = 300",
+                "mode    = \"assumed\"\nassumed = 300\nfield   = \"p\"",
+            ),
+            names: "`period.field` belongs to",
+        },
+        Rule {
+            says: "a from_field period's length comes from the response, never from `assumed`",
+            broken_by: changed(
+                LOGFILE,
+                "mode    = \"assumed\"\nassumed = 300",
+                "mode    = \"from_field\"\nfield   = \"p\"\nassumed = 300",
+            ),
+            names: "`period.assumed` is never read",
+        },
+        Rule {
+            says: "a static tag prints its `value`; a `path` beside it is never read",
+            broken_by: plus(HTTP, "[tag]\nfrom = \"static\"\nvalue = \"PRO\"\npath = \"plan\""),
+            names: "`[tag] path` belongs to",
+        },
+        Rule {
+            says: "a field tag reads its `path`; a `value` beside it is never read",
+            broken_by: plus(HTTP, "[tag]\nfrom = \"field\"\npath = \"plan\"\nvalue = \"PRO\""),
+            names: "`[tag] value` belongs to",
+        },
+        Rule {
+            says: "from = \"none\" draws no chip — anything beside it is never read",
+            broken_by: plus(HTTP, "[tag]\nfrom = \"none\"\nvalue = \"PRO\""),
+            names: "draws no chip",
+        },
+        Rule {
+            says: "a static tag whose value is blank prints nothing, forever",
+            broken_by: plus(HTTP, "[tag]\nfrom = \"static\"\nvalue = \"  \""),
+            names: "`[tag] value` must not be blank",
+        },
+        Rule {
+            says: "a field tag whose path is blank reads nothing, forever",
+            broken_by: plus(HTTP, "[tag]\nfrom = \"field\"\npath = \"  \""),
+            names: "`[tag] path` must not be blank",
+        },
+        Rule {
+            says: "an env override that names no variable can never fire",
+            broken_by: plus(
+                &http_declaring(r#"["http-value-path-env"]"#),
+                "[[http.value]]\nname = \"a\"\ntype = \"json-file\"\npath = \"~/x.json\"\n\
+                 json_path = \"a\"\npath_env = \"  \"",
+            ),
+            names: "`path_env` names no environment variable",
+        },
+        Rule {
+            // The capability is declared because it has to be: without it the
+            // gate refuses the `path_env_join` spelling before validation
+            // runs — the manifest is refused either way, and this row
+            // exercises the validator's own complaint.
+            says: "http.value path_env_join with no path_env has nothing to join onto",
+            broken_by: plus(
+                &http_declaring(r#"["http-value-path-env"]"#),
+                "[[http.value]]\nname = \"a\"\ntype = \"json-file\"\npath = \"~/x.json\"\n\
+                 json_path = \"a\"\npath_env_join = \"auth.json\"",
+            ),
+            names: "needs `path_env`",
+        },
+        Rule {
+            says: "path_env_join is appended to the variable's value — an absolute one discards it",
+            broken_by: plus(
+                &http_declaring(r#"["http-value-path-env"]"#),
+                "[[http.value]]\nname = \"a\"\ntype = \"json-file\"\npath = \"~/x.json\"\n\
+                 json_path = \"a\"\npath_env = \"SAMPLE_DIR\"\npath_env_join = \"/etc/passwd\"",
+            ),
+            names: "must be a relative filename",
+        },
+        Rule {
+            says: "path_env_join must not walk outside the directory the variable named",
+            broken_by: plus(
+                &http_declaring(r#"["http-value-path-env"]"#),
+                "[[http.value]]\nname = \"a\"\ntype = \"json-file\"\npath = \"~/x.json\"\n\
+                 json_path = \"a\"\npath_env = \"SAMPLE_DIR\"\npath_env_join = \"../x.json\"",
+            ),
+            names: "must not contain a `..`",
+        },
+        Rule {
+            // The app matches `NO_CREDENTIALS` literally to hide a row with
+            // no credentials; a manifest writing that sentence as its own
+            // message would make a genuine error vanish.
+            says: "no_credentials_message must not be the sentinel the app hides",
+            broken_by: changed(
+                HTTP,
+                "label         = \"Default\"",
+                "label         = \"Default\"\nno_credentials_message = \"no credentials found\"",
+            ),
+            names: "must not be the exact",
+        },
+        Rule {
+            says: "a reject-when message must not be the sentinel the app hides either",
+            broken_by: plus(
+                HTTP,
+                "[[surface.auth]]\ntype = \"reject-when\"\npath = \"~/.sample/auth.json\"\n\
+                 json_path = \"token.expired\"\nmessage = \"no credentials found\"",
+            ),
+            names: "`reject-when` auth step's `message` must not be the exact",
+        },
+        Rule {
+            says: "a credentials-file override that names no variable can never fire",
+            broken_by: changed(
+                &http_declaring(r#"["credentials-file-path-env"]"#),
+                "path            = \"~/.sample/auth.json\"",
+                "path            = \"~/.sample/auth.json\"\npath_env        = \"  \"",
+            ),
+            names: "names no environment variable",
+        },
+        Rule {
+            says: "a blank allowed_hosts entry matches no host, ever",
+            broken_by: changed(
+                HTTP,
+                "allowed_hosts = [\"example.com\"]",
+                "allowed_hosts = [\"example.com\", \"\"]",
+            ),
+            names: "must not contain a blank entry",
+        },
+        Rule {
+            says: "an [account] field can be present and still say nothing",
+            broken_by: plus(
+                LOGFILE,
+                "[account]\ntype = \"jwt-file\"\npath = \"~/a.json\"\ntoken_path = \"t\"\n\
+                 claim = \"  \"",
+            ),
+            names: "`[account] claim`",
         },
     ]
 }
@@ -2156,10 +2372,34 @@ fn the_shipped_antigravity_manifest_is_accepted() {
             .unwrap_or_else(|| panic!("{id}"))
     };
     for (id, role, period, bucket, group) in [
-        ("gemini-5h", Role::Primary, 300u64, "gemini-5h", 0),
-        ("gemini-wk", Role::Secondary, 10080, "gemini-weekly", 0),
-        ("3p-5h", Role::Extra, 300, "3p-5h", 1),
-        ("3p-wk", Role::Extra, 10080, "3p-weekly", 1),
+        (
+            "gemini-5h",
+            Role::Primary,
+            300u64,
+            "gemini-5h",
+            "displayName=Gemini Models",
+        ),
+        (
+            "gemini-wk",
+            Role::Secondary,
+            10080,
+            "gemini-weekly",
+            "displayName=Gemini Models",
+        ),
+        (
+            "3p-5h",
+            Role::Extra,
+            300,
+            "3p-5h",
+            "displayName=Claude and GPT models",
+        ),
+        (
+            "3p-wk",
+            Role::Extra,
+            10080,
+            "3p-weekly",
+            "displayName=Claude and GPT models",
+        ),
     ] {
         let w = by_id(id);
         assert_eq!(w.role, role, "{id} role");

@@ -36,14 +36,15 @@ pub const NO_CREDENTIALS: &str = "no credentials found";
 
 /// The [`resolve_token`] error text for "every step was absent, but at least
 /// one of them found a credential whose declared expiry had already passed"
-/// — a `keychain`/`credentials-file`/`win-credential` step with an
-/// `expiry_json_path` resolves Absent on a lapsed token exactly as it would
-/// on no token at all (so a refresh step behind it still gets its turn), and
-/// without this the two were indistinguishable once the chain ran out.
-/// `plugin::engine_http` matches this literal to offer a renewal ping
-/// (`[ping] renews_token`) where the manifest names one that can — see its
-/// own docs for what a plugin without such a ping gets instead (its own
-/// row, kept on screen, naming the same fact in plain text).
+/// — a `keychain`/`credentials-file`/`win-credential`/`credentials-map` step
+/// with an `expiry_json_path` resolves Absent on a lapsed token exactly as it
+/// would on no token at all (so a refresh step behind it still gets its
+/// turn), and without this the two were indistinguishable once the chain ran
+/// out. `plugin::engine_http` matches the typed [`ResolveEmpty::Lapsed`]
+/// behind this text to offer a renewal ping (`[ping] renews_token`) where the
+/// manifest names one that can — see its own docs for what a plugin without
+/// such a ping gets instead (its own row, kept on screen, naming the same
+/// fact in plain text).
 pub(crate) const TOKEN_LAPSED: &str = "the only credential found had lapsed";
 
 /// [`resolve_token`]'s chain running out — every step was absent — with
@@ -106,10 +107,18 @@ pub enum ResolveError {
 /// hand back a token from the second step — one `[ping]`'s CLI run cannot
 /// renew, since nothing about that env var's own lifetime was ever declared
 /// — and the caller needs to tell the two apart.
-pub fn resolve_token(surface: &SurfaceConfig) -> Result<(String, bool), ResolveError> {
+/// `provider` is the manifest's own display name (`PluginManifest::name`) —
+/// carried down to the one step whose errors can name it: `oauth-refresh`'s
+/// `invalid_grant` advice says *which* provider to sign back in to, and this
+/// module is shared by every manifest, so the name must come from the caller
+/// rather than being baked into the message.
+pub fn resolve_token(
+    surface: &SurfaceConfig,
+    provider: &str,
+) -> Result<(String, bool), ResolveError> {
     let mut lapsed_expiry: Option<u64> = None;
     for step in &surface.auth {
-        match run_step(step, &surface.allowed_hosts, &mut lapsed_expiry) {
+        match run_step(step, &surface.allowed_hosts, &mut lapsed_expiry, provider) {
             Ok(Some(token)) => return Ok((token, step.expiry_json_path.is_some())),
             Ok(None) => continue,
             Err(e) => return Err(ResolveError::PresentErr(e)),
@@ -143,6 +152,7 @@ fn run_step(
     step: &AuthStep,
     allowed_hosts: &[String],
     lapsed_expiry: &mut Option<u64>,
+    provider: &str,
 ) -> Result<Option<String>, String> {
     match step.kind {
         AuthType::CredentialsFile => credentials_file_step(step, lapsed_expiry),
@@ -152,7 +162,7 @@ fn run_step(
         AuthType::WinCredential => win_credential_step(step, lapsed_expiry),
         AuthType::CredentialsMap => credentials_map_step(step, lapsed_expiry),
         AuthType::RejectWhen => reject_when_step(step),
-        AuthType::OauthRefresh => oauth_refresh_step(step, allowed_hosts),
+        AuthType::OauthRefresh => oauth_refresh_step(step, allowed_hosts, provider),
     }
 }
 
@@ -169,7 +179,13 @@ fn reject_when_step(step: &AuthStep) -> Result<Option<String>, String> {
     let json_path = require_str("reject-when", "json_path", step.json_path.as_deref())?;
     let message = require_str("reject-when", "message", step.message.as_deref())?;
 
-    let file = super::expand_home(path);
+    // `path_env`/`path_env_join` honoured here too, same as a
+    // `credentials-file` step: a provider whose config directory an env var
+    // relocates (Codex's `CODEX_HOME`, Claude's `CLAUDE_CONFIG_DIR`) puts the
+    // file this rule inspects there as well, and probing the default
+    // location instead would read a file the relocated install never
+    // writes — or worse, a stale one it left behind.
+    let file = resolve_credentials_file_path(step, path);
     let Some(text) = super::read_regular_file(&file, super::SMALL_FILE_MAX_BYTES) else {
         return Ok(None);
     };
@@ -230,36 +246,19 @@ pub fn host_allowed(allowed_hosts: &[String], url: &str) -> bool {
 
 // ── Step: credentials-file ────────────────────────────────────────────────
 
-/// `path`'s location, subject to `path_env`/`path_env_join` — the credential
-/// variant of `engine_logfile::resolve_root` (see that function's own doc):
-/// `path_env` (if set and the env var names an absolute path) is taken
-/// verbatim as the base, joined with `path_env_join` if the manifest sets
-/// one; otherwise `path` itself, `~`-expanded. Claude's CLI honours
+/// `path`'s location, subject to the step's `path_env`/`path_env_join` —
+/// forwards to the shared [`super::resolve_env_overridden_path`], which owns
+/// the semantics (env value must be absolute, `path_env_join` is appended to
+/// the env value, never used in place of it). Claude's CLI honours
 /// `CLAUDE_CONFIG_DIR` this same way for `.credentials.json` — see
 /// `AuthStep::path_env`'s own doc for why only the file is covered, not the
 /// Keychain item name `CLAUDE_CONFIG_DIR` also renames.
-///
-/// Unlike `resolve_root`, an env value that is empty or relative is treated
-/// exactly as if the variable were unset, falling back to `path` — a
-/// credential must never be read relative to this process's own working
-/// directory, which is what an empty or relative override would otherwise
-/// do (`PathBuf::from("").join(…)` resolves against the CWD). `path` itself
-/// carries no such risk: it is `~`-expanded, never CWD-relative, and a
-/// manifest author who wants a relative-looking credential path can already
-/// only spell it starting from `~`.
 fn resolve_credentials_file_path(step: &AuthStep, path: &str) -> std::path::PathBuf {
-    if let Some(env_name) = &step.path_env {
-        if let Some(v) = std::env::var_os(env_name) {
-            let base = std::path::PathBuf::from(v);
-            if base.is_absolute() {
-                return match &step.path_env_join {
-                    Some(join) => base.join(join),
-                    None => base,
-                };
-            }
-        }
-    }
-    super::expand_home(path)
+    super::resolve_env_overridden_path(
+        step.path_env.as_deref(),
+        step.path_env_join.as_deref(),
+        path,
+    )
 }
 
 fn credentials_file_step(
@@ -297,8 +296,11 @@ fn credentials_file_step(
 /// than one record: pick the entry whose top-level key starts with
 /// `key_prefix`, then read `token_json_path` inside *that* entry.
 ///
-/// Absent only when the file itself is missing — mirroring
-/// `credentials_file_step`. Everything past that (broken JSON, a root that
+/// Absent only when the file itself is missing — or when the matched
+/// entry's token is found but already past its `expiry_json_path`, which
+/// resolves Absent exactly as it would on no token at all (recording the
+/// lapsed expiry in `lapsed_expiry`, same as `credentials_file_step`).
+/// Everything past that (broken JSON, a root that
 /// isn't an object, zero matching entries, more than one, or the matched
 /// entry not carrying the token) is Present-err: the store exists, so a rule
 /// that cannot resolve it is this app's problem to report, not a reason to
@@ -391,10 +393,11 @@ fn credentials_map_step(
 /// Reads one environment variable (`std::env::var`) and touches no Keychain
 /// itself, so it is tested directly, the same way `resolve_credentials_file_path`
 /// is.
-/// `#[cfg(any(target_os = "macos", test))]`: its only real caller,
-/// `keychain_step`, exists solely inside that same `cfg` block, so a non-macOS
-/// build would otherwise warn this dead code — the same shape `unwrap_go_keyring`
-/// above is gated for and for the same reason.
+/// `#[cfg(any(target_os = "macos", test))]`: its only call site lives inside
+/// `keychain_step`'s own `cfg(target_os = "macos")` block — the step itself
+/// compiles everywhere, but on any other platform that block is dead — so a
+/// non-macOS build would otherwise warn this as dead code, the same shape
+/// `unwrap_go_keyring` below is gated for and for the same reason.
 #[cfg(any(target_os = "macos", test))]
 fn resolve_keychain_service(step: &AuthStep, base: &str) -> String {
     let Some(env_name) = &step.service_env else {
@@ -1294,7 +1297,11 @@ const REFRESH_BACKOFF_SECS: i64 = 300;
 /// [`REFRESH_CACHE`]'s own doc) — a `Hit` needs no client at all, and a
 /// `Backoff` resolves one only to compare it against the entry's own
 /// `client_id`.
-fn oauth_refresh_step(step: &AuthStep, allowed_hosts: &[String]) -> Result<Option<String>, String> {
+fn oauth_refresh_step(
+    step: &AuthStep,
+    allowed_hosts: &[String],
+    provider: &str,
+) -> Result<Option<String>, String> {
     let path = require_str("oauth-refresh", "path", step.path.as_deref())?;
     let token_json_path = require_str(
         "oauth-refresh",
@@ -1470,15 +1477,20 @@ fn oauth_refresh_step(step: &AuthStep, allowed_hosts: &[String]) -> Result<Optio
             },
         );
     };
-    let response =
-        match oauth_refresh_request(token_url, &client_id, &client_secret, &refresh_token) {
-            Ok(r) => r,
-            Err(e) => {
-                store_backoff(e.clone());
-                on_exchange_error(step, &e);
-                return Err(e);
-            }
-        };
+    let response = match oauth_refresh_request(
+        token_url,
+        &client_id,
+        &client_secret,
+        &refresh_token,
+        provider,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            store_backoff(e.clone());
+            on_exchange_error(step, &e);
+            return Err(e);
+        }
+    };
     let (access_token, expires_in) = match extract_access_token(&response) {
         Some(v) => v,
         None => {
@@ -1580,9 +1592,9 @@ fn resolve_client(step: &AuthStep) -> Option<(String, String)> {
 /// effectively unreachable for a manifest that passed `manifest::validate`:
 /// it requires the pair set together or not at all, so `client.id_env`
 /// being `None` already implies `client.secret_env` is too. Kept as `?`
-/// rather than asserted away, the same way `resolve_client`'s literal-field
-/// fallback is kept: a hand-built `AuthStep` in this module's own tests can
-/// still set one without the other, and this must not panic on that.
+/// rather than asserted away: a hand-built `AuthStep` in this module's own
+/// tests can still set one without the other, and this must not panic on
+/// that.
 fn client_env_pair(client: &AuthClientDiscovery) -> Option<(String, String)> {
     let id_env = client.id_env.as_deref()?;
     let secret_env = client.secret_env.as_deref()?;
@@ -2520,6 +2532,11 @@ fn scan_candidate(
     }
     let mut file = match open_options.open(path) {
         Ok(f) => f,
+        // A candidate removed between the `metadata` check above and this
+        // `open` is the same fact that check already reports for one that
+        // never existed — `NotFound`, not an error worth a backoff or a
+        // diagnostic line over an ordinary uninstall-in-progress race.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ScanOutcome::NotFound,
         Err(e) => return ScanOutcome::Error(e.to_string()),
     };
     // The handle's own length, not merely its type: used below to tell a
@@ -2748,6 +2765,7 @@ fn oauth_refresh_request(
     client_id: &str,
     client_secret: &str,
     refresh_token: &str,
+    provider: &str,
 ) -> Result<Value, String> {
     let result = agent().post(token_url).send_form(&[
         ("client_id", client_id),
@@ -2786,12 +2804,19 @@ fn oauth_refresh_request(
                 "invalid_scope",
             ];
             Err(match oauth_error.as_deref() {
-                Some("invalid_grant") => "token refresh: the saved sign-in is no longer valid — sign in to Antigravity again".to_string(),
+                // `provider` is the manifest's display name — the advice
+                // names whichever provider's sign-in lapsed rather than
+                // one hard-coded provider's, since any manifest can carry
+                // an `oauth-refresh` step.
+                Some("invalid_grant") => format!(
+                    "token refresh: the saved sign-in is no longer valid — sign in to \
+                     {provider} again"
+                ),
                 Some(code_str) if KNOWN.contains(&code_str) => oauth_error_message(code_str, code),
-                _ => format!("token refresh failed: HTTP {code}"),
+                _ => format!("{OAUTH_ERROR_PREFIX}HTTP {code}"),
             })
         }
-        Err(e) => Err(format!("token refresh failed: {e}")),
+        Err(e) => Err(format!("{OAUTH_ERROR_PREFIX}{e}")),
     }
 }
 
@@ -2845,8 +2870,10 @@ fn is_invalid_client(err: &str) -> bool {
 const EXPIRES_IN_MAX_SECS: i64 = 24 * 60 * 60;
 
 /// The two fields this step needs out of a refresh response: the access token
-/// and how long it lasts. Pure, so the success path is tested without a
-/// network call. A non-string/blank `access_token` is "no usable token". A
+/// and how long it lasts. No network and no files — the success path is
+/// tested without either; the one side effect it keeps is a once-per-process
+/// `queue_diag_once` line when `expires_in` needs clamping, which is a log,
+/// not a dependency. A non-string/blank `access_token` is "no usable token". A
 /// missing `expires_in` falls back to a conservative hour; one that is zero
 /// or negative is rejected outright (`None`) — a token already dead on
 /// arrival would be cached expired and re-fetched on every tick, reopening
@@ -3187,37 +3214,58 @@ fn run_command_with_deadline(
     let expiry = Instant::now() + deadline;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => break Ok(status),
             Ok(None) if Instant::now() >= expiry => {
                 // One more check first, the same race `main.rs`'s own
                 // version closes the same way: a process that finished
                 // during the last sleep is not one this deadline killed.
-                if let Ok(Some(status)) = child.try_wait() {
-                    break Some(status);
+                // An *error* from this last poll is reported as itself
+                // rather than disguised as a timeout.
+                match child.try_wait() {
+                    Ok(Some(status)) => break Ok(status),
+                    res => {
+                        kill_and_wait(&mut child);
+                        break Err(match res {
+                            Err(e) => {
+                                format!("{program}: could not wait for it to exit: {e} — killed")
+                            }
+                            _ => format!(
+                                "{program} did not finish within {}s — killed",
+                                deadline.as_secs()
+                            ),
+                        });
+                    }
                 }
-                kill_and_wait(&mut child);
-                break None;
             }
             // Polled rather than blocked on, because a blocking wait can't
             // be woken by a deadline.
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            Err(_) => {
+            Err(e) => {
+                // A `try_wait` failure is not the same fact as a timeout —
+                // reporting it under the timeout's own wording used to bury
+                // the real error (an OS-level wait failure reads as "did
+                // not finish within Ns", which it provably did not do).
                 kill_and_wait(&mut child);
-                break None;
+                break Err(format!(
+                    "{program}: could not wait for it to exit: {e} — killed"
+                ));
             }
         }
     };
-    let Some(status) = status else {
-        return Err(format!(
-            "{program} did not finish within {}s — killed",
-            deadline.as_secs()
-        ));
-    };
-    Ok(DeadlineOutput {
+    let status = status?;
+    // Bound to a local rather than returned in tail position: the
+    // `MutexGuard` temporaries inside the struct literal would otherwise
+    // outlive `stdout_buf`/`stderr_buf` in drop order and not compile.
+    let output = DeadlineOutput {
         success: status.success(),
-        stdout: stdout_buf.lock().map(|b| b.clone()).unwrap_or_default(),
-        stderr: stderr_buf.lock().map(|b| b.clone()).unwrap_or_default(),
-    })
+        // Same poison recovery as every other Mutex in this module: a
+        // panicked drain thread must not turn a command that ran fine into
+        // one that appears to have printed nothing (the caller classifies
+        // empty stdout as "item not found" — Absent, not an error).
+        stdout: stdout_buf.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        stderr: stderr_buf.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+    };
+    Ok(output)
 }
 
 /// Drain `pipe` into a buffer on a thread of its own, handing back the other
@@ -3766,7 +3814,11 @@ mod tests {
         let mut step = oauth_refresh_step_for(&dir, r#"{"refresh_token":"r-1"}"#);
         step.path = Some(dir.join("no-such-file.json").to_string_lossy().into_owned());
         assert_eq!(
-            oauth_refresh_step(&step, &["oauth2.googleapis.com".to_string()]),
+            oauth_refresh_step(
+                &step,
+                &["oauth2.googleapis.com".to_string()],
+                "test provider"
+            ),
             Ok(None)
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -3778,8 +3830,12 @@ mod tests {
         // The stored access_token is what a plain read step would find instead
         // — present, and exactly the stale value this step exists to not rely on.
         let step = oauth_refresh_step_for(&dir, r#"{"access_token":"stale"}"#);
-        let err = oauth_refresh_step(&step, &["oauth2.googleapis.com".to_string()])
-            .expect_err("a file without a refresh token is Present-err, not Absent");
+        let err = oauth_refresh_step(
+            &step,
+            &["oauth2.googleapis.com".to_string()],
+            "test provider",
+        )
+        .expect_err("a file without a refresh token is Present-err, not Absent");
         assert!(
             err.contains("refresh_token") || err.contains("refresh token"),
             "{err}"
@@ -3791,7 +3847,7 @@ mod tests {
     fn oauth_refresh_step_refuses_a_token_url_outside_allowed_hosts() {
         let dir = temp_dir("oauth-blocked-host");
         let step = oauth_refresh_step_for(&dir, r#"{"refresh_token":"r-secret-value"}"#);
-        let err = oauth_refresh_step(&step, &["example.com".to_string()])
+        let err = oauth_refresh_step(&step, &["example.com".to_string()], "test provider")
             .expect_err("a token_url outside allowed_hosts must never be reached");
         assert!(err.contains("allowed_hosts"), "{err}");
         // The refresh token and client secret must never land in an error a
@@ -3811,7 +3867,7 @@ mod tests {
     fn oauth_refresh_step_refuses_an_empty_allowed_hosts() {
         let dir = temp_dir("oauth-no-hosts");
         let step = oauth_refresh_step_for(&dir, r#"{"refresh_token":"r-1"}"#);
-        let err = oauth_refresh_step(&step, &[])
+        let err = oauth_refresh_step(&step, &[], "test provider")
             .expect_err("an empty allowed_hosts must not default to \"anywhere\" here");
         assert!(err.contains("allowed_hosts"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
@@ -3820,7 +3876,7 @@ mod tests {
     #[test]
     fn oauth_refresh_step_missing_required_field_is_error() {
         let step = auth_step(AuthType::OauthRefresh);
-        assert!(oauth_refresh_step(&step, &[]).is_err());
+        assert!(oauth_refresh_step(&step, &[], "test provider").is_err());
     }
 
     #[test]
@@ -3837,10 +3893,11 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         );
-        let err = oauth_refresh_step(&step, &["example.com".to_string()]).expect_err(
-            "a token_url outside allowed_hosts must be refused before the missing \
+        let err = oauth_refresh_step(&step, &["example.com".to_string()], "test provider")
+            .expect_err(
+                "a token_url outside allowed_hosts must be refused before the missing \
                          refresh-token file is ever reached",
-        );
+            );
         assert!(err.contains("allowed_hosts"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3857,7 +3914,7 @@ mod tests {
         let dir = temp_dir("oauth-http");
         let mut step = oauth_refresh_step_for(&dir, r#"{"refresh_token":"r-1"}"#);
         step.token_url = Some("http://127.0.0.1:1/token".to_string());
-        let err = oauth_refresh_step(&step, &["127.0.0.1".to_string()])
+        let err = oauth_refresh_step(&step, &["127.0.0.1".to_string()], "test provider")
             .expect_err("an http token_url must be refused before any request");
         assert!(err.contains("https"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
@@ -4778,7 +4835,11 @@ mod tests {
         });
 
         assert_eq!(
-            oauth_refresh_step(&step, &["oauth2.googleapis.com".to_string()]),
+            oauth_refresh_step(
+                &step,
+                &["oauth2.googleapis.com".to_string()],
+                "test provider"
+            ),
             Ok(None)
         );
 
@@ -4826,7 +4887,7 @@ mod tests {
         );
 
         assert_eq!(
-            oauth_refresh_step(&step, &["oauth2.googleapis.com".to_string()]),
+            oauth_refresh_step(&step, &["oauth2.googleapis.com".to_string()], "test provider"),
             Ok(Some("still-valid-cached-token".to_string())),
             "a still-valid cached token must be served even though discovery would find nothing this tick"
         );
@@ -4852,7 +4913,11 @@ mod tests {
         );
 
         assert_eq!(
-            oauth_refresh_step(&step, &["oauth2.googleapis.com".to_string()]),
+            oauth_refresh_step(
+                &step,
+                &["oauth2.googleapis.com".to_string()],
+                "test provider"
+            ),
             Err("stale mock failure message".to_string()),
             "the same pair that just failed must not be retried before its backoff passes, and \
              must report exactly what that failure said"
@@ -4881,7 +4946,7 @@ mod tests {
             },
         );
 
-        let err = oauth_refresh_step(&step, &["127.0.0.1".to_string()])
+        let err = oauth_refresh_step(&step, &["127.0.0.1".to_string()], "test provider")
             .expect_err("nothing listens on 127.0.0.1:1 — some connection error is expected");
         assert!(
             !err.contains("stale mock failure message"),
@@ -4913,7 +4978,7 @@ mod tests {
             },
         );
 
-        let err = oauth_refresh_step(&step, &["127.0.0.1".to_string()])
+        let err = oauth_refresh_step(&step, &["127.0.0.1".to_string()], "test provider")
             .expect_err("nothing listens on 127.0.0.1:1 — some connection error is expected");
         assert!(
             !err.contains("stale mock failure message"),
@@ -4955,7 +5020,11 @@ mod tests {
         );
 
         assert_eq!(
-            oauth_refresh_step(&step, &["oauth2.googleapis.com".to_string()]),
+            oauth_refresh_step(
+                &step,
+                &["oauth2.googleapis.com".to_string()],
+                "test provider"
+            ),
             Err("stale mock failure message".to_string()),
             "an unresolvable client during an active backoff must report the backoff's own \
              message, not Absent"
@@ -4999,7 +5068,11 @@ mod tests {
         );
 
         assert_eq!(
-            oauth_refresh_step(&step, &["oauth2.googleapis.com".to_string()]),
+            oauth_refresh_step(
+                &step,
+                &["oauth2.googleapis.com".to_string()],
+                "test provider"
+            ),
             Ok(None),
             "once the backoff has lapsed, an unresolvable client is Absent again — there is no \
              message left to report"
@@ -5063,7 +5136,7 @@ mod tests {
         client_discovery_evict(&client);
 
         assert_eq!(
-            oauth_refresh_step(&step, &["127.0.0.1".to_string()]),
+            oauth_refresh_step(&step, &["127.0.0.1".to_string()], "test provider"),
             Err(message.clone()),
             "an undiscoverable client during an active refresh backoff must report the \
              backoff's own message, not Absent — the row must stay, with the reason, instead \
@@ -5085,7 +5158,7 @@ mod tests {
                 message: message.clone(),
             },
         );
-        let err = oauth_refresh_step(&step, &["127.0.0.1".to_string()])
+        let err = oauth_refresh_step(&step, &["127.0.0.1".to_string()], "test provider")
             .expect_err("nothing listens on 127.0.0.1:1 — some connection error is expected");
         assert!(
             !err.contains("invalid_client"),
@@ -5144,7 +5217,11 @@ mod tests {
         client_discovery_miss_store(client_config_key(&client), cache_now() + 500);
 
         assert_eq!(
-            oauth_refresh_step(&step, &["oauth2.googleapis.com".to_string()]),
+            oauth_refresh_step(
+                &step,
+                &["oauth2.googleapis.com".to_string()],
+                "test provider"
+            ),
             Err(message),
             "the last known failure must still be reported while the discovery-miss backoff is \
              armed, rather than silently going Absent"
@@ -6367,7 +6444,11 @@ mod tests {
         });
 
         assert_eq!(
-            oauth_refresh_step(&step, &["oauth2.googleapis.com".to_string()]),
+            oauth_refresh_step(
+                &step,
+                &["oauth2.googleapis.com".to_string()],
+                "test provider"
+            ),
             Ok(None),
             "nothing discoverable resolves the step Absent, not an error"
         );
@@ -7336,6 +7417,39 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `CODEX_HOME` relocates the whole auth file, so the rule has to look
+    /// where `path_env`/`path_env_join` point, not only at `path` — a
+    /// reject-when that checked the default location on a relocated install
+    /// would read an empty chair and stand down, letting a later step treat
+    /// an API-key login as a subscription token.
+    #[test]
+    fn reject_when_step_reads_the_file_path_env_relocates() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("rw-path-env");
+        std::fs::write(dir.join("auth.json"), r#"{"OPENAI_API_KEY":"sk-env"}"#).unwrap();
+        let env_name = format!("TICKOVER_TEST_REJECT_PATH_ENV_{}", std::process::id());
+        std::env::set_var(&env_name, &dir);
+        let step = AuthStep {
+            // Pointed at a file that does not exist: the env override is
+            // the only way this step can see the fixture at all.
+            path: Some("/nonexistent-should-not-be-used/auth.json".to_string()),
+            path_env: Some(env_name.clone()),
+            path_env_join: Some("auth.json".to_string()),
+            json_path: Some("OPENAI_API_KEY".to_string()),
+            unless_json_path: Some("tokens.access_token".to_string()),
+            message: Some("an API key has no subscription limits".to_string()),
+            ..auth_step(AuthType::RejectWhen)
+        };
+        let result = reject_when_step(&step);
+        std::env::remove_var(&env_name);
+        assert_eq!(
+            result,
+            Err("an API key has no subscription limits".to_string()),
+            "the env-relocated file must be the one the rule reads"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn reject_when_stops_the_chain_before_a_later_step_is_tried() {
         let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -7346,7 +7460,7 @@ mod tests {
             ..auth_step(AuthType::Env)
         };
         std::env::set_var("TICKOVER_TEST_REJECT_WHEN_UNREACHED", "tok-unreached");
-        let got = resolve_token(&surface(vec![reject, never]));
+        let got = resolve_token(&surface(vec![reject, never]), "test provider");
         std::env::remove_var("TICKOVER_TEST_REJECT_WHEN_UNREACHED");
 
         assert_eq!(
@@ -7607,7 +7721,7 @@ mod tests {
             ..auth_step(AuthType::CredentialsFile)
         };
         assert_eq!(
-            resolve_token(&surface(vec![step])),
+            resolve_token(&surface(vec![step]), "test provider"),
             Err(ResolveError::Empty(ResolveEmpty::Lapsed {
                 expires_at: 1_577_836_800 // 2020-01-01T00:00:00Z
             }))
@@ -7644,7 +7758,7 @@ mod tests {
         };
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(&var, "tok-fresh");
-        let got = resolve_token(&surface(vec![lapsed_step, env_step]));
+        let got = resolve_token(&surface(vec![lapsed_step, env_step]), "test provider");
         std::env::remove_var(&var);
         assert_eq!(
             got,
@@ -7684,7 +7798,7 @@ mod tests {
         };
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(&var, "tok-fresh");
-        let got = resolve_token(&surface(vec![lapsed_step, env_step]));
+        let got = resolve_token(&surface(vec![lapsed_step, env_step]), "test provider");
         std::env::remove_var(&var);
         assert_eq!(got, Ok(("tok-fresh".to_string(), false)));
         std::fs::remove_dir_all(&dir).ok();
@@ -7710,7 +7824,7 @@ mod tests {
             ..auth_step(AuthType::CredentialsFile)
         };
         assert_eq!(
-            resolve_token(&surface(vec![step])),
+            resolve_token(&surface(vec![step]), "test provider"),
             Ok(("tok-fresh".to_string(), true))
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -7728,7 +7842,7 @@ mod tests {
             ..auth_step(AuthType::CredentialsFile)
         };
         assert_eq!(
-            resolve_token(&surface(vec![step])),
+            resolve_token(&surface(vec![step]), "test provider"),
             Err(ResolveError::Empty(ResolveEmpty::NoCredentials))
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -7993,7 +8107,8 @@ mod tests {
             },
         ]);
 
-        let err = resolve_token(&s).expect_err("broken file must stop the chain, not fall through");
+        let err = resolve_token(&s, "test provider")
+            .expect_err("broken file must stop the chain, not fall through");
         // `PresentErr` structurally cannot carry a lapsed expiry any more —
         // this match is exhaustive, so a future third variant would fail to
         // compile here rather than let this assertion quietly stop meaning
@@ -8028,7 +8143,10 @@ mod tests {
             },
         ]);
 
-        assert_eq!(resolve_token(&s), Ok(("tok-from-env".to_string(), false)));
+        assert_eq!(
+            resolve_token(&s, "test provider"),
+            Ok(("tok-from-env".to_string(), false))
+        );
 
         std::env::remove_var("TICKOVER_AUTH_TEST_CHAIN_SKIP");
         std::fs::remove_dir_all(&dir).ok();
@@ -8056,7 +8174,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            resolve_token(&s),
+            resolve_token(&s, "test provider"),
             Err(ResolveError::Empty(ResolveEmpty::NoCredentials))
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -8066,7 +8184,7 @@ mod tests {
     fn chain_with_no_auth_steps_is_an_error() {
         let s = surface(Vec::new());
         assert_eq!(
-            resolve_token(&s),
+            resolve_token(&s, "test provider"),
             Err(ResolveError::Empty(ResolveEmpty::NoCredentials))
         );
     }

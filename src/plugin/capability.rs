@@ -322,6 +322,18 @@ pub(crate) const CAPABILITIES: &[Capability] = &[
         implemented: true,
         keys: &["surface.auth.path_env", "surface.auth.path_env_join"],
     },
+    // Codex's CLI honours `CODEX_HOME` for where it keeps `auth.json`, and a
+    // `[[http.value]]` `json-file` read that ignores the override reads the
+    // default `~/.codex/auth.json` — the wrong file, or none, on an account
+    // that has ever set it. `surface.auth.path_env` is a *different* spelling
+    // already covered by `credentials-file-path-env`; this one is new, so it
+    // gets a name no older build knows — a manifest that uses it is refused
+    // rather than quietly read from the un-overridden path.
+    Capability {
+        name: "http-value-path-env",
+        implemented: true,
+        keys: &["http.value.path_env", "http.value.path_env_join"],
+    },
     // Claude's CLI, continued: `CLAUDE_CONFIG_DIR` also renames the Keychain
     // item it writes, not only the credentials file `credentials-file-path-env`
     // above covers — a `keychain` step that always queries the fixed default

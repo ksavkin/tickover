@@ -10,8 +10,8 @@
 # figures — a prepaid balance and a pay-as-you-go allowance, the shape
 # [[balances]] exists for (see docs/PLUGIN-ARCHITECTURE.md and
 # `crate::plugin::manifest::BalanceConfig`) — against the account's monthly
-# billing cycle, a different period from the weekly one the window above
-# reads.
+# billing cycle, a different period from whatever the window below reads out
+# of the response's own `currentPeriod` bounds.
 # `creditUsagePercent`/`currentPeriod` supersede an older
 # `monthlyLimit`/`used`/`billingPeriodStart`/`billingPeriodEnd` pair xAI's own
 # client library still serves alongside them — so both are declared: the
@@ -40,7 +40,7 @@ order        = 30
 # stated start/end instead of a number typed into this file. See
 # docs/PLUGIN-ARCHITECTURE.md, "Reader capabilities".
 requires_reader = ["window-identity", "reading-balances", "credentials-map", "keychain-expiry", "window-period-bounds"]
-version      = "1.0.2"
+version      = "1.0.3"
 engine       = "http-api"
 refresh_secs = 60
 

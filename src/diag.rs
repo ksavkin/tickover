@@ -211,8 +211,16 @@ fn trim_if_large(path: &std::path::Path) {
     // this function can never shrink is worse still — every future write
     // would re-read the same oversized, still-growing tail from here on,
     // for good, since nothing about a line-less tail ever changes that on
-    // its own.
-    let start = tail.iter().position(|b| *b == b'\n').map_or(0, |i| i + 1);
+    // its own. The same answer covers the edge where the tail's *only*
+    // newline is its last byte: `position + 1` would then land on
+    // `tail.len()`, cutting the whole tail to nothing and writing an empty
+    // log — strictly worse than the half line, and no more "on a boundary"
+    // than it, so the tail is kept instead.
+    let start = tail
+        .iter()
+        .position(|b| *b == b'\n')
+        .filter(|i| i + 1 < tail.len())
+        .map_or(0, |i| i + 1);
     // Best-effort, like every other write in this module (see the module
     // doc): a trim that fails half-way is worth leaving the oversized file
     // in place for, not worth failing an app launch over.
@@ -300,6 +308,25 @@ mod tests {
             one_huge_line.as_bytes().ends_with(&after),
             "what survives is still the tail of what was there"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The tail's only newline sitting on its last byte must not leave an
+    /// empty log behind: nothing after it exists to keep, so the whole tail
+    /// is kept — same as a tail with no newline at all.
+    #[test]
+    fn trim_keeps_the_tail_when_its_only_newline_is_the_last_byte() {
+        let dir = temp_dir("lastbyte");
+        let path = dir.join("tickover.log");
+        // Head: ordinary lines that will be cut. Tail (the last KEEP_BYTES):
+        // one huge line with a newline only at its very end.
+        let head = "earlier line\n".repeat(4096);
+        let tail_line = format!("{}\n", "x".repeat(KEEP_BYTES - 1));
+        let text = format!("{head}{tail_line}");
+        std::fs::write(&path, &text).expect("seed log");
+        trim_if_large(&path);
+        let after = std::fs::read(&path).expect("still there");
+        assert_eq!(after, tail_line.as_bytes(), "the whole tail survives");
         std::fs::remove_dir_all(&dir).ok();
     }
 

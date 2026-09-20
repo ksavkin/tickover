@@ -194,8 +194,11 @@ fn migrate_legacy_dir_at(old: &Path, new: &Path) -> Result<bool, std::io::Error>
     std::fs::rename(old, new)?;
     // Best-effort: the directory itself has already moved, which is the part
     // that matters, and a log left under its old name inside the new
-    // directory is not worth reporting the migration as failed over.
+    // directory is not worth reporting the migration as failed over. The
+    // same goes for the `MIGRATION-FAILED.txt` an earlier failed attempt
+    // left inside `old` — it rode the rename and means nothing now.
     let _ = std::fs::rename(new.join("codex-limits.log"), new.join("tickover.log"));
+    let _ = std::fs::remove_file(new.join("MIGRATION-FAILED.txt"));
     Ok(true)
 }
 
@@ -681,9 +684,9 @@ pub fn set_plugin_option(id: &str, key: &str, v: bool) {
 //     a `[ping]` section — because both readers below need it to already be
 //     there by the time the window vanishes.
 //   * `plugin.<id>.seen_window` — what the above was before it had a reading id
-//     and a role: one value per plugin, the plugin's primary window on its
-//     first surface. Still on users' disks, still read (see
-//     `main.rs::seen_window_of`), never written again.
+//     and a window key: one value per plugin, the plugin's primary window on
+//     its first surface. Still on users' disks, still read (see
+//     `main.rs::seen_window_for`), never written again.
 //   * `plugin.<id>.pinged_at` — when the last auto-ping was fired. Compared
 //     against the *start* of the window on screen: a ping older than the
 //     current window means this window has not been pinged. A timestamp rather
@@ -738,20 +741,38 @@ pub struct SeenWindow {
     pub period_minutes: Option<u64>,
 }
 
-fn seen_key(plugin_id: &str, reading_id: &str, role: &str, field: &str) -> String {
-    format!("plugin.{plugin_id}.seen.{reading_id}.{role}.{field}")
+fn seen_key(plugin_id: &str, reading_id: &str, window: &str, field: &str) -> String {
+    format!("plugin.{plugin_id}.seen.{reading_id}.{window}.{field}")
 }
 
 /// What this plugin's provider last stated about one window of one reading, or
 /// `None` if it never stated anything about it.
 ///
-/// Keyed by *reading* id and role rather than by plugin: a plugin can report
-/// several accounts (Claude's CLI and desktop surfaces, a log-file engine's
-/// sub-accounts), and their windows empty independently. Nested under
-/// `plugin.<id>.` all the same, so [`remove_plugin_keys`] still takes the whole
-/// registry with the plugin.
-pub fn plugin_seen_window_for(plugin_id: &str, reading_id: &str, role: &str) -> Option<SeenWindow> {
-    with_config(|cfg| seen_window_from(cfg, plugin_id, reading_id, role))
+/// Keyed by *reading* id and *window key* rather than by plugin: a plugin can
+/// report several accounts (Claude's CLI and desktop surfaces, a log-file
+/// engine's sub-accounts), and their windows empty independently. By window
+/// key rather than by role for the mirror-image reason: nothing caps how many
+/// `secondary` windows a manifest may declare, and two of them keyed by role
+/// would share one record — the quiet rows both built from whichever length
+/// landed last. Nested under `plugin.<id>.` all the same, so
+/// [`remove_plugin_keys`] still takes the whole registry with the plugin.
+///
+/// The role-keyed entries an earlier build wrote (`…seen.<reading>.primary`)
+/// are simply orphaned by this scheme, not migrated: the pre-registry
+/// `seen_window` fallback still answers for the one window that matters most
+/// (the primary's), and a `secondary` boundary older than this release is
+/// worth less than a migration rule would be.
+///
+/// `window` is always a `<entry>:` key here: `<entry>:<element>` keys exist
+/// only on `for_each` windows, which the validator forces onto
+/// `role = "extra"` — and extras are filtered out of this registry before
+/// they are ever written (`main.rs`'s `seen_records`).
+pub fn plugin_seen_window_for(
+    plugin_id: &str,
+    reading_id: &str,
+    window: &str,
+) -> Option<SeenWindow> {
+    with_config(|cfg| seen_window_from(cfg, plugin_id, reading_id, window))
 }
 
 /// The read [`plugin_seen_window_for`] and [`set_plugin_seen_window_for`]'s
@@ -762,10 +783,10 @@ fn seen_window_from(
     cfg: &Value,
     plugin_id: &str,
     reading_id: &str,
-    role: &str,
+    window: &str,
 ) -> Option<SeenWindow> {
     let at = cfg
-        .get(seen_key(plugin_id, reading_id, role, "at"))
+        .get(seen_key(plugin_id, reading_id, window, "at"))
         .and_then(Value::as_u64)
         .filter(|at| *at > 0)?;
     Some(SeenWindow {
@@ -774,7 +795,7 @@ fn seen_window_from(
         // together — a period left over from the previous window would be read
         // as this one's.
         period_minutes: cfg
-            .get(seen_key(plugin_id, reading_id, role, "period_minutes"))
+            .get(seen_key(plugin_id, reading_id, window, "period_minutes"))
             .and_then(Value::as_u64)
             .filter(|m| *m > 0),
     })
@@ -782,7 +803,12 @@ fn seen_window_from(
 
 /// Record what the provider states about one window — both fields in a single
 /// write, so no reader can ever see the new reset beside the old length.
-pub fn set_plugin_seen_window_for(plugin_id: &str, reading_id: &str, role: &str, seen: SeenWindow) {
+pub fn set_plugin_seen_window_for(
+    plugin_id: &str,
+    reading_id: &str,
+    window: &str,
+    seen: SeenWindow,
+) {
     let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Normalised the same way the read above normalises what it returns: an
     // `at` of `0` never reads back as anything but `None`, so writing one here
@@ -800,7 +826,7 @@ pub fn set_plugin_seen_window_for(plugin_id: &str, reading_id: &str, role: &str,
     // the same owned copy either way, so a second call here would only ask
     // the disk the identical question this one already has the answer to.
     let mut cfg = load();
-    if seen_window_from(&cfg, plugin_id, reading_id, role) == Some(seen) {
+    if seen_window_from(&cfg, plugin_id, reading_id, window) == Some(seen) {
         return;
     }
     let Some(p) = path() else { return };
@@ -809,11 +835,11 @@ pub fn set_plugin_seen_window_for(plugin_id: &str, reading_id: &str, role: &str,
     }
     if let Some(obj) = cfg.as_object_mut() {
         obj.insert(
-            seen_key(plugin_id, reading_id, role, "at"),
+            seen_key(plugin_id, reading_id, window, "at"),
             Value::from(seen.at),
         );
         obj.insert(
-            seen_key(plugin_id, reading_id, role, "period_minutes"),
+            seen_key(plugin_id, reading_id, window, "period_minutes"),
             Value::from(seen.period_minutes.unwrap_or(0)),
         );
     }
@@ -822,7 +848,7 @@ pub fn set_plugin_seen_window_for(plugin_id: &str, reading_id: &str, role: &str,
 
 /// The pre-registry key: newest reset this plugin's provider stated for its
 /// primary window on its first surface, or `0` if it never did. Read as a
-/// fallback for exactly that one window (`main.rs::seen_window_of`) and never
+/// fallback for exactly that one window (`main.rs::seen_window_for`) and never
 /// written — an install upgrading into the registry above must not lose the
 /// boundary its auto-ping is working from.
 pub fn plugin_seen_window(id: &str) -> u64 {
@@ -1579,7 +1605,7 @@ mod tests {
     /// pinged), a stored value reads back, and both go with the plugin when it
     /// is removed — a reinstalled plugin must not inherit the ping history of
     /// the one it replaced. `seen_window` is the pre-registry key, still read
-    /// as a fallback (`main.rs::seen_window_of`) and never written any more.
+    /// as a fallback (`main.rs::seen_window_for`) and never written any more.
     #[test]
     fn auto_ping_timestamps_round_trip_and_are_removed_with_the_plugin() {
         with_test_config_path(|| {

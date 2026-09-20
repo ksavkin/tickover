@@ -7,9 +7,13 @@
 # the shipped Copilot language server (`copilot-agent/dist/main.js` inside the
 # JetBrains plugin) and then confirmed against a live 200.
 #
-# What this provider needs from the reader is what Grok already needed — no
-# mechanism is new here, which is the point: a fifth provider that is a
-# manifest and nothing else.
+# What this provider needs from the reader is almost entirely what Grok
+# already needed — the point being that a fifth provider is a manifest and
+# almost nothing else. The one mechanism this file adds is
+# `balance-unlimited`: Copilot's buckets arrive `unlimited = true` rather
+# than omitting their cap, so the "Unlimited" word the row draws has to be
+# the provider's own claim (see `[balances.unlimited]` below), not a zero
+# read as infinity.
 #  * `[[balances]]` (`reading-balances`), because Copilot reports no window at
 #    all: no rolling period, no percentage of one — a monthly allowance
 #    against a calendar reset date.
@@ -22,7 +26,7 @@ name         = "Copilot"
 menu_label   = "Cp"
 order        = 50
 requires_reader = ["reading-balances", "credentials-map", "balance-unlimited"]
-version      = "1.0.2"
+version      = "1.0.3"
 engine       = "http-api"
 # A monthly counter, not a rolling window, and the number is picked rather than
 # copied from the other manifests — none of which is measuring a month.

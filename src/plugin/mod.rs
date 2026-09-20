@@ -258,6 +258,47 @@ fn join_rest(base: PathBuf, rest: &str) -> PathBuf {
     }
 }
 
+/// A manifest path that an environment variable may relocate: `path_env`
+/// (if set and the variable names an absolute path) is taken verbatim as the
+/// file's location, joined with `path_env_join` if one is declared;
+/// otherwise `path` itself, [`expand_home`]-expanded.
+///
+/// Shared by every place a manifest points at a file the provider's own CLI
+/// may have put somewhere else: `credentials-file`/`reject-when` auth steps
+/// (`auth.rs`) and `[[http.value]]` `json-file` entries (`engine_http.rs`)
+/// all honour it — Codex's `CODEX_HOME` moves `.codex/auth.json` and
+/// Claude's `CLAUDE_CONFIG_DIR` moves `.credentials.json` the same way, and
+/// a manifest that can redirect one read but not another would read the
+/// relocated directory for credentials while still probing the default
+/// location for its reject rule.
+///
+/// An env value that is empty or relative is treated exactly as if the
+/// variable were unset, falling back to `path` — a credential or a request
+/// value must never be read relative to this process's own working
+/// directory, which is what an empty or relative override would otherwise do
+/// (`PathBuf::from("").join(…)` resolves against the CWD). `path` itself
+/// carries no such risk: it is `~`-expanded, never CWD-relative, and a
+/// manifest author who wants a relative-looking path can already only spell
+/// it starting from `~`.
+pub fn resolve_env_overridden_path(
+    path_env: Option<&str>,
+    path_env_join: Option<&str>,
+    path: &str,
+) -> PathBuf {
+    if let Some(env_name) = path_env {
+        if let Some(v) = std::env::var_os(env_name) {
+            let base = PathBuf::from(v);
+            if base.is_absolute() {
+                return match path_env_join {
+                    Some(join) => base.join(join),
+                    None => base,
+                };
+            }
+        }
+    }
+    expand_home(path)
+}
+
 /// Read a file that must resolve to a *regular* file, bounded in size.
 ///
 /// Every path this app reads is either configured in a manifest or sits in a
@@ -355,21 +396,45 @@ pub fn write_via_temp(
     bytes: &[u8],
     pre_rename: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(format!(".tmp{}", std::process::id()));
-    let tmp = target.with_file_name(tmp_name);
-    let _ = std::fs::remove_file(&tmp);
-    let result = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, bytes))
-        .and_then(|_| pre_rename(target))
-        .and_then(|_| std::fs::rename(&tmp, target));
+    let tmp = stage_temp_file(target, bytes)?;
+    let result = pre_rename(target).and_then(|_| std::fs::rename(&tmp, target));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp); // best-effort cleanup of a half-written temp file
     }
     result
+}
+
+/// The staging half of [`write_via_temp`], on its own for the one caller
+/// that needs it: `seed::write_templates` must stage *every* file in a batch
+/// before renaming any of them, so it cannot call `write_via_temp` itself.
+///
+/// Writes `bytes` to a fresh `<name>.tmp<pid>` sibling of `target` and
+/// returns its path — the caller owns the temp file from here: rename it
+/// into place or remove it. The temp path is predictable — `target`'s own
+/// file name with `.tmp<pid>` appended — and anything running as this user
+/// could plant a symlink there between one call and the next; `remove_file`
+/// before `create_new` removes the link itself, never what it points at, and
+/// `create_new` is what actually makes the file, so a symlink already
+/// sitting on the path is discarded rather than followed and written
+/// through. A failed `write_all` removes the half-written temp before the
+/// error is returned.
+pub fn stage_temp_file(
+    target: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
+    let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp{}", std::process::id()));
+    let tmp = target.with_file_name(tmp_name);
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, bytes))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
+    Ok(tmp)
 }
 
 /// Push `h` onto `hosts` if it isn't already there, compared

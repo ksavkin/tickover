@@ -336,8 +336,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let migrated_legacy_dir = match config::migrate_legacy_dir() {
         Ok(migrated) => migrated,
         Err(e) => {
-            diag::line(format!("could not migrate the old config directory: {e}"));
-            false
+            // `diag::line` cannot report this: it writes inside
+            // `<config>/tickover`, the very directory whose existence turns
+            // `migrate_legacy_dir` into a permanent no-op — and
+            // `claim_single_instance` below would create that directory on
+            // this launch anyway, so no later attempt would ever retry the
+            // rename either. The only honest answer is stderr, a marker
+            // left inside the *old* directory, and a nonzero exit: the app
+            // does not start, and the next launch retries the move.
+            eprintln!("could not migrate the old config directory: {e}");
+            if let Some(old) = dirs::config_dir().map(|d| d.join("codex-limits")) {
+                // Best-effort — whatever blocked the rename may block this
+                // write too, and the exit below is the part that matters.
+                // The marker travels with the directory on a later
+                // successful rename and is removed there.
+                let _ = std::fs::write(
+                    old.join("MIGRATION-FAILED.txt"),
+                    format!(
+                        "Tickover could not move this directory to its new name \
+                         (`codex-limits` -> `tickover`):\n\n{e}\n\nThe app exited rather than \
+                         start up beside settings it would never see. Fix whatever blocked \
+                         the move — the directory's permissions are the usual reason — and \
+                         launch it again; the move is retried on every start. This file is \
+                         removed once the move succeeds.\n"
+                    ),
+                );
+            }
+            std::process::exit(1);
         }
     };
     // Only when a pre-rename install was actually found and moved — a fresh
@@ -973,8 +998,9 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
             }
             refresh_all(&ctx);
             // A native dialog never opens for this callback, but keeping the
-            // popover's focus-loss clock fresh here too costs nothing and
-            // keeps every plugin-manager callback consistent.
+            // popover's focus-loss clock fresh here too costs nothing —
+            // the callbacks that do open one do the same, so the clock's
+            // meaning stays uniform across the manager's surface.
             ctx.shown_at.set(Instant::now());
         });
     }
@@ -1091,13 +1117,35 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                     );
                     break 'import;
                 }
-                let write_result = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&target)
-                    .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
-                if let Err(e) = write_result {
-                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                // Stage the bytes under a temp sibling and publish with
+                // `hard_link` — an atomic create that refuses to clobber.
+                // `target` is never written through and never unlinked on
+                // this path: the only `remove_file` below is our own temp
+                // file, so a foreign file that races into `target` can
+                // neither be deleted nor overwritten by us, and a loader
+                // can never observe a half-written manifest. (The plugins
+                // dir lives under the OS config dir; the filesystems that
+                // host it — APFS, NTFS, ext4 — all do hard links.)
+                let tmp = match tickover::plugin::stage_temp_file(&target, text.as_bytes()) {
+                    Ok(tmp) => tmp,
+                    Err(e) => {
+                        diag::line(format!(
+                            "add-plugin: could not write {}: {e}",
+                            target.display()
+                        ));
+                        show_alert("Could not import plugin", &e.to_string());
+                        break 'import;
+                    }
+                };
+                if let Err(e) = std::fs::hard_link(&tmp, &target) {
+                    let _ = std::fs::remove_file(&tmp);
+                    // `AlreadyExists` is the expected kind, but a file that
+                    // raced in after the check above can surface under a
+                    // different one on some filesystems — either way the
+                    // slot is taken and we refuse to clobber it.
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        || target.symlink_metadata().is_ok()
+                    {
                         diag::line(format!(
                             "add-plugin: {} already exists on disk, refusing to clobber it",
                             target.display()
@@ -1108,13 +1156,14 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                         );
                     } else {
                         diag::line(format!(
-                            "add-plugin: could not write {}: {e}",
+                            "add-plugin: could not create {}: {e}",
                             target.display()
                         ));
                         show_alert("Could not import plugin", &e.to_string());
                     }
                     break 'import;
                 }
+                let _ = std::fs::remove_file(&tmp);
                 // `reload_and_fetch` already rebuilds the plugin-manager
                 // model on its own (`reload_manifests_only`, inside it), so
                 // only the provider rows and the tray still need a refresh
@@ -1188,23 +1237,87 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                 return; // Cancel, closed, or no dialog at all — never destructive by default
             }
             let dir = seed::plugins_dir();
-            if let Some(path) = find_plugin_manifest_path(&dir, &id) {
-                match std::fs::remove_file(&path) {
-                    // Also drop this plugin's registry provenance record, if
-                    // any — see `remove_lockfile_entry`'s own docs for why a
-                    // later reinstall of the same id must not be diffed
-                    // against a now-deleted file's stale origin_sha256.
-                    Ok(()) => remove_lockfile_entry(&registry::lockfile_path(), &id),
-                    Err(e) => diag::line(format!(
-                        "could not remove plugin manifest {}: {e}",
-                        path.display()
-                    )),
+            match find_plugin_manifest_path(&dir, &id) {
+                Some(path) => match std::fs::remove_file(&path) {
+                    // `NotFound` lands in the same place as `Ok`: the file
+                    // removed by hand between `find` and `remove` is gone
+                    // either way, and the cleanup below is owed to both.
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    // Any other failure means the file is still there —
+                    // the plugin is not removed, so its config keys, cache
+                    // and lockfile record must all stay. Wiping them while
+                    // the manifest remains would resurrect the plugin on
+                    // the next reload with its config reset.
+                    Err(e) => {
+                        diag::line(format!(
+                            "could not remove plugin manifest {}: {e}",
+                            path.display()
+                        ));
+                        return;
+                    }
+                },
+                // No *parseable* file carries this id — but
+                // `find_plugin_manifest_path` matches by parsed id, so a
+                // manifest left under `<id>.toml` that no longer parses (a
+                // half-finished edit saved over itself) answers `None` here
+                // the same as a genuinely deleted one. Left behind, that
+                // file dead-ends a later Install of this id —
+                // `install_write` refuses to clobber — with no row left to
+                // remove it from. The conventional name is this plugin's
+                // remnant unless it parses as a *different* id (another
+                // plugin's manifest squatting on the name — that one stays).
+                None => {
+                    let remnant = dir.join(format!("{id}.toml"));
+                    let foreign = tickover::plugin::read_regular_file(
+                        &remnant,
+                        tickover::plugin::SMALL_FILE_MAX_BYTES,
+                    )
+                    .and_then(|text| PluginManifest::from_str(&text).ok())
+                    .is_some_and(|m| m.id != id);
+                    // `symlink_metadata`, not `exists()`: a dangling symlink
+                    // at this name blocks `install_write` just as surely and
+                    // `remove_file` on it removes the link, never a target.
+                    // A *directory* at the name blocks install the same way —
+                    // `remove_dir` takes an empty one (a populated one fails
+                    // and stays the user's to clear).
+                    if !foreign && remnant.symlink_metadata().is_ok() {
+                        let is_dir = remnant
+                            .symlink_metadata()
+                            .map(|m| m.file_type().is_dir())
+                            .unwrap_or(false);
+                        let gone = if is_dir {
+                            std::fs::remove_dir(&remnant)
+                        } else {
+                            std::fs::remove_file(&remnant)
+                        };
+                        match gone {
+                            Ok(()) => diag::line(format!(
+                                "remove-plugin: removed {} — unparsable remnant of id \"{id}\"",
+                                remnant.display()
+                            )),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            // The remnant stays — the plugin is still gone
+                            // (it did not parse), so the cleanup below is
+                            // owed either way; the install-blocking file is
+                            // the user's to clear once it cannot be ours.
+                            Err(e) => diag::line(format!(
+                                "remove-plugin: could not remove remnant {}: {e}",
+                                remnant.display()
+                            )),
+                        }
+                    }
+                    diag::line(format!(
+                        "remove-plugin: no manifest file found for id \"{id}\" — already gone"
+                    ))
                 }
-            } else {
-                diag::line(format!(
-                    "remove-plugin: no manifest file found for id \"{id}\""
-                ));
             }
+            // The file is gone (by us, by the user, or it already was):
+            // drop this plugin's registry provenance record, if any — see
+            // `remove_lockfile_entry`'s own docs for why a later reinstall
+            // of the same id must not be diffed against a now-deleted
+            // file's stale origin_sha256.
+            remove_lockfile_entry(&registry::lockfile_path(), &id);
             // Drop this plugin's generic `plugin.<id>.*` config keys (enabled
             // / ping / surface.* / option.*) — leaving them behind would
             // survive forever and silently apply to a future plugin that
@@ -1213,6 +1326,27 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
             config::remove_plugin_keys(&id);
             ctx.cache.borrow_mut().remove(&id);
             ctx.fetching.borrow_mut().remove(&id);
+            // The two statics keyed by plugin id are the only in-memory
+            // state `reload_and_fetch` does not rebuild (it drops the
+            // engine instances everything else lives in). A leftover probe
+            // entry would let a same-id reinstall ride a verdict — or an
+            // `in_flight` flag — recorded for the removed copy; a leftover
+            // `PING_NET_DOWN` tombstone would swallow that reinstall's
+            // first genuine "unreachable" note.
+            if let Some(probes) = PING_PROBE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+            {
+                probes.remove(&id);
+            }
+            if let Some(down) = PING_NET_DOWN
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+            {
+                down.retain(|(plugin_id, _)| plugin_id != &id);
+            }
             // `reload_and_fetch` already refreshed the plugin-manager rows —
             // see `on_add_plugin`'s identical comment above.
             reload_and_fetch(
@@ -1287,8 +1421,10 @@ fn wire_registry_callbacks(app: &AppWindow, ctx: &Ctx) {
             // failure mode `spawn_plugin_fetch`'s own doc comment describes.
             let spawned = std::thread::Builder::new().spawn(move || {
                 let guard = RegistryCheckGuard { tx: Some(tx) };
-                let hashed = hash_installed_manifests(&seed::plugins_dir(), &installed);
-                guard.finish(fetch_registry_index(DEFAULT_REGISTRY_URL, hashed));
+                let dir = seed::plugins_dir();
+                let hashed = hash_installed_manifests(&dir, &installed);
+                let broken = unparsable_manifest_files(&dir);
+                guard.finish(fetch_registry_index(DEFAULT_REGISTRY_URL, hashed, broken));
             });
             if spawned.is_err() {
                 // No thread means no result will ever arrive on `registry_rx`
@@ -1894,19 +2030,23 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                     // `seen_window_for` would otherwise reread and reparse
                     // `config.json` to learn what this loop's own caller already
                     // knows (that write is what invalidated `config`'s cache in
-                    // the first place). Falling back to `seen_window_for`, not
-                    // `seen_window_of`: this loop already holds the manifest, and
-                    // the registry key is namespaced by the *owner's* id, so
-                    // asking with `m` reads exactly the key `record_seen_windows`
-                    // wrote for it. Going back through the reading id would run
-                    // the inverse again only to have it answer `None` for a
-                    // reading id two manifests both claim — costing this provider
-                    // its auto-ping over a collision the panel is right to be
-                    // cautious about and the ping need not be.
+                    // the first place). Falling back to `seen_window_for` with
+                    // `m`, not a lookup by reading id: this loop already holds
+                    // the manifest, and the registry key is namespaced by the
+                    // *owner's* id, so asking with `m` reads exactly the key
+                    // `record_seen_windows` wrote for it. Going back through
+                    // the reading id would run `owning_manifest` again only to
+                    // have it answer `None` for a reading id two manifests both
+                    // claim — costing this provider its auto-ping over a
+                    // collision the panel is right to be cautious about and the
+                    // ping need not be.
+                    let Some(primary_key) = primary_window_key(m) else {
+                        continue;
+                    };
                     let seen_window = written
-                        .get(&(m.id.clone(), first_id.clone(), Role::Primary))
+                        .get(&(m.id.clone(), first_id.clone(), primary_key.clone()))
                         .copied()
-                        .or_else(|| seen_window_for(m, &first_id, Role::Primary));
+                        .or_else(|| seen_window_for(m, &first_id, &primary_key));
                     let Some(window) = ping_window(
                         m,
                         current.iter().find(|r| r.id == first_id),
@@ -1950,8 +2090,9 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                     // is deliberately no delay between the two: a gap is a window
                     // in which the app can be quit with the ping recorded and never
                     // sent, which on-disk state would then remember for good.
-                    config::set_plugin_pinged_at(&m.id, now);
-                    spawn_hello(bin, ping.args.clone(), None);
+                    // `pinged_at_while` hands the stamp back when the run never
+                    // started — see its own doc for why that undo matters.
+                    pinged_at_while(&m.id, now, || spawn_hello(bin, ping.args.clone(), None));
                 }
             }
         },
@@ -2213,10 +2354,13 @@ fn upgrade_builtin_manifests(dir: &std::path::Path) {
 /// it is what tells a genuinely missing file apart from one this function has
 /// no other way to ask about. It is *not* standing in for
 /// `seed::upgrade_builtin`'s own classification: `UpgradeAction::Absent`
-/// means exactly what `exists()` returning `false` means (no directory entry
-/// at all), never a directory or a dangling symlink at that path — anything
-/// `read_regular_file` refuses instead is `UpgradeAction::Unreadable`, said
-/// with its own line at the call site, not this one.
+/// means what `exists()` returning `false` means — no directory entry
+/// *reachable through that path* — which deliberately sweeps a dangling
+/// symlink in with the genuinely absent: following it fails either way, and
+/// the seeded copy then replaces the dead link rather than standing on it.
+/// Anything `read_regular_file` refuses instead is
+/// `UpgradeAction::Unreadable`, said with its own line at the call site,
+/// not this one.
 fn decided_yet_absent(dir: &std::path::Path, upgrade: &seed::BuiltinUpgrade) -> Option<String> {
     if dir.join(upgrade.file).exists() {
         return None;
@@ -2280,18 +2424,19 @@ fn load_plugins_from(dir: &std::path::Path) -> Vec<PluginManifest> {
             }
         })
         .collect();
+    let manifests = dedup_plugin_ids(manifests);
     // `manifest::load_dir` above already scanned `dir` once — this logs what
     // it found there rather than scanning it a second time (with its own
     // sort and name-join) purely to describe what the first scan was about
-    // to do. `manifests.len()` is every manifest that parsed, `dir.display()`
-    // is where they came from; a broken `.toml` already logged its own line,
-    // above, by id.
+    // to do. `manifests.len()` is what survived parsing *and* the dedup just
+    // above — the set the app will actually read — `dir.display()` is where
+    // they came from; a broken `.toml` already logged its own line, above,
+    // by id.
     diag::line(format!(
         "loaded {} plugin manifest(s) from {}",
         manifests.len(),
         dir.display()
     ));
-    let manifests = dedup_plugin_ids(manifests);
     // A backstop, not the primary defence any more: `dedup_plugin_ids` above
     // already drops the later of any two manifests claiming one reading id,
     // so this should find nothing on the set it just returned. Left in
@@ -2926,8 +3071,13 @@ fn windows_pick_toml_file() -> Option<std::path::PathBuf> {
 /// empty path. Split out so that rule is testable without a dialog on screen.
 #[cfg(any(target_os = "windows", target_os = "macos", test))]
 fn parse_picked_path(raw: &str) -> Option<std::path::PathBuf> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    // Only the line ending is stripped, not whitespace: a filename ending in
+    // a space is legal on APFS (and the picker can hand back exactly that),
+    // so `trim()` would silently break a real path. The all-whitespace case
+    // is still empty output — checked with a full `trim` rather than
+    // mistaken for a path of spaces.
+    let trimmed = raw.trim_end_matches(['\r', '\n']);
+    if trimmed.trim().is_empty() {
         None
     } else {
         Some(std::path::PathBuf::from(trimmed))
@@ -3361,7 +3511,19 @@ fn readings_with(
     let bare_plugin_id = owners
         .iter()
         .zip(out.iter())
-        .find(|(_, r)| r.windows.iter().any(|w| w.role != Role::Extra))
+        .find(|(_, r)| {
+            // Every half of this is load-bearing. `in_menu_bar`: an opt-in
+            // surface the user keeps hidden (Claude's `desktop`) is not in
+            // the title at all, so it must not claim the bare slot either —
+            // otherwise it eats the slot and the one provider that *is*
+            // printed keeps its label. `used_percent`: the title draws
+            // numbers, and a window that arrived without one draws nothing
+            // for this provider to be the bare spelling of.
+            r.in_menu_bar
+                && r.windows
+                    .iter()
+                    .any(|w| w.role != Role::Extra && w.used_percent.is_some())
+        })
         .map(|(owner, _)| *owner);
     for (r, owner) in out.iter_mut().zip(owners.iter()) {
         r.bare_when_sole = Some(*owner) == bare_plugin_id;
@@ -3529,17 +3691,13 @@ fn ping_window(
 // They do reach different conclusions from it, and deliberately so: see
 // [`SEEN_WINDOW_TTL_PERIODS`].
 
-/// The registry's name for a window's role. `Extra` has none, and that is the
-/// answer rather than an omission: a per-model allowance is a row the provider
-/// may withdraw at any time — `plugins/codex.toml` promises exactly that
-/// — so remembering it would both contradict the manifest and let keys pile up
-/// for every model that ever appeared.
-fn seen_role_key(role: Role) -> Option<&'static str> {
-    match role {
-        Role::Primary => Some("primary"),
-        Role::Secondary => Some("secondary"),
-        Role::Extra => None,
-    }
+/// Whether the registry remembers a window of this role at all. `Extra` is
+/// the answer rather than an omission: a per-model allowance is a row the
+/// provider may withdraw at any time — `plugins/codex.toml` promises exactly
+/// that — so remembering it would both contradict the manifest and let keys
+/// pile up for every model that ever appeared.
+fn seen_remembers_role(role: Role) -> bool {
+    !matches!(role, Role::Extra)
 }
 
 /// One window of one reading, as the provider currently states it — what the
@@ -3553,11 +3711,14 @@ struct SeenRecord<'a> {
     manifest: &'a PluginManifest,
     reading_id: String,
     role: Role,
-    /// [`seen_role_key`] of `role`, resolved once here rather than asked
-    /// again by every consumer: every `SeenRecord` that exists has already
-    /// passed the `Role::Extra` filter below, so `role` never reaches a
+    /// The window's own key (`Window::key`, `<entry>:`-shaped), not its
+    /// role's: nothing caps how many `secondary` windows a manifest may
+    /// declare, and two of them filed under one role key would share a
+    /// single record — the second's boundary silently merged into the
+    /// first's. Every `SeenRecord` that exists has already passed the
+    /// `Role::Extra` filter in `seen_records`, so `role` never reaches a
     /// consumer without a key to go with it.
-    key: &'static str,
+    key: String,
     seen: config::SeenWindow,
 }
 
@@ -3584,9 +3745,9 @@ fn seen_records<'a>(
             continue;
         };
         for w in &r.windows {
-            let Some(key) = seen_role_key(w.role) else {
+            if !seen_remembers_role(w.role) {
                 continue;
-            };
+            }
             // `0` is filtered here for the same reason
             // `config::plugin_seen_window_for` filters it on the way back out:
             // a boundary of `0` and "the provider never stated one" have to
@@ -3600,7 +3761,7 @@ fn seen_records<'a>(
                 manifest: m,
                 reading_id: r.id.clone(),
                 role: w.role,
-                key,
+                key: w.key.clone(),
                 // The manifest is the fallback, never the source: only a
                 // manifest whose window declares `period.mode = "assumed"` or
                 // `"from_bounds"` has a length of its own to give, and the
@@ -3610,7 +3771,7 @@ fn seen_records<'a>(
                     at,
                     period_minutes: w
                         .period_minutes
-                        .or_else(|| declared_period_minutes(m, w.role))
+                        .or_else(|| declared_period_minutes(m, &w.key))
                         .filter(|m| *m > 0),
                 },
             });
@@ -3620,11 +3781,16 @@ fn seen_records<'a>(
 }
 
 /// The length a manifest fixes for one of its windows, if it fixes one at all.
-fn declared_period_minutes(m: &PluginManifest, role: Role) -> Option<u64> {
+/// Found by window key rather than by role: two `secondary` entries are legal,
+/// and matching by role would hand whichever one sorts first's `assumed` to
+/// whichever window happened to ask.
+fn declared_period_minutes(m: &PluginManifest, window_key: &str) -> Option<u64> {
     let declared = m
         .windows
         .iter()
-        .find(|w| tickover::plugin::map_role(w.role) == role)?;
+        .enumerate()
+        .find(|(i, w)| tickover::plugin::window_key(w, *i) == window_key)
+        .map(|(_, w)| w)?;
     match declared.period.mode {
         manifest::PeriodMode::Assumed | manifest::PeriodMode::FromBounds => declared.period.assumed,
         manifest::PeriodMode::FromField => None,
@@ -3752,24 +3918,33 @@ fn seen_window_from(
     }
 }
 
-/// What the registry knows about one window of one reading of a known plugin.
-/// **The single place either feature asks** — see the section comment above.
-fn seen_window_for(m: &PluginManifest, reading_id: &str, role: Role) -> Option<config::SeenWindow> {
-    let key = seen_role_key(role)?;
-    seen_window_from(
-        config::plugin_seen_window_for(&m.id, reading_id, key),
-        || config::plugin_seen_window(&m.id),
-        || role == Role::Primary && first_surface_reading_id(m).as_deref() == Some(reading_id),
-    )
+/// The declared primary window's registry key, if this manifest declares one.
+fn primary_window_key(m: &PluginManifest) -> Option<String> {
+    m.windows
+        .iter()
+        .enumerate()
+        .find(|(_, w)| w.role == manifest::Role::Primary)
+        .map(|(i, w)| tickover::plugin::window_key(w, i))
 }
 
-/// [`seen_window_for`] for a caller holding only a reading id.
-fn seen_window_of(
-    plugins: &[PluginManifest],
+/// What the registry knows about one window of one reading of a known plugin.
+/// **The single place either feature asks** — see the section comment above.
+fn seen_window_for(
+    m: &PluginManifest,
     reading_id: &str,
-    role: Role,
+    window_key: &str,
 ) -> Option<config::SeenWindow> {
-    seen_window_for(owning_manifest(plugins, reading_id)?, reading_id, role)
+    seen_window_from(
+        config::plugin_seen_window_for(&m.id, reading_id, window_key),
+        || config::plugin_seen_window(&m.id),
+        // The pre-registry key (`plugin.<id>.seen_window`) only ever held the
+        // primary window of the plugin's first surface, so the fallback
+        // answers for exactly that one window and no other.
+        || {
+            primary_window_key(m).as_deref() == Some(window_key)
+                && first_surface_reading_id(m).as_deref() == Some(reading_id)
+        },
+    )
 }
 
 /// Record what every reading currently states about its windows.
@@ -3785,8 +3960,8 @@ fn seen_window_of(
 /// disagree with itself between the two calls.
 ///
 /// Returns exactly what it just wrote, keyed the same way the registry
-/// itself is (`plugin id`, `reading id`, `role`) — the auto-ping loop right
-/// after this call asks [`seen_window_for`] about a window this call may have
+/// itself is (`plugin id`, `reading id`, `window key`) — the auto-ping loop
+/// right after this call asks [`seen_window_for`] about a window this call may have
 /// *just* recorded, and `config`'s own cache (see `config::with_config`) only
 /// remembers one parsed copy of the whole file: the write above already threw
 /// it out, so asking again would reread and reparse `config.json` a second
@@ -3798,12 +3973,12 @@ fn record_seen_windows(
     plugins: &[PluginManifest],
     readings: &[ProviderReading],
     now: u64,
-) -> HashMap<(String, String, Role), config::SeenWindow> {
+) -> HashMap<(String, String, String), config::SeenWindow> {
     let mut written = HashMap::new();
     for rec in seen_writes(seen_records(plugins, readings), seen_window_for, now) {
-        config::set_plugin_seen_window_for(&rec.manifest.id, &rec.reading_id, rec.key, rec.seen);
+        config::set_plugin_seen_window_for(&rec.manifest.id, &rec.reading_id, &rec.key, rec.seen);
         written.insert(
-            (rec.manifest.id.clone(), rec.reading_id.clone(), rec.role),
+            (rec.manifest.id.clone(), rec.reading_id.clone(), rec.key),
             rec.seen,
         );
     }
@@ -3822,24 +3997,25 @@ fn record_seen_windows(
 /// decision comes out and the writing stays behind.
 fn seen_writes<'a>(
     stated: Vec<SeenRecord<'a>>,
-    previous: impl Fn(&PluginManifest, &str, Role) -> Option<config::SeenWindow>,
+    previous: impl Fn(&PluginManifest, &str, &str) -> Option<config::SeenWindow>,
     now: u64,
 ) -> Vec<SeenRecord<'a>> {
     let mut out: Vec<SeenRecord<'a>> = Vec::new();
     for rec in stated {
-        // At most one write per remembered window, however many windows of that
-        // role the reading carries. Validation caps `primary` at one, but
-        // nothing caps `secondary`, so a manifest may declare two — and each
-        // record is otherwise compared against what is *on disk*, which the
-        // earlier records of this same tick have not reached yet. Left alone
-        // the last would win rather than the newest, so an older boundary could
-        // overwrite a newer one: forward-only, undone by a loop.
+        // At most one write per remembered window, however many times the
+        // reading restates it. Each record is otherwise compared against
+        // what is *on disk*, which the earlier records of this same tick
+        // have not reached yet — left alone the last would win rather than
+        // the newest, so an older boundary could overwrite a newer one:
+        // forward-only, undone by a loop. Compared on the window *key*, so
+        // two genuinely different windows of one role (nothing caps
+        // `secondary`) keep separate records rather than folding together.
         let same = out.iter().position(|w| {
-            w.manifest.id == rec.manifest.id && w.reading_id == rec.reading_id && w.role == rec.role
+            w.manifest.id == rec.manifest.id && w.reading_id == rec.reading_id && w.key == rec.key
         });
         let known = match same {
             Some(i) => Some(out[i].seen),
-            None => previous(rec.manifest, &rec.reading_id, rec.role),
+            None => previous(rec.manifest, &rec.reading_id, &rec.key),
         };
         let Some(merged) = seen_merge(known, rec.seen, now) else {
             continue;
@@ -4454,7 +4630,12 @@ fn refresh_model_from(
             let (windows, balances) = match &r.error {
                 None => {
                     let m = owning_manifest(plugins, &r.id);
-                    let rows = window_rows(m, r, now, &|role| seen_window_of(plugins, &r.id, role));
+                    // `seen_window_for` with the manifest just resolved one
+                    // line up — looking up by reading id instead would rerun
+                    // `owning_manifest` for every window this row asks about.
+                    let rows = window_rows(m, r, now, &|key| {
+                        m.and_then(|m| seen_window_for(m, &r.id, key))
+                    });
                     let windows = reconcile_window_model(&mut win_models, &r.id, rows);
                     let brows = balance_rows(r, now);
                     let balances = reconcile_balance_model(&mut bal_models, &r.id, brows);
@@ -4816,10 +4997,10 @@ fn seen_window_ttl_secs(period_minutes: u64) -> u64 {
 /// The rows one provider's panel section shows: the windows it reported, plus
 /// the ones it has stopped reporting since we last saw them.
 ///
-/// `seen` answers what the registry knows about this reading's window in a
-/// given role ([`seen_window_of`] in production) — passed in so the decision
-/// below is testable without a config file, and so the panel and the auto-ping
-/// demonstrably read the same fact.
+/// `seen` answers what the registry knows about this reading's window under
+/// a given window key ([`seen_window_for`] in production) — passed in so the
+/// decision below is testable without a config file, and so the panel and the
+/// auto-ping demonstrably read the same fact.
 ///
 /// A row is added only when all of it holds:
 /// * **the reading is not in error.** A provider we could not read has said
@@ -4829,8 +5010,8 @@ fn seen_window_ttl_secs(period_minutes: u64) -> u64 {
 ///   reasoning is written into `seen_records` and a rule that lives in only one
 ///   of the two halves is the shape of this project's last latent hole;
 /// * the manifest declares the window, and it is not `Extra` (never
-///   remembered — see [`seen_role_key`]);
-/// * **the reading carries no window in that role at all** — asked of
+///   remembered — see [`seen_remembers_role`]);
+/// * **the reading carries no window under that key at all** — asked of
 ///   `r.windows` and not of the rows built below, which are the windows that
 ///   also had a percentage to draw. A window reported *without* a usable figure
 ///   is still a window the provider reported, and calling it "not started"
@@ -4847,7 +5028,7 @@ fn window_rows(
     m: Option<&PluginManifest>,
     r: &ProviderReading,
     now: u64,
-    seen: &dyn Fn(Role) -> Option<config::SeenWindow>,
+    seen: &dyn Fn(&str) -> Option<config::SeenWindow>,
 ) -> Vec<(String, WindowData)> {
     // A window the provider reported no percentage for is left out rather than
     // drawn as an empty bar over "no data": it occupies a block's worth of
@@ -4872,10 +5053,17 @@ fn window_rows(
     if let Some(m) = m.filter(|_| r.error.is_none()) {
         for (index, declared) in m.windows.iter().enumerate() {
             let role = tickover::plugin::map_role(declared.role);
-            if seen_role_key(role).is_none() || r.windows.iter().any(|w| w.role == role) {
+            let key = tickover::plugin::window_key(declared, index);
+            // Per *key*, not per role: a manifest may declare two `secondary`
+            // windows, and one of them still reporting must not suppress the
+            // quiet row the other is owed. `==` is exact here because every
+            // reachable `w.key` is `<entry>:` — `<entry>:<element>` keys
+            // exist only on `for_each` windows, which the validator forces
+            // onto `extra`, and extras never reach this check.
+            if !seen_remembers_role(role) || r.windows.iter().any(|w| w.key == key) {
                 continue;
             }
-            let Some((at, period_minutes)) = seen(role).and_then(|s| {
+            let Some((at, period_minutes)) = seen(&key).and_then(|s| {
                 s.period_minutes
                     .filter(|mins| *mins > 0)
                     .map(|mins| (s.at, mins))
@@ -4901,7 +5089,7 @@ fn window_rows(
                     // going quiet and coming back is one row throughout rather
                     // than a rebuild — and so the reconciler can tell the two
                     // quiet rows of one provider apart.
-                    tickover::plugin::window_key(declared, index),
+                    key,
                     not_started_row(&declared.label, role, period_minutes),
                 ),
             );
@@ -5225,8 +5413,14 @@ fn quote_command_arg(arg: &str) -> String {
 /// while running something else is how a third-party manifest would get a
 /// command executed without ever saying so.
 fn ping_command_line(ping: &manifest::PingConfig) -> String {
+    // `bin` is quoted by the same rule as the args: the checkbox shows a
+    // command line, and a `bin` with whitespace in it would read as the
+    // first of the args. (The validator refuses a path separator in `bin`,
+    // but whitespace in a bare program name it does not — and quoting is
+    // display-only either way, so quoting it always is the safe read.)
+    let bin = quote_command_arg(&ping.bin);
     if ping.args.is_empty() {
-        ping.bin.clone()
+        bin
     } else {
         let args = ping
             .args
@@ -5234,7 +5428,7 @@ fn ping_command_line(ping: &manifest::PingConfig) -> String {
             .map(|a| quote_command_arg(a))
             .collect::<Vec<_>>()
             .join(" ");
-        format!("{} {args}", ping.bin)
+        format!("{bin} {args}")
     }
 }
 
@@ -5411,6 +5605,12 @@ fn window_view(
 
 // ── Menu-bar title (plain-text fallback) ─────────────────────────────────────
 
+/// What [`menu_bar_title`] answers when nothing is visible — and what
+/// [`tray_tooltip`] compares its input against to recognise that same
+/// answer. Two spellings of one string would drift into two different
+/// strings, so both sides read this.
+const EMPTY_MENU_BAR_TITLE: &str = "Limits";
+
 /// Compact used-quota value, matching every other figure this app shows: the
 /// panel's caption, the widget's bar and its number. A trailing `!` is the
 /// only severity signal the plain macOS menu-bar title can carry.
@@ -5457,7 +5657,7 @@ fn menu_bar_title(readings: &[ProviderReading]) -> String {
         .collect();
 
     match visible.as_slice() {
-        [] => "Limits".to_string(),
+        [] => EMPTY_MENU_BAR_TITLE.to_string(),
         [(r, pair)] if r.bare_when_sole => pair.clone(),
         _ => visible
             .iter()
@@ -5604,7 +5804,7 @@ fn menu_theme_dark() -> bool {
 fn tray_tooltip(figures: &str) -> String {
     // `menu_bar_title`'s own "nothing to report" answer. Repeating it after
     // the name would read as a second, emptier label.
-    if figures == "Limits" {
+    if figures == EMPTY_MENU_BAR_TITLE {
         "Tickover".to_string()
     } else {
         format!("Tickover\n{figures}")
@@ -5727,6 +5927,14 @@ fn tray_indicator_key(
         None => 2u8.hash(&mut h),
     }
     tooltip.hash(&mut h);
+    // The badge is drawn at `tray_badge_px()` — a metric that changes with
+    // the display's DPI — so a monitor move or a scale change has to turn
+    // this key or the tray keeps showing a badge rendered for the old pixel
+    // size until some percentage happens to move. macOS draws through a
+    // template image the system resamples itself; there is no badge metric
+    // to key on there.
+    #[cfg(target_os = "windows")]
+    tray_badge_px().hash(&mut h);
     h.finish()
 }
 
@@ -6902,6 +7110,28 @@ fn ping_probe_decision(state: &PingProbe, host: &str, now: Instant) -> (PingNetw
     (PingNetwork::Pending, true)
 }
 
+/// The mutation [`ping_network_gate`] performs once [`ping_probe_decision`]
+/// has asked for a probe: stamp `host` as the in-flight probe's target.
+/// On a host change the whole state is dropped first — everything cached in
+/// it was learned for the host nobody is asking about any more, and while
+/// `ping_probe_decision` refuses to *answer* from a mismatched `last`, the
+/// refusal only holds while `state.host` still names the old host: left in
+/// place under the new stamp, that `last` would read next tick as a fresh
+/// verdict about the new one, crediting it with the old host's reachability.
+/// (The probe thread's own write-back is guarded by `state.host ==
+/// probe_host`, so it can never be the thing that clears this.) A respawn
+/// for the *same* host keeps `last` — stale past [`PING_PROBE_TTL`], it is
+/// already ignored, and dropping it would only widen the window in which
+/// nothing is known.
+fn ping_probe_stamp(state: &mut PingProbe, host: &str) {
+    if state.host != host {
+        *state = PingProbe::default();
+    }
+    state.host = host.to_string();
+    state.in_flight = true;
+    state.started = Some(Instant::now());
+}
+
 /// Insert `key` into `set`, returning whether it was not already
 /// there — the shared shape behind every "log this once, not on every
 /// check" dedupe in this file ([`PING_NET_DOWN`] via [`note_unreachable`],
@@ -6987,9 +7217,7 @@ fn ping_network_gate(plugin_id: &str, host: Option<&str>) -> PingNetwork {
             .or_default();
         let (answer, spawn) = ping_probe_decision(state, host, Instant::now());
         if spawn {
-            state.host = host.to_string();
-            state.in_flight = true;
-            state.started = Some(Instant::now());
+            ping_probe_stamp(state, host);
         }
         (answer, spawn)
     };
@@ -7144,23 +7372,41 @@ fn run_renewal_ping(
     let Some(bin) = ping_binary(plugin_id, ping) else {
         return false;
     };
-    let pinged_at_before = config::plugin_pinged_at(plugin_id);
-    config::set_plugin_pinged_at(plugin_id, now);
     let (previous, credited) = credit_renewal(&surface_key, renewal);
     diag::line(format!(
         "auto-ping: {plugin_id} token has lapsed, running {} to renew it (attempt {})",
         ping.bin, credited.attempts
     ));
-    let spawned = spawn_hello(
-        bin,
-        ping.args.clone(),
-        Some((surface_key.clone(), credited)),
-    );
+    let spawned = pinged_at_while(plugin_id, now, || {
+        spawn_hello(
+            bin,
+            ping.args.clone(),
+            Some((surface_key.clone(), credited)),
+        )
+    });
     if !spawned {
         uncredit_renewal(&surface_key, credited, previous);
-        config::set_plugin_pinged_at(plugin_id, pinged_at_before);
     }
     spawned
+}
+
+/// Record `plugin_id`'s ping timestamp for `now`, run `attempt`, and return
+/// its answer — but with the prior timestamp restored when `attempt` answers
+/// `false`. `false` from `spawn_hello` means the run never started (no working
+/// directory, the OS refused a thread): a `pinged_at` left stamped anyway
+/// would spend the window's one ping on nothing, silencing it until the
+/// window ends, so the stamp is borrowed for the attempt rather than spent
+/// on it. Used by every caller that pays for a ping out of `pinged_at` —
+/// the one-second tick's window ping and `run_renewal_ping` — so the
+/// read-stamp-restore sequence cannot drift between them.
+fn pinged_at_while(plugin_id: &str, now: u64, attempt: impl FnOnce() -> bool) -> bool {
+    let before = config::plugin_pinged_at(plugin_id);
+    config::set_plugin_pinged_at(plugin_id, now);
+    let ran = attempt();
+    if !ran {
+        config::set_plugin_pinged_at(plugin_id, before);
+    }
+    ran
 }
 
 // ── Registry: Check updates / Install / Update ───────────────────────────
@@ -7197,8 +7443,14 @@ enum RegistryCheckMsg {
     /// not by [`apply_registry_check`] once this lands back on the UI
     /// thread: reading and hashing every installed manifest is exactly the
     /// filesystem work `fetch_registry_index`'s own doc promises never runs
-    /// there.
-    Success(RegistryIndex, Vec<(String, String, String)>),
+    /// there. The third field is [`unparsable_manifest_files`]'s
+    /// `(file-stem, error)` list, gathered on the same thread for the same
+    /// reason.
+    Success(
+        RegistryIndex,
+        Vec<(String, String, String)>,
+        Vec<(String, String)>,
+    ),
 }
 
 /// Sends a "Check updates" worker's result exactly once — on
@@ -7268,7 +7520,11 @@ fn signature_url(index_url: &str) -> String {
 /// this still parses it — logged, not refused, on every single check (see the
 /// `Unverifiable` arm below). Everything downstream is unchanged either way;
 /// the check is a gate in front of them, never a substitute for one.
-fn fetch_registry_index(url: &str, installed: Vec<(String, String, String)>) -> RegistryCheckMsg {
+fn fetch_registry_index(
+    url: &str,
+    installed: Vec<(String, String, String)>,
+    broken: Vec<(String, String)>,
+) -> RegistryCheckMsg {
     // Fetched as bytes rather than text, because a signature is over the
     // bytes a server sent and nothing else. Decoding first and verifying the
     // decoded form would check a signature over something the publisher never
@@ -7321,7 +7577,7 @@ fn fetch_registry_index(url: &str, installed: Vec<(String, String, String)>) -> 
                 }
             };
             match RegistryIndex::from_str(&text) {
-                Ok(index) => RegistryCheckMsg::Success(index, installed),
+                Ok(index) => RegistryCheckMsg::Success(index, installed, broken),
                 Err(e) => {
                     diag::line(format!(
                         "check-updates: index.toml failed to parse ({url}): {e}"
@@ -7359,10 +7615,18 @@ struct RegistryDiff {
 /// "how many" reads `.len()` off whichever collection it means rather than
 /// trusting a third field to have been kept in step with the two that
 /// actually hold the rows.
+/// `broken` is [`unparsable_manifest_files`]'s `(file stem, error)` list —
+/// a `<stem>.toml` sitting in the plugins dir that no parse could read. When
+/// an index entry's id matches one, its Install click is doomed from the
+/// start (`install_write` refuses to clobber that file), so the row carries
+/// the parse error and the `Failed` status — a Retry the user can still try
+/// after removing the file — instead of an Install button that only ever
+/// errors with "already exists".
 fn fold_registry_diff(
     index: &RegistryIndex,
     installed: &[(String, String, String)],
     lockfile: &registry::RegistryLockState,
+    broken: &[(String, String)],
 ) -> RegistryDiff {
     let states = registry::diff_installed(index, installed, lockfile);
     let mut diff = RegistryDiff {
@@ -7372,7 +7636,16 @@ fn fold_registry_diff(
     for (entry, state) in index.plugins.iter().zip(states.iter()) {
         match state {
             RegistryPluginState::New => {
-                diff.new_rows.push(registry_entry_row(entry));
+                let mut row = registry_entry_row(entry);
+                if let Some((_, msg)) = broken.iter().find(|(stem, _)| *stem == entry.id) {
+                    row.status = InstallStatus::Failed;
+                    row.error = ss(format!(
+                        "the installed {stem}.toml cannot be read — {msg}. \
+                         Remove or fix that file to install this plugin.",
+                        stem = entry.id,
+                    ));
+                }
+                diff.new_rows.push(row);
             }
             RegistryPluginState::UpdateAvailable { overwrite_safe, .. } => {
                 diff.updates
@@ -7413,29 +7686,63 @@ fn registry_entry_row(entry: &RegistryEntry) -> RegistryPluginRow {
 /// diff_installed`]'s own doc comment: never a re-serialization), pulled out
 /// so it can run entirely on the "Check updates" worker thread rather than on
 /// the UI thread once the result lands back on it.
+/// Stands in for the sha256 of a manifest file that could not be read or
+/// found this run. Deliberately not 64 hex digits, so it can never compare
+/// equal to a recorded `origin_sha256` — the row then reads as
+/// installed-with-local-edits (or an unsafe update) rather than `New`, which
+/// is the failure this exists to prevent: dropping the id entirely would
+/// have "Check updates" offer *Install* for a plugin that is installed, and
+/// the install would write a second file under `<id>.toml` beside the one
+/// the loader found it in (the file was located by parsed id, not by
+/// filename — see [`find_plugin_manifest_path`]).
+const UNREADABLE_MANIFEST_SHA: &str = "unreadable";
+
 fn hash_installed_manifests(
     dir: &std::path::Path,
     installed: &[(String, String)],
 ) -> Vec<(String, String, String)> {
     installed
         .iter()
-        .filter_map(|(id, version)| {
-            let path = find_plugin_manifest_path(dir, id)?;
-            // Bounded and FIFO-safe, the same as every other manifest read:
-            // this path came out of the plugins folder, exactly as reachable
-            // by another program as any third-party manifest is.
-            let text =
-                tickover::plugin::read_regular_file(&path, tickover::plugin::SMALL_FILE_MAX_BYTES)?;
-            Some((
-                id.clone(),
-                registry::sha256_hex(text.as_bytes()),
-                version.clone(),
-            ))
+        .map(|(id, version)| {
+            let sha = find_plugin_manifest_path(dir, id)
+                .and_then(|path| {
+                    // Bounded and FIFO-safe, the same as every other manifest read:
+                    // this path came out of the plugins folder, exactly as reachable
+                    // by another program as any third-party manifest is.
+                    tickover::plugin::read_regular_file(
+                        &path,
+                        tickover::plugin::SMALL_FILE_MAX_BYTES,
+                    )
+                    .map(|text| registry::sha256_hex(text.as_bytes()))
+                })
+                .unwrap_or_else(|| UNREADABLE_MANIFEST_SHA.to_string());
+            (id.clone(), sha, version.clone())
         })
         .collect()
 }
 
-/// Apply a "Check updates" background result to the UI. The two error
+/// The `*.toml` files in `dir` that exist but did not load, as
+/// `(file stem, parse error)` pairs — the stem doubles as the id an
+/// Install click would write under ([`install_write`] always targets
+/// `<id>.toml`), which is the only link a file that cannot declare its
+/// own id can offer. Surfaced so a registry row can say *why* its Install
+/// would fail: `install_write` refuses to clobber an existing file, so a
+/// `New` row for an id whose `<id>.toml` sits unreadable on disk is a
+/// button that can only ever error.
+fn unparsable_manifest_files(dir: &std::path::Path) -> Vec<(String, String)> {
+    manifest::load_dir(dir)
+        .into_iter()
+        .filter_map(|result| match result {
+            Ok(_) => None,
+            Err((path, msg)) => Some((
+                path.file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                msg,
+            )),
+        })
+        .collect()
+}
 /// statuses render a fixed sentence (`registry-error`); a successful fetch
 /// diffs the installed-manifest hashes [`hash_installed_manifests`] already
 /// computed, off this thread, against the index, then rebuilds the plugin
@@ -7469,9 +7776,9 @@ fn apply_registry_check(
                 "Registry index rejected — see the diagnostic log for the reason",
             ));
         }
-        RegistryCheckMsg::Success(index, installed) => {
+        RegistryCheckMsg::Success(index, installed, broken) => {
             let lockfile = registry::load_lockfile(&registry::lockfile_path());
-            let diff = fold_registry_diff(&index, &installed, &lockfile);
+            let diff = fold_registry_diff(&index, &installed, &lockfile, &broken);
             // Read before `diff.updates`/`diff.new_rows` are moved out below
             // — `RegistryDiff` no longer carries its own running counts (see
             // `fold_registry_diff`'s own doc), so this is where the two
@@ -10576,7 +10883,7 @@ mod title_tests {
             at: NOW - 600,
             period_minutes: Some(300),
         };
-        let rows = window_rows(Some(&m), &reading, NOW, &seen_only(Role::Primary, seen));
+        let rows = window_rows(Some(&m), &reading, NOW, &seen_only("w0:", seen));
 
         assert_eq!(
             labels(&rows),
@@ -11160,13 +11467,16 @@ mod title_tests {
         PluginManifest::from_str(toml).expect("valid two-window manifest")
     }
 
-    /// A registry answer for one role and nothing else — the shape
+    /// A registry answer for one window key and nothing else — the shape
     /// [`window_rows`] takes so it can be tested without a config file.
+    /// `two_window_manifest` declares no `id`s, so its entries key as
+    /// `w0:` (primary), `w1:` (secondary), `w2:` (extra).
     fn seen_only(
-        role: Role,
+        key: &str,
         seen: config::SeenWindow,
-    ) -> impl Fn(Role) -> Option<config::SeenWindow> {
-        move |asked| (asked == role).then_some(seen)
+    ) -> impl Fn(&str) -> Option<config::SeenWindow> {
+        let key = key.to_string();
+        move |asked| (asked == key).then_some(seen)
     }
 
     fn labels(rows: &[(String, WindowData)]) -> Vec<String> {
@@ -11191,7 +11501,7 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &weekly_only, NOW, &seen_only(Role::Primary, seen));
+        let rows = window_rows(Some(&m), &weekly_only, NOW, &seen_only("w0:", seen));
 
         assert_eq!(
             labels(&rows),
@@ -11233,7 +11543,7 @@ mod title_tests {
                 at: NOW - elapsed,
                 period_minutes: Some(300),
             };
-            window_rows(Some(&m), &nothing, NOW, &seen_only(Role::Primary, seen))
+            window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", seen))
         };
 
         assert_eq!(
@@ -11268,7 +11578,7 @@ mod title_tests {
                 at: NOW - elapsed,
                 period_minutes: Some(10_080),
             };
-            window_rows(Some(&m), &nothing, NOW, &seen_only(Role::Secondary, seen))
+            window_rows(Some(&m), &nothing, NOW, &seen_only("w1:", seen))
         };
 
         assert_eq!(labels(&rows_at(0)), vec!["Weekly limit"]);
@@ -11309,7 +11619,7 @@ mod title_tests {
             at: NOW + 600,
             period_minutes: Some(300),
         };
-        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only(Role::Primary, seen)).is_empty());
+        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", seen)).is_empty());
     }
 
     /// A reading we could not take is not evidence that a window is empty. The
@@ -11325,7 +11635,7 @@ mod title_tests {
             at: NOW - 600,
             period_minutes: Some(300),
         };
-        assert!(window_rows(Some(&m), &broken, NOW, &seen_only(Role::Primary, seen)).is_empty());
+        assert!(window_rows(Some(&m), &broken, NOW, &seen_only("w0:", seen)).is_empty());
     }
 
     /// A window nobody ever saw is not a window we can say anything about —
@@ -11351,24 +11661,12 @@ mod title_tests {
             at: NOW - 600,
             period_minutes: None,
         };
-        assert!(window_rows(
-            Some(&m),
-            &nothing,
-            NOW,
-            &seen_only(Role::Primary, no_length)
-        )
-        .is_empty());
+        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", no_length)).is_empty());
         let zero_length = config::SeenWindow {
             at: NOW - 600,
             period_minutes: Some(0),
         };
-        assert!(window_rows(
-            Some(&m),
-            &nothing,
-            NOW,
-            &seen_only(Role::Primary, zero_length)
-        )
-        .is_empty());
+        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", zero_length)).is_empty());
     }
 
     /// A window the provider *is* reporting is drawn from what it reported.
@@ -11383,7 +11681,7 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &live, NOW, &seen_only(Role::Primary, seen));
+        let rows = window_rows(Some(&m), &live, NOW, &seen_only("w0:", seen));
         assert_eq!(labels(&rows), vec!["5-hour limit"]);
         assert!(!rows[0].1.not_started);
         assert_eq!(rows[0].1.pct, 12.0);
@@ -11427,7 +11725,10 @@ mod title_tests {
         let m = two_window_manifest();
         let figureless = reading_with(
             vec![Window {
-                key: String::new(),
+                // The primary entry's own key — the window *is* being
+                // reported, just with no figure, which is exactly why its
+                // quiet row must not also appear.
+                key: "w0:".to_string(),
                 label: "5H".into(),
                 role: Role::Primary,
                 used_percent: None,
@@ -11441,7 +11742,7 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &figureless, NOW, &seen_only(Role::Primary, seen));
+        let rows = window_rows(Some(&m), &figureless, NOW, &seen_only("w0:", seen));
         assert!(
             rows.is_empty(),
             "no row to draw, and no claim that the window is empty: {:?}",
@@ -11449,24 +11750,24 @@ mod title_tests {
         );
     }
 
-    /// An extra quota is never remembered (`seen_role_key`), and this proves
-    /// the row builder agrees even when handed a registry that answers for
-    /// every role: `plugins/codex.toml` promises that a model Codex
+    /// An extra quota is never remembered (`seen_remembers_role`), and this
+    /// proves the row builder agrees even when handed a registry that answers
+    /// for every key: `plugins/codex.toml` promises that a model Codex
     /// withdraws simply stops being a row.
     #[test]
     fn an_extra_quota_never_gets_a_not_started_row() {
         let m = two_window_manifest();
         let nothing = reading_with(Vec::new(), None);
-        // Answers for *every* role, the per-model one included, and with its
-        // own length each so a row filed under the wrong role is visible in
+        // Answers for *every* key, the per-model one's included, and with its
+        // own length each so a row filed under the wrong key is visible in
         // the caption rather than hidden behind an identical one.
-        let seen = |role: Role| {
+        let seen = |key: &str| {
             Some(config::SeenWindow {
                 at: NOW - 600,
-                period_minutes: Some(match role {
-                    Role::Primary => 300,
-                    Role::Secondary => 10_080,
-                    Role::Extra => 1_440,
+                period_minutes: Some(match key {
+                    "w0:" => 300,
+                    "w1:" => 10_080,
+                    _ => 1_440,
                 }),
             })
         };
@@ -11478,8 +11779,8 @@ mod title_tests {
             "both subscription windows, and nothing for the per-model one"
         );
         assert!(
-            seen_role_key(Role::Extra).is_none(),
-            "and the registry has no name to file it under"
+            !seen_remembers_role(Role::Extra),
+            "and the registry keeps no record of it"
         );
     }
 
@@ -11500,16 +11801,16 @@ mod title_tests {
             }],
             None,
         );
-        let seen = |role: Role| match role {
-            Role::Primary => Some(config::SeenWindow {
+        let seen = |key: &str| match key {
+            "w0:" => Some(config::SeenWindow {
                 at: NOW - 600,
                 period_minutes: Some(300),
             }),
-            Role::Secondary => Some(config::SeenWindow {
+            "w1:" => Some(config::SeenWindow {
                 at: NOW - 600,
                 period_minutes: Some(10_080),
             }),
-            Role::Extra => None,
+            _ => None,
         };
 
         let rows = window_rows(Some(&m), &extra_only, NOW, &seen);
@@ -11533,7 +11834,7 @@ mod title_tests {
             at: NOW - 600,
             period_minutes: Some(300),
         };
-        let rows = window_rows(None, &live, NOW, &seen_only(Role::Primary, seen));
+        let rows = window_rows(None, &live, NOW, &seen_only("w0:", seen));
         assert_eq!(labels(&rows), vec!["Weekly limit"]);
     }
 
@@ -11551,7 +11852,7 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &empty, NOW, &seen_only(Role::Primary, seen));
+        let rows = window_rows(Some(&m), &empty, NOW, &seen_only("w0:", seen));
         assert!(
             rows.iter()
                 .any(|(_, w)| w.label == "5-hour limit" && w.not_started),
@@ -11665,15 +11966,15 @@ mod title_tests {
         );
     }
 
-    /// Nothing caps how many `secondary` windows a manifest may declare (only
-    /// `primary` is capped at one), so a reading can carry two windows of one
-    /// role. Each record is compared against what is on disk, which the earlier
-    /// records of the same tick have not reached — so without folding them, the
-    /// *last* would win rather than the newest, and an older boundary could
-    /// overwrite a newer one inside a single tick.
+    /// One window can be restated twice inside a single tick (a provider may
+    /// say the same thing twice). Each record is compared against what is on
+    /// disk, which the earlier records of the same tick have not reached — so
+    /// without folding them, the *last* would win rather than the newest, and
+    /// an older boundary could overwrite a newer one inside a single tick.
     #[test]
     fn two_windows_of_one_role_produce_one_write_and_the_newest_boundary_wins() {
         let plugins = vec![two_window_manifest()];
+        // Same declared key (`w1:`): the two reports are one window, restated.
         let newer = win("WK", Role::Secondary, 69.0, 7200, 10_080);
         let older = win("WK", Role::Secondary, 12.0, 600, 10_080);
         let reading = |windows: Vec<Window>| vec![reading_with(windows, None)];
@@ -11719,12 +12020,12 @@ mod title_tests {
             period_minutes: Some(300),
         };
         assert_eq!(
-            written.get(&(id.clone(), id.clone(), Role::Primary)),
+            written.get(&(id.clone(), id.clone(), "w0:".to_string())),
             Some(&expected),
             "the map carries the window this call just recorded"
         );
         assert_eq!(
-            config::plugin_seen_window_for(&id, &id, "primary"),
+            config::plugin_seen_window_for(&id, &id, "w0:"),
             Some(expected),
             "and it matches what actually landed on disk"
         );
@@ -11835,7 +12136,9 @@ mod title_tests {
         let from_field = two_window_manifest(); // period.mode = "from_field"
         let no_length = reading_with(
             vec![Window {
-                key: String::new(),
+                // Both manifests declare their primary as the first entry —
+                // `w0:` is the key an engine would have built for it.
+                key: "w0:".to_string(),
                 label: "5H".into(),
                 role: Role::Primary,
                 used_percent: Some(3.0),
@@ -12129,7 +12432,7 @@ mod title_tests {
         assert_ne!(was.reset_rel, "");
 
         let gone = reading_with(Vec::new(), None);
-        let after = window_rows(Some(&m), &gone, NOW, &seen_only(Role::Primary, seen));
+        let after = window_rows(Some(&m), &gone, NOW, &seen_only("w0:", seen));
         let model = reconcile_window_model(&mut models, "codex", after);
         assert_eq!(
             model.row_count(),
@@ -14071,6 +14374,41 @@ mod title_tests {
         );
     }
 
+    /// The stamp half of a host flip: `ping_probe_decision` answers Pending
+    /// for the new host, but the *old* host's verdict has to leave with it —
+    /// stamped over in place, `last` would read next tick as a fresh answer
+    /// about the new host.
+    #[test]
+    fn ping_probe_stamp_drops_the_old_hosts_verdict_on_a_flip() {
+        let mut state = PingProbe {
+            host: "old.example.com".to_string(),
+            in_flight: false,
+            started: None,
+            last: Some((Instant::now(), false)),
+        };
+        ping_probe_stamp(&mut state, "new.example.com");
+        assert!(
+            state.last.is_none() && state.in_flight && state.host == "new.example.com",
+            "the flip starts clean: {state:?}"
+        );
+
+        // Same-host respawn (a verdict aged past the TTL) keeps `last` —
+        // it is ignored anyway, and dropping it would only widen the window
+        // in which nothing is known.
+        let at = Instant::now();
+        let mut same = PingProbe {
+            host: "example.com".to_string(),
+            in_flight: false,
+            started: None,
+            last: Some((at - PING_PROBE_TTL - Duration::from_secs(1), true)),
+        };
+        ping_probe_stamp(&mut same, "example.com");
+        assert!(
+            same.last.is_some(),
+            "a stale verdict for the same host is kept — it changes nothing"
+        );
+    }
+
     #[test]
     fn spawn_hello_marks_a_credited_renewal_failed_when_command_spawn_itself_fails() {
         // A directory path stands in for "exists but cannot actually be
@@ -14609,13 +14947,23 @@ mod title_tests {
 
         assert_eq!(
             out,
-            vec![(
-                "real-id".to_string(),
-                registry::sha256_hex(bytes.as_bytes()),
-                "3.2.1".to_string(),
-            )],
+            vec![
+                (
+                    "real-id".to_string(),
+                    registry::sha256_hex(bytes.as_bytes()),
+                    "3.2.1".to_string(),
+                ),
+                (
+                    "not-installed".to_string(),
+                    UNREADABLE_MANIFEST_SHA.to_string(),
+                    "9.9.9".to_string(),
+                ),
+            ],
             "the id with a manifest on disk is hashed and keeps its given version; \
-             the one with none contributes nothing, not an entry with an empty hash"
+             the one without is still carried — with the sentinel hash, so the \
+             registry row says installed-but-unreadable instead of offering an \
+             Install that would either refuse to clobber or write a second file \
+             under a different name for the same id"
         );
     }
 
@@ -14721,7 +15069,7 @@ mod title_tests {
         );
         let installed = vec![("existing".to_string(), origin_sha, "1.0.0".to_string())];
 
-        let diff = fold_registry_diff(&index, &installed, &lockfile);
+        let diff = fold_registry_diff(&index, &installed, &lockfile, &[]);
 
         assert_eq!(diff.updates.len(), 1);
         let (available, has_local_edits) = diff
@@ -14789,7 +15137,7 @@ mod title_tests {
         );
         let installed = vec![("prov".to_string(), edited_sha, "1.0.0".to_string())];
 
-        let diff = fold_registry_diff(&index, &installed, &lockfile);
+        let diff = fold_registry_diff(&index, &installed, &lockfile, &[]);
 
         assert_eq!(diff.updates.len(), 1);
         assert_eq!(diff.new_rows.len(), 0);

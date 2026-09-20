@@ -18,14 +18,14 @@ order        = 20
 # the CLI renames under it — see docs/PLUGIN-ARCHITECTURE.md, "Reader
 # capabilities".
 requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry", "reading-balances", "balance-conditional", "credentials-file-path-env", "keychain-service-env"]
-version      = "1.4.5"
+version      = "1.4.6"
 engine       = "http-api"
 # Re-fetched every 60 s.
 refresh_secs = 60
 
 # Claude reports no window lengths of its own, so the nominal periods (5h =
 # 300 min, weekly = 10080 min) are assumed here. This is the mirror image of
-# Codex, whose windows carry their own `window_minutes`.
+# Codex, whose windows carry their own `limit_window_seconds`.
 # Both windows are `required`: Anthropic reports both for every account, so a
 # response missing one has changed shape under us. That is worth saying out
 # loud — the alternative is a panel drawing whichever half still parsed, where

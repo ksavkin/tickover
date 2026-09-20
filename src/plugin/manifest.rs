@@ -150,6 +150,16 @@ pub struct PluginManifest {
     #[serde(default)]
     pub surface: Vec<SurfaceConfig>,
 
+    /// Whether `surface` is that synthesized default rather than anything the
+    /// manifest actually wrote — set by [`PluginManifest::apply_defaults`],
+    /// never deserialized. `engine_http`'s tag precedence reads this instead
+    /// of guessing from the shape (`len == 1 && id == "default"`), which a
+    /// hand-written `[[surface]] id = "default"` satisfies too — such a
+    /// surface's own `label` would otherwise be silently swallowed by the
+    /// `[tag]` fallback it should have won over.
+    #[serde(skip)]
+    pub surface_synthesized: bool,
+
     /// `[ping]` — optional auto-ping command run after a window resets.
     pub ping: Option<PingConfig>,
 
@@ -306,6 +316,7 @@ impl PluginManifest {
             *name = name.trim().to_string();
         }
         if self.surface.is_empty() {
+            self.surface_synthesized = true;
             self.surface.push(SurfaceConfig {
                 id: "default".to_string(),
                 label: "Default".to_string(),
@@ -532,6 +543,18 @@ impl PluginManifest {
                         .to_string(),
                 );
             }
+            // The mirror of the arm above, refused for the same reason: a
+            // `[logfile]` on an `http-api` manifest is `root`/`glob`/
+            // `container_key` parsed, validated and then never walked by
+            // anything — a whole section of dead configuration reading as
+            // if it did something.
+            EngineKind::HttpApi if self.logfile.is_some() => {
+                return Err(
+                    "engine = \"http-api\" does not read a [logfile] section — only \
+                     engine = \"log-file\" does"
+                        .to_string(),
+                );
+            }
             EngineKind::HttpApi => match &self.http {
                 None => {
                     return Err("engine = \"http-api\" requires an [http] section".to_string());
@@ -561,12 +584,29 @@ impl PluginManifest {
             if let Some((field, _)) = blank.iter().find(|(_, empty)| *empty) {
                 return Err(format!("`[logfile] {field}` must not be empty"));
             }
+            // `root_env` is `Option`, so it cannot sit in the blank list
+            // above, but a blank name is the same dead config: it reads as
+            // "set" to a manifest author while `env::var_os("")` can never
+            // return a value — the override silently never applies, and any
+            // `root_env_join` beside it is dead with it.
+            if lf.root_env.as_deref().is_some_and(|e| e.trim().is_empty()) {
+                return Err("`[logfile] root_env` names no environment variable".to_string());
+            }
             // `root_env_join` is joined onto the env var's *value*
             // (`$CODEX_HOME` → `$CODEX_HOME/sessions`), never onto `root`
             // itself — it is a subdirectory name, not a path of its own, so
             // an absolute value would silently discard whatever the
             // environment named, and a `..` component would walk the search
-            // outside whatever directory that env var pointed at.
+            // outside whatever directory that env var pointed at. And with
+            // no `root_env` at all there is nothing to join onto — it would
+            // load clean and never once be read.
+            if lf.root_env.is_none() && lf.root_env_join.is_some() {
+                return Err(
+                    "`[logfile] root_env_join` needs `root_env` — it joins onto the \
+                     variable's value, and without one it is never read"
+                        .to_string(),
+                );
+            }
             if let Some(join) = &lf.root_env_join {
                 if is_absolute_on_any_platform(Path::new(join)) {
                     return Err(format!(
@@ -690,8 +730,8 @@ impl PluginManifest {
             return Err(format!(
                 "{where_it_is} names {marker}, but an earlier `{{` — typically a JSON \
                  object's own opening brace — pairs with that placeholder's closing brace \
-                 before its name is ever read, so it would be sent on the wire exactly as \
-                 written"
+                 before its name is ever read, so the field would be used verbatim, \
+                 braces and all, instead of resolving"
             ));
         }
         Ok(())
@@ -743,6 +783,13 @@ impl PluginManifest {
         // its own grows that card to whatever length it names, the same
         // shape `name`/`menu_label`'s own caps exist to bound.
         for w in &self.windows {
+            // Empty first: every refusal below names the window by its
+            // label, and a blank one would leave every one of those
+            // sentences (and the row itself, which draws it verbatim)
+            // saying `windows[label = ""]`.
+            if w.label.trim().is_empty() {
+                return Err("`[[windows]] label` must not be empty".to_string());
+            }
             if w.label.chars().count() > LABEL_MAX_CHARS {
                 return Err(format!(
                     "windows[label = \"{}\"]: label is {} characters — {LABEL_MAX_CHARS} is the \
@@ -794,6 +841,17 @@ impl PluginManifest {
         // no row and says nothing about why. The corpus has a line for every
         // one of them (`tests/manifest_corpus.rs`).
         for w in &self.windows {
+            // `for_each = ""` is not "do not enumerate" — it is a key the
+            // author set and this app reads exactly as if it were absent,
+            // which is the same silent-no-op shape the blank-path refusals
+            // everywhere else in this file exist for.
+            if w.for_each.as_deref().is_some_and(|p| p.trim().is_empty()) {
+                return Err(format!(
+                    "windows[label = \"{}\"]: `for_each` is present but blank — an empty path \
+                     enumerates nothing and reads as \"not set\" everywhere upstream",
+                    w.label
+                ));
+            }
             let enumerating = w
                 .for_each
                 .as_deref()
@@ -1061,7 +1119,8 @@ impl PluginManifest {
             if b.reads_nothing() {
                 return Err(format!(
                     "balances[label = \"{}\"] names no figure — declare at least one of `used`, \
-                     `cap`, `remaining`, `source.percent_path` or `source.limit_reached_path`",
+                     `cap`, `remaining`, `source.percent_path`, `source.limit_reached_path` or \
+                     `source.period_end_path`",
                     b.label
                 ));
             }
@@ -1307,12 +1366,45 @@ impl PluginManifest {
                         w.label
                     ));
                 }
-            } else if w.period.start_path.is_some() || w.period.end_path.is_some() {
-                return Err(format!(
-                    "windows[label = \"{}\"]: `period.start_path`/`period.end_path` belong to \
-                     `mode = \"from_bounds\"` only",
-                    w.label
-                ));
+            } else {
+                if w.period.start_path.is_some() || w.period.end_path.is_some() {
+                    return Err(format!(
+                        "windows[label = \"{}\"]: `period.start_path`/`period.end_path` belong \
+                         to `mode = \"from_bounds\"` only",
+                        w.label
+                    ));
+                }
+                // The same "belongs to `from_field`" refusal on `assumed`:
+                // the length there is the manifest's own number, and neither
+                // `field` nor `unit` is ever read.
+                if w.period.mode == PeriodMode::Assumed {
+                    let irrelevant: &[(&str, bool)] = &[
+                        ("field", w.period.field.is_some()),
+                        ("unit", w.period.unit != PeriodUnit::default()),
+                    ];
+                    if let Some((name, _)) = irrelevant.iter().find(|(_, present)| *present) {
+                        return Err(format!(
+                            "windows[label = \"{}\"]: `period.{name}` belongs to \
+                             `mode = \"from_field\"` only — `mode = \"assumed\"` states the \
+                             length itself",
+                            w.label
+                        ));
+                    }
+                }
+                // And the mirror image on `from_field`: the length comes
+                // from the response's own `field`, or the window reports
+                // none — `container_period_minutes`'s `FromField` arm has no
+                // `assumed` fallback the way `FromBounds`'s does, so an
+                // `assumed` written here is a number nothing ever reads
+                // (and no fallback the ping could arm on either).
+                if w.period.mode == PeriodMode::FromField && w.period.assumed.is_some() {
+                    return Err(format!(
+                        "windows[label = \"{}\"]: `period.assumed` is never read under \
+                         `mode = \"from_field\"` — the length comes from `period.field`, or \
+                         the window reports none",
+                        w.label
+                    ));
+                }
             }
         }
         Ok(())
@@ -1333,6 +1425,55 @@ impl PluginManifest {
                 return Err("`[tag] from = \"field\"` requires `path`".to_string());
             }
             _ => {}
+        }
+        // The mirror half — the field only the *other* mode reads is dead
+        // weight here, the same "present but pointless" shape
+        // `[windows.period]` refuses above: under `static` a `path` never
+        // resolves, under `field` a `value` never prints, and under `none`
+        // neither does — each loads clean today and is silently ignored on
+        // every fetch.
+        match self.tag.from {
+            TagFrom::Static if self.tag.path.is_some() => {
+                return Err(
+                    "`[tag] path` belongs to `from = \"field\"` only — `from = \"static\"` \
+                     prints `value`"
+                        .to_string(),
+                );
+            }
+            TagFrom::Field if self.tag.value.is_some() => {
+                return Err(
+                    "`[tag] value` belongs to `from = \"static\"` only — `from = \"field\"` \
+                     reads `path`"
+                        .to_string(),
+                );
+            }
+            TagFrom::None if self.tag.value.is_some() || self.tag.path.is_some() => {
+                return Err(
+                    "`[tag] from = \"none\"` draws no chip — `value`/`path` beside it are \
+                     never read"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+        // Present-but-blank, same rule as every other string this file
+        // checks: `value = ""` passes the `is_none()` requirements above
+        // and then draws an empty chip on every fetch.
+        if self
+            .tag
+            .value
+            .as_deref()
+            .is_some_and(|v| v.trim().is_empty())
+        {
+            return Err("`[tag] value` must not be blank".to_string());
+        }
+        if self
+            .tag
+            .path
+            .as_deref()
+            .is_some_and(|p| p.trim().is_empty())
+        {
+            return Err("`[tag] path` must not be blank".to_string());
         }
         Ok(())
     }
@@ -1556,7 +1697,7 @@ impl PluginManifest {
                         "`[http.version] files` entry \"{bad}\" must not be blank"
                     ));
                 }
-                // Same rule and the same reasoning as `client.files` above:
+                // Same rule and the same reasoning as `client.files` below:
                 // a relative entry resolves against whatever directory this
                 // process happens to be running from, never the intent of
                 // naming an installed client's own version file, and
@@ -1700,6 +1841,45 @@ impl PluginManifest {
                         }
                     }
                 }
+                // Same rules an auth step's `path_env`/`path_env_join` are
+                // held to (see `validate_auth`): the env name must name
+                // something, and the join is appended to the env var's
+                // *value* — an absolute or `..`-carrying one would read
+                // outside the directory that variable pointed at.
+                if v.path_env.as_deref().is_some_and(|e| e.trim().is_empty()) {
+                    return Err(format!(
+                        "`[[http.value]] name = \"{}\"` `path_env` names no environment variable",
+                        v.name
+                    ));
+                }
+                // `path_env_join` is appended to `path_env`'s *value* — with
+                // no `path_env` there is nothing to join onto, so it would
+                // load clean and never once be read.
+                if v.path_env.is_none() && v.path_env_join.is_some() {
+                    return Err(format!(
+                        "`[[http.value]] name = \"{}\"` `path_env_join` needs `path_env` — \
+                         it joins onto the variable's value, and without one it is never read",
+                        v.name
+                    ));
+                }
+                if let Some(join) = &v.path_env_join {
+                    if is_absolute_on_any_platform(Path::new(join)) {
+                        return Err(format!(
+                            "`[[http.value]] name = \"{}\"` `path_env_join = \"{join}\"` must be \
+                             a relative filename — it is appended to `path_env`'s value, not used \
+                             in its place",
+                            v.name
+                        ));
+                    }
+                    if has_dotdot_component(join) {
+                        return Err(format!(
+                            "`[[http.value]] name = \"{}\"` `path_env_join = \"{join}\"` must not \
+                             contain a `..` component — it would read outside the directory \
+                             `path_env` named",
+                            v.name
+                        ));
+                    }
+                }
             }
         }
         Ok(())
@@ -1711,6 +1891,32 @@ impl PluginManifest {
         // fine and then fails on every single fetch, with an error about a
         // field the user cannot see from the row it lands on.
         for surface in &self.surface {
+            // `no_credentials_message` and a `reject-when` step's `message`
+            // are both rendered *as the row's error text* — and `main.rs`
+            // matches `auth::NO_CREDENTIALS` literally to decide a row holds
+            // no credentials and should be hidden outright. A manifest
+            // writing that exact sentence as its own message would turn a
+            // genuine error into a vanished row, so the literal itself is
+            // refused here rather than trusted never to be written.
+            let sentinel = crate::plugin::auth::NO_CREDENTIALS;
+            if surface.no_credentials_message.as_deref() == Some(sentinel) {
+                return Err(format!(
+                    "surface \"{}\": `no_credentials_message` must not be the exact \
+                     `{sentinel}` sentinel — the app hides a row carrying it, so an error that \
+                     meant to display would vanish instead",
+                    surface.id
+                ));
+            }
+            for step in &surface.auth {
+                if step.kind == AuthType::RejectWhen && step.message.as_deref() == Some(sentinel) {
+                    return Err(format!(
+                        "surface \"{}\": a `reject-when` auth step's `message` must not be the \
+                         exact `{sentinel}` sentinel — the app hides a row carrying it, so the \
+                         error this step means to display would vanish instead",
+                        surface.id
+                    ));
+                }
+            }
             for step in &surface.auth {
                 let missing: &[(&str, bool)] = match step.kind {
                     AuthType::CredentialsFile => &[
@@ -1729,10 +1935,16 @@ impl PluginManifest {
                         ("config_path", step.config_path.is_none()),
                         ("blob_json_path", step.blob_json_path.is_none()),
                     ],
-                    AuthType::WinCredential => &[(
-                        "targets",
-                        step.targets.as_ref().is_none_or(|t| t.is_empty()),
-                    )],
+                    AuthType::WinCredential => &[
+                        (
+                            "targets",
+                            step.targets.as_ref().is_none_or(|t| t.is_empty()),
+                        ),
+                        // Required at run time (`auth::win_credential_step`
+                        // does `require_str` on it) — left out of this table
+                        // it loaded clean and failed on every fetch.
+                        ("token_json_path", step.token_json_path.is_none()),
+                    ],
                     AuthType::CredentialsMap => &[
                         ("path", step.path.is_none()),
                         ("key_prefix", step.key_prefix.is_none()),
@@ -1802,37 +2014,87 @@ impl PluginManifest {
                 // false for `Some("")`) and would then fail on every single
                 // fetch, with an error naming a field the user cannot see
                 // from the row it lands on — the same gap `[logfile]`'s blank
-                // check above closes for `root`/`glob`/`container_key`. Only
-                // `credentials-map` needs it here: its other siblings either
-                // have no field a manifest could plausibly leave blank
-                // (`env`'s `var`, `keychain`'s `service`) or are already
-                // covered elsewhere (`win-credential`'s `targets` is checked
-                // non-empty, not non-blank, by the table above). `oauth-refresh`
-                // needs it for the same reason — a blank `client_secret` loads
-                // and then fails every exchange. One `return Err` shared by both;
-                // only the field list differs per kind.
-                if matches!(step.kind, AuthType::CredentialsMap | AuthType::OauthRefresh) {
+                // check above closes for `root`/`glob`/`container_key`. Every
+                // kind needs it, not just the two that grew it first: `env`'s
+                // `var`, `keychain`'s `service`, `reject-when`'s `message`
+                // and `credentials-file`'s `path` are all fields whose only
+                // other check is `is_some()` — `Some("")` passes it and then
+                // resolves to nothing (or, for `message`, prints nothing) on
+                // every fetch. One `return Err` shared by all of them; only
+                // the field list differs per kind.
+                {
                     let is_blank =
                         |f: &Option<String>| f.as_deref().unwrap_or_default().trim().is_empty();
-                    // Present-and-blank only, unlike `is_blank` above: `client_id`
-                    // /`client_secret` are legitimately absent the moment a
-                    // `client` table is doing the discovery instead, and an
-                    // absent field must read as "not used", never as "blank".
+                    // Present-and-blank only, unlike `is_blank` above: fields
+                    // that are legitimately absent (an optional with an
+                    // engine default, or a credential a `client` table
+                    // discovers instead) must read as "not used", never as
+                    // "blank".
                     let is_present_but_blank =
                         |f: &Option<String>| f.as_deref().is_some_and(|s| s.trim().is_empty());
-                    let mut blank: Vec<(&str, bool)> = vec![
-                        ("path", is_blank(&step.path)),
-                        ("token_json_path", is_blank(&step.token_json_path)),
-                    ];
-                    match step.kind {
-                        AuthType::CredentialsMap => {
-                            blank.push(("key_prefix", is_blank(&step.key_prefix)))
-                        }
+                    let mut blank: Vec<(&str, bool)> = match step.kind {
+                        AuthType::CredentialsFile => vec![
+                            ("path", is_blank(&step.path)),
+                            ("token_json_path", is_blank(&step.token_json_path)),
+                        ],
+                        AuthType::Keychain => vec![
+                            ("service", is_blank(&step.service)),
+                            ("token_json_path", is_blank(&step.token_json_path)),
+                        ],
+                        AuthType::Env => vec![("var", is_blank(&step.var))],
+                        AuthType::ElectronSafeStorage => vec![
+                            ("config_path", is_blank(&step.config_path)),
+                            ("blob_json_path", is_blank(&step.blob_json_path)),
+                            // Optional here (the engine has a default), so a
+                            // blank one — never an absent one — is the error.
+                            (
+                                "token_json_path",
+                                is_present_but_blank(&step.token_json_path),
+                            ),
+                            // Same: optional, but blank names a Keychain
+                            // service of "" — a lookup that can only miss.
+                            (
+                                "macos_keychain_key",
+                                is_present_but_blank(&step.macos_keychain_key),
+                            ),
+                        ],
+                        AuthType::WinCredential => vec![
+                            ("token_json_path", is_blank(&step.token_json_path)),
+                            // Read per target, so each blank *entry* is the
+                            // mistake, not the list itself.
+                            (
+                                "targets",
+                                step.targets.as_deref().is_some_and(|targets| {
+                                    targets.iter().any(|t| t.trim().is_empty())
+                                }),
+                            ),
+                        ],
+                        AuthType::CredentialsMap => vec![
+                            ("path", is_blank(&step.path)),
+                            ("token_json_path", is_blank(&step.token_json_path)),
+                            ("key_prefix", is_blank(&step.key_prefix)),
+                        ],
+                        AuthType::RejectWhen => vec![
+                            ("path", is_blank(&step.path)),
+                            ("json_path", is_blank(&step.json_path)),
+                            ("message", is_blank(&step.message)),
+                            // Optional: names a path whose *absence* of a
+                            // match keeps the rejection. Blank is not absent
+                            // — `json_path_get(v, "")` resolves to nothing,
+                            // so the escape hatch silently never fires.
+                            (
+                                "unless_json_path",
+                                is_present_but_blank(&step.unless_json_path),
+                            ),
+                        ],
                         AuthType::OauthRefresh => {
-                            blank.push(("token_url", is_blank(&step.token_url)));
-                            blank.push(("client_id", is_present_but_blank(&step.client_id)));
-                            blank
-                                .push(("client_secret", is_present_but_blank(&step.client_secret)));
+                            let mut blank = vec![
+                                ("path", is_blank(&step.path)),
+                                ("token_json_path", is_blank(&step.token_json_path)),
+                                ("token_url", is_blank(&step.token_url)),
+                                ("client_id", is_present_but_blank(&step.client_id)),
+                                ("client_secret", is_present_but_blank(&step.client_secret)),
+                            ];
                             // The `client` table's own fields, walked here
                             // rather than in a table of their own: the same
                             // "present and still says nothing" rule, so a
@@ -1857,8 +2119,27 @@ impl PluginManifest {
                                     is_blank(&client.secret_pattern),
                                 ));
                             }
+                            blank
                         }
-                        _ => unreachable!("guarded by the `matches!` above"),
+                    };
+                    // `expiry_json_path` is optional on the four kinds that
+                    // read it — but a *blank* one is not "no expiry check":
+                    // `split_fallback_keys("")` yields `[""]`, which
+                    // `json_path_get` resolves to nothing, silently dropping
+                    // the lapse check the manifest asked for. The kinds that
+                    // never read the field are refused outright by the
+                    // kind-gate below, which must get to say so first.
+                    if matches!(
+                        step.kind,
+                        AuthType::CredentialsFile
+                            | AuthType::Keychain
+                            | AuthType::WinCredential
+                            | AuthType::CredentialsMap
+                    ) {
+                        blank.push((
+                            "expiry_json_path",
+                            is_present_but_blank(&step.expiry_json_path),
+                        ));
                     }
                     if let Some((field, _)) = blank.iter().find(|(_, empty)| *empty) {
                         return Err(format!(
@@ -2222,16 +2503,34 @@ impl PluginManifest {
                         auth_type_name(step.kind)
                     ));
                 }
-                // `path_env`/`path_env_join` are `credentials_file_step`'s
-                // own fields (`auth::resolve_credentials_file_path`) —
-                // every other step kind never reads either, same silent-
-                // no-op reasoning as the three checks above.
+                // `path_env`/`path_env_join` are honoured by
+                // `credentials-file` and `reject-when` steps (both resolve
+                // `path` through `auth::resolve_credentials_file_path` →
+                // `crate::plugin::resolve_env_overridden_path`) — every
+                // other step kind never reads either, same silent-no-op
+                // reasoning as the three checks above.
                 if (step.path_env.is_some() || step.path_env_join.is_some())
-                    && step.kind != AuthType::CredentialsFile
+                    && !matches!(step.kind, AuthType::CredentialsFile | AuthType::RejectWhen)
                 {
                     return Err(format!(
                         "surface \"{}\": auth step {i} (`{}`) sets `path_env`/`path_env_join`, \
-                         which only `credentials-file` steps honour",
+                         which only `credentials-file` and `reject-when` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                // A `path_env` that names no variable can never fire — an
+                // empty name resolves to nothing under `std::env::var_os`,
+                // so the step would silently read `path` forever while the
+                // manifest claims an override exists.
+                if step
+                    .path_env
+                    .as_deref()
+                    .is_some_and(|e| e.trim().is_empty())
+                {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) `path_env` names no environment \
+                         variable",
                         surface.id,
                         auth_type_name(step.kind)
                     ));
@@ -2243,6 +2542,17 @@ impl PluginManifest {
                 // silently discard whatever the environment named, and a
                 // `..` component would read a file outside the directory
                 // that env var pointed at.
+                // `path_env_join` is appended to `path_env`'s *value* — with
+                // no `path_env` there is nothing to join onto, so it would
+                // load clean and never once be read.
+                if step.path_env.is_none() && step.path_env_join.is_some() {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) `path_env_join` needs `path_env` — \
+                         it joins onto the variable's value, and without one it is never read",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
                 if let Some(join) = &step.path_env_join {
                     if is_absolute_on_any_platform(Path::new(join)) {
                         return Err(format!(
@@ -2277,14 +2587,27 @@ impl PluginManifest {
                         auth_type_name(step.kind)
                     ));
                 }
+                // A `service_env` that names no variable can never fire —
+                // an empty string reads as "set" to a manifest author while
+                // `env::var("")` always misses, so the keychain item is
+                // silently queried under its un-rekeyed name. The same dead
+                // config `path_env` above is refused for.
+                if step
+                    .service_env
+                    .as_deref()
+                    .is_some_and(|e| e.trim().is_empty())
+                {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) `service_env` names no environment \
+                         variable",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
                 // `service_env_suffix` names the recipe for turning
                 // `service_env`'s value into a suffix; without a variable to
-                // hash, it loads clean and is never consulted. Stricter than
-                // `path_env`/`path_env_join` above, which only refuses this
-                // direction — `path_env_join` alone is accepted and ignored
-                // (see its own doc) — because there is exactly one recipe to
-                // silently default to here, where `path_env_join` has no
-                // default worth guessing at all.
+                // hash, it loads clean and is never consulted — the same
+                // "no partner field" refusal `path_env_join` gets above.
                 if step.service_env_suffix.is_some() && step.service_env.is_none() {
                     return Err(format!(
                         "surface \"{}\": auth step {i} (`{}`) sets `service_env_suffix` without \
@@ -2326,7 +2649,15 @@ impl PluginManifest {
             // `allowed_hosts` is an exact-match list — no wildcards, by design
             // (see `crate::plugin::auth::host_allowed`). A manifest writing
             // `"*"` is asking for something this app deliberately doesn't do,
-            // and would otherwise silently match nothing at all.
+            // and would otherwise silently match nothing at all. A blank
+            // entry is the quieter version of the same mistake: it matches no
+            // host, and reads like a restriction that is not one.
+            if surface.allowed_hosts.iter().any(|h| h.trim().is_empty()) {
+                return Err(format!(
+                    "surface \"{}\": `allowed_hosts` must not contain a blank entry",
+                    surface.id
+                ));
+            }
             if let Some(bad) = surface.allowed_hosts.iter().find(|h| h.contains('*')) {
                 return Err(format!(
                     "surface \"{}\": `allowed_hosts` entry \"{bad}\" — hosts are matched exactly, \
@@ -2355,6 +2686,28 @@ impl PluginManifest {
         };
         if let Some((field, _)) = account_missing.iter().find(|(_, absent)| *absent) {
             return Err(format!("`[account]` of this type requires `{field}`"));
+        }
+        // Present-but-blank, the same rule the auth steps and `[tag]` are
+        // held to: `path = ""` satisfies the `is_none()` requirement above
+        // and then resolves to nothing on every fetch.
+        let account_blank: &[(&str, &Option<String>)] = match self.account.kind {
+            AccountType::None => &[],
+            AccountType::JwtFile => &[
+                ("path", &self.account.path),
+                ("token_path", &self.account.token_path),
+                ("claim", &self.account.claim),
+            ],
+            AccountType::Http => &[
+                ("url", &self.account.url),
+                ("json_path", &self.account.json_path),
+            ],
+            AccountType::ResponseField => &[("json_path", &self.account.json_path)],
+        };
+        if let Some((field, _)) = account_blank
+            .iter()
+            .find(|(_, f)| f.as_deref().is_some_and(|s| s.trim().is_empty()))
+        {
+            return Err(format!("`[account] {field}` must not be blank"));
         }
 
         // A `[ping]` runs a program. Naming it by path is not something a
@@ -2527,6 +2880,18 @@ impl PluginManifest {
             control_char_fields.push((
                 format!("balances[label = \"{}\"]: `label`", b.label),
                 b.label.as_str(),
+                CharClass::Narrow,
+            ));
+        }
+        // `[tag] value` is drawn verbatim as the chip next to the provider
+        // name — the same display-text criterion as `name`/`menu_label` and
+        // the window/balance labels above. (`tag.path` is a JSON path, not
+        // display text, and the response text it resolves to is sanitised
+        // at render — `main.rs`'s `resolve_tag` — so it is not listed.)
+        if let Some(value) = &self.tag.value {
+            control_char_fields.push((
+                "`[tag] value`".to_string(),
+                value.as_str(),
                 CharClass::Narrow,
             ));
         }
@@ -3086,6 +3451,17 @@ const HEADER_ONLY: [&str; 3] = ["{token}", "{version}", "{value."];
 fn swallowed_placeholder(text: &str) -> Option<&'static str> {
     let names = placeholders(text);
     let raw = |marker: &str| text.matches(marker).count();
+    // The prefix markers are counted with a twist the exact ones do not
+    // need: `{token}`/`{version}` carry their own `}`, so an unclosed
+    // `{token` is never counted — it is literal text `substitute` leaves
+    // alone, not a swallow. `{value.`/`{option.` without that same guard
+    // would count an unclosed prefix at the end of the string as if an
+    // earlier `{` had eaten it, reporting a swallow that never happened.
+    let raw_prefix = |prefix: &str| {
+        text.match_indices(prefix)
+            .filter(|(i, _)| text[i + prefix.len()..].contains('}'))
+            .count()
+    };
     let recognized_exact = |name: &str| names.iter().filter(|n| **n == name).count();
     let recognized_prefix = |prefix: &str| names.iter().filter(|n| n.starts_with(prefix)).count();
     let [token_marker, version_marker, value_marker] = HEADER_ONLY;
@@ -3095,10 +3471,10 @@ fn swallowed_placeholder(text: &str) -> Option<&'static str> {
     if raw(version_marker) > recognized_exact("version") {
         return Some("{version}");
     }
-    if raw(value_marker) > recognized_prefix("value.") {
+    if raw_prefix(value_marker) > recognized_prefix("value.") {
         return Some("{value.<name>}");
     }
-    if raw("{option.") > recognized_prefix("option.") {
+    if raw_prefix("{option.") > recognized_prefix("option.") {
         return Some("{option.<key>}");
     }
     None
@@ -3319,14 +3695,24 @@ fn filter_complaint(field: &str, value: &str) -> Option<&'static str> {
 /// What is wrong with an enumerating entry's label template, if anything.
 ///
 /// Only the shapes [`crate::plugin::engine_http`] cannot act on: an unclosed
-/// `{`, an empty `{}`, and a `{` inside a placeholder (which would make the
-/// first `}` close a path nobody wrote). A placeholder naming a field the
+/// `{`, an empty `{}`, a `{` inside a placeholder (which would make the
+/// first `}` close a path nobody wrote), and a `}` with no `{` before it —
+/// literal text, but only ever typed by mistake, and `fill_label` answers it
+/// with the same silence as every other shape here. That last one has to be
+/// checked on *every* literal stretch, not just the tail after the last
+/// placeholder: `"{a} } {b}"` and `"} {b}"` both carry it, and only the
+/// second used to be caught.
+///
+/// A placeholder naming a field the
 /// response does not carry is *not* checked here — that is the provider's
 /// business and is answered at read time by drawing no row, the same as any
 /// other path that does not resolve.
 fn template_complaint(label: &str) -> Option<&'static str> {
     let mut rest = label;
     while let Some(open) = rest.find('{') {
+        if rest[..open].contains('}') {
+            return Some("a `}` with no `{` before it");
+        }
         let after = &rest[open + 1..];
         let Some(close) = after.find('}') else {
             return Some("a `{placeholder}` is never closed — the row would silently not draw");
@@ -3354,12 +3740,13 @@ fn template_complaint(label: &str) -> Option<&'static str> {
 /// [`crate::plugin::encode_key_part`] it becomes the `<entry>` half of
 /// [`crate::model::Window::key`]/[`crate::model::Balance::key`]
 /// (`crate::plugin::window_key`/`balance_key`), the identity this app
-/// matches and dedupes readings by across fetches — not, despite an earlier
-/// version of this comment, a segment `config::seen_key` writes: that
-/// registry keys by *role* ("primary"/"secondary"), not by a window's
-/// declared `id`, and never records an `Extra`-role window at all (see
-/// `main.rs`'s `seen_role_key`). Capped here rather than left open, because a
-/// manifest that already shipped with a 4 KB id would have to keep working.
+/// matches and dedupes readings by across fetches — the same string
+/// `config::seen_key` writes into `plugin.<id>.seen.<reading>.<key>` records
+/// (`main.rs`'s `seen_records`), so the registry survives a relabel or a
+/// reorder and two windows of one role stay distinct. Never recorded for an
+/// `Extra`-role window at all (see `main.rs`'s `seen_remembers_role`). Capped
+/// here rather than left open, because a manifest that already shipped with a
+/// 4 KB id would have to keep working.
 pub(crate) const WINDOW_ID_MAX_BYTES: usize = 64;
 
 /// The charset, length cap and "starts with a letter or digit" rule shared
@@ -3736,12 +4123,17 @@ impl BalanceConfig {
     /// draws a label beside empty space. `when` is not counted: it gates
     /// whether the entry draws at all, but states no figure of its own, so an
     /// entry naming only `when` still reads nothing to draw when it passes.
+    /// `period_end_path` *is* counted: a balance whose only statement is "the
+    /// billing period ends on the 1st" still draws that date — which is more
+    /// than nothing, and refusing it would leave no way to write a balance
+    /// that genuinely only carries its period.
     fn reads_nothing(&self) -> bool {
         self.used.is_none()
             && self.cap.is_none()
             && self.remaining.is_none()
             && self.source.percent_path.is_none()
             && self.source.limit_reached_path.is_none()
+            && self.source.period_end_path.is_none()
             && self.unlimited.is_none()
     }
 }
@@ -3799,8 +4191,9 @@ pub struct LogFileConfig {
     pub root_env: Option<String>,
     /// Subdirectory appended onto the `root_env` override, if set (e.g.
     /// `"sessions"` so `$CODEX_HOME` resolves to `$CODEX_HOME/sessions`).
-    /// Ignored when `root_env` is unset or the env var itself isn't; has no
-    /// effect on the plain `root` fallback, which is used verbatim.
+    /// Refused when `root_env` is unset — with no variable to join onto it
+    /// would never be read — and has no effect on the plain `root`
+    /// fallback, which is used verbatim.
     #[serde(default)]
     pub root_env_join: Option<String>,
     /// Root directory to search (subject to `root_env` override and `~`
@@ -3981,6 +4374,22 @@ pub struct HttpValueConfig {
     pub path: Option<String>,
     /// `json-file`: dotted JSON path to the value inside that file.
     pub json_path: Option<String>,
+    /// Name of an environment variable that, when set to an absolute path,
+    /// replaces `path` entirely — the same override `[[surface.auth]]`'s
+    /// `path_env` gives a credentials file (see `AuthStep::path_env`), for
+    /// the same reason: Codex's `CODEX_HOME` relocates `auth.json`, and the
+    /// `{value.<name>}` this file provides has to come from the same
+    /// relocated file the credential steps read. A set-but-relative or
+    /// empty value is treated as unset (see
+    /// `crate::plugin::resolve_env_overridden_path`).
+    pub path_env: Option<String>,
+    /// Appended to `path_env`'s value when both are present — e.g.
+    /// `path_env = "CODEX_HOME"` + `path_env_join = "auth.json"` reads
+    /// `$CODEX_HOME/auth.json`. Refused when `path_env` is unset — with no
+    /// variable to join onto it would never be read — and ignored when the
+    /// variable is not set to an absolute path. Must be a relative filename
+    /// with no `..` component (see `validate`).
+    pub path_env_join: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -4137,26 +4546,30 @@ pub struct AuthStep {
 
     /// `credentials-file` / `credentials-map`: path to the JSON file.
     pub path: Option<String>,
-    /// `credentials-file` only: env var that, if set to an absolute path,
-    /// overrides `path`'s directory — the credential variant of
-    /// `[logfile] root_env` (see that field's own doc), additionally
+    /// `credentials-file` and `reject-when` only: env var that, if set to an
+    /// absolute path, overrides `path`'s directory — the credential variant
+    /// of `[logfile] root_env` (see that field's own doc), additionally
     /// ignoring an env value that is empty or relative, falling back to
     /// `path` exactly as if the variable were unset (a credential must never
     /// be read relative to this process's own working directory). For
     /// Claude, whose CLI honours `CLAUDE_CONFIG_DIR` for both its
     /// credentials file and its Keychain item name: this covers the file,
     /// naming the keychain item is out of scope (see the comment on
-    /// claude.toml's own step). `false`/refused on any other step kind, the
-    /// same rule `expiry_json_path` is refused under above. Needs
+    /// claude.toml's own step). `reject-when` honours it because a provider
+    /// whose config directory an env var relocates (Codex's `CODEX_HOME`)
+    /// puts the file the rule inspects there as well — probing the default
+    /// location would read a file the relocated install never writes.
+    /// Refused on any other step kind, the same rule `expiry_json_path` is
+    /// refused under above. Needs
     /// `requires_reader = ["credentials-file-path-env"]`.
     #[serde(default)]
     pub path_env: Option<String>,
     /// Filename appended onto the `path_env` override, if set (e.g.
     /// `".credentials.json"` so `$CLAUDE_CONFIG_DIR` resolves to
-    /// `$CLAUDE_CONFIG_DIR/.credentials.json`). Ignored when `path_env` is
-    /// unset or the env var itself isn't; has no effect on the plain `path`
-    /// fallback, which is used verbatim — mirrors `[logfile] root_env_join`
-    /// exactly.
+    /// `$CLAUDE_CONFIG_DIR/.credentials.json`). Refused when `path_env` is
+    /// unset — with no variable to join onto it would never be read — and
+    /// has no effect on the plain `path` fallback, which is used verbatim.
+    /// Mirrors `[logfile] root_env_join` exactly.
     #[serde(default)]
     pub path_env_join: Option<String>,
     /// `credentials-file` / `keychain` / `credentials-map`: JSON path(s) to
@@ -6382,9 +6795,16 @@ mod tests {
         );
 
         let when_only = base
+            // `period_end_path` reads a date of its own, so a `when` beside
+            // it is not "alone" — strip it too, leaving `when` as the only
+            // field the entry would read.
             .replace(
                 "[balances.source]",
                 "[balances.when]\n        path = \"config.enabled\"\n        [balances.source]",
+            )
+            .replace(
+                "        period_end_path   = \"config.billingPeriodEnd\"\n",
+                "",
             )
             .replace(
                 "requires_reader = [\"reading-balances\"]",
