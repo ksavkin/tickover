@@ -3262,11 +3262,16 @@ fn run_command_with_deadline(
     // drains a bounded moment to finish: a detached *grandchild* can keep
     // its inherited write end open past the parent's exit, so this is a
     // short spin, not a `join` — waiting one out forever would reinstate the
-    // very hang `deadline` exists to end. This wait sits *outside* the
-    // deadline's promise (which bounds the child, not this settling) and in
-    // the worst case — a grandchild holding the pipe — adds its length on
-    // top; the ordinary case costs a few microseconds.
-    let drain_deadline = Instant::now() + std::time::Duration::from_millis(250);
+    // very hang `deadline` exists to end. The settle stays inside the
+    // caller's `deadline` while any of it remains; once that budget is
+    // spent the drains still get a 50 ms floor of scheduler lag to notice
+    // their EOF, so a grandchild holding the pipe can overshoot the
+    // deadline by that floor at most — and the 250 ms cap means the
+    // ordinary case costs a few microseconds, not a wait on the cap.
+    let drain_deadline = expiry.clamp(
+        Instant::now() + std::time::Duration::from_millis(50),
+        Instant::now() + std::time::Duration::from_millis(250),
+    );
     loop {
         let drained = [&stdout_drain, &stderr_drain]
             .iter()
