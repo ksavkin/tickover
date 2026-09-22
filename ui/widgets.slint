@@ -1,11 +1,11 @@
-// Reusable, hand-styled components for the Limits popover.
+// Reusable, hand-styled components for the Tickover popover.
 import { Theme, Icons } from "theme.slint";
 
 // Which of the three shapes a window's reset countdown takes — Rust
 // constructs one of these rather than overloading `WindowData.reset-rel`
 // with the sentinel strings `"unknown"`/`"due"` alongside a real countdown
 // like `"6d 2h"`, where a typo in a string comparison on either side falls
-// through to `LimitBlock`'s own `else` branch in silence ("resets in
+// through to `QuotaBlock`'s own `else` branch in silence ("resets in
 // unknown"); a typo in an enum variant is a compile error on whichever side
 // made it.
 export enum ResetRelKind {
@@ -17,7 +17,7 @@ export enum ResetRelKind {
     due,
 }
 
-// A bar asking for its hover tooltip to be drawn — see `LimitBlock`'s
+// A bar asking for its hover tooltip to be drawn — see `QuotaBlock`'s
 // `tip-changed`. The bubble cannot be drawn where it is asked for: Slint has no
 // z-index, so painting order is declaration order, and a tooltip that lives
 // inside a bar is painted before every row below it and comes out with the next
@@ -50,7 +50,7 @@ export struct BarTip {
 // tick and a signed pace figure competed with both, so answering "how much is
 // left" meant first sorting out which number was the answer. The tick and the
 // pace live on in the bar's hover tooltip, where they cost nothing to ignore.
-export component LimitBlock inherits VerticalLayout {
+export component QuotaBlock inherits VerticalLayout {
     in property <string> win-label;      // "5H" / "WK"
     in property <float> pct;             // used %
     // "6d 2h" / "2h 4m" when `reset-rel-kind` is `known`; empty otherwise.

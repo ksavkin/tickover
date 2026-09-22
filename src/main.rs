@@ -796,7 +796,7 @@ fn setup_tray(
         .with_tooltip("Tickover")
         // Set an initial title while the native status item is created. The
         // live compact quota title replaces it after the first refresh.
-        .with_title("Limits")
+        .with_title("Tickover")
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(false);
     let tray_builder = match load_tray_icon() {
@@ -3563,7 +3563,7 @@ fn readings_with(
     // one) contributes no title numbers either way, so handing it the slot
     // would leave the lone remaining provider printing `Cl 94/23` where it
     // used to print `94/23`, and such an account alone would print the bare
-    // word `Limits`.
+    // word `Tickover`.
     let bare_plugin_id = owners
         .iter()
         .zip(out.iter())
@@ -5558,7 +5558,7 @@ fn engine_label(kind: EngineKind) -> &'static str {
 /// two states, which a string sentinel (`"unknown"`/`"due"`) would
 /// otherwise have to overload `reset-rel` itself with, are `ResetRelKind`
 /// variants instead, constructed here rather than left for
-/// `ui/widgets.slint`'s `LimitBlock` to recover by string comparison.
+/// `ui/widgets.slint`'s `QuotaBlock` to recover by string comparison.
 /// `reset-at` is the absolute clock ("19 Jul 22:18" for weekly, "22:10" for
 /// 5h).
 fn window_view(
@@ -5571,7 +5571,7 @@ fn window_view(
 ) -> (ResetRelKind, String, String, String, f32, bool) {
     use chrono::{Local, TimeZone};
 
-    // Round once and derive the complement — matching `LimitBlock`'s caption,
+    // Round once and derive the complement — matching `QuotaBlock`'s caption,
     // which does the same. Rounding both sides independently makes a 34.5%
     // reading say "35% used · 66% left" in the tooltip while the caption says
     // "35% / 65% left".
@@ -5665,7 +5665,7 @@ fn window_view(
 /// [`tray_tooltip`] compares its input against to recognise that same
 /// answer. Two spellings of one string would drift into two different
 /// strings, so both sides read this.
-const EMPTY_MENU_BAR_TITLE: &str = "Limits";
+const EMPTY_MENU_BAR_TITLE: &str = "Tickover";
 
 /// Compact used-quota value, matching every other figure this app shows: the
 /// panel's caption, the widget's bar and its number. A trailing `!` is the
@@ -9351,12 +9351,12 @@ mod title_tests {
 
         let desktop = claude_reading("claude-desktop", false, claude_windows(), None);
         let title = menu_bar_title(&[desktop]);
-        assert_eq!(title, "Limits", "menu bar tracks the CLI account only");
+        assert_eq!(title, "Tickover", "menu bar tracks the CLI account only");
     }
 
     #[test]
     fn no_data_falls_back_to_app_name() {
-        assert_eq!(menu_bar_title(&[]), "Limits");
+        assert_eq!(menu_bar_title(&[]), "Tickover");
     }
 
     #[test]
@@ -9949,7 +9949,7 @@ mod title_tests {
         // anyway, the provider that *does* print numbers would start
         // printing them with its label back on (`Cx 96/80` where the bare
         // slot would otherwise print `96/80`), and a lone balances-only
-        // provider would render the bare word "Limits". Grok's real manifest
+        // provider would render the bare word "Tickover". Grok's real manifest
         // keeps its own window out of the menu-bar title *and* out of the
         // bare slot — it is `role = "extra"`, and neither `chunk_pair`
         // (title numbers) nor the bare-slot search above admits anything

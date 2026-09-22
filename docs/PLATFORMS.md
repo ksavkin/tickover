@@ -14,9 +14,7 @@ older macOS has been tried; treat that floor as declared, not measured.
   `LSUIElement` key; the binary switches itself to the accessory activation
   policy at launch instead (`src/platform.rs`'s `set_accessory_policy`), the
   runtime equivalent — it lives in the menu bar and nowhere else. Left-click
-  the glyph for the panel, right-click for the menu. The panel and the
-  menu-bar title call themselves "Limits" — the name of the meter inside
-  Tickover.
+  the glyph for the panel, right-click for the menu.
 - **First launch of an unsigned build.** Releases are not yet signed with a
   Developer ID, so Gatekeeper says "Apple could not verify Tickover is free
   of malware". Right-click → *Open*, or System Settings → Privacy & Security

@@ -1,6 +1,6 @@
-// Limits — the popover window.
+// Tickover — the popover window.
 import { Theme, Icons } from "theme.slint";
-import { LimitBlock, ToggleRow, GhostButton, InfoDot, IconButton, BarTip, ResetRelKind } from "widgets.slint";
+import { QuotaBlock, ToggleRow, GhostButton, InfoDot, IconButton, BarTip, ResetRelKind } from "widgets.slint";
 
 // Whether a `ProviderData` draws its `windows`/`balances` rows or its
 // `message` line instead — see `ProviderData.status`.
@@ -183,7 +183,7 @@ component Chip inherits Rectangle {
 // what this file drew inline before the two components merged.
 
 // One balance row, drawn under a provider's quota windows. Simpler than
-// `LimitBlock` by design: a stated percentage is not always there, so there
+// `QuotaBlock` by design: a stated percentage is not always there, so there
 // is no bar to draw — this is text only, in the same type scale as a
 // window's caption and reset lines, over figures Rust has already formatted.
 component BalanceRow inherits VerticalLayout {
@@ -307,7 +307,7 @@ component ProviderCard inherits VerticalLayout {
         // Blocks are three lines tall, so they need real air between them or
         // one window's reset time reads as the next one's caption.
         spacing: 18px;
-        for w[i] in data.windows : LimitBlock {
+        for w[i] in data.windows : QuotaBlock {
             win-label: w.label; pct: w.pct;
             reset-rel: w.reset-rel; reset-rel-kind: w.reset-rel-kind;
             reset-at: w.reset-at; tooltip: w.tooltip;
@@ -517,7 +517,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     Text {
-                        text: "Limits";
+                        text: "Tickover";
                         font-size: 13px;
                         font-weight: 700;
                         letter-spacing: 0.4px;

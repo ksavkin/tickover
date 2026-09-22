@@ -3,3 +3,8 @@
 **/*.rs.bk
 Cargo.lock.orig
 .DS_Store
+# Local working notes — session state, review scratchpads, the design brief.
+# These live beside the repo on this machine and must never be published.
+/scratchpad/
+/docs/superpowers/
+/docs/DESIGN-BRIEF.md

@@ -18,7 +18,7 @@ fix is an edit, not a release.
 
 <p align="center">
   <img src="docs/screenshot-macos.png" width="440"
-       alt="The Limits panel: a section per signed-in account, each quota window a captioned bar with its reset time">
+       alt="The Tickover panel: a section per signed-in account, each quota window a captioned bar with its reset time">
 </p>
 
 <p align="center">
@@ -164,7 +164,7 @@ reporting, nothing on a timer against a host this project controls.
 
 ## Engineering notes
 
-About 47,000 lines of Rust, roughly half of it tests — some 800 test
+About 57,000 lines of Rust, roughly half of it tests — some 960 test
 functions — one tree for both desktops.
 Six things worth a look:
 
