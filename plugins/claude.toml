@@ -17,8 +17,8 @@ order        = 20
 # keychain step below honour the same variable, for the Keychain item name
 # the CLI renames under it — see docs/PLUGIN-ARCHITECTURE.md, "Reader
 # capabilities".
-requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry", "reading-balances", "balance-conditional", "credentials-file-path-env", "keychain-service-env"]
-version      = "1.4.6"
+requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry", "reading-balances", "balance-conditional", "credentials-file-path-env", "keychain-service-env", "reading-history"]
+version      = "1.5.0"
 engine       = "http-api"
 # Re-fetched every 60 s.
 refresh_secs = 60
@@ -253,3 +253,14 @@ bin  = "claude"
 args = ["-p", "hello", "--model", "haiku"]
 # The CLI renews its own token only when it runs.
 renews_token = true
+
+# Token usage history: the CLI writes one JSONL transcript per session under
+# `~/.claude/projects/<encoded-cwd>/`. `CLAUDE_CONFIG_DIR` relocates the
+# whole `~/.claude` tree — the same override the credentials-file step above
+# honours — so `root_env` + `root_env_join` land on `$CLAUDE_CONFIG_DIR/projects`.
+[history]
+format        = "claude-transcripts"
+root          = "~/.claude/projects"
+glob          = "*.jsonl"
+root_env      = "CLAUDE_CONFIG_DIR"
+root_env_join = "projects"

@@ -2183,13 +2183,14 @@ fn the_shipped_grok_manifest_is_accepted() {
         "credentials-map",
         "keychain-expiry",
         "window-period-bounds",
+        "reading-history",
     ] {
         assert!(
             m.requires_reader.iter().any(|c| c == capability),
             "{capability} is load-bearing here"
         );
     }
-    assert_eq!(m.requires_reader.len(), 5, "and nothing else is claimed");
+    assert_eq!(m.requires_reader.len(), 6, "and nothing else is claimed");
 
     // The golden half: a manifest that parses is not a manifest that reads the
     // right fields. Every path this provider depends on is asserted, because a
@@ -2445,13 +2446,14 @@ fn the_shipped_antigravity_manifest_is_accepted() {
         "http-post",
         "remaining-fraction",
         "window-identity",
+        "reading-history",
     ] {
         assert!(
             m.requires_reader.iter().any(|c| c == capability),
             "{capability} is load-bearing here"
         );
     }
-    assert_eq!(m.requires_reader.len(), 6, "and nothing else is claimed");
+    assert_eq!(m.requires_reader.len(), 7, "and nothing else is claimed");
 
     // Four windows, each addressed by its stable bucketId — a typo in a
     // selector reads nothing and the row silently vanishes.

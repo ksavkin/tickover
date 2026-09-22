@@ -1836,8 +1836,8 @@ order        = 10
 # a window by identity rather than by position; `[status]` needs one that
 # reads the quota's own standing. See docs/PLUGIN-ARCHITECTURE.md, "Reader
 # capabilities".
-requires_reader = ["window-presence", "window-identity", "reading-status", "reading-balances", "credentials-file-path-env", "http-value-path-env"]
-version      = "2.5.3"
+requires_reader = ["window-presence", "window-identity", "reading-status", "reading-balances", "credentials-file-path-env", "http-value-path-env", "reading-history"]
+version      = "2.6.0"
 engine       = "http-api"
 # One request a minute, matching Claude. The log-file reader polled every 15s
 # because re-reading a local file is free; four requests a minute at somebody
@@ -2102,6 +2102,16 @@ token_json_path = "tokens.access_token"
 [ping]
 bin  = "codex"
 args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "hello"]
+
+# Token usage history: rollout JSONL under `~/.codex/sessions/` (and the
+# same files under `archived_sessions/`). `CODEX_HOME` relocates the whole
+# tree, same as it does `auth.json` above. `token_count` events are
+# cumulative per session; the extractor diffs them.
+[history]
+format        = "codex-rollouts"
+root          = "~/.codex"
+glob          = "rollout-*.jsonl"
+root_env      = "CODEX_HOME"
 ```
 
 ### When an upgrade replaces an installed manifest
@@ -2148,8 +2158,8 @@ order        = 20
 # keychain step below honour the same variable, for the Keychain item name
 # the CLI renames under it — see docs/PLUGIN-ARCHITECTURE.md, "Reader
 # capabilities".
-requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry", "reading-balances", "balance-conditional", "credentials-file-path-env", "keychain-service-env"]
-version      = "1.4.6"
+requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry", "reading-balances", "balance-conditional", "credentials-file-path-env", "keychain-service-env", "reading-history"]
+version      = "1.5.0"
 engine       = "http-api"
 # Re-fetched every 60 s.
 refresh_secs = 60
@@ -2384,6 +2394,17 @@ bin  = "claude"
 args = ["-p", "hello", "--model", "haiku"]
 # The CLI renews its own token only when it runs.
 renews_token = true
+
+# Token usage history: the CLI writes one JSONL transcript per session under
+# `~/.claude/projects/<encoded-cwd>/`. `CLAUDE_CONFIG_DIR` relocates the
+# whole `~/.claude` tree — the same override the credentials-file step above
+# honours — so `root_env` + `root_env_join` land on `$CLAUDE_CONFIG_DIR/projects`.
+[history]
+format        = "claude-transcripts"
+root          = "~/.claude/projects"
+glob          = "*.jsonl"
+root_env      = "CLAUDE_CONFIG_DIR"
+root_env_join = "projects"
 ```
 
 ## Registry

@@ -36,8 +36,8 @@ order        = 10
 # a window by identity rather than by position; `[status]` needs one that
 # reads the quota's own standing. See docs/PLUGIN-ARCHITECTURE.md, "Reader
 # capabilities".
-requires_reader = ["window-presence", "window-identity", "reading-status", "reading-balances", "credentials-file-path-env", "http-value-path-env"]
-version      = "2.5.3"
+requires_reader = ["window-presence", "window-identity", "reading-status", "reading-balances", "credentials-file-path-env", "http-value-path-env", "reading-history"]
+version      = "2.6.0"
 engine       = "http-api"
 # One request a minute, matching Claude. The log-file reader polled every 15s
 # because re-reading a local file is free; four requests a minute at somebody
@@ -302,3 +302,13 @@ token_json_path = "tokens.access_token"
 [ping]
 bin  = "codex"
 args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "hello"]
+
+# Token usage history: rollout JSONL under `~/.codex/sessions/` (and the
+# same files under `archived_sessions/`). `CODEX_HOME` relocates the whole
+# tree, same as it does `auth.json` above. `token_count` events are
+# cumulative per session; the extractor diffs them.
+[history]
+format        = "codex-rollouts"
+root          = "~/.codex"
+glob          = "rollout-*.jsonl"
+root_env      = "CODEX_HOME"

@@ -11,6 +11,8 @@ mod autostart;
 mod config;
 mod diag;
 mod platform;
+#[cfg(feature = "history")]
+mod stats_cli;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -383,6 +385,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
+    // `tickover stats` is a CLI invocation, not a tray launch — it runs
+    // here, before the single-instance claim and any Slint/tray setup, so
+    // `tickover stats` in a terminal while the app is running prints stats
+    // rather than signalling the running copy to open its panel.
+    #[cfg(feature = "history")]
+    if let Some(code) = stats_cli::maybe_run(|| {
+        seed_and_upgrade_builtins(&seed::plugins_dir());
+        load_plugins()
+    }) {
+        std::process::exit(code);
+    }
+
     // Only when a pre-rename install was actually found and moved — a fresh
     // install never held the old login item this retires, and asking macOS
     // to touch one it does not hold can raise the same permission prompt

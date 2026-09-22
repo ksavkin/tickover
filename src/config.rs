@@ -566,6 +566,20 @@ pub fn set_menu_bar_text(v: bool) {
     set_bool("menu_bar_text", v);
 }
 
+/// Show estimated list-price cost in `stats`/panel/report. Off by
+/// default: subscription users' numbers would be notional anyway, and a
+/// dollar figure beside quota bars reads as real spend when it is not.
+pub fn history_cost_estimate() -> bool {
+    get_bool("history_cost_estimate_opt_in")
+}
+/// Bound by the settings sheet's cost-toggle (T15); until then the setter
+/// has no caller — `allow` rather than delete because the toggle is part
+/// of the same feature landing.
+#[allow(dead_code)]
+pub fn set_history_cost_estimate(v: bool) {
+    set_bool("history_cost_estimate_opt_in", v);
+}
+
 /// Run from the Dock with an ordinary window instead of the menu bar.
 ///
 /// A full menu bar makes macOS drop the status item with no warning and no

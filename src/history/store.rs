@@ -155,6 +155,13 @@ pub struct DayLine {
     pub messages: u32,
 }
 
+impl DayLine {
+    /// Total tokens across every class in this bucket.
+    pub fn sum(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_write + self.thinking
+    }
+}
+
 /// The pair of files plus the in-memory state between them.
 pub struct HistoryStore {
     dir: PathBuf,

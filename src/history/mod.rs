@@ -12,6 +12,9 @@
 //! only token counts, model names, session ids and project basenames.
 
 pub mod formats;
+pub mod pricing;
+pub mod query;
+pub mod report;
 pub mod scanner;
 pub mod store;
 
