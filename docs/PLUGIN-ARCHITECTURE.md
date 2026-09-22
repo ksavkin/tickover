@@ -227,6 +227,7 @@ Two rules keep the key lists true:
 | `credentials-file-path-env` | **yes** | `[[surface.auth]]` `path_env` / `path_env_join` on a `credentials-file` or `reject-when` step — an env var override for where the credentials file lives, mirroring `[logfile] root_env`/`root_env_join` |
 | `http-value-path-env` | **yes** | `[[http.value]]` `path_env` / `path_env_join` — the same env var override, for the file a named value is read from (Codex's `chatgpt-account-id` lives under `$CODEX_HOME`) |
 | `keychain-service-env` | **yes** | `[[surface.auth]]` `service_env` / `service_env_suffix` on a `keychain` step — re-keys `service` from an env var's value, mirroring `credentials-file-path-env` for the Keychain item name Claude's CLI also renames under `CLAUDE_CONFIG_DIR` |
+| `reading-history` | **yes** | `[history]` — the provider publishes a local usage log the scanner can read (see [`[history]`](#history)); a manifest without it is quota-only |
 
 `window-severity` is listed without being implemented, and that is the useful
 state, not an oversight: the name ships ahead of the semantics so the build
@@ -1105,6 +1106,39 @@ bidirectional override (U+200E/F, U+202A–E, U+2066–9, or the Unicode line/
 paragraph separators U+2028/9) — refused at load, for the same reason: one of
 these can rewrite a trust dialog, a log line, or the panel around it without
 a single visible character looking wrong.
+
+### `[history]`
+
+Optional. Declares that the provider writes a local usage log the history
+scanner can read — the Activity card, `tickover stats`, and the HTML report
+draw on it. A manifest without the section simply has no history: the
+provider's quota blocks render normally with a `quota only` badge, and the
+Activity card names it under "not counted" rather than implying its zero
+means something. Requires `requires_reader = ["reading-history"]`.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `format` | `"claude-transcripts"` \| `"codex-rollouts"` \| `"grok-unified"` \| `"antigravity-sqlite"` | — (required) | which extractor parses the matched files. There is no default: every format's correctness rules differ (dedup keys, cumulative counters, sub-agent filtering), and guessing one is how double-counted histories are born. An unknown value is refused at load, like an unknown `engine` — a new format ships as an app release |
+| `root` | string | — (required) | root directory the scanner walks; `~` and `{config_dir}` expand (see [Path expansion](#path-expansion)); no `..` component |
+| `glob` | string | — (required) | glob, relative to `root`, matching history files — `"**/*.jsonl"` for the JSONL formats, `"*.db"` for `antigravity-sqlite` |
+| `root_env` | string | — (optional) | env var that overrides where the scanner searches — same semantics as `[logfile] root_env` (Claude's `CLAUDE_CONFIG_DIR` relocates the transcripts root) |
+| `root_env_join` | string | — (optional) | subdirectory appended onto `root_env`'s value when set — same rules as `[logfile] root_env_join`: refused without `root_env`, relative, no `..` |
+
+The scanner (`src/history/scanner.rs`) treats the matched corpus as strictly
+read-only — it never writes into a provider's directory, and
+`antigravity-sqlite` opens each database with `mode=ro&immutable=1`. Work is
+incremental and bounded: per-file cursors resume appends, a rewritten file is
+detected by a prefix-digest change and its derived records are replaced, a
+wall-clock budget ends a pass early (the next tick resumes where it stopped),
+and a per-file byte cap plus a tracked-file ceiling keep a runaway log from
+stalling the panel. Files that fail to parse count toward a `skipped` total
+the UI surfaces as drift, never silently.
+
+What an extractor is allowed to emit is deliberately narrow — timestamp,
+provider, project, session, model, and token-class counts. Message bodies,
+prompts, and file contents never leave the format module; the privacy test
+(`tests/history_e2e.rs`) scans the persisted store and the rendered report
+for a sentinel prompt to keep that true.
 
 ### Path expansion
 

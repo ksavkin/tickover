@@ -204,7 +204,7 @@ impl HistoryStore {
         };
         let mut days = Vec::new();
         let mut seen_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
-        match fs::read_to_string(Self::days_path(&dir)) {
+        match fs::read_to_string(Self::days_path(dir)) {
             Ok(text) => {
                 for line in text.lines() {
                     // Exact-duplicate lines are the rescan artifact a crash

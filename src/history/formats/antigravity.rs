@@ -295,7 +295,7 @@ fn varint_field(blob: &[u8], target: u64) -> Option<u64> {
         })
 }
 
-fn message_field<'a>(blob: &'a [u8], target: u64) -> Option<&'a [u8]> {
+fn message_field(blob: &[u8], target: u64) -> Option<&[u8]> {
     fields(blob)
         .into_iter()
         .find_map(|(f, w, v)| match (f == target, w, v) {

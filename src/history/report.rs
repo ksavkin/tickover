@@ -95,7 +95,7 @@ fn fmt_int(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -392,16 +392,8 @@ fn right_now(h: &mut String, quota: &[QuotaNow]) {
 fn headline(h: &mut String, st: &Stats, cost_on: bool) {
     let active_days = st.daily.len() as u64;
     let sessions = st.sessions.len() as u64;
-    let msgs_per_day = if active_days > 0 {
-        st.total.messages / active_days
-    } else {
-        0
-    };
-    let avg_msg = if st.total.messages > 0 {
-        st.total.sum() / st.total.messages
-    } else {
-        0
-    };
+    let msgs_per_day = st.total.messages.checked_div(active_days).unwrap_or(0);
+    let avg_msg = st.total.sum().checked_div(st.total.messages).unwrap_or(0);
     let cache = st
         .total
         .cache_hit_pct()
@@ -475,10 +467,9 @@ fn coverage(h: &mut String, st: &Stats) {
 "#,
     );
     for p in &st.providers {
-        let _ = write!(
+        let _ = writeln!(
             h,
-            r#"<span class="pill"><span style="width: 7px; height: 7px; border-radius: 50%; background: {color};"></span>{name}</span>
-"#,
+            r#"<span class="pill"><span style="width: 7px; height: 7px; border-radius: 50%; background: {color};"></span>{name}</span>"#,
             color = provider_color(p),
             name = esc(provider_name(p)),
         );

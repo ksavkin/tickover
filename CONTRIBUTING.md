@@ -93,3 +93,21 @@ Read `SECURITY.md` first. A change that widens what a manifest can reach — a
 new credential store, a new place a token may be substituted into, a relaxation
 of `allowed_hosts` — is a trust-model change and should say so in its commit
 message, whatever its size.
+
+## History extractors
+
+The `[history]` formats in `src/history/formats/` are clean-room work: they
+were derived from watching what the CLIs write on disk, not from reading
+provider source. `docs/history-formats.md` carries the wire details so a new
+extractor — or a fix to an old one — can be argued from the file format
+itself.
+
+Two invariants are not negotiable:
+
+- **A provider's corpus is read-only.** No extractor writes into it; the
+  SQLite format opens `mode=ro&immutable=1` for exactly this reason. A
+  locked or busy file yields nothing this tick rather than blocking.
+- **Usage metadata only.** An extractor emits timestamps, project names,
+  model names, and token counts — never prompt or message text. The
+  sentinel test in `tests/history_e2e.rs` fails the build if any of that
+  ever reaches the store or the report.

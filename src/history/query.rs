@@ -169,7 +169,7 @@ pub fn compute(store: &HistoryStore, days: u32) -> Stats {
         models.entry(d.model.clone()).or_default().add(d);
         provider_models
             .entry(d.provider.clone())
-            .or_insert_with(HashMap::new)
+            .or_default()
             .entry(d.model.clone())
             .or_default()
             .add(d);
@@ -208,7 +208,7 @@ pub fn compute(store: &HistoryStore, days: u32) -> Stats {
         .collect();
     st.sessions = {
         let mut v: Vec<SessionStat> = sessions.into_values().collect();
-        v.sort_by(|a, b| b.totals.sum().cmp(&a.totals.sum()));
+        v.sort_by_key(|a| std::cmp::Reverse(a.totals.sum()));
         v
     };
     st.streak_days = streak(&day_totals, today);
@@ -319,9 +319,10 @@ pub enum PanelRange {
 }
 
 /// Which face the Activity card shows — the design's three panel states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PanelState {
     /// Store has never seen a record: ghosted sparkline, explainer copy.
+    #[default]
     FirstRun,
     /// History exists, but the selected range is empty: `0`, quiet copy,
     /// the last-seen session named.
@@ -373,25 +374,20 @@ pub struct PanelSummary {
     pub not_counted: Vec<String>,
 }
 
-impl Default for PanelState {
-    fn default() -> Self {
-        PanelState::FirstRun
-    }
-}
+/// What [`panel`] takes to price a `(provider, model, Totals)` triple —
+/// `None` disables cost estimation entirely (the config's opt-in).
+pub type CostFn<'a> = Option<&'a dyn Fn(&str, &str, &Totals) -> Option<f64>>;
 
 /// Compute the Activity card's data for `range`.
 ///
 /// `quota_only` is the enabled providers with no `[history]` section: they
 /// land in `not_counted` so the card can mark partial coverage instead of
 /// implying it.
-///
-/// `cost_fn` prices a `(provider, model, Totals)` triple; `None` disables
-/// cost estimation entirely (the config's opt-in).
 pub fn panel(
     store: &HistoryStore,
     range: PanelRange,
     quota_only: &[String],
-    cost_fn: Option<&dyn Fn(&str, &str, &Totals) -> Option<f64>>,
+    cost_fn: CostFn,
 ) -> PanelSummary {
     let now = Local::now();
     let today = now.date_naive();
@@ -448,7 +444,10 @@ pub fn panel(
     let (base_lo, base_hi): (NaiveDate, NaiveDate) = match range {
         PanelRange::Day => (today - Duration::days(7), today - Duration::days(1)),
         PanelRange::Week => (day_floor - Duration::days(7), day_floor - Duration::days(1)),
-        PanelRange::Month => (day_floor - Duration::days(30), day_floor - Duration::days(1)),
+        PanelRange::Month => (
+            day_floor - Duration::days(30),
+            day_floor - Duration::days(1),
+        ),
     };
     let mut base_total = 0u64;
     // For 24h the baseline is a 7-day mean of daily totals.
@@ -499,7 +498,7 @@ pub fn panel(
             // Mean daily total over the 7 baseline days that had any data.
             (base_days > 0).then(|| base_total as f64 / base_days as f64)
         }
-        _ => (base_total > 0).then(|| base_total as f64),
+        _ => (base_total > 0).then_some(base_total as f64),
     }
     .filter(|b| *b > 0.0)
     .map(|b| (range_total as f64 - b) / b);

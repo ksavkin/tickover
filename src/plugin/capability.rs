@@ -203,10 +203,12 @@ pub(crate) const CAPABILITIES: &[Capability] = &[
     // build.
     Capability {
         name: "reading-history",
-        // Follows the cargo feature: a `--no-default-features` build has no
-        // scanner at all, so accepting a `[history]` manifest there would be
-        // the silent misread the gate exists to refuse.
-        implemented: cfg!(feature = "history"),
+        // Always implemented: the section parses in every build — a
+        // `--no-default-features` binary simply never runs the scanner, the
+        // way a manifest key without a consumer is inert. Refusing the whole
+        // manifest there would knock the provider's quota rows out too,
+        // which is a far worse misread than a quiet `[history]` section.
+        implemented: true,
         keys: &["history.*"],
     },
     // Window severity. The server's own per-window severity. Split out of

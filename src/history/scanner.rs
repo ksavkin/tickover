@@ -261,6 +261,6 @@ fn collect(root: &Path, glob: &str) -> Vec<FileSig> {
                 .map_or(0, |d| d.as_secs() as i64),
         });
     }
-    files.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    files.sort_by_key(|f| std::cmp::Reverse(f.mtime));
     files
 }

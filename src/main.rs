@@ -5395,7 +5395,7 @@ fn window_rows(
     // Burn projection per window, from the history store — `None` answers
     // draw no hatch. Tests pass [`no_projection`]; production passes a
     // closure over the shared snapshot.
-    proj: &dyn Fn(&Window, f64) -> Option<(f32, i32, String)>,
+    proj: &ProjectionFn<'_>,
 ) -> Vec<(String, WindowData)> {
     // A window the provider reported no percentage for is left out rather than
     // drawn as an empty bar over "no data": it occupies a block's worth of
@@ -5589,7 +5589,11 @@ fn quota_projection(
 /// with a second walker on the same directories.
 #[cfg(feature = "history")]
 fn spawn_history_scan(ctx: &Ctx) {
-    if ctx.history_io.busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    if ctx
+        .history_io
+        .busy
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
         return;
     }
     let manifests: Vec<PluginManifest> = ctx
@@ -5600,7 +5604,9 @@ fn spawn_history_scan(ctx: &Ctx) {
         .cloned()
         .collect();
     if manifests.is_empty() {
-        ctx.history_io.busy.store(false, std::sync::atomic::Ordering::SeqCst);
+        ctx.history_io
+            .busy
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         return;
     }
     let tx = ctx.history_io.tx.clone();
@@ -5624,8 +5630,7 @@ fn spawn_history_scan(ctx: &Ctx) {
             // Resumable ticks: a pass that stopped on its wall-clock budget
             // reports `partial`, and a cold corpus takes a few of them.
             for _ in 0..8 {
-                let scans =
-                    tickover::history::scan_tick(&mut store, &manifests, &plugin_options);
+                let scans = tickover::history::scan_tick(&mut store, &manifests, &plugin_options);
                 if let Err(e) = store.commit() {
                     diag::line(format!("history: store commit failed: {e}"));
                     return report_done(false);
@@ -5638,7 +5643,9 @@ fn spawn_history_scan(ctx: &Ctx) {
         })
         .is_err()
     {
-        ctx.history_io.busy.store(false, std::sync::atomic::Ordering::SeqCst);
+        ctx.history_io
+            .busy
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         diag::line("history: could not spawn the scan thread".into());
     }
 }
@@ -5675,30 +5682,25 @@ fn sync_activity(app: &AppWindow, ctx: &Ctx) {
         2 => PanelRange::Month,
         _ => PanelRange::Day,
     };
-    let cost_fn: Option<&dyn Fn(&str, &str, &Totals) -> Option<f64>> =
-        config::history_cost_estimate().then_some(
-            &|_: &str, m: &str, t: &Totals| tickover::history::pricing::cost_usd(m, t),
-        );
+    let cost_fn: tickover::history::query::CostFn = config::history_cost_estimate()
+        .then_some(&|_: &str, m: &str, t: &Totals| tickover::history::pricing::cost_usd(m, t));
     let sum = ctx
         .history
         .borrow()
         .as_ref()
-        .map(|store| {
-            tickover::history::query::panel(store, range, &quota_only, cost_fn)
-        });
+        .map(|store| tickover::history::query::panel(store, range, &quota_only, cost_fn));
     if std::env::var_os("TICKOVER_DEBUG_ACTIVITY").is_some() {
         if let Some(s) = &sum {
             eprintln!(
                 "activity: state={:?} headline={} spark={:?} segs={:?} delta={:?}",
-                s.state,
-                s.headline,
-                s.spark,
-                s.segments,
-                s.delta,
+                s.state, s.headline, s.spark, s.segments, s.delta,
             );
         }
     }
-    let scanning = ctx.history_io.busy.load(std::sync::atomic::Ordering::Relaxed);
+    let scanning = ctx
+        .history_io
+        .busy
+        .load(std::sync::atomic::Ordering::Relaxed);
     app.set_activity(activity_data(sum.as_ref(), range, &plugins, scanning));
 }
 #[cfg(not(feature = "history"))]
@@ -5750,12 +5752,7 @@ fn activity_data(
             let (when, wher) = sum
                 .last_seen
                 .as_ref()
-                .map(|(t, p)| {
-                    (
-                        t.format("%b %-d %H:%M").to_string(),
-                        p.clone(),
-                    )
-                })
+                .map(|(t, p)| (t.format("%b %-d %H:%M").to_string(), p.clone()))
                 .unwrap_or_default();
             (
                 if when.is_empty() {
@@ -5795,7 +5792,11 @@ fn activity_data(
             "{} publish{} no local token history — totals here exclude {}.",
             missing_names.join(", "),
             if missing_names.len() == 1 { "es" } else { "" },
-            if missing_names.len() == 1 { "it" } else { "them" },
+            if missing_names.len() == 1 {
+                "it"
+            } else {
+                "them"
+            },
         )
     } else {
         String::new()
@@ -5914,9 +5915,7 @@ fn open_history_report(ctx: &Ctx) {
                     .resets_at
                     .zip(w.period_minutes)
                     .and_then(|(reset, m)| reset.checked_sub(m * 60))
-                    .and_then(|start| {
-                        tickover::history::query::window_burn(store, &r.id, start)
-                    })
+                    .and_then(|start| tickover::history::query::window_burn(store, &r.id, start))
                     .map(|(tokens, h)| (tokens as f64 / h).round() as u64);
                 Some(tickover::history::report::QuotaNow {
                     provider: r.id.clone(),
@@ -5948,6 +5947,12 @@ fn open_history_report(ctx: &Ctx) {
 #[cfg(not(feature = "history"))]
 fn open_history_report(_: &Ctx) {}
 
+/// The projection closure `window_rows` consults per window — returns
+/// `(projected_pct, tone, burn_line)` or `None` when history offers no
+/// honest answer. The `+ 'a` bound keeps a borrowed closure legal — a bare
+/// `dyn Fn` alias defaults to `'static` and only `'static` closures pass.
+type ProjectionFn<'a> = dyn Fn(&Window, f64) -> Option<(f32, i32, String)> + 'a;
+
 /// Build one `WindowData` row from a reading window and the percentage it
 /// reported. The window's `role` decides the tooltip name and clock format
 /// (5-hour vs weekly); its numbers drive the bar, countdown and pace via
@@ -5957,12 +5962,7 @@ fn open_history_report(_: &Ctx) {}
 /// that reported one becomes a row at all — the caller establishes that, and
 /// taking it as an argument keeps this from carrying a second, unreachable
 /// shape for the case it has already excluded.
-fn window_data(
-    now: u64,
-    w: &Window,
-    used: f64,
-    proj: Option<(f32, i32, String)>,
-) -> WindowData {
+fn window_data(now: u64, w: &Window, used: f64, proj: Option<(f32, i32, String)>) -> WindowData {
     // Whether the reset clock carries a date. A week away needs one; five
     // hours away does not. Decided by length when the window states one —
     // the same rule `window_title`/`window_title_of` already use to choose
@@ -12598,7 +12598,7 @@ mod title_tests {
 
     /// The tests here predate the quota×history projection and exercise
     /// rows/hysteresis, not burn math — they all want "no projection".
-    const NO_PROJ: &dyn Fn(&Window, f64) -> Option<(f32, i32, String)> = &|_, _| None;
+    const NO_PROJ: &ProjectionFn<'static> = &|_, _| None;
 
     fn labels(rows: &[(String, WindowData)]) -> Vec<String> {
         rows.iter().map(|(_, w)| w.label.to_string()).collect()
@@ -12622,7 +12622,13 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &weekly_only, NOW, &seen_only("w0:", seen), &NO_PROJ);
+        let rows = window_rows(
+            Some(&m),
+            &weekly_only,
+            NOW,
+            &seen_only("w0:", seen),
+            &NO_PROJ,
+        );
 
         assert_eq!(
             labels(&rows),
@@ -12782,12 +12788,26 @@ mod title_tests {
             at: NOW - 600,
             period_minutes: None,
         };
-        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", no_length), &NO_PROJ).is_empty());
+        assert!(window_rows(
+            Some(&m),
+            &nothing,
+            NOW,
+            &seen_only("w0:", no_length),
+            &NO_PROJ
+        )
+        .is_empty());
         let zero_length = config::SeenWindow {
             at: NOW - 600,
             period_minutes: Some(0),
         };
-        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", zero_length), &NO_PROJ).is_empty());
+        assert!(window_rows(
+            Some(&m),
+            &nothing,
+            NOW,
+            &seen_only("w0:", zero_length),
+            &NO_PROJ
+        )
+        .is_empty());
     }
 
     /// A window the provider *is* reporting is drawn from what it reported.
@@ -12863,7 +12883,13 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &figureless, NOW, &seen_only("w0:", seen), &NO_PROJ);
+        let rows = window_rows(
+            Some(&m),
+            &figureless,
+            NOW,
+            &seen_only("w0:", seen),
+            &NO_PROJ,
+        );
         assert!(
             rows.is_empty(),
             "no row to draw, and no claim that the window is empty: {:?}",

@@ -119,18 +119,14 @@ fn scan_then_query_matches_the_fixture() {
     let claude_root = tmpdir("claude");
     let codex_root = tmpdir("codex");
     fs::create_dir_all(claude_root.join("proj-a")).unwrap();
-    fs::write(
-        claude_root.join("proj-a/sess-1.jsonl"),
-        claude_fixture(),
-    )
-    .unwrap();
+    fs::write(claude_root.join("proj-a/sess-1.jsonl"), claude_fixture()).unwrap();
     fs::write(codex_root.join("rollout-1.jsonl"), codex_fixture()).unwrap();
 
     let manifests = vec![
         manifest("claude", "claude-transcripts", &claude_root, "**/*.jsonl"),
         manifest("codex", "codex-rollouts", &codex_root, "rollout-*.jsonl"),
     ];
-        let mut store = HistoryStore::open(&store_dir).unwrap();
+    let mut store = HistoryStore::open(&store_dir).unwrap();
 
     let scans = scan_tick(&mut store, &manifests, &|_| BTreeMap::new());
     assert_eq!(scans.len(), 2, "both providers scanned");

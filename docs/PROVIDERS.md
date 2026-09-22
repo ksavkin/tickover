@@ -26,6 +26,27 @@ and Copilot's allowance is monthly. Each provider is asked less often while
 it is failing, and opening the panel redraws the last reading rather than
 firing a request.
 
+## Local usage history
+
+Beside the live quota readings, four of the five providers also write a
+local usage log the app reads for the Activity card, `tickover stats`, and
+the HTML report. History is declared in the manifest as `[history]` (see
+[PLUGIN-ARCHITECTURE.md](PLUGIN-ARCHITECTURE.md#history)); the corpus is
+read-only — the scanner never writes into a provider's directory.
+
+| Provider | History source | Format |
+|---|---|---|
+| **Claude** | `~/.claude/projects/**/*.jsonl` (or `$CLAUDE_CONFIG_DIR/projects`) | one JSON object per line; `type = "assistant"` lines carry `message.usage` with input/output/cache classes |
+| **Codex** | `~/.codex/sessions/**/rollout-*.jsonl` + `archived_sessions/` (`$CODEX_HOME` honoured) | `token_count` events whose cumulative counters are differenced per session |
+| **Grok** | `~/.grok/logs/unified.jsonl` | `shell.turn.inference_done` events carrying per-turn token counts |
+| **Antigravity** | `~/.gemini/antigravity-cli/conversations/*.db` | per-conversation SQLite (opened `mode=ro&immutable=1`); protobuf-encoded generation records |
+| **Copilot** | none | Copilot publishes no local token history — it appears under "not counted" in the Activity card and `quota only` on its row |
+
+History is stored locally and nowhere else — under the app's own config
+directory, aggregated into hourly buckets. No prompt text, message body, or
+file content is ever read out of these logs; the extractors emit only
+timestamps, project names, model names, and token counts.
+
 ## Auto-ping
 
 Two of the five manifests declare a `[ping]` — Codex
