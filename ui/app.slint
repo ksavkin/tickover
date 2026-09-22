@@ -886,12 +886,12 @@ export component AppWindow inherits Window {
                             // explanation and the re-check button.
                             if root.activity.first-run : VerticalLayout {
                                 spacing: 10px;
-                                HorizontalLayout {
+                                Rectangle {
                                     height: 30px;
-                                    spacing: 2px;
                                     opacity: 0.45;
-                                    for _ in 24 : Rectangle {
-                                        horizontal-stretch: 1;
+                                    for i in 24 : Rectangle {
+                                        x: i * parent.width / 24;
+                                        width: max(1px, parent.width / 24 - 2px);
                                         height: 3px;
                                         y: parent.height - 3px;
                                         border-radius: 1px;
@@ -946,7 +946,6 @@ export component AppWindow inherits Window {
                                 spacing: 10px;
                                 HorizontalLayout {
                                     spacing: 10px;
-                                    alignment: end;
                                     VerticalLayout {
                                         spacing: 1px;
                                         Text {
@@ -965,12 +964,12 @@ export component AppWindow inherits Window {
                                     Rectangle { horizontal-stretch: 1; }
                                     // Dashed baseline — dashes, not a border,
                                     // because Slint borders are solid.
-                                    HorizontalLayout {
+                                    Rectangle {
                                         horizontal-stretch: 3;
                                         height: 30px;
-                                        spacing: 5px;
-                                        for _ in 34 : Rectangle {
-                                            horizontal-stretch: 1;
+                                        for i in 34 : Rectangle {
+                                            x: i * parent.width / 34;
+                                            width: max(1px, parent.width / 34 - 5px);
                                             height: 1px;
                                             y: parent.height - 1px;
                                             background: #262b33;
