@@ -191,6 +191,21 @@ pub(crate) const CAPABILITIES: &[Capability] = &[
         implemented: true,
         keys: &["balances.*"],
     },
+    // Usage history. `[history]` tells the history scanner where this
+    // provider's local token records live and which extractor parses them.
+    // A build without this ignores the section — which is the bad outcome
+    // the gate exists for: a manifest author who writes `[history]` expects
+    // the panel's Activity card to fill, and an older build would install
+    // the plugin cleanly and then never read a byte of history, silently.
+    //
+    // `history.*` rather than `history`, like `balances.*` above: the whole
+    // section is new, so every key inside it is unreadable to an older
+    // build.
+    Capability {
+        name: "reading-history",
+        implemented: true,
+        keys: &["history.*"],
+    },
     // Window severity. The server's own per-window severity. Split out of
     // `reading-status`, which it shipped inside: `reading-status` covers the
     // quota's status but *not* this, and leaving the two under one name would
