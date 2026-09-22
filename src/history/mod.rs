@@ -15,7 +15,13 @@ pub mod formats;
 pub mod scanner;
 pub mod store;
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Instant;
+
 use chrono::{DateTime, Utc};
+
+use crate::plugin::manifest::PluginManifest;
 
 /// One provider request's token usage, normalised across formats.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,4 +55,63 @@ impl UsageRecord {
     pub fn total(&self) -> u64 {
         self.input + self.output + self.cache_read + self.cache_write + self.thinking
     }
+}
+
+/// Where the history store lives: `<config>/tickover/history/` —
+/// the app's own namespace, never a provider's. `None` when the platform
+/// reports no config dir (a pathological environment — the caller treats
+/// it as "history unavailable", not a crash).
+pub fn default_dir() -> Option<PathBuf> {
+    crate::plugin::app_config_dir().map(|d| d.join("history"))
+}
+
+/// What one scan tick did per provider — surfaced by `stats` so format
+/// drift (`skipped_unparsed`) and budget exhaustion (`partial`) are
+/// visible rather than silent.
+#[derive(Debug)]
+pub struct ProviderScan {
+    pub provider: String,
+    /// `true` when the manifest's root resolved to nothing readable —
+    /// provider installed-but-no-history, not an error.
+    pub root_missing: bool,
+    pub outcome: scanner::ScanOutcome,
+}
+
+/// One scan tick across every loaded manifest that declares `[history]`.
+/// Each provider gets its own slice of the shared wall-clock budget; the
+/// tick ends early (providers after the cutoff simply report `partial`)
+/// rather than overrun it.
+pub fn scan_tick(
+    store: &mut store::HistoryStore,
+    manifests: &[PluginManifest],
+    options: &BTreeMap<String, bool>,
+) -> Vec<ProviderScan> {
+    let deadline = Instant::now() + scanner::SCAN_WALL_BUDGET;
+    let mut scans = Vec::new();
+    for m in manifests {
+        let Some(h) = &m.history else { continue };
+        let root = crate::plugin::engine_logfile::resolve_root_fields(
+            &h.root,
+            &h.root_env,
+            &h.root_env_join,
+            options,
+        );
+        if !root.is_dir() {
+            scans.push(ProviderScan {
+                provider: m.id.clone(),
+                root_missing: true,
+                outcome: scanner::ScanOutcome::default(),
+            });
+            continue;
+        }
+        let extractor = formats::extractor_for(h.format);
+        let outcome =
+            scanner::scan_root(store, &m.id, &root, &h.glob, extractor.as_ref(), deadline);
+        scans.push(ProviderScan {
+            provider: m.id.clone(),
+            root_missing: false,
+            outcome,
+        });
+    }
+    scans
 }
