@@ -282,7 +282,9 @@ struct Ctx {
     anchor: Anchor,
     shown_at: Rc<Cell<Instant>>,
     tray_click_at: Rc<Cell<Option<Instant>>>,
+    tray_press_at: Rc<Cell<Option<Instant>>>,
     hidden_by_focus_at: Rc<Cell<Option<Instant>>>,
+    opened_by_activation_at: Rc<Cell<Option<(Instant, bool)>>>,
 }
 
 /// The refresh triple nearly every settings-sheet callback below closes
@@ -453,6 +455,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // status item is what takes that focus away, so the hide lands *before*
     // the click that caused it — see `TRAY_CLICK_DISMISS_WINDOW`.
     let hidden_by_focus_at: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
+    // This gesture's `Down` mark, set when it drains and taken by its `Up`
+    // — `Some` means a press is in flight. It is what ties the gesture's
+    // press time to *this* click rather than an older one's, which the
+    // dismissed and absorbed checks both reason causally from (see
+    // `tray_click_dismissed_panel`, `click_absorbed_by_its_activation`).
+    let tray_press_at: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
+    // When an unexplained activation edge last opened the panel, and whether
+    // that open actually *placed* the window. The status-item click that
+    // caused it can still be in flight to the click drain — when it arrives
+    // it is the same gesture's other half and must be absorbed, not toggled;
+    // and only a placement is worth re-anchoring to the click's `rect` (a
+    // window the user parked should stay put). See
+    // `click_absorbed_by_its_activation`.
+    let opened_by_activation_at: Rc<Cell<Option<(Instant, bool)>>> = Rc::new(Cell::new(None));
     // Change-detection key for the tray indicator (avoids icon churn).
     // `sync_tray_indicator_from` treats an unchanged key as "nothing to draw"
     // and returns before ever setting the icon or tooltip — `None` here means
@@ -542,6 +558,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shown_at: shown_at.clone(),
         tray_click_at: tray_click_at.clone(),
         hidden_by_focus_at: hidden_by_focus_at.clone(),
+        tray_press_at: tray_press_at.clone(),
+        opened_by_activation_at: opened_by_activation_at.clone(),
     };
 
     wire_ui_callbacks(&app, &ctx);
@@ -1762,46 +1780,7 @@ fn run_fast_timer(
             );
         }
 
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                rect,
-                ..
-            } = event
-            {
-                *ctx.anchor.borrow_mut() = Some((
-                    rect.position.x,
-                    rect.position.y,
-                    rect.size.width as f64,
-                    rect.size.height as f64,
-                ));
-                // This click owns whatever activation it causes.
-                let now = Instant::now();
-                ctx.tray_click_at.set(Some(now));
-                // Taken whatever the platform, so the mark cannot go
-                // stale and answer for a much later click.
-                let hidden_at = ctx.hidden_by_focus_at.take();
-                let dismissed = TRAY_CLICK_CAN_ARRIVE_AFTER_ITS_OWN_DISMISSAL
-                    && tray_click_dismissed_panel(hidden_at, now);
-                if app.window().is_visible() {
-                    let _ = app.window().hide();
-                } else if !dismissed {
-                    spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
-                    if should_refresh_panel(app.window().is_visible(), true) {
-                        refresh_model(
-                            &app,
-                            &ctx.model,
-                            &ctx.plugins.borrow(),
-                            &ctx.cache,
-                            &ctx.window_models,
-                            &ctx.balance_models,
-                        );
-                    }
-                    present_popover(&app, &ctx.anchor, &ctx.shown_at, Shown::ByTrayClick);
-                }
-            }
-        }
+        drain_tray_clicks(&app, &ctx);
 
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == tray_menu.refresh_id {
@@ -2169,6 +2148,120 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
 /// Outside dock mode the returned [`Timer`] is simply never started — cheap
 /// to always build, so `main` can hold one `Timer` binding for it
 /// unconditionally, the same as every other timer here.
+/// Drain every queued status-item event, applying each left-button release
+/// as the panel toggle it asks for. Returns how many left clicks it
+/// applied — including ones absorbed or dismissed without a visible toggle,
+/// since either still owns the activation its gesture caused.
+///
+/// Two timers call this: the event timer (its usual owner) and the dock-mode
+/// reopen tick, which must settle queued clicks *before* it reads the
+/// activation edge — the click and the activation it causes are observable
+/// by different pollers, and whichever sees the activation first must still
+/// find `tray_click_at` already answered.
+fn drain_tray_clicks(app: &AppWindow, ctx: &Ctx) -> usize {
+    let mut tray_clicks = 0;
+    while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+        if let TrayIconEvent::Click {
+            button,
+            button_state,
+            ..
+        } = &event
+        {
+            diag::line(format!("tray event: {button:?} {button_state:?}"));
+        }
+        if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state,
+            rect,
+            ..
+        } = event
+        {
+            *ctx.anchor.borrow_mut() = Some((
+                rect.position.x,
+                rect.position.y,
+                rect.size.width as f64,
+                rect.size.height as f64,
+            ));
+            // The gesture owns its activation from the *press*, not the
+            // release: macOS activates the app at mouse-down while the click
+            // event only lands on mouse-up, so without marking on Down a
+            // reopen tick landing between the two reads the activation edge
+            // before the click exists.
+            let now = Instant::now();
+            ctx.tray_click_at.set(Some(now));
+            if button_state == MouseButtonState::Down {
+                ctx.tray_press_at.set(Some(now));
+                continue;
+            }
+            if button_state != MouseButtonState::Up {
+                continue;
+            }
+            // This Up completes the gesture: `press_at` is *its* Down's
+            // mark, taken so a press cancelled mid-flight cannot answer for
+            // it. `None` — a platform delivering Up without Down, or a
+            // release whose press never reached us — falls the checks below
+            // back to their window heuristics. No staleness bound: a mark
+            // that old can never satisfy `mark_pairs_with_press`, so residue
+            // answers the same way `None` does.
+            let press_at = ctx.tray_press_at.take();
+            // Taken whatever the platform, so the mark cannot go
+            // stale and answer for a much later click.
+            let hidden_at = ctx.hidden_by_focus_at.take();
+            let dismissed = TRAY_CLICK_CAN_ARRIVE_AFTER_ITS_OWN_DISMISSAL
+                && tray_click_dismissed_panel(hidden_at, press_at, now);
+            // And if the activation edge this click caused already opened
+            // the panel, the click is that gesture's other half arriving
+            // late — absorb it rather than toggling the panel it just
+            // opened straight back off. The mark is taken unconditionally:
+            // a click on a panel that hid in the meantime must not leave it
+            // to answer for the *next* click. (Only dock mode can set it —
+            // the reopen tick is the panel's only activation-driven opener,
+            // so outside it the mark is simply never `Some` and `absorbed`
+            // is dead on purpose.)
+            let mark = ctx.opened_by_activation_at.take();
+            let absorbed = app.window().is_visible()
+                && mark.is_some_and(|(at, _)| {
+                    click_absorbed_by_its_activation(Some(at), press_at, now)
+                });
+            diag::line(format!(
+                "tray click drained: visible={} dismissed={} absorbed={} active={}",
+                app.window().is_visible(),
+                dismissed,
+                absorbed,
+                platform::app_is_active()
+            ));
+            if absorbed {
+                // The edge opened the panel before this click's `rect` was
+                // known — *if* that open placed the window, it sits wherever
+                // a stale or absent anchor put it, so move it under the item
+                // actually pressed. If the open left the window where the
+                // user parked it, the absorb must too: a mark this gesture
+                // did not cause is no licence to move their window.
+                if mark.is_some_and(|(_, moved)| moved) {
+                    position_popover(app, &ctx.anchor, Shown::ByTrayClick);
+                }
+            } else if app.window().is_visible() {
+                let _ = app.window().hide();
+            } else if !dismissed {
+                spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
+                if should_refresh_panel(app.window().is_visible(), true) {
+                    refresh_model(
+                        app,
+                        &ctx.model,
+                        &ctx.plugins.borrow(),
+                        &ctx.cache,
+                        &ctx.window_models,
+                        &ctx.balance_models,
+                    );
+                }
+                present_popover(app, &ctx.anchor, &ctx.shown_at, Shown::ByTrayClick);
+            }
+            tray_clicks += 1;
+        }
+    }
+    tray_clicks
+}
+
 fn run_dock_reopen_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
     let reopen_timer = Timer::default();
     if platform::dock_mode() {
@@ -2182,17 +2275,50 @@ fn run_dock_reopen_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
             if !handler_ready.get() {
                 handler_ready.set(platform::install_reopen_handler());
             }
+            let Some(app) = weak.upgrade() else { return };
+            // A status-item click activates the app, and only this drain is
+            // what turns it into `tray_click_at` — so it has to run before
+            // the edge below is read. Left to the event timer alone, this
+            // tick can see the activation first, open the panel for it, and
+            // the click then drains and toggles the panel straight back off.
+            let tray_clicks = drain_tray_clicks(&app, &ctx);
             let active = platform::app_is_active();
+            // The activation this mark answered for is over — whatever
+            // opens the panel next belongs to a new gesture, and a mark
+            // left standing would absorb that gesture's click instead. A
+            // press still in flight keeps it: its Up may yet be the tail of
+            // the activation the mark answers for. Residue — a Down whose
+            // Up never arrived — can keep it harmlessly: the causal pairing
+            // needs the mark within slack of a fresh press, and any Up at
+            // all takes it unconditionally.
+            if !active && ctx.tray_press_at.get().is_none() {
+                ctx.opened_by_activation_at.set(None);
+            }
             // An activation the status item caused is that click's business:
             // the tray handler has already toggled the panel, and treating the
-            // same click as a Dock reopen would toggle it straight back.
-            let by_tray = activation_owned_by_tray(ctx.tray_click_at.get(), Instant::now());
+            // same click as a Dock reopen would toggle it straight back. A
+            // click this tick's own drain applied counts too — its mark is
+            // fresh by construction, where the timestamp window could already
+            // be spent if the toggle path ran long.
+            //
+            // Accepted cost: a mark left by a press cancelled before release
+            // suppresses a genuine edge (Cmd-Tab, Dock) landing inside the
+            // same window — and a suppressed edge is consumed, not deferred,
+            // so that activation never opens the panel. Bounded to one
+            // activation within ~600ms of the cancelled press; the
+            // alternative — not marking on Down — is the bug this fixes.
+            let by_tray = tray_clicks > 0
+                || activation_owned_by_tray(ctx.tray_click_at.get(), Instant::now());
             let became_active = dock_activation_edge(&was_active, active, by_tray);
-            let Some(app) = weak.upgrade() else { return };
             let clicks = platform::take_reopen_requests();
             let visible = app.window().is_visible();
 
             let want_visible = panel_target_visibility(became_active, clicks, visible);
+            if became_active || clicks > 0 || want_visible != visible {
+                diag::line(format!(
+                    "reopen tick: active={active} by_tray={by_tray} edge={became_active} clicks={clicks} tray_clicks={tray_clicks} visible={visible} want={want_visible}"
+                ));
+            }
             if want_visible && !visible {
                 // The panel was hidden — the tick timer's own gate has been
                 // skipping `refresh_model_from` for it — so it must be forced
@@ -2209,7 +2335,17 @@ fn run_dock_reopen_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                         &ctx.balance_models,
                     );
                 }
-                present_popover(&app, &ctx.anchor, &ctx.shown_at, Shown::ByAnythingElse);
+                let moved =
+                    present_popover(&app, &ctx.anchor, &ctx.shown_at, Shown::ByAnythingElse);
+                // An unexplained activation opened this panel: remember
+                // when — and whether it moved the window — so the
+                // status-item click that caused it, whose event can still
+                // be in flight, is absorbed as the same gesture rather than
+                // toggling the panel straight back off; and so the absorb
+                // knows whether a re-anchor is owed.
+                if became_active && clicks == 0 {
+                    ctx.opened_by_activation_at.set(Some((Instant::now(), moved)));
+                }
             } else if !want_visible && visible {
                 let _ = app.window().hide();
             }
@@ -6053,6 +6189,49 @@ fn dock_activation_edge(was_active: &Cell<bool>, active: bool, by_tray: bool) ->
     active && !was && !by_tray
 }
 
+/// Whether a status-item click is the tail of an activation that already
+/// opened the panel — the same gesture, seen from the other side.
+///
+/// Clicking the item activates the app, and the reopen tick can observe that
+/// activation before the click's own event reaches the drain — activation
+/// posts at press time while the click event lands on release. The edge
+/// opens the panel and marks `opened_by_activation_at`; when the click then
+/// drains, toggling on sight would undo the open the user just asked for,
+/// so it is absorbed instead.
+///
+/// Two ways to tell, same shape as `tray_click_dismissed_panel`:
+///
+/// * The release lands inside `TRAY_CLICK_OWNS_ACTIVATION` of the edge —
+///   the plain window, which answers for most gestures and is also the
+///   accepted cost: an *unrelated* activation (Cmd-Tab) inside that window
+///   can absorb a following click, one missed toggle that the next click
+///   settles.
+/// * `press_at` pairs the mark causally: the edge must sit at or before
+///   this gesture's drained `Down`, within `PRESS_DRAIN_SLACK`. The
+///   ordering is load-bearing, not just the distance: a mark stamped
+///   *after* the `Down` drained cannot be this press's activation — had the
+///   press caused it, the `Down` would have marked `tray_click_at` first
+///   and `by_tray` would have suppressed the edge entirely. This is the arm
+///   that keeps held presses working — a release any number of seconds
+///   past the window still absorbs the edge its own press caused.
+///
+/// This is the backstop, not the primary fix: marking `tray_click_at` on the
+/// `Down` already suppresses the edge from the press, so the ordering this
+/// covers — the edge observed before the `Down` itself drained — should be
+/// down to what one event-loop pass can interleave.
+fn click_absorbed_by_its_activation(
+    opened_at: Option<Instant>,
+    press_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    opened_at.is_some_and(|at| {
+        now.saturating_duration_since(at) < TRAY_CLICK_OWNS_ACTIVATION
+            || press_at.is_some_and(|press| {
+                at <= press && press.saturating_duration_since(at) <= PRESS_DRAIN_SLACK
+            })
+    })
+}
+
 /// Whether this platform delivers the focus loss a status-item click causes
 /// *before* the click itself.
 ///
@@ -6070,13 +6249,45 @@ fn dock_activation_edge(was_active: &Cell<bool>, active: bool, by_tray: bool) ->
 const TRAY_CLICK_CAN_ARRIVE_AFTER_ITS_OWN_DISMISSAL: bool = cfg!(target_os = "windows");
 
 /// How long after hiding on focus loss a status-item click still counts as
-/// the thing that caused it.
+/// the thing that caused it — the fallback answer when the gesture's `Down`
+/// was never seen and there is no `press_at` to reason causally from.
 ///
 /// Only has to cover the gap between the press taking focus off the panel and
 /// the click being delivered — both on the same thread, so this is scheduling
 /// latency. Short enough that going away, clicking something else, and coming
 /// back to the item is an ordinary open.
 const TRAY_CLICK_DISMISS_WINDOW: Duration = Duration::from_millis(500);
+
+/// How far apart this gesture's `Down` mark and a causally-paired mark may
+/// sit and still belong to the same gesture — a *drain-latency* bound,
+/// shared by the dismissed and absorbed checks.
+///
+/// `hidden_by_focus_at` and `opened_by_activation_at` are stamped when their
+/// handlers run on the main loop; the `Down` mark is stamped when its event
+/// drains there too. The gap between a cause and its drained `Down` is
+/// therefore pure scheduling latency: a tick or two, plus jitter — two
+/// hundred milliseconds covers it with room to spare. What it must *not*
+/// cover is the gap between two different user actions — a hide or an
+/// activation from an unrelated click sits a quarter-second or more away —
+/// which is why this stays a latency bound and not a gesture one.
+const PRESS_DRAIN_SLACK: Duration = Duration::from_millis(200);
+
+/// Whether a mark sits within `PRESS_DRAIN_SLACK` of this gesture's `Down`
+/// mark, in either direction — the causal-pairing test for the *dismissed*
+/// check.
+///
+/// The focus-loss hide and the `Down` drain are two callbacks on the same
+/// main loop: under load either can run after the other, so pairing allows
+/// the mark on both sides of the press. What it does not do is reach
+/// further than the slack either way — a hide from an unrelated click,
+/// earlier or later, is never this gesture's.
+fn mark_pairs_with_press(at: Instant, press: Instant) -> bool {
+    if at <= press {
+        press.saturating_duration_since(at) <= PRESS_DRAIN_SLACK
+    } else {
+        at.saturating_duration_since(press) <= PRESS_DRAIN_SLACK
+    }
+}
 
 /// Whether a status-item click has already had its effect — closing the panel
 /// — before it arrived.
@@ -6089,11 +6300,27 @@ const TRAY_CLICK_DISMISS_WINDOW: Duration = Duration::from_millis(500);
 /// straight back, and the item only ever opens, never closes. Measured here:
 /// two clicks in a row both logged `visible=false`.
 ///
-/// Saturating only so the subtraction cannot panic; `Instant` is monotonic,
-/// so the ordering this relies on holds.
-fn tray_click_dismissed_panel(hidden_by_focus_at: Option<Instant>, now: Instant) -> bool {
-    hidden_by_focus_at
-        .is_some_and(|at| now.saturating_duration_since(at) < TRAY_CLICK_DISMISS_WINDOW)
+/// Two ways to tell, depending on what the gesture left behind:
+///
+/// * The release lands inside `TRAY_CLICK_DISMISS_WINDOW` of the hide — the
+///   window this always used, kept as the base case. Its known price stands:
+///   the mark is armed by *any* focus loss, so a click inside the window of
+///   an unrelated dismissal is swallowed (Windows only — the caller gates
+///   the whole thing behind `TRAY_CLICK_CAN_ARRIVE_AFTER_ITS_OWN_DISMISSAL`).
+/// * `press_at` pairs the hide causally: it happened at or after this
+///   gesture's press (within `PRESS_DRAIN_SLACK` of drain latency). This is
+///   the arm that keeps held presses working — a hide the press caused is
+///   still its dismissal however many seconds later the release arrives,
+///   which the fixed window cannot say.
+fn tray_click_dismissed_panel(
+    hidden_by_focus_at: Option<Instant>,
+    press_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    hidden_by_focus_at.is_some_and(|at| {
+        now.saturating_duration_since(at) < TRAY_CLICK_DISMISS_WINDOW
+            || press_at.is_some_and(|press| mark_pairs_with_press(at, press))
+    })
 }
 
 /// Where the dock-mode panel should end up after one poll tick.
@@ -6163,7 +6390,16 @@ fn popover_moves(dock_mode: bool, placed_before: bool, shown: Shown) -> bool {
     !dock_mode || !placed_before || shown == Shown::ByTrayClick
 }
 
-fn present_popover(app: &AppWindow, anchor: &Anchor, shown_at: &Rc<Cell<Instant>>, shown: Shown) {
+/// Returns whether this presentation placed the window — the reopen tick's
+/// activation-open needs to know: only a presentation that actually moved
+/// the panel can have left it somewhere its click's anchor would not have
+/// put it, and only that case is worth re-anchoring when the click arrives.
+fn present_popover(
+    app: &AppWindow,
+    anchor: &Anchor,
+    shown_at: &Rc<Cell<Instant>>,
+    shown: Shown,
+) -> bool {
     // A new popover presentation always starts on the gauges, not a stale modal.
     app.set_settings_open(false);
     // Nor a stale tooltip. A bubble raised by hovering a bar has no leave
@@ -6171,7 +6407,7 @@ fn present_popover(app: &AppWindow, anchor: &Anchor, shown_at: &Rc<Cell<Instant>
     // without this it is what greets the next presentation.
     app.set_tip(BarTip::default());
     let _ = app.window().show();
-    position_popover(app, anchor, shown);
+    let moved = position_popover(app, anchor, shown);
     // Only after show + position: Slint creates the winit window lazily, so
     // measuring before `show()` is a no-op on the first presentation, and
     // measuring before `position_popover` reads the monitor the window is
@@ -6194,6 +6430,7 @@ fn present_popover(app: &AppWindow, anchor: &Anchor, shown_at: &Rc<Cell<Instant>
         w.focus_window();
     });
     platform::activate_app();
+    moved
 }
 
 /// A screen the popover has to stay inside: `(x, y, width, height)` in
@@ -6312,7 +6549,10 @@ fn anchor_screen(app: &AppWindow, anchor: Option<(f64, f64, f64, f64)>) -> Optio
     found
 }
 
-fn position_popover(app: &AppWindow, anchor: &Anchor, shown: Shown) {
+/// Returns whether the window was actually moved — `popover_moves` can say
+/// no, and only the caller who asked for a placement (or compensates for
+/// one that landed on a stale anchor) needs the answer.
+fn position_popover(app: &AppWindow, anchor: &Anchor, shown: Shown) -> bool {
     // Recorded whatever the mode, so that switching into dock mode mid-session
     // does not count the window as never placed.
     thread_local! {
@@ -6320,7 +6560,7 @@ fn position_popover(app: &AppWindow, anchor: &Anchor, shown: Shown) {
     }
     let placed_before = PLACED.with(|placed| placed.replace(true));
     if !popover_moves(platform::dock_mode(), placed_before, shown) {
-        return;
+        return false;
     }
     let scale = app.window().scale_factor() as f64;
     let size = app.window().size();
@@ -6341,6 +6581,7 @@ fn position_popover(app: &AppWindow, anchor: &Anchor, shown: Shown) {
     );
     app.window()
         .set_position(PhysicalPosition::new(x as i32, y as i32));
+    true
 }
 
 /// The directories a provider CLI is looked for in — and, just as importantly,
@@ -8703,8 +8944,9 @@ mod dock_panel_tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        activation_owned_by_tray, dock_activation_edge, panel_target_visibility as target,
-        popover_moves as moves, Shown, TRAY_CLICK_OWNS_ACTIVATION,
+        activation_owned_by_tray, click_absorbed_by_its_activation as absorbed,
+        dock_activation_edge, panel_target_visibility as target, popover_moves as moves, Shown,
+        TRAY_CLICK_OWNS_ACTIVATION,
     };
 
     // Nothing happened this tick: whatever is on screen stays.
@@ -8805,6 +9047,110 @@ mod dock_panel_tests {
         );
     }
 
+    // A status-item click activates the app, and the reopen tick can see
+    // that activation before the click's own event reaches the drain —
+    // activation posts at press time, the event on release. The edge opens
+    // the panel and marks `opened_by_activation_at`; the late-arriving click
+    // is then the same gesture's other half and must be absorbed, not
+    // toggled — otherwise the panel flicks open and straight back off and
+    // the item only ever opens on the *second* click (the macOS bug this
+    // fixes).
+    #[test]
+    fn a_click_landing_after_its_own_activation_open_is_absorbed() {
+        use super::PRESS_DRAIN_SLACK;
+        let opened = Instant::now();
+        let press = opened + Duration::from_millis(80);
+        // The plain window answers for most gestures.
+        assert!(
+            absorbed(Some(opened), Some(press), press + Duration::from_millis(10)),
+            "the release lands right after the press's activation"
+        );
+        assert!(
+            absorbed(
+                Some(opened),
+                None,
+                opened + TRAY_CLICK_OWNS_ACTIVATION - Duration::from_millis(1)
+            ),
+            "no Down seen — still inside the gesture window"
+        );
+        assert!(
+            !absorbed(Some(opened), None, opened + TRAY_CLICK_OWNS_ACTIVATION),
+            "past it the click is a new intent"
+        );
+        assert!(
+            !absorbed(None, Some(press), press),
+            "a panel nobody activated open has nothing to absorb"
+        );
+        // The causal arm is what survives a held press: the release can land
+        // seconds past the window and the mark is still its own gesture's.
+        assert!(
+            absorbed(Some(opened), Some(press), press + Duration::from_secs(2)),
+            "a held press still absorbs its own release — duration is not the test"
+        );
+        // Its boundary, past the window: the mark must sit within drain
+        // latency of this gesture's press — the drain can be stretched by
+        // the winning tick's own open work, which is why the slack is a
+        // latency bound and not a gesture one.
+        let old_mark = opened;
+        assert!(
+            absorbed(
+                Some(old_mark),
+                Some(old_mark + PRESS_DRAIN_SLACK),
+                old_mark + Duration::from_secs(2)
+            ),
+            "a mark exactly a slack before the press still counts"
+        );
+        assert!(
+            !absorbed(
+                Some(old_mark),
+                Some(old_mark + PRESS_DRAIN_SLACK + Duration::from_millis(1)),
+                old_mark + Duration::from_secs(2)
+            ),
+            "one millisecond past it does not — that mark is another gesture's"
+        );
+        assert!(
+            !absorbed(
+                Some(old_mark),
+                Some(old_mark + Duration::from_secs(1)),
+                old_mark + Duration::from_secs(1) + Duration::from_millis(50)
+            ),
+            "a press a whole second after the mark is plainly a new intent"
+        );
+        // And the direction matters, not just the distance: a mark stamped
+        // *after* this gesture's `Down` drained can never be its activation
+        // — the `Down` would have suppressed that edge first. An unrelated
+        // activation during a hold must not pair however close it sits.
+        assert!(
+            !absorbed(
+                Some(press + Duration::from_millis(50)),
+                Some(press),
+                press + Duration::from_secs(2)
+            ),
+            "a mark raised mid-hold by something else is not the gesture's"
+        );
+    }
+
+    // The mark is what makes the two orderings equal: click-first is owned
+    // via `tray_click_at`, edge-first via `opened_by_activation_at` —
+    // whichever half arrives second finds the other has already answered.
+    #[test]
+    fn both_orderings_of_one_gesture_open_exactly_once() {
+        // Edge first: activation opens (marked), the drained click absorbs.
+        let opened_at = Instant::now();
+        let press = opened_at + Duration::from_millis(50);
+        assert!(target(true, 0, false), "the edge opens");
+        assert!(
+            absorbed(
+                Some(opened_at),
+                Some(press),
+                press + Duration::from_millis(40)
+            ),
+            "and its click does not toggle the result"
+        );
+        // Click first: the drain opens, the edge is suppressed by
+        // `by_tray` — asserted already in `dock_activation_edge_defers_to_the_tray`.
+    }
+
     // The flyout hangs off the status item, so every show places it. Nothing
     // about it is the user's to arrange, and a stale position would leave it
     // pointing at an icon it is no longer under.
@@ -8845,16 +9191,102 @@ mod dock_panel_tests {
         use super::{tray_click_dismissed_panel as dismissed, TRAY_CLICK_DISMISS_WINDOW};
         let hidden = Instant::now();
         assert!(
-            dismissed(Some(hidden), hidden + Duration::from_millis(10)),
+            dismissed(Some(hidden), None, hidden + Duration::from_millis(10)),
             "the click arrives just after the hide it caused"
         );
         assert!(
-            !dismissed(Some(hidden), hidden + TRAY_CLICK_DISMISS_WINDOW),
+            !dismissed(Some(hidden), None, hidden + TRAY_CLICK_DISMISS_WINDOW),
             "long enough later and it is a fresh request to open"
         );
         assert!(
-            !dismissed(None, hidden),
+            !dismissed(None, None, hidden),
             "a panel that was never hidden by focus loss cannot have been dismissed"
+        );
+    }
+
+    #[test]
+    fn a_held_press_still_dismisses_no_matter_how_long_the_hold() {
+        use super::tray_click_dismissed_panel as dismissed;
+        // The gesture's own timeline: the hide is stamped at real press time,
+        // the `Down` mark when the event drains — later, so the mark reads
+        // slightly *after* the hide it pairs with.
+        let hidden = Instant::now();
+        let press = hidden + Duration::from_millis(60);
+        // However long the button is held, the release completes the same
+        // gesture: the panel it closed stays closed. Short holds are covered
+        // by the window; past it the causal arm is the only thing that can.
+        for hold in [100u64, 600, 2_500] {
+            let up = press + Duration::from_millis(hold);
+            assert!(
+                dismissed(Some(hidden), Some(press), up),
+                "a {hold}ms hold is still the press's own dismissal"
+            );
+        }
+        // A hide that fails both arms — outside the release window *and*
+        // beyond drain latency of the press — is a different cause: the user
+        // clicked away, waited, and this click is an ordinary open.
+        let press = hidden + Duration::from_millis(900);
+        let up = press + Duration::from_millis(280);
+        let long_ago = hidden + Duration::from_millis(400);
+        assert!(
+            !dismissed(Some(long_ago), Some(press), up),
+            "a hide half a second before the press is a new intent"
+        );
+    }
+
+    #[test]
+    fn the_dismissal_follows_the_press_not_the_release() {
+        use super::{tray_click_dismissed_panel as dismissed, PRESS_DRAIN_SLACK};
+        // The failure the press-based answer fixes: panel open, user presses,
+        // focus loss hides the panel at press time, the button is held past
+        // the old 500ms window, and release used to read "closed, so open" —
+        // reopening the panel the gesture just dismissed.
+        let t0 = Instant::now();
+        // The hide sits at real press time; the `Down` mark lags it by the
+        // drain — well inside the slack — and the release is a 900ms hold,
+        // long past the window: only the causal arm can still say dismissed.
+        let hidden = t0 + Duration::from_millis(500);
+        let press = hidden + Duration::from_millis(60);
+        let up = press + Duration::from_millis(900);
+        assert!(dismissed(Some(hidden), Some(press), up));
+        // Boundary past the window: a hide exactly `PRESS_DRAIN_SLACK` before
+        // the press still counts — the mark can lag the real press by the
+        // winning tick's whole open pass — and one millisecond earlier does
+        // not.
+        let boundary = press - PRESS_DRAIN_SLACK;
+        assert!(dismissed(Some(boundary), Some(press), up));
+        assert!(!dismissed(
+            Some(boundary - Duration::from_millis(1)),
+            Some(press),
+            up
+        ));
+    }
+
+    // The pairing is symmetric because both marks and the `Down` mark are
+    // drain-side timestamps of press-time events: either can lag the other.
+    // What it must never do is reach past drain latency in *either*
+    // direction — a mark created during a held press by something else is
+    // not this gesture's.
+    #[test]
+    fn a_mark_pairs_with_its_press_within_drain_latency_either_way() {
+        use super::{mark_pairs_with_press as pairs, PRESS_DRAIN_SLACK};
+        let press = Instant::now();
+        assert!(pairs(press, press), "same pass");
+        assert!(
+            pairs(press - PRESS_DRAIN_SLACK, press),
+            "mark lagged the drain"
+        );
+        assert!(
+            pairs(press + PRESS_DRAIN_SLACK, press),
+            "drain lagged the mark"
+        );
+        assert!(
+            !pairs(press - PRESS_DRAIN_SLACK - Duration::from_millis(1), press),
+            "an older gesture's mark is out"
+        );
+        assert!(
+            !pairs(press + PRESS_DRAIN_SLACK + Duration::from_millis(1), press),
+            "and so is a mark something else raised mid-hold"
         );
     }
 
