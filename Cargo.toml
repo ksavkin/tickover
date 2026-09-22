@@ -23,6 +23,14 @@ categories = ["gui", "command-line-utilities"]
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
+[features]
+# Local usage-history collection: provider transcript scanning, the
+# `stats` CLI and the panel's Activity section. `rusqlite` is the only
+# dependency it pulls — a `--no-default-features` build drops SQLite and
+# the whole subsystem for environments that want the quota-only binary.
+default = ["history"]
+history = ["dep:rusqlite"]
+
 [lib]
 name = "tickover"
 path = "src/lib.rs"
@@ -86,6 +94,12 @@ sha2 = "0.10"
 # way this app derives the item name, or an account that types (or a shell
 # that expands) the other form silently names a different Keychain item.
 unicode-normalization = "0.1"
+
+# Antigravity conversation history (`[history] format = "antigravity-sqlite"`):
+# read-only opens only (`mode=ro&immutable=1`), bundled so no system
+# libsqlite3 has to exist. Optional — gated behind the `history` feature,
+# which is the whole reason this crate is here.
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 # ed25519 verification of the registry index's minisign signature. Already in
 # the binary — rustls reaches it through `ureq` — so naming it here as a direct
 # dependency compiles no new cryptographic code, which is the argument the
