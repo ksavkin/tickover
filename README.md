@@ -119,7 +119,8 @@ popover still lists all of them.
 - **Grok** — credits used in the current weekly usage period, plus prepaid
   credit and pay-as-you-go spend; `~/.grok/auth.json`.
 - **Antigravity** — 5-hour and weekly allowances for Gemini and third-party
-  models; the Keychain item its CLI writes.
+  models; the Keychain item its CLI writes (Windows Credential Manager on
+  Windows), refreshed through its own OAuth flow.
 - **GitHub Copilot** — the month's premium-request allowance and its reset;
   `~/.config/github-copilot/apps.json`.
 
@@ -164,7 +165,7 @@ reporting, nothing on a timer against a host this project controls.
 
 ## Engineering notes
 
-About 57,000 lines of Rust, roughly half of it tests — some 960 test
+About 60,000 lines of Rust, roughly half of it tests — some 970 test
 functions — one tree for both desktops.
 Six things worth a look:
 
@@ -232,8 +233,6 @@ Tests run under a substituted `HOME` — the invocation and the reason are in
   plugin registry — *Check updates* is transport integrity, not provenance.
 - **A provider you are not signed into is hidden, not announced** — except
   Codex, the one shipped manifest that sets a message for it.
-- **Copilot's unlimited premium allowance draws `cap 0 / remaining 0`**,
-  which reads like an exhausted quota and is not one.
 - **The panel is dark only**; the tray pill follows the system theme. No
   notifications, no cost accounting, no Linux.
 

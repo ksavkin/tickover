@@ -61,7 +61,7 @@ its warning on a download. Expect:
 The plan is to remove both warnings, not document them forever: **SignPath
 Foundation** signs Windows builds for open-source projects for free, once a
 project is public, OSI-licensed, and already shipping releases in the form it
-would sign — true here once a release has been published, not merely
-tagged. Apple's side needs a paid
+would sign — true here once the repository is public (it is still private)
+and a release has been published, not merely tagged. Apple's side needs a paid
 Developer ID (**$99/year**) and `notarytool` in CI — a later step, once
 downloads justify it.

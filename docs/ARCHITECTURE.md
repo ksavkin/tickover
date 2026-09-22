@@ -225,8 +225,8 @@ by `src/menubar.rs`.
 
 ## Numbers
 
-About 47,000 lines of Rust (roughly half of it tests), three Slint files,
-some 800 test functions, a release binary of about 8 MB per architecture
+About 60,000 lines of Rust (roughly half of it tests), three Slint files,
+some 970 test functions, a release binary of about 8 MB per architecture
 (the macOS binary is universal, so twice that on disk; the zip is about
 8 MB). CI builds and tests on macOS and Windows,
 with clippy at `-D warnings` on macOS — the half that can be reproduced on

@@ -71,7 +71,7 @@ credential source and calling whatever host it declares. See
 | `refresh_secs` | integer | no | `60` | poll interval, seconds; from 5 to 86 400 (a day) inclusive |
 | `enabled` | bool | no | `true` | whether the plugin is active at all |
 | `requires_reader` | array of strings | no | `[]` | reader capabilities this manifest needs — see [Reader capabilities](#reader-capabilities-requires_reader) |
-| `version` | string | no | — | this manifest's own version. The registry's update check compares it against the index, and the built-in upgrade step records it in `config.json` once a shipped copy is replaced — see [Registry](#registry) |
+| `version` | string | no | `""` | this manifest's own version — `#[serde(default)]`, so an absent field reads as the empty string, and a blank version simply loses every registry comparison. The registry's update check compares it against the index, and the built-in upgrade step records it in `config.json` once a shipped copy is replaced — see [Registry](#registry) |
 | `[tag]` | table | no | all fields empty/none | see [`[tag]`](#tag) |
 | `[account]` | table | no | `type = "none"` | see [`[account]`](#account) |
 | `[[windows]]` | array of tables | conditional | — | at least one `[[windows]]` **or** one `[[balances]]` entry, enforced by validation rather than by a schema default — see [`[[windows]]`](#windows) |
@@ -80,6 +80,7 @@ credential source and calling whatever host it declares. See
 | `[logfile]` | table | conditional | — | required when `engine = "log-file"` |
 | `[http]` | table | conditional | — | required when `engine = "http-api"` |
 | `[[surface]]` | array of tables | no | one synthesized `"default"` surface | see [`[[surface]]`](#surface) |
+| `[[option]]` | array of tables | no | empty | boolean toggles the manifest declares for the settings sheet, substituted into requests as `{option.<key>}` — see [`[[option]]`](#option) |
 | `[ping]` | table | no | absent = no auto-ping | see [`[ping]`](#ping) |
 
 Values for enum-typed fields (`engine`, `role`, `from`, `transform`, `type`,
@@ -95,7 +96,8 @@ doesn't understand yet. This matters for the registry (below) —
 plugins can advertise a newer schema version without breaking older installs.
 
 One table breaks that rule: [`[surface.auth.client]`](#surfaceauthclient) is
-`#[serde(deny_unknown_fields)]`. `files`, `bins` and `id_env` are exactly what
+`#[serde(deny_unknown_fields)]`. `files`, `bins`, `id_env`/`secret_env` and
+`id_pattern`/`secret_pattern` are exactly what
 the install-time trust dialog shows before anything is written to disk (see
 [Trust model](#trust-model)) — a typo there (`fils` for `files`, say) would
 otherwise silently disable a candidate list or an override rather than refuse
@@ -222,7 +224,8 @@ Two rules keep the key lists true:
 | `oauth-client-discovery` | **yes** | `[surface.auth.client]` — reads an `oauth-refresh` step's installed-app client id/secret back out of the credential's own installed client at run time, instead of shipping the pair in the manifest — see [`[surface.auth.client]`](#surfaceauthclient) |
 | `balance-unlimited` | **yes** | `[balances.unlimited]` — a bucket the response marks as having no ceiling draws "Unlimited" instead of a `used`/`cap`/`remaining` pair that would otherwise read `0 / 0` |
 | `balance-conditional` | **yes** | `[balances.when]` — a `[[balances]]` entry that draws no row at all unless a boolean the response states resolves `true` |
-| `credentials-file-path-env` | **yes** | `[[surface.auth]]` `path_env` / `path_env_join` on a `credentials-file` step — an env var override for where the credentials file lives, mirroring `[logfile] root_env`/`root_env_join` |
+| `credentials-file-path-env` | **yes** | `[[surface.auth]]` `path_env` / `path_env_join` on a `credentials-file` or `reject-when` step — an env var override for where the credentials file lives, mirroring `[logfile] root_env`/`root_env_join` |
+| `http-value-path-env` | **yes** | `[[http.value]]` `path_env` / `path_env_join` — the same env var override, for the file a named value is read from (Codex's `chatgpt-account-id` lives under `$CODEX_HOME`) |
 | `keychain-service-env` | **yes** | `[[surface.auth]]` `service_env` / `service_env_suffix` on a `keychain` step — re-keys `service` from an env var's value, mirroring `credentials-file-path-env` for the Keychain item name Claude's CLI also renames under `CLAUDE_CONFIG_DIR` |
 
 `window-severity` is listed without being implemented, and that is the useful
@@ -533,7 +536,8 @@ row. With bounds declared, each window takes the first candidate whose own
 length (`period.field`, converted by `period.unit`) falls inside its
 `min_period_minutes`/`max_period_minutes` — the same first-match rule
 `log-file` uses for its `primary`/`secondary` pair. Declaring neither bound is
-also legal with several candidates: the first one that resolves to a value at
+also legal with several candidates — under `from_field`, the one mode that
+accepts more than one — the first one that resolves to a value at
 all (skipping `null`) wins, in the order `containers` names them. On this
 engine, either bound only means something once `period.mode = "from_field"`
 gives a length, per candidate, to measure it against — `mode = "assumed"`
@@ -794,6 +798,8 @@ speaks for is named in `~/.codex/auth.json`, not in the URL.
 | `name` | string | placeholder name; ASCII letters, digits and underscores, unique within the manifest |
 | `type` | `"json-file"` | where to read it from |
 | `path` | string | file to read (`~` / `{config_dir}` expanded) |
+| `path_env` | string | env var that, if set to an absolute path, overrides `path`'s directory — the same rule `[[surface.auth]]` `path_env` carries, including the empty/relative fallback to `path`. Needs `requires_reader = ["http-value-path-env"]` |
+| `path_env_join` | string | filename appended onto the `path_env` override, if set; ignored under the same conditions as the auth-step variant. Must be relative with no `..` component |
 | `json_path` | string | dotted JSON path to a non-empty string inside that file |
 
 A value that can't be resolved is an error on the provider's row, and **no
@@ -845,9 +851,9 @@ needs and ignores the rest.
 | Field | Type | Used by | Notes |
 |---|---|---|---|
 | `type` | `"credentials-file"` \| `"credentials-map"` \| `"keychain"` \| `"env"` \| `"electron-safe-storage"` \| `"win-credential"` \| `"reject-when"` \| `"oauth-refresh"` | all | which credential store this step reads from (`reject-when` reads none, `oauth-refresh` reads one and spends it — see below) |
-| `path` | string | `credentials-file`, `credentials-map`, `oauth-refresh` | path to the JSON file |
-| `path_env` | string | `credentials-file` — refused on any other step kind | env var that, if set to an absolute path, overrides `path`'s directory — the credential variant of `[logfile] root_env`, additionally ignoring an env value that is empty or relative and falling back to `path` as if the variable were unset. Needs `requires_reader = ["credentials-file-path-env"]` |
-| `path_env_join` | string | `credentials-file` | filename appended onto the `path_env` override, if set (e.g. `".credentials.json"` so `$CLAUDE_CONFIG_DIR` resolves to `$CLAUDE_CONFIG_DIR/.credentials.json`); ignored when `path_env` is unset, the env var itself isn't, or its value is empty or not absolute. Must be relative with no `..` component — mirrors `[logfile] root_env_join` exactly |
+| `path` | string | `credentials-file`, `credentials-map`, `reject-when`, `oauth-refresh` | path to the JSON file |
+| `path_env` | string | `credentials-file`, `reject-when` — refused on any other step kind | env var that, if set to an absolute path, overrides `path`'s directory — the credential variant of `[logfile] root_env`, additionally ignoring an env value that is empty or relative and falling back to `path` as if the variable were unset. `reject-when` honours it because a provider that relocates its config dir puts the whole directory there, not just the token file. Needs `requires_reader = ["credentials-file-path-env"]` |
+| `path_env_join` | string | `credentials-file`, `reject-when` | filename appended onto the `path_env` override, if set (e.g. `".credentials.json"` so `$CLAUDE_CONFIG_DIR` resolves to `$CLAUDE_CONFIG_DIR/.credentials.json`); ignored when `path_env` is unset, the env var itself isn't, or its value is empty or not absolute. Must be relative with no `..` component — mirrors `[logfile] root_env_join` exactly |
 | `token_json_path` | string | `credentials-file`, `credentials-map`, `keychain`, `win-credential`, `oauth-refresh`; optional on `electron-safe-storage` (default `"claudeAiOauth.accessToken\|access_token"`) | `\|`-separated fallback JSON paths to the token (e.g. `"claudeAiOauth.accessToken\|access_token"` — try camelCase, then snake_case). For `credentials-map` it is read inside the *matched entry*; for `oauth-refresh` it names the **refresh** token |
 | `key_prefix` | string | `credentials-map` | prefix the entry's key in the top-level object at `path` must start with. Needs `requires_reader = ["credentials-map"]` |
 | `service` | string | `keychain` | Keychain service name to query |
@@ -1091,7 +1097,7 @@ does not resolve; the tick simply tries again once it does.
 |---|---|---|---|
 | `bin` | string | — (required) | binary to run; a bare program name, not a path — no `/`, `\` or `:` (the last rules out a Windows prefixed-relative path like `C:evil`, which has neither of the other two) |
 | `args` | array of strings | empty | arguments; at most 32, each non-empty and at most 256 bytes — the install-time trust dialog renders the whole command line, and these bounds keep one argument from pushing its untrusted-host warning off the bottom |
-| `renews_token` | bool | `false` | whether running this command also renews the provider's token, as a side effect the provider's own CLI has and this app does not (it never spends a provider's refresh token). A surface whose auth chain ends "lapsed" (a credential found, past its `expiry_json_path`, with no working step behind it) runs this command instead of only waiting for the user to sign in again — bounded by the same ten-minute floor as the window ping above, backing off to an hour apart once three attempts per token have ended without success, and never abandoned (see [Renewing a lapsed token](#renewing-a-lapsed-token)) |
+| `renews_token` | bool | `false` | whether running this command also renews the provider's token, as a side effect the provider's own CLI has and this app does not (outside an `oauth-refresh` auth step a manifest asks for by name, this app never spends a provider's refresh token). A surface whose auth chain ends "lapsed" (a credential found, past its `expiry_json_path`, with no working step behind it) runs this command instead of only waiting for the user to sign in again — bounded by the same ten-minute floor as the window ping above, backing off to an hour apart once three attempts per token have ended without success, and never abandoned (see [Renewing a lapsed token](#renewing-a-lapsed-token)) |
 
 No argument, label, hostname, message, or other manifest-supplied string
 listed in this document may contain a control character (C0, DEL) or a
@@ -1222,7 +1228,7 @@ sharing one.
 ### `engine = "http-api"`
 
 1. For each active surface (its auth chain resolved to a token — see
-   below), issue every `[[http.request]]`, substituting `{token}` with
+   below), issue the `[[http.request]]`, substituting `{token}` with
    that surface's resolved credential and `{version}` with
    `[http.version]`'s resolved value (or its `fallback`) in header values.
 2. Before sending, the resolved request host — the one named in the
@@ -1268,7 +1274,8 @@ ten requests. `src/plugin/throttle.rs` holds one state machine per surface:
   `backoff_max_secs`), then steady at the ceiling. A provider that is down is
   polled rarely, never never. While backing off, the row keeps showing the
   last good reading if there is one, else the failure.
-- **A stop on HTTP 401.** This app never spends a provider's refresh token —
+- **A stop on HTTP 401.** Outside an `oauth-refresh` step a manifest asks for
+  by name, this app never spends a provider's refresh token —
   that would invalidate the copy the provider's own CLI holds — so an expired
   token cannot come back on its own, and retrying it on the refresh cadence is
   a request that can only fail.
@@ -1324,9 +1331,9 @@ resolves to one of three outcomes:
   install on this machine" differs from "Claude desktop is installed but
   denied Keychain access").
 
-For Claude this chain runs credentials file, then Keychain, then Windows
-Credential Manager — expressed as a declarative, ordered list any plugin can
-configure, not hardcoded to that one provider.
+For Claude's `cli` surface this chain runs credentials file, then Keychain —
+expressed as a declarative, ordered list any plugin can configure, not
+hardcoded to that one provider.
 
 ## Surfaces & accounts
 
@@ -1347,15 +1354,16 @@ which may be signed into a different account). Each surface:
 
 `role = "primary"` marks the window that drives the automatic refresh
 timer and fills the first mini-bar in the menu-bar pill when a provider has
-more than one window; `role = "secondary"` is everything else. A manifest
+more than one window; `role = "secondary"` is the other named window —
+anything beyond those two is `role = "extra"` (see below). A manifest
 with two or more `primary` windows fails validation — there's exactly one
 "main" window per provider.
 
 `period.mode` says whether a window's nominal length is a fixed constant
 (`"assumed"`, e.g. Claude's 5-hour/weekly windows, which the API doesn't
 report a length for), read out of the reading itself as a duration
-(`"from_field"`, e.g. Codex's `window_minutes`, since Codex can and does
-report a window whose stated period differs from the "usual" 5h/weekly
+(`"from_field"`, e.g. Codex's `limit_window_seconds`, since Codex can and
+does report a window whose stated period differs from the "usual" 5h/weekly
 split), or read off the reading's own start/end bounds (`"from_bounds"`,
 e.g. Grok's `currentPeriod.start`/`.end`, for a provider that states a
 period as two timestamps rather than a duration — with `assumed` as the
@@ -1432,8 +1440,9 @@ Consequences worth knowing:
 
 A second, independent trigger for the same command: `[ping] renews_token =
 true` means running `bin`/`args` also renews the provider's token, as a side
-effect the provider's own CLI has and this app does not — it never spends a
-provider's refresh token (see [Auth chain semantics](#auth-chain-semantics)
+effect the provider's own CLI has and this app does not — outside an
+`oauth-refresh` step, it never spends a provider's refresh token (see [Auth
+chain semantics](#auth-chain-semantics)
 and `plugin::throttle`'s module doc). Claude's CLI keeps its 8-hour access
 token current only when it itself makes a request; while the app is otherwise
 idle, that token can lapse with nothing here to renew it until the next
@@ -1442,7 +1451,7 @@ window boundary happens to fire the ordinary ping — a gap of up to two hours.
 Only a surface whose own auth chain declares a token lifetime is even
 *consulted* by the tick — `SurfaceConfig::declares_token_expiry`, true iff
 some `[[surface.auth]]` step on it sets `expiry_json_path`. Claude's `cli`
-surface does (all three of its steps carry `expiry_json_path`); its
+surface does (both of its steps carry `expiry_json_path`); its
 `desktop` surface does not (`electron-safe-storage`, its own separate
 token, opt-in, renewed by the desktop app itself) — so a lapsed or 401'd
 `desktop` reading is never rewritten and never triggers a ping, even though
@@ -1621,7 +1630,7 @@ schema for `chatgpt.com/backend-api/wham/usage`, i.e. the contract
   `metered_feature` (stable key), and a full `rate_limit` of its own — meaning
   its own `allowed` and its own two windows.
 * `credits` is a separate quota family (`has_credits`, `unlimited`, `balance`)
-  that this app does not read at all.
+  — read by the shipped manifest's `codex-credits` balance row below.
 * `rate_limit_reached_type` and `plan_type` are closed enums *with an explicit
   `unknown` catch-all variant*. The official client treats an unrecognised
   value as unknown rather than as a state — the same rule this app applies to a
@@ -1758,7 +1767,11 @@ scrutiny beyond what the toggle above already covers.
 ### Secrets aren't persisted or logged by this app
 
 A resolved token lives in memory only for the duration of the request that
-needs it; it is never logged, never written to disk by this app (it's only
+needs it — with one named exception: an `oauth-refresh` result is kept in a
+process-global in-memory cache (`auth::REFRESH_CACHE`) until shortly before
+the provider-stated expiry, since the one-minute poll would otherwise mean a
+token exchange a minute. It is never logged, never written to disk by this
+app (it's only
 ever *read* from a store something else — Keychain, the CLI's own
 credentials file, Electron Safe Storage — already wrote), and the app's own
 persisted config (`config.json`) never contains one. This is a real

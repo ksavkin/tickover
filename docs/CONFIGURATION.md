@@ -70,6 +70,7 @@ Copilot, whose allowance is monthly.
 | `TICKOVER_DEMO_ACCOUNT=you@example.com` | show this in place of the real account label — for screenshots; it rewrites the label only, never the reading or the token |
 | `CODEX_HOME=/path` | honoured by the `log-file` engine's `root_env`; the shipped Codex manifest no longer uses it |
 | `TICKOVER_ANTIGRAVITY_CLIENT_ID` / `TICKOVER_ANTIGRAVITY_CLIENT_SECRET` | override the OAuth client pair the Antigravity manifest otherwise reads from the installed Antigravity app or `agy` binary; set both or neither |
+| `SLINT_BACKEND` | Slint toolkit variable, honoured as-is — the app only defaults it to `winit` when unset; set it yourself to override the UI backend |
 
 ## When something goes wrong
 
