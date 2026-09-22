@@ -81,23 +81,37 @@ pub struct ProviderScan {
 }
 
 /// One scan tick across every loaded manifest that declares `[history]`.
-/// Each provider gets its own slice of the shared wall-clock budget; the
-/// tick ends early (providers after the cutoff simply report `partial`)
-/// rather than overrun it.
+/// The wall-clock budget is divided evenly across them up front — a shared
+/// deadline would let the first provider's cold corpus starve the rest for
+/// tick after tick, which is exactly what happened to every manifest that
+/// sorted after Codex's several-thousand rollouts.
+///
+/// `options_for` resolves a manifest's declared `[[option]]`s — per plugin,
+/// not global, since two manifests can reuse a key name for different
+/// values.
 pub fn scan_tick(
     store: &mut store::HistoryStore,
     manifests: &[PluginManifest],
-    options: &BTreeMap<String, bool>,
+    options_for: &dyn Fn(&PluginManifest) -> BTreeMap<String, bool>,
 ) -> Vec<ProviderScan> {
-    let deadline = Instant::now() + scanner::SCAN_WALL_BUDGET;
+    let with_history = manifests.iter().filter(|m| m.history.is_some()).count();
+    let slice = if with_history == 0 {
+        scanner::SCAN_WALL_BUDGET
+    } else {
+        scanner::SCAN_WALL_BUDGET / with_history as u32
+    };
     let mut scans = Vec::new();
     for m in manifests {
         let Some(h) = &m.history else { continue };
+        // A fresh deadline per provider: one that finishes early simply
+        // leaves its slice unused — the next provider starts its own.
+        let deadline = Instant::now() + slice;
+        let options = options_for(m);
         let root = crate::plugin::engine_logfile::resolve_root_fields(
             &h.root,
             &h.root_env,
             &h.root_env_join,
-            options,
+            &options,
         );
         if !root.is_dir() {
             scans.push(ProviderScan {

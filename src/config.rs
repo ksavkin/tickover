@@ -569,6 +569,7 @@ pub fn set_menu_bar_text(v: bool) {
 /// Show estimated list-price cost in `stats`/panel/report. Off by
 /// default: subscription users' numbers would be notional anyway, and a
 /// dollar figure beside quota bars reads as real spend when it is not.
+#[cfg_attr(not(feature = "history"), allow(dead_code))]
 pub fn history_cost_estimate() -> bool {
     get_bool("history_cost_estimate_opt_in")
 }

@@ -203,7 +203,10 @@ pub(crate) const CAPABILITIES: &[Capability] = &[
     // build.
     Capability {
         name: "reading-history",
-        implemented: true,
+        // Follows the cargo feature: a `--no-default-features` build has no
+        // scanner at all, so accepting a `[history]` manifest there would be
+        // the silent misread the gate exists to refuse.
+        implemented: cfg!(feature = "history"),
         keys: &["history.*"],
     },
     // Window severity. The server's own per-window severity. Split out of

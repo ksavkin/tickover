@@ -190,6 +190,31 @@ struct BalanceModel {
     model: Rc<VecModel<BalanceData>>,
     keys: Vec<String>,
 }
+
+/// The UI-side handle to the history store: a reopened-after-each-scan
+/// snapshot the refresh path reads for the quota-projection hatch and the
+/// Activity card. Scanning itself runs on a worker thread against its own
+/// store instance — this one is only ever read. `()` in a build without the
+/// feature, so the refresh signatures below stay uniform either way.
+#[cfg(feature = "history")]
+type HistoryShared = Rc<RefCell<Option<tickover::history::store::HistoryStore>>>;
+#[cfg(not(feature = "history"))]
+type HistoryShared = ();
+
+/// The scan-worker's plumbing: a sender it reports each commit on, and a
+/// busy flag so a slow scan is never stacked with a second one (the same
+/// one-thread-at-a-time rule [`Fetching`] gives provider fetches — the
+/// scanner walks provider directories, and two concurrent walks double the
+/// IO for nothing).
+#[cfg(feature = "history")]
+#[derive(Clone)]
+struct HistoryIo {
+    tx: mpsc::Sender<()>,
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+#[cfg(not(feature = "history"))]
+#[derive(Clone)]
+struct HistoryIo;
 /// The plugin-manager rows shown in the settings sheet, one per loaded
 /// manifest (rebuilt from config on every relevant change).
 type PluginRows = Rc<VecModel<PluginRow>>;
@@ -283,6 +308,12 @@ struct Ctx {
     install_tx: mpsc::Sender<(PendingKind, RegistryEntry, InstallOutcome)>,
     anchor: Anchor,
     shown_at: Rc<Cell<Instant>>,
+    /// See [`HistoryShared`]. `()` when the feature is compiled out — the
+    /// field exists either way so refresh plumbing doesn't fork on the flag.
+    history: HistoryShared,
+    /// See [`HistoryIo`]. Empty unit struct when the feature is compiled out.
+    #[cfg_attr(not(feature = "history"), allow(dead_code))]
+    history_io: HistoryIo,
     tray_click_at: Rc<Cell<Option<Instant>>>,
     tray_press_at: Rc<Cell<Option<Instant>>>,
     hidden_by_focus_at: Rc<Cell<Option<Instant>>>,
@@ -304,6 +335,7 @@ fn refresh_all(ctx: &Ctx) {
             &ctx.cache,
             &ctx.window_models,
             &ctx.balance_models,
+            &ctx.history,
         );
         sync_tray_indicator(
             &ctx.tray,
@@ -541,12 +573,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // trust dialog and the actual disk write both need the UI thread, so
     // only the network+sha256 half runs off it.
     let (install_tx, install_rx) = mpsc::channel::<(PendingKind, RegistryEntry, InstallOutcome)>();
+    // History scan worker → UI: "the store changed on disk, reopen your
+    // snapshot". The scan itself runs off the UI thread (IO under a
+    // wall-clock budget); the receiver lives in `run_slow_timer`.
+    #[cfg(feature = "history")]
+    let (history_tx, history_rx) = mpsc::channel::<()>();
 
     // Slint creates the native macOS application lazily. Deferring tray
     // construction by one event-loop turn (`setup_tray`, below) makes the
     // status item durable even when the popover has not been shown yet —
     // declared here, ahead of that, so `Ctx` can carry it from the start.
     let tray: TraySlot = Rc::new(RefCell::new(None));
+
+    // The UI-side history snapshot (see [`HistoryShared`]): reopened after
+    // each scan-worker commit; `()` when the feature is compiled out.
+    #[cfg(feature = "history")]
+    let history_cell: HistoryShared = Rc::new(RefCell::new(None));
+    #[cfg(not(feature = "history"))]
+    let history_cell: HistoryShared = ();
 
     let ctx = Ctx {
         weak: app.as_weak(),
@@ -570,6 +614,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         install_tx: install_tx.clone(),
         anchor: anchor.clone(),
         shown_at: shown_at.clone(),
+        history: history_cell,
+        #[cfg(feature = "history")]
+        history_io: HistoryIo {
+            tx: history_tx,
+            busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+        #[cfg(not(feature = "history"))]
+        history_io: HistoryIo,
         tray_click_at: tray_click_at.clone(),
         hidden_by_focus_at: hidden_by_focus_at.clone(),
         tray_press_at: tray_press_at.clone(),
@@ -585,6 +637,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     wire_frameless_chrome(&app, &ctx);
 
     let (tray_menu, tray_init_timer) = setup_tray(&app, &ctx, menubar_on)?;
+
+    // Local usage history: the store the panel reads (projections + the
+    // Activity card) lives on the UI side and is reopened whenever the scan
+    // worker reports a commit. First open is synchronous — the panel can be
+    // raised before the first scan finishes, and "no store yet" must not
+    // read as "no history".
+    #[cfg(feature = "history")]
+    spawn_history_scan(&ctx);
+    #[cfg(feature = "history")]
+    {
+        *ctx.history.borrow_mut() = tickover::history::default_dir()
+            .and_then(|d| tickover::history::store::HistoryStore::open(&d).ok());
+        sync_activity(&app, &ctx);
+    }
 
     wire_plugin_manager_callbacks(&app, &ctx);
 
@@ -609,6 +675,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cache,
         &window_models,
         &balance_models,
+        &ctx.history,
     );
     sync_tray_indicator(&tray, menubar_on, &plugins.borrow(), &cache, &tray_key);
 
@@ -687,6 +754,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Timers ──────────────────────────────────────────────────────────
     let _event_timer = run_fast_timer(&app, &ctx, tray_menu, plugin_rx, registry_rx, install_rx);
+    #[cfg(feature = "history")]
+    let _tick_timer = run_slow_timer(&app, &ctx, history_rx);
+    #[cfg(not(feature = "history"))]
     let _tick_timer = run_slow_timer(&app, &ctx);
 
     Timer::single_shot(Duration::from_millis(60), platform::set_accessory_policy);
@@ -705,20 +775,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// The panel's own "Refresh" button: a fetch of every plugin, and — once it
 /// lands — a rebuild of the provider rows.
 fn wire_ui_callbacks(app: &AppWindow, ctx: &Ctx) {
-    let ctx = ctx.clone();
-    app.on_refresh(move || {
-        spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
-        if let Some(app) = ctx.weak.upgrade() {
-            refresh_model(
-                &app,
-                &ctx.model,
-                &ctx.plugins.borrow(),
-                &ctx.cache,
-                &ctx.window_models,
-                &ctx.balance_models,
-            );
-        }
-    });
+    {
+        let ctx = ctx.clone();
+        app.on_refresh(move || {
+            spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
+            if let Some(app) = ctx.weak.upgrade() {
+                refresh_model(
+                    &app,
+                    &ctx.model,
+                    &ctx.plugins.borrow(),
+                    &ctx.cache,
+                    &ctx.window_models,
+                    &ctx.balance_models,
+                    &ctx.history,
+                );
+            }
+        });
+    }
+    // Activity card: the range toggle re-renders from the same snapshot,
+    // "Full report" opens the generated HTML, and the first-run button
+    // kicks a scan rather than waiting for the slow timer's cadence.
+    {
+        let ctx = ctx.clone();
+        let weak = app.as_weak();
+        app.on_activity_range_changed(move |_| {
+            if let Some(app) = weak.upgrade() {
+                sync_activity(&app, &ctx);
+            }
+        });
+    }
+    {
+        let ctx2 = ctx.clone();
+        app.on_open_report(move || open_history_report(&ctx2));
+        let ctx2 = ctx.clone();
+        app.on_check_log_paths(move || spawn_history_scan(&ctx2));
+    }
 }
 
 /// Only platforms that draw their own edge around a frameless window want
@@ -1288,6 +1379,7 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                         &ctx.cache,
                         &ctx.window_models,
                         &ctx.balance_models,
+                        &ctx.history,
                     );
                     sync_tray_indicator(
                         &ctx.tray,
@@ -1451,6 +1543,7 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                     &ctx.cache,
                     &ctx.window_models,
                     &ctx.balance_models,
+                    &ctx.history,
                 );
                 sync_tray_indicator(
                     &ctx.tray,
@@ -1784,6 +1877,7 @@ fn run_fast_timer(
                 &ctx.cache,
                 &ctx.window_models,
                 &ctx.balance_models,
+                &ctx.history,
             );
             sync_tray_indicator(
                 &ctx.tray,
@@ -1806,6 +1900,7 @@ fn run_fast_timer(
                     &ctx.cache,
                     &ctx.window_models,
                     &ctx.balance_models,
+                    &ctx.history,
                 );
                 sync_tray_indicator(
                     &ctx.tray,
@@ -1841,10 +1936,16 @@ fn run_fast_timer(
 /// `refresh_secs` cadence, and auto-ping shortly after a 5-hour window
 /// resets. `main` must keep the returned [`Timer`] alive for the rest of
 /// the run.
-fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
+fn run_slow_timer(
+    app: &AppWindow,
+    ctx: &Ctx,
+    #[cfg(feature = "history")] history_rx: mpsc::Receiver<()>,
+) -> Timer {
     let tick_timer = Timer::default();
     let weak = app.as_weak();
     let ctx = ctx.clone();
+    #[cfg(feature = "history")]
+    let history_rx = history_rx;
     let ticks = Cell::new(0u32);
     tick_timer.start(
         TimerMode::Repeated,
@@ -1875,6 +1976,27 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                 }
             }
 
+            // Local usage history: a committed scan means the on-disk store
+            // moved — reopen the UI's snapshot and redraw, so Activity and
+            // the quota hatches pick the new buckets up within a second.
+            // Rescans run on a slow cadence of their own: the scanner is
+            // incremental, but every pass still stats the provider trees.
+            #[cfg(feature = "history")]
+            {
+                let mut committed = false;
+                while history_rx.try_recv().is_ok() {
+                    committed = true;
+                }
+                if committed {
+                    *ctx.history.borrow_mut() = tickover::history::default_dir()
+                        .and_then(|d| tickover::history::store::HistoryStore::open(&d).ok());
+                    sync_activity(&app, &ctx);
+                }
+                if n % 120 == 17 {
+                    spawn_history_scan(&ctx);
+                }
+            }
+
             // Built once and threaded through the rest of this tick —
             // `refresh_model_from`, `sync_tray_indicator_from`, and the
             // ping loop below all read the same `current` rather than
@@ -1900,6 +2022,7 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                     &current,
                     &ctx.window_models,
                     &ctx.balance_models,
+                    &ctx.history,
                 );
             }
             // Cheap no-op unless data, theme, or the toggle actually changed.
@@ -1925,6 +2048,7 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                         &current,
                         &ctx.window_models,
                         &ctx.balance_models,
+                        &ctx.history,
                     );
                 }
                 present_popover(&app, &ctx.anchor, &ctx.shown_at, Shown::ByAnythingElse);
@@ -2266,6 +2390,7 @@ fn drain_tray_clicks(app: &AppWindow, ctx: &Ctx) -> usize {
                         &ctx.cache,
                         &ctx.window_models,
                         &ctx.balance_models,
+                        &ctx.history,
                     );
                 }
                 present_popover(app, &ctx.anchor, &ctx.shown_at, Shown::ByTrayClick);
@@ -2347,6 +2472,7 @@ fn run_dock_reopen_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                         &ctx.cache,
                         &ctx.window_models,
                         &ctx.balance_models,
+                        &ctx.history,
                     );
                 }
                 let moved =
@@ -3617,6 +3743,20 @@ fn owning_manifest<'a>(
     claimants.next().is_none().then_some(only)
 }
 
+/// Whether the reading's provider gets the "quota only" badge — true when
+/// its manifest declares no `[history]` section. Always false without the
+/// feature: that build has no Activity card for the badge to refer to.
+#[cfg(feature = "history")]
+fn quota_only_badge(plugins: &[PluginManifest], reading_id: &str) -> bool {
+    owning_manifest(plugins, reading_id)
+        .map(|m| m.history.is_none())
+        .unwrap_or(false)
+}
+#[cfg(not(feature = "history"))]
+fn quota_only_badge(_: &[PluginManifest], _: &str) -> bool {
+    false
+}
+
 /// All provider readings, merged from each plugin's cached fetch result, in
 /// plugin-manifest order (`plugins` is already sorted by `order`, ties by
 /// `id` — see `plugin::manifest::load_dir`). This is the single source for
@@ -4798,6 +4938,7 @@ fn refresh_model(
     cache: &PluginCache,
     window_models: &WindowModels,
     balance_models: &BalanceModels,
+    hist: &HistoryShared,
 ) {
     let readings = readings(plugins, &cache.borrow());
     refresh_model_from(
@@ -4807,6 +4948,7 @@ fn refresh_model(
         &readings,
         window_models,
         balance_models,
+        hist,
     );
 }
 
@@ -4822,6 +4964,7 @@ fn refresh_model_from(
     readings: &[ProviderReading],
     window_models: &WindowModels,
     balance_models: &BalanceModels,
+    hist: &HistoryShared,
 ) {
     let now = now_unix();
 
@@ -4839,9 +4982,16 @@ fn refresh_model_from(
                     // `seen_window_for` with the manifest just resolved one
                     // line up — looking up by reading id instead would rerun
                     // `owning_manifest` for every window this row asks about.
-                    let rows = window_rows(m, r, now, &|key| {
-                        m.and_then(|m| seen_window_for(m, &r.id, key))
-                    });
+                    let rows = window_rows(
+                        m,
+                        r,
+                        now,
+                        &|key| m.and_then(|m| seen_window_for(m, &r.id, key)),
+                        &|w, used| {
+                            m.map(|mm| mm.id.as_str())
+                                .and_then(|p| quota_projection(hist, p, w, used, now))
+                        },
+                    );
                     let windows = reconcile_window_model(&mut win_models, &r.id, rows);
                     let brows = balance_rows(r, now);
                     let balances = reconcile_balance_model(&mut bal_models, &r.id, brows);
@@ -4849,7 +4999,14 @@ fn refresh_model_from(
                 }
                 Some(_) => (ModelRc::default(), ModelRc::default()),
             };
-            provider_data_from_reading(r, windows, balances)
+            let mut d = provider_data_from_reading(r, windows, balances);
+            // "quota only" badge (design §6-B): the manifest carries no
+            // `[history]` section, so Activity's totals never include this
+            // provider — the card's coverage note says as much; the badge
+            // says it at the row. A build without the feature has no Activity
+            // card to contradict, so it shows no badge either.
+            d.quota_only = quota_only_badge(plugins, &r.id);
+            d
         })
         .collect();
 
@@ -5235,6 +5392,10 @@ fn window_rows(
     r: &ProviderReading,
     now: u64,
     seen: &dyn Fn(&str) -> Option<config::SeenWindow>,
+    // Burn projection per window, from the history store — `None` answers
+    // draw no hatch. Tests pass [`no_projection`]; production passes a
+    // closure over the shared snapshot.
+    proj: &dyn Fn(&Window, f64) -> Option<(f32, i32, String)>,
 ) -> Vec<(String, WindowData)> {
     // A window the provider reported no percentage for is left out rather than
     // drawn as an empty bar over "no data": it occupies a block's worth of
@@ -5245,8 +5406,13 @@ fn window_rows(
         .windows
         .iter()
         .filter_map(|w| {
-            w.used_percent
-                .map(|used| (w.role, w.key.clone(), window_data(now, w, used)))
+            w.used_percent.map(|used| {
+                (
+                    w.role,
+                    w.key.clone(),
+                    window_data(now, w, used, proj(w, used)),
+                )
+            })
         })
         .collect();
     // Stable, and the reason the `slot` search below is allowed to assume
@@ -5338,8 +5504,449 @@ fn not_started_row(label: &str, role: Role, period_minutes: u64) -> WindowData {
         reset_rel_kind: ResetRelKind::Unknown,
         reset_at: ss(""),
         tooltip: ss(""),
+        proj_pct: 0.0,
+        proj_tone: 1,
+        burn_line: ss(""),
     }
 }
+
+/// The quota-projection hatch's one input (design §4): where the burn rate
+/// lands the window at reset, its tone, and the right-hand caption.
+/// `None` — nothing drawn — when there is no history to project from, no
+/// window bounds, or nothing spent yet; a projection never fabricates.
+#[cfg(feature = "history")]
+fn quota_projection(
+    hist: &HistoryShared,
+    provider: &str,
+    w: &Window,
+    used: f64,
+    now: u64,
+) -> Option<(f32, i32, String)> {
+    let guard = hist.borrow();
+    let store = guard.as_ref()?;
+    let reset = w.resets_at?;
+    let period_secs = w.period_minutes?.checked_mul(60)?;
+    let start = reset.checked_sub(period_secs)?;
+    // Only an open window projects: before its start there is no burn to
+    // measure, past its reset the percentage belongs to the next window.
+    if now <= start || now >= reset {
+        return None;
+    }
+    let (tokens, elapsed_h) = tickover::history::query::window_burn(store, provider, start)?;
+    if used <= 0.0 || elapsed_h <= 0.0 {
+        return None;
+    }
+    let hours_left = (reset - now) as f64 / 3600.0;
+    // The window's own reading implies % per token — no provider-stated cap
+    // needed: tokens so far bought `used` percent, so the same pace over the
+    // hours left buys burn·hours_left·pct_per_token more.
+    let pct_per_token = used / tokens as f64;
+    let burn_per_h = tokens as f64 / elapsed_h;
+    let projected = used + burn_per_h * hours_left * pct_per_token;
+    if projected >= 100.0 {
+        // Reaching the cap before reset is the crit state — it names when.
+        let pct_per_h = used / elapsed_h;
+        let caps_at = if pct_per_h > 0.0 {
+            now + (((100.0 - used) / pct_per_h) * 3600.0) as u64
+        } else {
+            reset
+        };
+        let at = chrono::DateTime::from_timestamp(caps_at as i64, 0)
+            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+            .unwrap_or_default();
+        Some((100.0, 3, format!("caps ~{at}")))
+    } else {
+        let tone = if projected >= 90.0 { 2 } else { 1 };
+        Some((
+            projected as f32,
+            tone,
+            format!(
+                "burn {}/h → ~{:.0}%",
+                stats_cli::fmt_tokens(burn_per_h.round() as u64),
+                projected
+            ),
+        ))
+    }
+}
+
+#[cfg(not(feature = "history"))]
+fn quota_projection(
+    _: &HistoryShared,
+    _: &str,
+    _: &Window,
+    _: f64,
+    _: u64,
+) -> Option<(f32, i32, String)> {
+    None
+}
+
+/// Spawn the one-at-a-time history scan: the worker opens its own store
+/// handle, ticks the incremental scanner over every `[history]` manifest —
+/// each manifest's declared `[[option]]`s resolving its own `root` — and
+/// commits, then signals the slow timer, which reopens the UI's snapshot.
+/// The `busy` cell is the one-thread-at-a-time rule [`Fetching`] gives
+/// provider fetches: a still-running scan is left to finish, never stacked
+/// with a second walker on the same directories.
+#[cfg(feature = "history")]
+fn spawn_history_scan(ctx: &Ctx) {
+    if ctx.history_io.busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let manifests: Vec<PluginManifest> = ctx
+        .plugins
+        .borrow()
+        .iter()
+        .filter(|m| m.history.is_some() && plugin_enabled(m))
+        .cloned()
+        .collect();
+    if manifests.is_empty() {
+        ctx.history_io.busy.store(false, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
+    let tx = ctx.history_io.tx.clone();
+    let busy = ctx.history_io.busy.clone();
+    // `Builder::spawn` rather than `thread::spawn`: a refused spawn must
+    // not panic with `busy` already raised — see `spawn_plugin_fetch`.
+    if std::thread::Builder::new()
+        .spawn(move || {
+            let report_done = |store_moved: bool| {
+                busy.store(false, std::sync::atomic::Ordering::SeqCst);
+                if store_moved {
+                    let _ = tx.send(());
+                }
+            };
+            let Some(dir) = tickover::history::default_dir() else {
+                return report_done(false);
+            };
+            let Ok(mut store) = tickover::history::store::HistoryStore::open(&dir) else {
+                return report_done(false);
+            };
+            // Resumable ticks: a pass that stopped on its wall-clock budget
+            // reports `partial`, and a cold corpus takes a few of them.
+            for _ in 0..8 {
+                let scans =
+                    tickover::history::scan_tick(&mut store, &manifests, &plugin_options);
+                if let Err(e) = store.commit() {
+                    diag::line(format!("history: store commit failed: {e}"));
+                    return report_done(false);
+                }
+                if !scans.iter().any(|s| s.outcome.partial) {
+                    break;
+                }
+            }
+            report_done(true);
+        })
+        .is_err()
+    {
+        ctx.history_io.busy.store(false, std::sync::atomic::Ordering::SeqCst);
+        diag::line("history: could not spawn the scan thread".into());
+    }
+}
+#[cfg(not(feature = "history"))]
+fn spawn_history_scan(_: &Ctx) {}
+
+/// Push the Activity card's data to the window for whichever range its
+/// toggle currently shows. Start-up, each scan commit, and
+/// `activity-range-changed` all come through here — one code path, so a
+/// toggle and fresh data can never disagree about what the card means.
+#[cfg(feature = "history")]
+fn sync_activity(app: &AppWindow, ctx: &Ctx) {
+    use tickover::history::query::{PanelRange, Totals};
+    let plugins = ctx.plugins.borrow();
+    let history_providers: Vec<String> = plugins
+        .iter()
+        .filter(|m| m.history.is_some())
+        .map(|m| m.id.clone())
+        .collect();
+    if history_providers.is_empty() {
+        return; // no [history] manifest — the card stays hidden
+    }
+    // Design §6: "not counted" names providers that cannot publish local
+    // history — the ones with no `[history]` section, like Copilot. A
+    // provider that declares history but saw no usage in range is counted;
+    // its contribution is simply zero.
+    let quota_only: Vec<String> = plugins
+        .iter()
+        .filter(|m| m.history.is_none() && plugin_enabled(m))
+        .map(|m| m.id.clone())
+        .collect();
+    let range = match app.get_activity_range() {
+        1 => PanelRange::Week,
+        2 => PanelRange::Month,
+        _ => PanelRange::Day,
+    };
+    let cost_fn: Option<&dyn Fn(&str, &str, &Totals) -> Option<f64>> =
+        config::history_cost_estimate().then_some(
+            &|_: &str, m: &str, t: &Totals| tickover::history::pricing::cost_usd(m, t),
+        );
+    let sum = ctx
+        .history
+        .borrow()
+        .as_ref()
+        .map(|store| {
+            tickover::history::query::panel(store, range, &quota_only, cost_fn)
+        });
+    if std::env::var_os("TICKOVER_DEBUG_ACTIVITY").is_some() {
+        if let Some(s) = &sum {
+            eprintln!(
+                "activity: state={:?} headline={} spark={:?} segs={:?} delta={:?}",
+                s.state,
+                s.headline,
+                s.spark,
+                s.segments,
+                s.delta,
+            );
+        }
+    }
+    let scanning = ctx.history_io.busy.load(std::sync::atomic::Ordering::Relaxed);
+    app.set_activity(activity_data(sum.as_ref(), range, &plugins, scanning));
+}
+#[cfg(not(feature = "history"))]
+fn sync_activity(_: &AppWindow, _: &Ctx) {}
+
+/// Render a [`PanelSummary`] into the card's Slint struct — every string
+/// and fraction the UI needs, so `ui/app.slint` draws and never computes.
+#[cfg(feature = "history")]
+fn activity_data(
+    sum: Option<&tickover::history::query::PanelSummary>,
+    range: tickover::history::query::PanelRange,
+    plugins: &[PluginManifest],
+    scanning: bool,
+) -> ActivityData {
+    use tickover::history::query::{PanelRange, PanelState, PanelSummary};
+    let empty = PanelSummary::default();
+    let sum = sum.unwrap_or(&empty);
+    let delta_tail = match range {
+        PanelRange::Day => "vs 7d avg",
+        PanelRange::Week => "vs prev 7d",
+        PanelRange::Month => "vs prev 30d",
+    };
+    let range_name = match range {
+        PanelRange::Day => "the last 24h",
+        PanelRange::Week => "the last 7 days",
+        PanelRange::Month => "the last 30 days",
+    };
+    let (first_run, empty_range) = match sum.state {
+        PanelState::FirstRun => (true, false),
+        PanelState::EmptyRange => (false, true),
+        PanelState::Data => (false, false),
+    };
+    let caption = if empty_range {
+        format!("tokens in {range_name}")
+    } else {
+        "tokens".to_string()
+    };
+    let (empty_line1, empty_line2, last_when, last_where) = match sum.state {
+        PanelState::FirstRun => (
+            "No local history yet.".to_string(),
+            "Quota tracking already works above. Token history appears after \
+             your first CLI session — tickover reads it from log files on \
+             this machine and never uploads anything."
+                .to_string(),
+            String::new(),
+            String::new(),
+        ),
+        PanelState::EmptyRange => {
+            let (when, wher) = sum
+                .last_seen
+                .as_ref()
+                .map(|(t, p)| {
+                    (
+                        t.format("%b %-d %H:%M").to_string(),
+                        p.clone(),
+                    )
+                })
+                .unwrap_or_default();
+            (
+                if when.is_empty() {
+                    "Quiet stretch.".to_string()
+                } else {
+                    "Quiet day. Last session was".to_string()
+                },
+                String::new(),
+                when,
+                wher,
+            )
+        }
+        PanelState::Data => Default::default(),
+    };
+    // Partial coverage (design §6-B): the uncounted providers are named in
+    // the legend's right side, a warn-icon note says why, and the token bar
+    // keeps a dashed slot where their share would sit.
+    let missing_names: Vec<String> = sum
+        .not_counted
+        .iter()
+        .map(|id| {
+            plugins
+                .iter()
+                .find(|m| &m.id == id)
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| id.clone())
+        })
+        .collect();
+    let partial = !missing_names.is_empty();
+    let not_counted = if partial {
+        format!("{} not counted", missing_names.join(", "))
+    } else {
+        String::new()
+    };
+    let note = if partial {
+        format!(
+            "{} publish{} no local token history — totals here exclude {}.",
+            missing_names.join(", "),
+            if missing_names.len() == 1 { "es" } else { "" },
+            if missing_names.len() == 1 { "it" } else { "them" },
+        )
+    } else {
+        String::new()
+    };
+    // The dashed slot's width: the counted providers' shares leave it the
+    // rest of the bar, like the mock's flex-grow slot — a visible missing
+    // chunk, never a fabricated share.
+    let seg_sum: f32 = sum.segments.iter().sum();
+    let missing_share = if partial {
+        (seg_sum * 0.5).max(0.15)
+    } else {
+        0.0
+    };
+    let footer_left = match sum.state {
+        PanelState::EmptyRange => format!("streak ended at {}d", sum.streak_ended),
+        _ => format!("{}-day streak · {} sessions", sum.streak_days, sum.sessions),
+    };
+    ActivityData {
+        visible: true,
+        first_run,
+        scanning,
+        empty_range,
+        headline: ss(stats_cli::fmt_tokens(sum.headline)),
+        caption: ss(caption),
+        delta: ss(sum
+            .delta
+            .map(|d| format!("{:+.0}%", d * 100.0))
+            .unwrap_or_default()),
+        delta_good: sum.delta.map(|d| d >= 0.0).unwrap_or(true),
+        delta_tail: ss(delta_tail),
+        spark: ModelRc::new(VecModel::from(
+            sum.spark
+                .iter()
+                .enumerate()
+                .map(|(i, h)| SparkBar {
+                    h: *h,
+                    current: i + 1 == sum.spark.len(),
+                })
+                .collect::<Vec<_>>(),
+        )),
+        seg_cache_read: sum.segments[0],
+        seg_cache_write: sum.segments[1],
+        seg_input: sum.segments[2],
+        seg_output: sum.segments[3],
+        has_cache_write: sum.segments[1] > 0.0,
+        missing_share,
+        legend_cached: ss(sum
+            .cache_hit_pct
+            .map(|p| format!("cached {p:.0}%"))
+            .unwrap_or_default()),
+        legend_in: ss(format!("in {}", stats_cli::fmt_tokens(sum.in_tokens))),
+        legend_out: ss(format!("out {}", stats_cli::fmt_tokens(sum.out_tokens))),
+        legend_cost: ss(sum
+            .est_cost
+            .map(|c| format!("est. ${c:.2}"))
+            .unwrap_or_default()),
+        // The bright figure — the Slint row adds the dim "counted" word.
+        legend_counted: ss(if partial {
+            stats_cli::fmt_tokens(sum.headline)
+        } else {
+            String::new()
+        }),
+        not_counted: ss(not_counted),
+        note: ss(note),
+        projects: ModelRc::new(VecModel::from(
+            sum.projects
+                .iter()
+                .map(|(name, share, tokens)| ActivityProject {
+                    name: ss(name.clone()),
+                    share: *share,
+                    value: ss(stats_cli::fmt_tokens(*tokens)),
+                })
+                .collect::<Vec<_>>(),
+        )),
+        footer_left: ss(footer_left),
+        empty_line1: ss(empty_line1),
+        empty_line2: ss(empty_line2),
+        last_when: ss(last_when),
+        last_where: ss(last_where),
+    }
+}
+
+/// "Full report ↗": render the HTML report from the in-memory snapshot and
+/// hand it to the browser. Runs on the callback — `compute` is a single
+/// pass over buckets the store already holds, so no worker is worth the
+/// plumbing. A failed write is a diag line, not a panel error.
+#[cfg(feature = "history")]
+fn open_history_report(ctx: &Ctx) {
+    let store = ctx.history.borrow();
+    let Some(store) = store.as_ref() else { return };
+    let stats = tickover::history::query::compute(store, 30);
+    let now = now_unix();
+    // The panel's live readings become the report's RIGHT NOW cards — same
+    // primary window, same projection math the quota blocks already drew.
+    let quota: Vec<tickover::history::report::QuotaNow> =
+        readings(&ctx.plugins.borrow(), &ctx.cache.borrow())
+            .iter()
+            .filter_map(|r| {
+                let w = r.primary_window()?;
+                let used = w.used_percent?;
+                let proj = quota_projection(&ctx.history, &r.id, w, used, now);
+                let weekly = w
+                    .period_minutes
+                    .map_or(w.role == Role::Secondary, |m| m > 720);
+                let name = window_title(w);
+                let (_, rel, at, ..) =
+                    window_view(now, used, w.resets_at, w.period_minutes, weekly, &name);
+                let reset_hint = if rel.is_empty() {
+                    at.clone()
+                } else if at.is_empty() {
+                    rel
+                } else {
+                    format!("{rel} · {at}")
+                };
+                let burn_per_hour = w
+                    .resets_at
+                    .zip(w.period_minutes)
+                    .and_then(|(reset, m)| reset.checked_sub(m * 60))
+                    .and_then(|start| {
+                        tickover::history::query::window_burn(store, &r.id, start)
+                    })
+                    .map(|(tokens, h)| (tokens as f64 / h).round() as u64);
+                Some(tickover::history::report::QuotaNow {
+                    provider: r.id.clone(),
+                    label: name,
+                    used_pct: used,
+                    projected_pct: proj.map(|p| p.0 as f64),
+                    reset_hint,
+                    burn_per_hour,
+                })
+            })
+            .collect();
+    let sources: Vec<String> = ctx
+        .plugins
+        .borrow()
+        .iter()
+        .filter_map(|m| m.history.as_ref().map(|h| h.root.clone()))
+        .collect();
+    match tickover::history::report::write(
+        &stats,
+        None,
+        config::history_cost_estimate(),
+        &quota,
+        &sources,
+    ) {
+        Ok(path) => stats_cli::open_in_browser(&path),
+        Err(e) => diag::line(format!("history: report write failed: {e}")),
+    }
+}
+#[cfg(not(feature = "history"))]
+fn open_history_report(_: &Ctx) {}
 
 /// Build one `WindowData` row from a reading window and the percentage it
 /// reported. The window's `role` decides the tooltip name and clock format
@@ -5350,7 +5957,12 @@ fn not_started_row(label: &str, role: Role, period_minutes: u64) -> WindowData {
 /// that reported one becomes a row at all — the caller establishes that, and
 /// taking it as an argument keeps this from carrying a second, unreachable
 /// shape for the case it has already excluded.
-fn window_data(now: u64, w: &Window, used: f64) -> WindowData {
+fn window_data(
+    now: u64,
+    w: &Window,
+    used: f64,
+    proj: Option<(f32, i32, String)>,
+) -> WindowData {
     // Whether the reset clock carries a date. A week away needs one; five
     // hours away does not. Decided by length when the window states one —
     // the same rule `window_title`/`window_title_of` already use to choose
@@ -5377,6 +5989,9 @@ fn window_data(now: u64, w: &Window, used: f64) -> WindowData {
         reset_rel_kind: kind,
         reset_at: ss(at),
         tooltip: ss(tooltip),
+        proj_pct: proj.as_ref().map(|p| p.0).unwrap_or(0.0),
+        proj_tone: proj.as_ref().map(|p| p.1).unwrap_or(1),
+        burn_line: ss(proj.as_ref().map(|p| p.2.as_str()).unwrap_or("")),
     }
 }
 
@@ -9550,7 +10165,7 @@ mod title_tests {
         // regardless of length, so the caption and the clock underneath it
         // told two different stories.
         let w = win("5H", Role::Primary, 50.0, 3 * 86400, 10_080);
-        let data = window_data(NOW, &w, 50.0);
+        let data = window_data(NOW, &w, 50.0, None);
         assert_eq!(data.label, "Weekly limit");
         assert!(
             data.reset_at.contains(' '),
@@ -9572,7 +10187,7 @@ mod title_tests {
             resets_at: Some(NOW + 3 * 86400),
             period_minutes: None,
         };
-        let data = window_data(NOW, &w, 50.0);
+        let data = window_data(NOW, &w, 50.0, None);
         assert!(
             data.reset_at.contains(' '),
             "a Secondary window with no stated length must still fall back to a dated clock: {:?}",
@@ -9586,7 +10201,7 @@ mod title_tests {
         // a `Primary` window at its ordinary 5-hour length keeps the bare
         // time it always had.
         let w = win("5H", Role::Primary, 50.0, 3 * 3600, 300);
-        let data = window_data(NOW, &w, 50.0);
+        let data = window_data(NOW, &w, 50.0, None);
         assert!(
             !data.reset_at.contains(' '),
             "a same-day reset needs no date: {:?}",
@@ -11385,7 +12000,7 @@ mod title_tests {
             at: NOW - 600,
             period_minutes: Some(300),
         };
-        let rows = window_rows(Some(&m), &reading, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(Some(&m), &reading, NOW, &seen_only("w0:", seen), &NO_PROJ);
 
         assert_eq!(
             labels(&rows),
@@ -11981,6 +12596,10 @@ mod title_tests {
         move |asked| (asked == key).then_some(seen)
     }
 
+    /// The tests here predate the quota×history projection and exercise
+    /// rows/hysteresis, not burn math — they all want "no projection".
+    const NO_PROJ: &dyn Fn(&Window, f64) -> Option<(f32, i32, String)> = &|_, _| None;
+
     fn labels(rows: &[(String, WindowData)]) -> Vec<String> {
         rows.iter().map(|(_, w)| w.label.to_string()).collect()
     }
@@ -12003,7 +12622,7 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &weekly_only, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(Some(&m), &weekly_only, NOW, &seen_only("w0:", seen), &NO_PROJ);
 
         assert_eq!(
             labels(&rows),
@@ -12045,7 +12664,7 @@ mod title_tests {
                 at: NOW - elapsed,
                 period_minutes: Some(300),
             };
-            window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", seen))
+            window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", seen), &NO_PROJ)
         };
 
         assert_eq!(
@@ -12080,7 +12699,7 @@ mod title_tests {
                 at: NOW - elapsed,
                 period_minutes: Some(10_080),
             };
-            window_rows(Some(&m), &nothing, NOW, &seen_only("w1:", seen))
+            window_rows(Some(&m), &nothing, NOW, &seen_only("w1:", seen), &NO_PROJ)
         };
 
         assert_eq!(labels(&rows_at(0)), vec!["Weekly limit"]);
@@ -12121,7 +12740,7 @@ mod title_tests {
             at: NOW + 600,
             period_minutes: Some(300),
         };
-        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", seen)).is_empty());
+        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", seen), &NO_PROJ).is_empty());
     }
 
     /// A reading we could not take is not evidence that a window is empty. The
@@ -12137,7 +12756,7 @@ mod title_tests {
             at: NOW - 600,
             period_minutes: Some(300),
         };
-        assert!(window_rows(Some(&m), &broken, NOW, &seen_only("w0:", seen)).is_empty());
+        assert!(window_rows(Some(&m), &broken, NOW, &seen_only("w0:", seen), &NO_PROJ).is_empty());
     }
 
     /// A window nobody ever saw is not a window we can say anything about —
@@ -12147,7 +12766,7 @@ mod title_tests {
     fn a_window_never_seen_gets_no_row() {
         let m = two_window_manifest();
         let nothing = reading_with(Vec::new(), None);
-        assert!(window_rows(Some(&m), &nothing, NOW, &|_| None).is_empty());
+        assert!(window_rows(Some(&m), &nothing, NOW, &|_| None, &NO_PROJ).is_empty());
     }
 
     /// Graceful degradation on the first launch after an upgrade: the
@@ -12163,12 +12782,12 @@ mod title_tests {
             at: NOW - 600,
             period_minutes: None,
         };
-        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", no_length)).is_empty());
+        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", no_length), &NO_PROJ).is_empty());
         let zero_length = config::SeenWindow {
             at: NOW - 600,
             period_minutes: Some(0),
         };
-        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", zero_length)).is_empty());
+        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", zero_length), &NO_PROJ).is_empty());
     }
 
     /// A window the provider *is* reporting is drawn from what it reported.
@@ -12183,7 +12802,7 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &live, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(Some(&m), &live, NOW, &seen_only("w0:", seen), &NO_PROJ);
         assert_eq!(labels(&rows), vec!["5-hour limit"]);
         assert!(!rows[0].1.not_started);
         assert_eq!(rows[0].1.pct, 12.0);
@@ -12207,7 +12826,7 @@ mod title_tests {
             None,
         );
 
-        let rows = window_rows(Some(&m), &scrambled, NOW, &|_| None);
+        let rows = window_rows(Some(&m), &scrambled, NOW, &|_| None, &NO_PROJ);
         assert_eq!(
             labels(&rows),
             vec!["5-hour limit", "Weekly limit", "GPT-5.3-Codex-Spark"],
@@ -12244,7 +12863,7 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &figureless, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(Some(&m), &figureless, NOW, &seen_only("w0:", seen), &NO_PROJ);
         assert!(
             rows.is_empty(),
             "no row to draw, and no claim that the window is empty: {:?}",
@@ -12274,7 +12893,7 @@ mod title_tests {
             })
         };
 
-        let rows = window_rows(Some(&m), &nothing, NOW, &seen);
+        let rows = window_rows(Some(&m), &nothing, NOW, &seen, &NO_PROJ);
         assert_eq!(
             labels(&rows),
             vec!["5-hour limit", "Weekly limit"],
@@ -12315,7 +12934,7 @@ mod title_tests {
             _ => None,
         };
 
-        let rows = window_rows(Some(&m), &extra_only, NOW, &seen);
+        let rows = window_rows(Some(&m), &extra_only, NOW, &seen, &NO_PROJ);
         assert_eq!(
             labels(&rows),
             vec!["5-hour limit", "Weekly limit", "GPT-5.3-Codex-Spark"],
@@ -12336,7 +12955,7 @@ mod title_tests {
             at: NOW - 600,
             period_minutes: Some(300),
         };
-        let rows = window_rows(None, &live, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(None, &live, NOW, &seen_only("w0:", seen), &NO_PROJ);
         assert_eq!(labels(&rows), vec!["Weekly limit"]);
     }
 
@@ -12354,7 +12973,7 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &empty, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(Some(&m), &empty, NOW, &seen_only("w0:", seen), &NO_PROJ);
         assert!(
             rows.iter()
                 .any(|(_, w)| w.label == "5-hour limit" && w.not_started),
@@ -12927,14 +13546,14 @@ mod title_tests {
         };
 
         let live = reading_with(vec![win("5H", Role::Primary, 42.0, 600, 300)], None);
-        let before = window_rows(Some(&m), &live, NOW, &|_| None);
+        let before = window_rows(Some(&m), &live, NOW, &|_| None, &NO_PROJ);
         let model = reconcile_window_model(&mut models, "codex", before);
         let was = model.row_data(0).expect("one row");
         assert!(!was.not_started);
         assert_ne!(was.reset_rel, "");
 
         let gone = reading_with(Vec::new(), None);
-        let after = window_rows(Some(&m), &gone, NOW, &seen_only("w0:", seen));
+        let after = window_rows(Some(&m), &gone, NOW, &seen_only("w0:", seen), &NO_PROJ);
         let model = reconcile_window_model(&mut models, "codex", after);
         assert_eq!(
             model.row_count(),
@@ -12983,6 +13602,9 @@ mod title_tests {
                     reset_rel_kind: ResetRelKind::Unknown,
                     reset_at: ss(""),
                     tooltip: ss(""),
+                    proj_pct: 0.0,
+                    proj_tone: 1,
+                    burn_line: ss(""),
                 },
             )
         };

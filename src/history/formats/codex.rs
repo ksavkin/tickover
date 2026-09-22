@@ -14,9 +14,13 @@
 //!
 //! Token classes map as: `cached_input_tokens` → `cache_read`,
 //! `cache_write_input_tokens` → `cache_write`, `reasoning_output_tokens`
-//! → `thinking`, `output_tokens` → `output`, and `input_tokens` here
-//! already excludes the cached part (Codex counts it separately, unlike
-//! Claude whose `input_tokens` is the uncached remainder by convention).
+//! → `thinking`. Codex follows the OpenAI Responses convention where the
+//! parent count *includes* the detailed subset — `input_tokens` contains
+//! `cached_input_tokens`, `output_tokens` contains
+//! `reasoning_output_tokens` (checked against real rollouts:
+//! `total_tokens` equals `input + output` exactly, and each subset never
+//! exceeds its parent) — so the uncached remainder and the non-reasoning
+//! output are the differences, not the raw fields.
 
 use std::io;
 use std::path::Path;
@@ -215,8 +219,10 @@ impl HistoryExtractor for CodexExtractor {
                         project: project_basename(ctx.cwd.as_deref()),
                         session_id: ctx.id.clone(),
                         model: ctx.model.clone().unwrap_or_else(|| "unknown".into()),
-                        input: usage.input_tokens,
-                        output: usage.output_tokens,
+                        input: usage.input_tokens.saturating_sub(usage.cached_input_tokens),
+                        output: usage
+                            .output_tokens
+                            .saturating_sub(usage.reasoning_output_tokens),
                         cache_read: usage.cached_input_tokens,
                         cache_write: usage.cache_write_input_tokens,
                         thinking: usage.reasoning_output_tokens,
@@ -281,11 +287,38 @@ mod tests {
             .unwrap();
         assert_eq!(ex.records.len(), 1);
         let r = &ex.records[0];
-        assert_eq!((r.input, r.cache_read, r.output), (100, 40, 30));
+        // input_tokens includes the cached part, so `input` is the
+        // uncached remainder; `cache_read` holds the cached share.
+        assert_eq!((r.input, r.cache_read, r.output), (60, 40, 30));
         assert_eq!(r.project, "proj");
         assert_eq!(r.model, "gpt-5.2-codex");
         assert_eq!(r.session_id, "sess1");
         assert_eq!(r.dedup_key, "sess1:2");
+    }
+
+    #[test]
+    fn reasoning_is_split_out_of_output_not_doubled() {
+        // Real-rollout semantics: `output_tokens` already contains
+        // `reasoning_output_tokens` (total = input + output exactly), so
+        // reporting both raw would count reasoning twice.
+        let tmp = TmpDir::new("codex-reasoning");
+        let p = tmp.write(
+            "rollout-r.jsonl",
+            &(meta("s1", "/u/p")
+                + "\n"
+                + &turn_ctx("gpt-5.2-codex")
+                + "\n"
+                + r#"{"timestamp":"2026-09-22T10:01:00.000Z","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":103036,"cached_input_tokens":96000,"cache_write_input_tokens":0,"output_tokens":331,"reasoning_output_tokens":209,"total_tokens":103367},"last_token_usage":{"input_tokens":103036,"cached_input_tokens":96000,"cache_write_input_tokens":0,"output_tokens":331,"reasoning_output_tokens":209,"total_tokens":103367}},"rate_limits":null}}"#
+                + "\n"),
+        );
+        let ex = CodexExtractor
+            .extract(&p, &mut fresh(), u64::MAX, later())
+            .unwrap();
+        let r = &ex.records[0];
+        assert_eq!(
+            (r.input, r.cache_read, r.output, r.thinking),
+            (7036, 96000, 122, 209)
+        );
     }
 
     #[test]

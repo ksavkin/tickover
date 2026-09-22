@@ -239,6 +239,37 @@ fn streak(day_totals: &BTreeMap<NaiveDate, u64>, today: NaiveDate) -> u32 {
     n
 }
 
+/// The most recent completed streak — the run of active days that ended
+/// before the live one (or before today, when the live one is empty). The
+/// empty-range state prints it as "streak ended at Nd"; a run that could
+/// still grow is not "ended", so a live streak never counts here.
+fn ended_streak(day_totals: &BTreeMap<NaiveDate, u64>, today: NaiveDate, current: u32) -> u32 {
+    // Where the live streak is anchored — `streak` counts from yesterday
+    // when today has no activity yet.
+    let cur_end = if day_totals.contains_key(&today) {
+        today
+    } else {
+        today - Duration::days(1)
+    };
+    // One day before the live run started; when the live run is empty this
+    // is two days back, and the quiet tail is skipped to the last active
+    // day either way.
+    let mut end = cur_end - Duration::days(current as i64 + 1);
+    if let Some(&first) = day_totals.keys().next() {
+        while end >= first && !day_totals.contains_key(&end) {
+            end -= Duration::days(1);
+        }
+    } else {
+        return 0;
+    }
+    let mut n = 0;
+    while day_totals.contains_key(&end) {
+        n += 1;
+        end -= Duration::days(1);
+    }
+    n
+}
+
 /// 52 Sunday-aligned weeks ending this week, each a 7-day row of
 /// `(date, total)` — zeros included so the renderer can stay dumb.
 fn heatmap(day_totals: &BTreeMap<NaiveDate, u64>, today: NaiveDate) -> Vec<Vec<(NaiveDate, u64)>> {
@@ -272,6 +303,298 @@ impl Stats {
             .cloned()
             .unwrap_or_default()
     }
+}
+
+// ── Panel summary ───────────────────────────────────────────────────────────
+
+/// The Activity card's range toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelRange {
+    /// Last 24 hours, hourly bars.
+    Day,
+    /// Last 7 local days, daily bars.
+    Week,
+    /// Last 30 local days, daily bars.
+    Month,
+}
+
+/// Which face the Activity card shows — the design's three panel states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelState {
+    /// Store has never seen a record: ghosted sparkline, explainer copy.
+    FirstRun,
+    /// History exists, but the selected range is empty: `0`, quiet copy,
+    /// the last-seen session named.
+    EmptyRange,
+    /// Ordinary populated card.
+    Data,
+}
+
+/// Everything the Activity card draws, computed in one pass. Strings the
+/// card shows verbatim are formatted by the caller (`stats_cli`/`main`),
+/// not here — this struct stays numeric so the UI stays dumb.
+#[derive(Debug, Default)]
+pub struct PanelSummary {
+    pub state: PanelState,
+    /// Total tokens inside the range (every class — the headline).
+    pub headline: u64,
+    /// Range total vs. the comparison baseline, e.g. +0.38. `None` when the
+    /// baseline is zero (a percentage against nothing would lie).
+    pub delta: Option<f64>,
+    /// Bar heights 0..=1 over the range's buckets — 24 for [`PanelRange::Day`]
+    /// (hours), 7 or 30 for the others (days). `spark.len()-1` is the
+    /// current bucket, drawn in the accent.
+    pub spark: Vec<f32>,
+    /// Token-class shares of the range total: `[cache_read, cache_write,
+    /// input, output]` — the order the four-segment bar draws them.
+    pub segments: [f32; 4],
+    /// `cache_read / (cache_read + input)` over the range.
+    pub cache_hit_pct: Option<f64>,
+    /// Range totals the legend names: `in`/`out` token counts and an
+    /// optional estimated cost (set only when the user opted in).
+    pub in_tokens: u64,
+    pub out_tokens: u64,
+    pub est_cost: Option<f64>,
+    /// Top 2 projects in range: `(name, share 0..=1, tokens)`.
+    pub projects: Vec<(String, f32, u64)>,
+    /// All-time streak and the range's session count — the footer pair.
+    pub streak_days: u32,
+    /// The most recent *completed* streak — what "streak ended at Nd" names
+    /// in the empty-range state. `0` when there is no completed run at all.
+    pub streak_ended: u32,
+    pub sessions: u64,
+    /// For the empty-range state: when and where usage last happened —
+    /// "yesterday 23:14 on codewiki" as `(timestamp, project)`.
+    pub last_seen: Option<(DateTime<Local>, String)>,
+    /// Enabled providers with no `[history]` section at all — named so the
+    /// card can say "N counted, X not counted" (design §6: the not-counted
+    /// mark is for providers that *cannot* publish local history, not for
+    /// ones that merely saw no usage in the range).
+    pub not_counted: Vec<String>,
+}
+
+impl Default for PanelState {
+    fn default() -> Self {
+        PanelState::FirstRun
+    }
+}
+
+/// Compute the Activity card's data for `range`.
+///
+/// `quota_only` is the enabled providers with no `[history]` section: they
+/// land in `not_counted` so the card can mark partial coverage instead of
+/// implying it.
+///
+/// `cost_fn` prices a `(provider, model, Totals)` triple; `None` disables
+/// cost estimation entirely (the config's opt-in).
+pub fn panel(
+    store: &HistoryStore,
+    range: PanelRange,
+    quota_only: &[String],
+    cost_fn: Option<&dyn Fn(&str, &str, &Totals) -> Option<f64>>,
+) -> PanelSummary {
+    let now = Local::now();
+    let today = now.date_naive();
+    let mut out = PanelSummary {
+        last_seen: last_seen(store),
+        ..Default::default()
+    };
+
+    // Range bounds as local-day / UTC-hour windows. Day is an hourly view
+    // (buckets are already UTC hours); Week/Month aggregate whole local days.
+    let range_start_hour: Option<DateTime<Utc>> = match range {
+        PanelRange::Day => Some(now.with_timezone(&Utc) - Duration::hours(24)),
+        _ => None,
+    };
+    let day_floor = match range {
+        PanelRange::Day => today,
+        PanelRange::Week => today - Duration::days(6),
+        PanelRange::Month => today - Duration::days(29),
+    };
+
+    // Buckets for the sparkline: hour slots for Day, day slots otherwise —
+    // dense, so a quiet stretch draws a flat run instead of missing bars.
+    let mut slots: Vec<u64> = match range {
+        PanelRange::Day => vec![0; 24],
+        PanelRange::Week => vec![0; 7],
+        PanelRange::Month => vec![0; 30],
+    };
+    // Slot index per bucket, computed per line.
+    let slot_of = |d: &DayLine| -> Option<usize> {
+        let hour_utc = parse_bucket_hour(&d.hour)?;
+        let local: DateTime<Local> = hour_utc.with_timezone(&Local);
+        match range {
+            PanelRange::Day => {
+                let start = *range_start_hour.as_ref().unwrap();
+                if hour_utc >= start && hour_utc <= now.with_timezone(&Utc) {
+                    Some((hour_utc - start).num_hours().clamp(0, 23) as usize)
+                } else {
+                    None
+                }
+            }
+            _ => {
+                let day = local.date_naive();
+                if day < day_floor || day > today {
+                    return None;
+                }
+                Some((day - day_floor).num_days() as usize)
+            }
+        }
+    };
+
+    // For the delta baseline: the previous window of equal length.
+    // 24h compares against the mean of the preceding 7 days (the design's
+    // "vs 7d avg"); 7d/30d against the window immediately before.
+    let (base_lo, base_hi): (NaiveDate, NaiveDate) = match range {
+        PanelRange::Day => (today - Duration::days(7), today - Duration::days(1)),
+        PanelRange::Week => (day_floor - Duration::days(7), day_floor - Duration::days(1)),
+        PanelRange::Month => (day_floor - Duration::days(30), day_floor - Duration::days(1)),
+    };
+    let mut base_total = 0u64;
+    // For 24h the baseline is a 7-day mean of daily totals.
+    let mut base_days = 0u64;
+
+    let mut class_totals = Totals::default();
+    let mut projects: HashMap<String, Totals> = HashMap::new();
+    let mut sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut range_total = 0u64;
+    let mut any_history = false;
+    // (provider, model) totals inside the range — priced per pair.
+    let mut price_units: HashMap<(String, String), Totals> = HashMap::new();
+
+    for d in store.live_days() {
+        any_history = true;
+        let Some(hour_utc) = parse_bucket_hour(&d.hour) else {
+            continue;
+        };
+        let local: DateTime<Local> = hour_utc.with_timezone(&Local);
+        let day = local.date_naive();
+        if day >= base_lo && day <= base_hi {
+            base_total += d.sum();
+            base_days += 1;
+        }
+        let Some(slot) = slot_of(d) else { continue };
+        slots[slot] += d.sum();
+        range_total += d.sum();
+        class_totals.add(d);
+        projects.entry(d.project.clone()).or_default().add(d);
+        sessions.insert(format!("{}:{}", d.provider, d.session));
+        price_units
+            .entry((d.provider.clone(), d.model.clone()))
+            .or_default()
+            .add(d);
+    }
+
+    out.headline = range_total;
+    let peak = slots.iter().copied().max().unwrap_or(0);
+    out.spark = if peak == 0 {
+        // Flat ghost row: a quiet range draws dashes of track, not bumps.
+        slots.iter().map(|_| 0.0f32).collect()
+    } else {
+        slots.iter().map(|&v| v as f32 / peak as f32).collect()
+    };
+
+    out.delta = match range {
+        PanelRange::Day => {
+            // Mean daily total over the 7 baseline days that had any data.
+            (base_days > 0).then(|| base_total as f64 / base_days as f64)
+        }
+        _ => (base_total > 0).then(|| base_total as f64),
+    }
+    .filter(|b| *b > 0.0)
+    .map(|b| (range_total as f64 - b) / b);
+
+    let denom = range_total.max(1) as f32;
+    out.segments = [
+        class_totals.cache_read as f32 / denom,
+        class_totals.cache_write as f32 / denom,
+        class_totals.input as f32 / denom,
+        class_totals.output as f32 / denom,
+    ];
+    out.cache_hit_pct = class_totals.cache_hit_pct();
+    out.in_tokens = class_totals.input;
+    out.out_tokens = class_totals.output;
+    out.est_cost = cost_fn.and_then(|f| {
+        let mut sum = 0.0;
+        let mut any = false;
+        for ((p, m), t) in &price_units {
+            if let Some(c) = f(p, m, t) {
+                sum += c;
+                any = true;
+            }
+        }
+        any.then_some(sum)
+    });
+    out.projects = sorted_desc(projects)
+        .into_iter()
+        .take(2)
+        .map(|(name, t)| (name, t.sum() as f32 / range_total.max(1) as f32, t.sum()))
+        .collect();
+    out.sessions = sessions.len() as u64;
+    let day_totals = store
+        .live_days()
+        .filter_map(|d| {
+            let h = parse_bucket_hour(&d.hour)?;
+            let local: DateTime<Local> = h.with_timezone(&Local);
+            Some((local.date_naive(), d.sum()))
+        })
+        .fold(BTreeMap::new(), |mut m, (day, s)| {
+            *m.entry(day).or_insert(0) += s;
+            m
+        });
+    out.streak_days = streak(&day_totals, today);
+    // "Ended" names the most recent *completed* run. An inactive today
+    // means `streak`'s yesterday-anchored run is exactly that; an active
+    // today means the live run doesn't count and the one before it does.
+    out.streak_ended = if day_totals.contains_key(&today) {
+        ended_streak(&day_totals, today, out.streak_days)
+    } else if out.streak_days > 0 {
+        out.streak_days
+    } else {
+        ended_streak(&day_totals, today, 0)
+    };
+    out.not_counted = quota_only.to_vec();
+
+    out.state = if !any_history {
+        PanelState::FirstRun
+    } else if range_total == 0 {
+        PanelState::EmptyRange
+    } else {
+        PanelState::Data
+    };
+    out
+}
+
+/// Most recent bucket with any usage — the empty state's "last session
+/// was …" line.
+fn last_seen(store: &HistoryStore) -> Option<(DateTime<Local>, String)> {
+    store
+        .live_days()
+        .filter_map(|d| {
+            parse_bucket_hour(&d.hour).map(|h| (h, d.project.clone(), d.session.clone()))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(h, project, _)| (h.with_timezone(&Local), project))
+}
+
+/// Tokens a provider spent inside a quota window, for the projection hatch:
+/// `since` is the window's start (unix seconds). Returns `(tokens, hours
+/// elapsed)` — `None` when nothing was counted, so the caller can omit the
+/// burn figure rather than draw a fabricated one.
+pub fn window_burn(store: &HistoryStore, provider: &str, since_unix: u64) -> Option<(u64, f64)> {
+    let since = Utc.timestamp_opt(since_unix as i64, 0).single()?;
+    let now = Utc::now();
+    if since >= now {
+        return None;
+    }
+    let tokens: u64 = store
+        .live_days()
+        .filter(|d| d.provider == provider)
+        .filter_map(|d| parse_bucket_hour(&d.hour).map(|h| (h, d.sum())))
+        .filter(|(h, _)| *h >= since)
+        .map(|(_, s)| s)
+        .sum();
+    (tokens > 0).then(|| (tokens, (now - since).num_seconds().max(1) as f64 / 3600.0))
 }
 
 #[cfg(test)]

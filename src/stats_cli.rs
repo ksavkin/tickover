@@ -65,11 +65,10 @@ fn run(json: bool, report: Option<Option<PathBuf>>, manifests: Vec<PluginManifes
     };
     // Fresh data first: resumable ticks until the budget stops coming back
     // early. A cold corpus takes a few passes; a warm one costs a stat.
-    let options = std::collections::BTreeMap::new();
     let mut scans;
     let mut guard = 0;
     loop {
-        scans = tickover::history::scan_tick(&mut store, &manifests, &options);
+        scans = tickover::history::scan_tick(&mut store, &manifests, &crate::plugin_options);
         let _ = store.commit();
         guard += 1;
         if !scans.iter().any(|s| s.outcome.partial) || guard >= 60 {
@@ -117,7 +116,7 @@ fn quota_only(manifests: &[PluginManifest], stats: &query::Stats) -> Vec<String>
 
 /// Open `path` in the default browser — plain `open`/`start`/`xdg-open`.
 /// The CLI exits right after, so no child reaping is needed.
-fn open_in_browser(path: &std::path::Path) {
+pub(crate) fn open_in_browser(path: &std::path::Path) {
     #[cfg(target_os = "macos")]
     let cmd = std::process::Command::new("open").arg(path).spawn();
     #[cfg(target_os = "windows")]
@@ -130,7 +129,7 @@ fn open_in_browser(path: &std::path::Path) {
     let _ = cmd;
 }
 
-fn fmt_tokens(n: u64) -> String {
+pub(crate) fn fmt_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1e6)
     } else if n >= 1_000 {
