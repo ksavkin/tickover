@@ -111,7 +111,14 @@ pub struct Stats {
 
 /// Compute everything [`Stats`] exposes over the store's live buckets.
 /// `days` bounds `daily`/`heatmap` lookback; all-time groupings ignore it.
-pub fn compute(store: &HistoryStore, days: u32) -> Stats {
+/// `enabled` is the providers the user hasn't disabled — a disabled
+/// provider's stored buckets stay on disk but drop out of every figure,
+/// matching what its hidden quota card already implies.
+pub fn compute(
+    store: &HistoryStore,
+    days: u32,
+    enabled: &std::collections::HashSet<String>,
+) -> Stats {
     let now = Local::now();
     let today = now.date_naive();
     let week_start = today - Duration::days(today.weekday().num_days_from_monday() as i64);
@@ -135,7 +142,13 @@ pub fn compute(store: &HistoryStore, days: u32) -> Stats {
         sessions: Vec::new(),
         streak_days: 0,
         active_days: 0,
-        skipped_unparsed: store.state.files.values().map(|f| f.skipped_unparsed).sum(),
+        skipped_unparsed: store
+            .state
+            .files
+            .values()
+            .filter(|f| enabled.contains(&f.provider))
+            .map(|f| f.skipped_unparsed)
+            .sum(),
     };
 
     let mut projects: HashMap<String, Totals> = HashMap::new();
@@ -146,6 +159,9 @@ pub fn compute(store: &HistoryStore, days: u32) -> Stats {
     let mut day_totals: BTreeMap<NaiveDate, u64> = BTreeMap::new();
 
     for d in store.live_days() {
+        if !enabled.contains(&d.provider) {
+            continue;
+        }
         // Bucket hour is UTC `"YYYY-MM-DDTHH"` — convert to the local
         // instant, then take the local date/hour for day-level views.
         let Some(hour_utc) = parse_bucket_hour(&d.hour) else {
@@ -392,12 +408,13 @@ pub fn panel(
     store: &HistoryStore,
     range: PanelRange,
     quota_only: &[String],
+    enabled: &std::collections::HashSet<String>,
     cost_fn: CostFn,
 ) -> PanelSummary {
     let now = Local::now();
     let today = now.date_naive();
     let mut out = PanelSummary {
-        last_seen: last_seen(store),
+        last_seen: last_seen(store, enabled),
         ..Default::default()
     };
 
@@ -469,6 +486,9 @@ pub fn panel(
     let mut price_units: HashMap<(String, String), Totals> = HashMap::new();
 
     for d in store.live_days() {
+        if !enabled.contains(&d.provider) {
+            continue;
+        }
         any_history = true;
         let Some(hour_utc) = parse_bucket_hour(&d.hour) else {
             continue;
@@ -542,6 +562,7 @@ pub fn panel(
     out.sessions = sessions.len() as u64;
     let day_totals = store
         .live_days()
+        .filter(|d| enabled.contains(&d.provider))
         .filter_map(|d| {
             let h = parse_bucket_hour(&d.hour)?;
             let local: DateTime<Local> = h.with_timezone(&Local);
@@ -570,9 +591,13 @@ pub fn panel(
 
 /// Most recent bucket with any usage — the empty state's "last session
 /// was …" line.
-fn last_seen(store: &HistoryStore) -> Option<(DateTime<Local>, String)> {
+fn last_seen(
+    store: &HistoryStore,
+    enabled: &std::collections::HashSet<String>,
+) -> Option<(DateTime<Local>, String)> {
     store
         .live_days()
+        .filter(|d| enabled.contains(&d.provider))
         .filter_map(|d| {
             parse_bucket_hour(&d.hour).map(|h| (h, d.project.clone(), d.session.clone()))
         })
@@ -607,6 +632,7 @@ pub fn window_burn(store: &HistoryStore, provider: &str, since_unix: u64) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::store::FileState;
     use crate::history::store::SCHEMA_VERSION;
     use std::fs;
 
@@ -622,6 +648,15 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Test lines belong to `claude`/`codex` — the enabled set the
+    /// filtering API expects.
+    fn enabled_all() -> std::collections::HashSet<String> {
+        ["claude", "codex", "grok", "antigravity"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     fn line(hour: &str, provider: &str, project: &str, input: u64) -> DayLine {
@@ -658,7 +693,7 @@ mod tests {
             .unwrap();
         store.commit().unwrap();
         let store = HistoryStore::open(&dir).unwrap();
-        let st = compute(&store, 30);
+        let st = compute(&store, 30, &enabled_all());
         assert_eq!(st.total.input, 100);
         assert_eq!(st.providers, vec!["claude".to_string()]);
         assert_eq!(st.by_provider["claude"].cache_read, 200);
@@ -671,11 +706,61 @@ mod tests {
     fn empty_store_computes_to_zeros_not_a_crash() {
         let dir = tmpdir("empty");
         let store = HistoryStore::open(&dir).unwrap();
-        let st = compute(&store, 30);
+        let st = compute(&store, 30, &enabled_all());
         assert_eq!(st.total.sum(), 0);
         assert!(st.providers.is_empty());
         assert_eq!(st.heatmap.len(), 52);
         assert_eq!(st.streak_days, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disabled_providers_drop_out_of_every_total() {
+        // A provider the user disabled keeps its lines on disk — but no
+        // figure may count them, or the panel/report imply coverage they
+        // don't have.
+        let dir = tmpdir("disabled");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let utc_now = Utc::now();
+        let hour = utc_now.format("%Y-%m-%dT%H").to_string();
+        store
+            .append_days(&[
+                line(&hour, "claude", "p1", 100),
+                line(&hour, "codex", "p2", 900),
+            ])
+            .unwrap();
+        store.commit().unwrap();
+        let store = HistoryStore::open(&dir).unwrap();
+
+        let enabled: std::collections::HashSet<String> =
+            ["claude".to_string()].into_iter().collect();
+        let st = compute(&store, 30, &enabled);
+        assert_eq!(st.total.input, 100, "codex's 900 must not count");
+        assert_eq!(st.providers, vec!["claude".to_string()]);
+        assert!(!st.by_provider.contains_key("codex"));
+
+        let sum = panel(&store, PanelRange::Day, &[], &enabled, None);
+        assert_eq!(sum.headline, 325); // 100 in + 25 out + 200 cache_read
+        assert!(!sum.segments.iter().any(|s| s.is_nan())); // shape intact
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skipped_unparsed_counts_enabled_providers_only() {
+        // Drift counts are provider-owned: a disabled provider's parse
+        // failures must not inflate the warning the user sees.
+        let dir = tmpdir("skipped");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        for (path, provider, n) in [("/a", "claude", 3u64), ("/b", "codex", 5u64)] {
+            let mut st = FileState::fresh("d".into(), 1, 1);
+            st.provider = provider.to_string();
+            st.skipped_unparsed = n;
+            store.state.files.insert(path.to_string(), st);
+        }
+        let enabled: std::collections::HashSet<String> =
+            ["claude".to_string()].into_iter().collect();
+        let st = compute(&store, 30, &enabled);
+        assert_eq!(st.skipped_unparsed, 3);
         let _ = fs::remove_dir_all(&dir);
     }
 }

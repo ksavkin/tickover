@@ -93,7 +93,11 @@ fn run(json: bool, report: Option<Option<PathBuf>>, manifests: Vec<PluginManifes
         }
     }
 
-    let stats = query::compute(&store, 30);
+    // Buckets from a disabled provider stay on disk but leave every
+    // figure — `manifests` was already filtered to enabled above.
+    let enabled: std::collections::HashSet<String> =
+        manifests.iter().map(|m| m.id.clone()).collect();
+    let stats = query::compute(&store, 30, &enabled);
     let cost_on = crate::config::history_cost_estimate();
 
     if let Some(path) = report {

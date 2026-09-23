@@ -5,8 +5,8 @@
 //! `prompt_tokens`, `cached_prompt_tokens`, `completion_tokens` and
 //! `reasoning_tokens`. Two sibling events supply attribution the usage
 //! event itself lacks: `session created` carries `ctx.cwd`, and
-//! `model changed` carries `ctx.model` — both keyed by the same `sid`, so
-//! they are collected into a per-pass map and joined onto the records.
+//! `model changed` carries `ctx.model` — both keyed by the same `sid`,
+//! applied to the turns that follow them.
 //!
 //! Mapping to the shared record: `prompt_tokens` → `input`,
 //! `cached_prompt_tokens` → `cache_read`, `completion_tokens` → `output`,
@@ -90,46 +90,18 @@ impl HistoryExtractor for GrokExtractor {
             cursor,
             ..Default::default()
         };
-        // Two passes over the same buffer: `session created`/`model
-        // changed` can appear lines after the inference they describe, so
-        // attribution is collected file-wide before records are built.
-        // The map is seeded from `aux` — events already consumed by earlier
-        // passes are behind the cursor and won't be re-read here.
+        // Single pass, map-as-of-that-line: `model changed` marks a
+        // switch, so an inference logged *before* the event ran on the
+        // old model — collecting attribution file-wide first would stamp
+        // it with the new one. `session created` precedes its session's
+        // turns by definition, and the map is seeded from `aux` — events
+        // already consumed by earlier passes sit behind the cursor and
+        // won't be re-read here.
         let mut sessions: HashMap<String, SessionInfo> = st
             .aux
             .get("sess")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
-        for raw in buf.split(|&b| b == b'\n') {
-            if raw.is_empty() || raw.len() > MAX_LINE_BYTES {
-                continue;
-            }
-            let Ok(line) = serde_json::from_slice::<Line>(raw) else {
-                continue;
-            };
-            let Some(ctx) = line.ctx.as_ref() else {
-                continue;
-            };
-            let sid = line
-                .sid
-                .clone()
-                .or_else(|| ctx.session_id.clone())
-                .unwrap_or_default();
-            if sid.is_empty() {
-                continue;
-            }
-            match line.msg.as_deref() {
-                Some("session created") if ctx.cwd.is_some() => {
-                    sessions.entry(sid).or_default().cwd = ctx.cwd.clone();
-                }
-                Some(m) if m.contains("model") && ctx.model.is_some() => {
-                    // "model changed", "model catalog: …", "backend_search:
-                    // model switch" — any event carrying a model name.
-                    sessions.entry(sid).or_default().model = ctx.model.clone();
-                }
-                _ => {}
-            }
-        }
         let mut offset_in_buf = resume_from;
         for raw in buf.split(|&b| b == b'\n') {
             let line_start = offset_in_buf;
@@ -141,17 +113,7 @@ impl HistoryExtractor for GrokExtractor {
                 out.skipped_unparsed += 1;
                 continue;
             };
-            if line.msg.as_deref() != Some("shell.turn.inference_done") {
-                continue;
-            }
-            let Some(ctx) = line.ctx else { continue };
-            let Some(ts) = line
-                .ts
-                .as_deref()
-                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                .map(|t| t.with_timezone(&chrono::Utc))
-            else {
-                out.skipped_unparsed += 1;
+            let Some(ctx) = line.ctx.as_ref() else {
                 continue;
             };
             let sid = line
@@ -159,26 +121,52 @@ impl HistoryExtractor for GrokExtractor {
                 .clone()
                 .or_else(|| ctx.session_id.clone())
                 .unwrap_or_default();
-            let info = sessions.get(&sid);
-            out.records.push(UsageRecord {
-                ts,
-                provider: String::new(),
-                project: project_basename(info.and_then(|i| i.cwd.as_deref())),
-                session_id: sid.clone(),
-                model: info
-                    .and_then(|i| i.model.clone())
-                    .unwrap_or_else(|| "unknown".into()),
-                input: ctx.prompt_tokens,
-                output: ctx.completion_tokens,
-                cache_read: ctx.cached_prompt_tokens,
-                cache_write: 0,
-                thinking: ctx.reasoning_tokens,
-                dedup_key: format!(
-                    "grok:{sid}:{}:{}",
-                    line.ts.unwrap_or_default(),
-                    ctx.loop_index.unwrap_or(line_start)
-                ),
-            });
+            match line.msg.as_deref() {
+                Some("session created") if ctx.cwd.is_some() && !sid.is_empty() => {
+                    sessions.entry(sid).or_default().cwd = ctx.cwd.clone();
+                }
+                Some("model changed") if ctx.model.is_some() && !sid.is_empty() => {
+                    sessions.entry(sid).or_default().model = ctx.model.clone();
+                }
+                Some("shell.turn.inference_done") => {
+                    let Some(ts) = line
+                        .ts
+                        .as_deref()
+                        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                        .map(|t| t.with_timezone(&chrono::Utc))
+                    else {
+                        out.skipped_unparsed += 1;
+                        continue;
+                    };
+                    let info = sessions.get(&sid);
+                    out.records.push(UsageRecord {
+                        ts,
+                        provider: String::new(),
+                        project: project_basename(info.and_then(|i| i.cwd.as_deref())),
+                        session_id: sid.clone(),
+                        model: info
+                            .and_then(|i| i.model.clone())
+                            .unwrap_or_else(|| "unknown".into()),
+                        input: ctx.prompt_tokens,
+                        output: ctx.completion_tokens,
+                        cache_read: ctx.cached_prompt_tokens,
+                        cache_write: 0,
+                        thinking: ctx.reasoning_tokens,
+                        dedup_key: format!(
+                            "grok:{sid}:{}:{}",
+                            line.ts.unwrap_or_default(),
+                            ctx.loop_index.unwrap_or(line_start)
+                        ),
+                    });
+                }
+                // A msg we don't know that still carries a model name is
+                // format drift worth counting — silently stamping "unknown"
+                // would hide the day Grok renames the event.
+                Some(_) if ctx.model.is_some() && !sid.is_empty() => {
+                    out.skipped_unparsed += 1;
+                }
+                _ => {}
+            }
         }
         // Persist attribution for the next pass — the events that produced
         // it sit behind the cursor by then. The map is bounded: `unified.
@@ -245,6 +233,32 @@ mod tests {
         assert_eq!(r.project, "proj");
         assert_eq!(r.model, "grok-4.5");
         assert_eq!(r.session_id, "s1");
+    }
+
+    #[test]
+    fn a_model_change_does_not_relabel_the_turn_before_it() {
+        // The model switch is logged at the switch: the inference above
+        // it ran on the old model, the one below on the new.
+        let tmp = TmpDir::new("grok-switch");
+        let content = concat!(
+            r#"{"ts":"2026-09-22T10:00:00.000Z","sid":"s1","msg":"session created","ctx":{"cwd":"/u/proj"}}"#,
+            "\n",
+            r#"{"ts":"2026-09-22T10:00:01.000Z","sid":"s1","msg":"model changed","ctx":{"model":"grok-4"}}"#,
+            "\n",
+            r#"{"ts":"2026-09-22T10:05:00.000Z","sid":"s1","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":100,"completion_tokens":20}}"#,
+            "\n",
+            r#"{"ts":"2026-09-22T10:06:00.000Z","sid":"s1","msg":"model changed","ctx":{"model":"grok-4.5"}}"#,
+            "\n",
+            r#"{"ts":"2026-09-22T10:07:00.000Z","sid":"s1","msg":"shell.turn.inference_done","ctx":{"loop_index":2,"prompt_tokens":200,"completion_tokens":40}}"#,
+            "\n"
+        );
+        let p = tmp.write("unified.jsonl", content);
+        let ex = GrokExtractor
+            .extract(&p, &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert_eq!(ex.records.len(), 2);
+        assert_eq!(ex.records[0].model, "grok-4");
+        assert_eq!(ex.records[1].model, "grok-4.5");
     }
 
     #[test]

@@ -26,6 +26,11 @@ pub struct Extraction {
     /// The new cursor position — a byte offset for line formats, a
     /// timestamp watermark for SQLite. Only ever advances on success.
     pub cursor: u64,
+    /// The `[lo, hi)` range these records were aggregated from — defaults
+    /// to the byte range read (`resume_from..cursor`). A format whose
+    /// cursor isn't byte-linear (SQLite's row watermark) reports its own
+    /// monotonic span so re-emitted records supersede correctly.
+    pub range: Option<(u64, u64)>,
     /// Lines/records that looked like they should carry usage but did not
     /// parse — the format-drift observability counter.
     pub skipped_unparsed: u64,
@@ -48,6 +53,15 @@ pub trait HistoryExtractor: Send + Sync {
         byte_cap: u64,
         deadline: Instant,
     ) -> io::Result<Extraction>;
+
+    /// Whether this format's writes can land in a sibling file the
+    /// `(size, mtime)` signature misses — SQLite in WAL mode appends to
+    /// `<path>-wal` while the `.db` itself stays untouched until a
+    /// checkpoint. When true the scanner folds the sibling's signature
+    /// into its unchanged check instead of skipping a live database.
+    fn watches_wal(&self) -> bool {
+        false
+    }
 }
 
 /// The extractor a manifest's `[history] format` selects.

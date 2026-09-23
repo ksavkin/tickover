@@ -69,7 +69,10 @@ impl HistoryExtractor for AntigravityExtractor {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        let watermark = st.aux.get("max_idx").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
+        // `-1`, not `0`: gen_metadata indexes rows from 0, so the first
+        // generation of every conversation sits at `idx = 0` — a zero
+        // default would skip it forever.
+        let watermark = st.aux.get("max_idx").and_then(|v| v.as_i64()).unwrap_or(-1);
         let mut stmt =
             match conn.prepare("SELECT idx, data FROM gen_metadata WHERE idx > ?1 ORDER BY idx") {
                 Ok(s) => s,
@@ -124,13 +127,24 @@ impl HistoryExtractor for AntigravityExtractor {
                 Gen::NoUsage => {}
             }
         }
-        st.aux.insert("max_idx".into(), (max_idx as u64).into());
+        st.aux
+            .insert("max_idx".into(), (max_idx.max(0) as u64).into());
         // A deadline-truncated pass must NOT report the file consumed:
         // `cursor >= size` is the scanner's "unchanged" check, and a db
         // that never changes again would keep its tail rows unread
         // forever. The `max_idx` watermark does the real resuming.
         out.cursor = if completed { st.size } else { 0 };
+        // Supersession needs a monotonic span, not the byte cursor: row
+        // idx ranges are what a re-emit overlaps. The span is half-open
+        // `[wm+1, max_idx+1)` so a single-row pass still writes `hi > 0` —
+        // a zero-hi range can neither supersede nor be superseded, and a
+        // state-loss rescan would double the rows.
+        out.range = Some(((watermark + 1).max(0) as u64, (max_idx + 1).max(0) as u64));
         Ok(out)
+    }
+
+    fn watches_wal(&self) -> bool {
+        true
     }
 }
 
@@ -161,7 +175,22 @@ fn parse_generation(blob: &[u8]) -> Gen {
     let cache_read = varint_field(usage, 5).unwrap_or(0);
     let output = varint_field(usage, 9).unwrap_or(0);
     let thinking = varint_field(usage, 10).unwrap_or(0);
-    if system + new_input + cache_read + output + thinking == 0 {
+    // Corrupt blobs decode to near-u64::MAX varints — a plain `+` panics
+    // in debug builds and wraps into a bogus record in release. Any
+    // single field past 2^62 is already absurd for a token count.
+    if [system, new_input, cache_read, output, thinking]
+        .iter()
+        .any(|&v| v >= 1 << 62)
+    {
+        return Gen::NoUsage;
+    }
+    if system
+        .saturating_add(new_input)
+        .saturating_add(cache_read)
+        .saturating_add(output)
+        .saturating_add(thinking)
+        == 0
+    {
         return Gen::NoUsage;
     }
     let dedup = string_field(usage, 11).unwrap_or_default();
@@ -173,7 +202,12 @@ fn parse_generation(blob: &[u8]) -> Gen {
         .and_then(timestamp_field);
     let model = string_field(chat_model, 19).unwrap_or_else(|| "unknown".into());
     Gen::Record {
-        usage: (system + new_input, output, cache_read, thinking),
+        usage: (
+            system.saturating_add(new_input),
+            output,
+            cache_read,
+            thinking,
+        ),
         model,
         ts,
         dedup,
@@ -363,15 +397,19 @@ mod tests {
     }
 
     fn generation_blob() -> Vec<u8> {
+        generation_blob_keyed(b"dedup-1")
+    }
+
+    fn generation_blob_keyed(dedup: &[u8]) -> Vec<u8> {
         let ts = proto(&[(1, 0, V(1_758_500_000)), (2, 0, V(0))]);
         let reply_meta = proto(&[(4, 2, B(&ts))]);
         let usage = proto(&[
-            (1, 0, V(100)),         // system
-            (2, 0, V(50)),          // new input
-            (5, 0, V(400)),         // cache read
-            (9, 0, V(30)),          // output
-            (10, 0, V(7)),          // thinking
-            (11, 2, B(b"dedup-1")), // dedup key
+            (1, 0, V(100)),    // system
+            (2, 0, V(50)),     // new input
+            (5, 0, V(400)),    // cache read
+            (9, 0, V(30)),     // output
+            (10, 0, V(7)),     // thinking
+            (11, 2, B(dedup)), // dedup key
         ]);
         proto(&[(
             1,
@@ -412,6 +450,20 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_varints_cannot_panic_the_sum() {
+        // A corrupt blob decodes fields near u64::MAX — the class sum
+        // must saturate to a rejected record, never overflow-panic.
+        let usage = proto(&[
+            (1, 0, V(u64::MAX)),
+            (2, 0, V(u64::MAX)),
+            (9, 0, V(30)),
+            (11, 2, B(b"d")),
+        ]);
+        let blob = proto(&[(1, 2, B(&proto(&[(4, 2, B(&usage))])))]);
+        assert!(matches!(parse_generation(&blob), Gen::NoUsage));
+    }
+
+    #[test]
     fn malformed_wire_stops_cleanly() {
         assert!(matches!(parse_generation(&[0xff, 0xff]), Gen::NoUsage));
         // Truncated length-delimited field
@@ -419,5 +471,79 @@ mod tests {
             parse_generation(&[0x0a, 0x7f, 0x01]),
             Gen::NoUsage
         ));
+    }
+
+    #[test]
+    fn row_zero_is_read_and_the_range_stays_half_open() {
+        // `gen_metadata` indexes from 0: a fresh watermark must be -1 so
+        // the first row is read, and the emitted span `[0, max+1)` must be
+        // non-empty for a single-row db so supersession can cover it.
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-agy-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("conv.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
+                [],
+            )
+            .unwrap();
+            for (idx, key) in [(0i64, &b"dedup-0"[..]), (1, &b"dedup-1"[..])] {
+                conn.execute(
+                    "INSERT INTO gen_metadata (idx, data) VALUES (?1, ?2)",
+                    rusqlite::params![idx, generation_blob_keyed(key)],
+                )
+                .unwrap();
+            }
+        }
+        let size = std::fs::metadata(&db).unwrap().len();
+        let mut st = FileState::fresh("d".into(), size, 1);
+        let out = AntigravityExtractor
+            .extract(
+                &db,
+                &mut st,
+                u64::MAX,
+                Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(out.records.len(), 2, "idx = 0 must not be skipped");
+        assert_eq!(out.range, Some((0, 2)), "half-open [0, max_idx+1)");
+        // Resume: the same FileState emits nothing new, and the next row
+        // alone still produces a non-empty range.
+        let out = AntigravityExtractor
+            .extract(
+                &db,
+                &mut st,
+                u64::MAX,
+                Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(out.records.is_empty());
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)",
+                [generation_blob_keyed(b"dedup-2")],
+            )
+            .unwrap();
+        }
+        let out = AntigravityExtractor
+            .extract(
+                &db,
+                &mut st,
+                u64::MAX,
+                Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(out.range, Some((2, 3)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

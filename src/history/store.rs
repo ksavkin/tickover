@@ -8,6 +8,11 @@
 //!   (size, mtime, cursor, prefix digest, generation, dedup ring). Rewritten
 //!   atomically (tmp + rename) like `config.rs` does; a corrupt one is
 //!   quarantined aside and rebuilt from a full rescan rather than trusted.
+//!   Known narrow gap: a crash between an append and the commit *plus* a
+//!   file-order change on retry can leave one cross-file duplicate counted
+//!   twice — the committed day line carries no dedup key to recognize its
+//!   twin by. Day lines stay aggregates; the residual is one event, not a
+//!   class of them.
 //! * `days.jsonl` — append-only [`DayLine`] records, one per
 //!   (hour, provider, project, model, session, file generation). Never
 //!   edited in place: a file that was rewritten gets a new `gen`, and its
@@ -24,7 +29,7 @@ use serde::{Deserialize, Serialize};
 /// Current on-disk schema. Bump when a field's meaning changes; an older
 /// `state.json` that fails to parse is quarantined and rebuilt — a rescan
 /// is always the correct recovery because day lines are only ever additive.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// How many dedup keys one file remembers between scans. The ring exists
 /// for the tail-overlap case (a file rewritten since its last scan, or the
@@ -80,7 +85,10 @@ pub struct FileState {
     /// Incremented on every reset; [`DayLine::gen`] lines from an older
     /// generation stop counting the moment this bumps.
     pub gen: u32,
-    /// Bounded ring of recently seen dedup keys, oldest first.
+    /// Bounded ring of recently seen dedup keys, oldest first — persisted
+    /// across commits: providers legitimately re-log an id at a later
+    /// offset (Claude rewrites an assistant message as it streams), and
+    /// the ring is what tells that repeat from a new event next pass.
     pub recent_ids: VecDeque<String>,
     /// Membership mirror of `recent_ids` — checked per record, so O(1).
     /// Rebuilt from `recent_ids` at store open.
@@ -90,6 +98,11 @@ pub struct FileState {
     /// file's current generation — the format-drift signal `stats` shows.
     #[serde(default)]
     pub skipped_unparsed: u64,
+    /// The provider manifest that owns this file's root — lets queries
+    /// attribute drift counts (and any per-file figure) to a provider so a
+    /// disabled one drops out of every total.
+    #[serde(default)]
+    pub provider: String,
     /// Format-specific extractor state that must survive between passes —
     /// e.g. Codex's cumulative `total_token_usage` baseline when a file's
     /// events lack `last_token_usage`, or the session-attribution map Grok
@@ -115,6 +128,7 @@ impl FileState {
             recent_ids: VecDeque::new(),
             recent_set: std::collections::HashSet::new(),
             skipped_unparsed: 0,
+            provider: String::new(),
             aux: BTreeMap::new(),
         }
     }
@@ -158,7 +172,8 @@ impl FileState {
 /// by its own file must count again (its old lines died with the gen
 /// bump), while the same key from a *different* file is the duplicate.
 /// `V1` accepts ring entries written before paths were tracked; they
-/// dedup as "another path" for everyone — conservative, self-evicting.
+/// carry no owner so they never enter the lookup map — they only occupy
+/// ring slots until they age out.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum GlobalKey {
@@ -240,7 +255,49 @@ pub fn lock_store(dir: &Path) -> io::Result<StoreLock> {
         .truncate(false)
         .open(dir.join("lock"))?;
     f.lock()?;
+    repair_days_tail(dir)?;
     Ok(StoreLock(f))
+}
+
+/// A crash mid-append can leave `days.jsonl` ending without a newline.
+/// Left in place, the fragment merges with the next append's first line
+/// and *both* fail to parse — the retried buckets are lost for good.
+/// Only ever called with the lock held, so a torn tail is always a crash
+/// leftover, never a write in flight: cut it back to the last newline.
+fn repair_days_tail(dir: &Path) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = HistoryStore::days_path(dir);
+    let mut f = match fs::OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let len = f.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    f.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    f.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    // Walk backwards for the last newline — a torn tail is short (one
+    // line), but bound the scan anyway.
+    let mut pos = len;
+    let mut buf = [0u8; 4096];
+    while pos > 0 {
+        let n = (pos.min(buf.len() as u64)) as usize;
+        pos -= n as u64;
+        f.seek(SeekFrom::Start(pos))?;
+        f.read_exact(&mut buf[..n])?;
+        if let Some(i) = buf[..n].iter().rposition(|&b| b == b'\n') {
+            f.set_len(pos + i as u64 + 1)?;
+            return Ok(());
+        }
+    }
+    // No newline at all — the whole file is one torn write.
+    f.set_len(0)
 }
 
 /// `File::create` with 0600 on unix — the store's files hold project
@@ -375,7 +432,12 @@ impl HistoryStore {
                     let Ok(d) = serde_json::from_str::<DayLine>(line) else {
                         continue;
                     };
-                    if d.v != SCHEMA_VERSION {
+                    // Lines from *older* schemas still count — a rescan
+                    // supersedes what it can re-derive, and lines whose
+                    // files no longer exist are the only record of that
+                    // usage. Only a line written by a *newer* app version
+                    // is dropped: its fields could mean something else.
+                    if d.v > SCHEMA_VERSION {
                         continue;
                     }
                     store.fold_line(d);
@@ -411,14 +473,28 @@ impl HistoryStore {
     /// what makes append-then-commit crash-safe both at load *and* inside
     /// a session (a state-loss rebuild rescans into the same ranges).
     fn fold_line(&mut self, d: DayLine) {
+        // A line with `hi <= lo` never carried a real range: pre-range
+        // writes deserialize to `lo = hi = 0`, and a buggy extractor can
+        // persist an empty span. The rule is asymmetric: such a line
+        // never supersedes (it cannot say what it covered — two rangeless
+        // lines of one bucket must still sum), but counts as covering its
+        // bucket's whole span *as the old line*, so any re-emitted real
+        // range replaces it.
         let idxs = self.by_key.entry(bucket_key(&d)).or_default();
-        idxs.retain(|&i| {
-            let old = &self.days[i];
-            !(d.lo < old.hi && old.lo < d.hi) || {
-                self.dead.insert(i);
-                false
-            }
-        });
+        if d.hi > d.lo {
+            idxs.retain(|&i| {
+                let old = &self.days[i];
+                let (olo, ohi) = if old.hi <= old.lo {
+                    (0, u64::MAX)
+                } else {
+                    (old.lo, old.hi)
+                };
+                !(d.lo < ohi && olo < d.hi) || {
+                    self.dead.insert(i);
+                    false
+                }
+            });
+        }
         idxs.push(self.days.len());
         self.days.push(d);
     }
@@ -808,6 +884,119 @@ mod tests {
         store.append_days(&[day("/gone", 0, 5)]).unwrap();
         // Provider removed its history file; nothing re-registers it.
         assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 5);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn torn_tail_is_cut_back_to_the_last_newline() {
+        // A crash mid-append leaves a fragment with no newline; left in
+        // place it would merge with the next append's first line and
+        // poison both forever.
+        let dir = tmpdir("torn");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let mut first = day("/f", 0, 10);
+        first.lo = 0;
+        first.hi = 50;
+        store.append_days(&[first]).unwrap();
+        store.commit().unwrap();
+        drop(store);
+        // Simulate the torn write: append half a serialized line.
+        let mut a = day("/f", 0, 99);
+        a.lo = 100;
+        a.hi = 200;
+        let fragment = serde_json::to_string(&a).unwrap();
+        use std::io::Write;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("days.jsonl"))
+            .unwrap()
+            .write_all(&fragment.as_bytes()[..fragment.len() / 2])
+            .unwrap();
+
+        let lock = lock_store(&dir).unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            10,
+            "the fragment was never acknowledged — only the complete line survives"
+        );
+        // The next append must land on a clean boundary, not glue itself
+        // to the fragment.
+        let mut b = day("/f", 0, 7);
+        b.lo = 200;
+        b.hi = 300;
+        store.append_days(&[b]).unwrap();
+        store.commit().unwrap();
+        drop(store);
+        drop(lock);
+        let _lock = lock_store(&dir).unwrap();
+        let store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 17);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_zero_range_lines_are_superseded_but_never_supersede() {
+        // A `hi == 0` line never carried a real range (the pre-watermark
+        // Antigravity deadline bug wrote them). It cannot say what it
+        // covered, so it never supersedes a sibling — but any re-emitted
+        // real range replaces it.
+        let dir = tmpdir("legacy");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store
+            .append_days(&[day("/f", 0, 10), day("/f", 0, 20)])
+            .unwrap();
+        store.commit().unwrap();
+        drop(store);
+        let mut store = HistoryStore::open(&dir).unwrap();
+        // Both legacy lines survived (summing preserved).
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 30);
+        // A real-range re-parse of the same bucket supersedes them.
+        let mut r = day("/f", 0, 42);
+        r.lo = 0;
+        r.hi = 500;
+        store.append_days(&[r]).unwrap();
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 42);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_file_dedup_rings_survive_commit_and_reopen() {
+        // A provider can re-log an id at a later offset (Claude streams
+        // usage updates under one message id); the ring must still say
+        // "seen" on the next pass — across commits and across restarts.
+        let dir = tmpdir("rings");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store
+            .state
+            .files
+            .insert("/f".to_string(), FileState::fresh("d".into(), 1, 1));
+        store
+            .file_state_mut(Path::new("/f"))
+            .unwrap()
+            .mark_seen("k1".into());
+        store.commit().unwrap();
+        assert!(store.file_state(Path::new("/f")).unwrap().seen("k1"));
+        drop(store);
+        let store = HistoryStore::open(&dir).unwrap();
+        assert!(store.file_state(Path::new("/f")).unwrap().seen("k1"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lines_from_an_older_schema_still_count() {
+        // A v1 day line is data the current schema can still read — and
+        // for a file that no longer exists it is the only record left.
+        // Only lines from a *newer* schema are refused.
+        let dir = tmpdir("oldschema");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let mut old = day("/gone", 0, 33);
+        old.v = SCHEMA_VERSION - 1;
+        store.append_days(&[old]).unwrap();
+        store.commit().unwrap();
+        drop(store);
+        let store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 33);
         let _ = fs::remove_dir_all(&dir);
     }
 }

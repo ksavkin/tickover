@@ -5694,6 +5694,13 @@ fn sync_activity(app: &AppWindow, ctx: &Ctx) {
         .filter(|m| m.history.is_none() && plugin_enabled(m))
         .map(|m| m.id.clone())
         .collect();
+    // Buckets from a disabled provider stay on disk but leave every
+    // figure — same rule the scan and the card's coverage apply.
+    let enabled: std::collections::HashSet<String> = plugins
+        .iter()
+        .filter(|m| plugin_enabled(m))
+        .map(|m| m.id.clone())
+        .collect();
     let range = match app.get_activity_range() {
         1 => PanelRange::Week,
         2 => PanelRange::Month,
@@ -5701,11 +5708,10 @@ fn sync_activity(app: &AppWindow, ctx: &Ctx) {
     };
     let cost_fn: tickover::history::query::CostFn = config::history_cost_estimate()
         .then_some(&|_: &str, m: &str, t: &Totals| tickover::history::pricing::cost_usd(m, t));
-    let sum = ctx
-        .history
-        .borrow()
-        .as_ref()
-        .map(|store| tickover::history::query::panel(store, range, &quota_only, cost_fn));
+    let sum =
+        ctx.history.borrow().as_ref().map(|store| {
+            tickover::history::query::panel(store, range, &quota_only, &enabled, cost_fn)
+        });
     if std::env::var_os("TICKOVER_DEBUG_ACTIVITY").is_some() {
         if let Some(s) = &sum {
             eprintln!(
@@ -5910,7 +5916,14 @@ fn activity_data(
 fn open_history_report(ctx: &Ctx) {
     let store = ctx.history.borrow();
     let Some(store) = store.as_ref() else { return };
-    let stats = tickover::history::query::compute(store, 30);
+    let enabled: std::collections::HashSet<String> = ctx
+        .plugins
+        .borrow()
+        .iter()
+        .filter(|m| plugin_enabled(m))
+        .map(|m| m.id.clone())
+        .collect();
+    let stats = tickover::history::query::compute(store, 30, &enabled);
     let now = now_unix();
     // The panel's live readings become the report's RIGHT NOW cards — same
     // primary window, same projection math the quota blocks already drew.

@@ -68,6 +68,12 @@ glob   = "{glob}"
     PluginManifest::from_str(&text).unwrap_or_else(|e| panic!("fixture manifest: {e}"))
 }
 
+/// Test manifests are all enabled — mirror the filter the app applies
+/// before it trusts stored buckets.
+fn all_enabled(manifests: &[PluginManifest]) -> std::collections::HashSet<String> {
+    manifests.iter().map(|m| m.id.clone()).collect()
+}
+
 /// A Claude transcript: one assistant usage line, one sidechain (skipped),
 /// one user line carrying the sentinel prompt.
 fn claude_fixture() -> String {
@@ -134,7 +140,7 @@ fn scan_then_query_matches_the_fixture() {
         assert!(!s.root_missing, "{} fixture root missing", s.provider);
     }
 
-    let st = query::compute(&store, 30);
+    let st = query::compute(&store, 30, &all_enabled(&manifests));
     // Claude: msg-1 counted once (the duplicate line dedups on message id),
     // the sidechain's 999999 tokens never land.
     let cl = &st.by_provider["claude"];
@@ -160,7 +166,7 @@ fn scan_then_query_matches_the_fixture() {
     for s in &scans {
         assert!(!s.root_missing);
     }
-    let st2 = query::compute(&store, 30);
+    let st2 = query::compute(&store, 30, &all_enabled(&manifests));
     assert_eq!(st2.by_provider["claude"].input, 1000);
     assert_eq!(st2.by_provider["codex"].input, 6000);
 
@@ -196,7 +202,7 @@ fn nothing_but_usage_metadata_leaves_the_extractor() {
         );
     }
 
-    let st = query::compute(&store, 30);
+    let st = query::compute(&store, 30, &all_enabled(&manifests));
     let report_path = store_dir.join("report.html");
     let written = report::write(&st, Some(report_path.clone()), false, &[], &[]).unwrap();
     let html = fs::read_to_string(&written).unwrap();

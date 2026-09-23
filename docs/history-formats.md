@@ -91,6 +91,10 @@ The file is opened read-only (`mode=ro` — deliberately not `immutable=1`,
 which would hide rows still sitting in the WAL); a busy or locked
 database yields zero records for the tick rather than blocking — the next
 scan picks it up. Nothing is ever written to a provider database.
+Because fresh writes land in `<db>-wal` while the `.db`'s own size and
+mtime stay frozen until a checkpoint, the scanner folds the sibling's
+signature into its unchanged check — a live conversation is never
+skipped as "unchanged".
 
 Per-generation usage sits in `gen_metadata.data` as a protobuf blob:
 
@@ -130,7 +134,11 @@ Whatever the format, the same rules apply at the store boundary:
   than adding to them.
 - **A torn tail is deferred, not dropped.** A final line without its
   newline is a write in flight; the cursor holds so the next pass reads
-  it complete.
+  it complete. The same rule applied to the store's own `days.jsonl`: a
+  crash mid-append leaves a fragment that, left in place, would glue
+  itself to the retry's first line — so the open path cuts the file back
+  to its last newline before parsing (under the lock, so the fragment is
+  always a crash leftover, never a write in flight).
 
 ## The store
 
@@ -146,10 +154,14 @@ created `0600`:
   double-counting — while identical aggregates at disjoint ranges
   legitimately sum.
 - `state.json` — per-file cursor, size/mtime, prefix digest (with the
-  span it covered), generation, a recent dedup ring, the extractor's
-  persisted `aux` (Grok's session map, Codex's turn context and
-  cumulative baseline, Antigravity's `max_idx` watermark), plus a global
-  dedup ring for ids that can appear in more than one file.
+  span it covered), owning provider, generation, a recent dedup ring,
+  the extractor's persisted `aux` (Grok's session map, Codex's turn
+  context and cumulative baseline, Antigravity's `max_idx` watermark and
+  WAL signature), plus a global dedup ring for ids that can appear in
+  more than one file. The per-file rings persist across commits on
+  purpose: a provider can re-log an id at a later byte offset (Claude
+  rewrites an assistant message as it streams), and the ring is the only
+  thing that recognizes the repeat on a later pass.
 
 The whole open→scan→commit sequence runs under a `flock` on a `lock`
 file in the same directory, so the tray app and `tickover stats` can

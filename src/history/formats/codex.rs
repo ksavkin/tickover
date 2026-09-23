@@ -200,12 +200,21 @@ impl HistoryExtractor for CodexExtractor {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
         if ctx.id.is_empty() {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                let tail = &stem[stem.len().saturating_sub(36)..];
-                if tail.len() == 36 {
-                    ctx.id = tail.to_string();
-                }
-            }
+            // `get` rather than `[]`: a 36-byte cut can land inside a
+            // multi-byte char on a renamed file — and with no uuid the
+            // stem itself is the id, still unique per file, which is
+            // all the dedup key needs (`":{ordinal}"` would collide
+            // across files in the cross-file ring). A non-UTF-8 or
+            // missing stem falls back to the full path for the same
+            // reason.
+            ctx.id = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(stem) => stem
+                    .get(stem.len().saturating_sub(36)..)
+                    .filter(|t| t.len() == 36)
+                    .unwrap_or(stem)
+                    .to_string(),
+                None => path.to_string_lossy().into_owned(),
+            };
         }
         let mut offset_in_buf = resume_from;
         for raw in buf.split(|&b| b == b'\n') {
@@ -226,10 +235,15 @@ impl HistoryExtractor for CodexExtractor {
             };
             match (line.kind.as_str(), payload.kind.as_str()) {
                 ("session_meta", _) => {
+                    // An explicitly empty id is no id — filter *before*
+                    // the fallback chain or `Some("")` would shadow a
+                    // valid `id`, and keep the stem so the dedup key never
+                    // degenerates to ":{ordinal}".
                     ctx.id = payload
                         .session_id
                         .clone()
-                        .or(payload.id.clone())
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| payload.id.clone().filter(|s| !s.is_empty()))
                         .unwrap_or(ctx.id);
                     if payload.cwd.is_some() {
                         ctx.cwd = payload.cwd.clone();
@@ -361,7 +375,44 @@ mod tests {
         assert_eq!(r.project, "proj");
         assert_eq!(r.model, "gpt-5.2-codex");
         assert_eq!(r.session_id, "sess1");
-        assert_eq!(r.dedup_key, "sess1:2");
+    }
+
+    #[test]
+    fn a_file_without_session_meta_keys_by_its_stem() {
+        // Renamed/archived rollouts lose the uuid tail; the dedup key
+        // must still be unique per file — `":{ordinal}"` would collide
+        // with every other meta-less file in the cross-file ring.
+        let tmp = TmpDir::new("codex-nometa");
+        let p = tmp.write(
+            "renamed-日本語.jsonl",
+            &(token_count(2, 100, 40, 30) + "\n"),
+        );
+        let ex = CodexExtractor
+            .extract(&p, &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert_eq!(ex.records.len(), 1);
+        let r = &ex.records[0];
+        assert!(r.dedup_key.starts_with("renamed-日本語:"));
+        assert!(!r.dedup_key.starts_with(':'));
+        assert_eq!(r.session_id, "renamed-日本語");
+    }
+
+    #[test]
+    fn an_empty_session_id_falls_through_to_the_id_field() {
+        // `session_id: ""` must not shadow a valid `payload.id` — and
+        // must not fall back to the file stem either.
+        let tmp = TmpDir::new("codex-emptyid");
+        let meta = r#"{"timestamp":"2026-09-22T10:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"session_id":"","id":"sess9","cwd":"/u/proj","model_provider":"openai"}}"#;
+        let p = tmp.write(
+            "rollout-x.jsonl",
+            &(meta.to_string() + "\n" + &token_count(2, 100, 40, 30) + "\n"),
+        );
+        let ex = CodexExtractor
+            .extract(&p, &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert_eq!(ex.records.len(), 1);
+        assert_eq!(ex.records[0].session_id, "sess9");
+        assert_eq!(ex.records[0].dedup_key, "sess9:2");
     }
 
     #[test]
