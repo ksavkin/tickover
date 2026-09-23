@@ -566,9 +566,11 @@ export component AppWindow inherits Window {
     // What that place is called, and what actually appears there, differ per
     // platform — see `menu_bar_text_label` in `main.rs`.
     in property <string> menu-bar-text-label: "Show stats in menu bar";
-    // Height budget for the provider list, set from the current monitor's
-    // logical size by `sync_providers_cap`. The default only covers the first
-    // frames before Rust has measured a monitor.
+    // Height budget for the provider list, set from the target monitor's
+    // logical size by `sync_providers_cap` — which derives it by subtracting
+    // the chrome around the list (header, a visible ACTIVITY strip) from the
+    // screen. The default only covers the first frames before Rust has
+    // measured a monitor.
     in property <length> providers-cap: 620px;
     // Whether the platform draws its own edge and shadow around a frameless
     // window (macOS does; Windows does not). Gates the card's own chrome.
@@ -775,10 +777,11 @@ export component AppWindow inherits Window {
                 // hugs its content exactly as before.
                 //
                 // The cap itself comes from Rust (`sync_providers_cap`), which
-                // reads the current monitor's logical height — a fixed cap
-                // sized for 768px would still overflow a 768px display at
-                // 125% scaling, and the Flickable would consider its whole
-                // viewport visible, leaving the overflow unreachable.
+                // reads the current monitor's logical height minus the
+                // surrounding chrome — a fixed cap sized for 768px would
+                // still overflow a 768px display at 125% scaling, and the
+                // Flickable would consider its whole viewport visible,
+                // leaving the overflow unreachable.
                 providers-region := Rectangle {
                     preferred-height: providers-column.preferred-height;
                     height: min(providers-column.preferred-height, root.providers-cap);

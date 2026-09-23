@@ -317,7 +317,20 @@ struct Ctx {
     tray_click_at: Rc<Cell<Option<Instant>>>,
     tray_press_at: Rc<Cell<Option<Instant>>>,
     hidden_by_focus_at: Rc<Cell<Option<Instant>>>,
-    opened_by_activation_at: Rc<Cell<Option<(Instant, bool)>>>,
+    opened_by_activation_at: Rc<Cell<Option<Instant>>>,
+    /// A [`present_popover`] that asked for a placement before the winit
+    /// window had a size — `window().size()` reads 0×0 until the first
+    /// `Resized` event lands, and positioning a 0×0 frame drops it wherever
+    /// the window manager defaults to. The winit-event hook replays this
+    /// when the real size arrives. Timestamped so a request whose `Resized`
+    /// never came (the window was never realized — that presentation never
+    /// happened) cannot surface later and move a window the user has since
+    /// parked somewhere. The flag marks a *settling* request — one a landed
+    /// placement re-armed so the next `Resized` re-places against whatever
+    /// size the cap sync and platform layout actually produced; settling
+    /// replays bypass the dock-mode parking courtesy because they are the
+    /// same presentation still converging, not a new one.
+    pending_position: Rc<Cell<Option<PendingPosition>>>,
 }
 
 /// The refresh triple nearly every settings-sheet callback below closes
@@ -507,14 +520,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dismissed and absorbed checks both reason causally from (see
     // `tray_click_dismissed_panel`, `click_absorbed_by_its_activation`).
     let tray_press_at: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
-    // When an unexplained activation edge last opened the panel, and whether
-    // that open actually *placed* the window. The status-item click that
-    // caused it can still be in flight to the click drain — when it arrives
-    // it is the same gesture's other half and must be absorbed, not toggled;
-    // and only a placement is worth re-anchoring to the click's `rect` (a
-    // window the user parked should stay put). See
+    // When an unexplained activation edge last opened the panel. The
+    // status-item click that caused it can still be in flight to the click
+    // drain — when it arrives it is the same gesture's other half and must
+    // be absorbed, not toggled; and since the edge opened before the click's
+    // `rect` was known, the absorb also re-anchors the panel under the item
+    // actually pressed (a click the user made is licence enough — in dock
+    // mode the open itself deliberately did not move the window). See
     // `click_absorbed_by_its_activation`.
-    let opened_by_activation_at: Rc<Cell<Option<(Instant, bool)>>> = Rc::new(Cell::new(None));
+    let opened_by_activation_at: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
+    // A presentation that wanted to place the window but found it still
+    // 0×0 — winit realizes the window asynchronously after `show()`, so the
+    // size (and with it `set_position`'s frame math) is not yet real. The
+    // winit-event hook replays the placement on the first `Resized`.
+    let pending_position: Rc<Cell<Option<PendingPosition>>> = Rc::new(Cell::new(None));
     // Change-detection key for the tray indicator (avoids icon churn).
     // `sync_tray_indicator_from` treats an unchanged key as "nothing to draw"
     // and returns before ever setting the icon or tooltip — `None` here means
@@ -626,6 +645,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hidden_by_focus_at: hidden_by_focus_at.clone(),
         tray_press_at: tray_press_at.clone(),
         opened_by_activation_at: opened_by_activation_at.clone(),
+        pending_position: pending_position.clone(),
     };
 
     wire_ui_callbacks(&app, &ctx);
@@ -680,11 +700,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     sync_tray_indicator(&tray, menubar_on, &plugins.borrow(), &cache, &tray_key);
 
     if std::env::var_os("TICKOVER_SHOW_ON_START").is_some() || platform::dock_mode() {
-        present_popover(&app, &anchor, &shown_at, Shown::ByAnythingElse);
+        present_popover(
+            &app,
+            &anchor,
+            &shown_at,
+            &pending_position,
+            Shown::ByAnythingElse,
+        );
     }
 
     if let Some(path) = snapshot_path {
-        present_popover(&app, &anchor, &shown_at, Shown::ByAnythingElse);
+        present_popover(
+            &app,
+            &anchor,
+            &shown_at,
+            &pending_position,
+            Shown::ByAnythingElse,
+        );
         // Snapshot the settings sheet instead of the gauges when asked.
         if std::env::var_os("TICKOVER_SNAPSHOT_SETTINGS").is_some() {
             app.set_settings_open(true);
@@ -842,10 +874,28 @@ fn wire_frameless_chrome(app: &AppWindow, ctx: &Ctx) {
                 if auto_hide && ctx.shown_at.get().elapsed() > Duration::from_millis(250) {
                     if let Some(app) = ctx.weak.upgrade() {
                         let _ = app.window().hide();
+                        // A hidden window's placement requests die with the
+                        // presentation — a settling re-arm must not survive
+                        // to re-place whatever opens next.
+                        ctx.pending_position.set(None);
                         // Remember *when*, so the click that took this focus
                         // away is not then read as a request to re-open.
                         ctx.hidden_by_focus_at.set(Some(Instant::now()));
                     }
+                }
+            }
+            // A placement deferred because the window was still 0×0 — its
+            // real size arrives as the first `Resized`. Replay it then, with
+            // the freshest anchor the click drain has since recorded — but
+            // never from inside this hook: it can run before the backend has
+            // stored the size the event carries, so `window().size()` here
+            // reads the *previous* size — 0×0 on the very first resize and
+            // the stale old frame on every settling one. Replaying one turn
+            // later always sees the size this resize installed.
+            if let WindowEvent::Resized(size) = event {
+                if size.width > 0 && size.height > 0 && ctx.pending_position.get().is_some() {
+                    let ctx = ctx.clone();
+                    Timer::single_shot(Duration::ZERO, move || replay_pending_position(&ctx));
                 }
             }
             EventResult::Propagate
@@ -860,6 +910,12 @@ fn wire_frameless_chrome(app: &AppWindow, ctx: &Ctx) {
     {
         let ctx = ctx.clone();
         app.on_start_drag(move || {
+            // The user just took manual control of the position — any
+            // deferred or settling placement must not yank it back, and a
+            // dragged window counts as placed: dock mode must not later
+            // move it as "never positioned".
+            ctx.pending_position.set(None);
+            POPOVER_PLACED.with(|placed| placed.set(true));
             if let Some(app) = ctx.weak.upgrade() {
                 app.window().with_winit_window(|win| {
                     let _ = win.drag_window();
@@ -2051,7 +2107,13 @@ fn run_slow_timer(
                         &ctx.history,
                     );
                 }
-                present_popover(&app, &ctx.anchor, &ctx.shown_at, Shown::ByAnythingElse);
+                present_popover(
+                    &app,
+                    &ctx.anchor,
+                    &ctx.shown_at,
+                    &ctx.pending_position,
+                    Shown::ByAnythingElse,
+                );
             }
 
             // Keep "· checked <registry-checked-at>" live (Slint only ever
@@ -2358,9 +2420,7 @@ fn drain_tray_clicks(app: &AppWindow, ctx: &Ctx) -> usize {
             // is dead on purpose.)
             let mark = ctx.opened_by_activation_at.take();
             let absorbed = app.window().is_visible()
-                && mark.is_some_and(|(at, _)| {
-                    click_absorbed_by_its_activation(Some(at), press_at, now)
-                });
+                && mark.is_some_and(|at| click_absorbed_by_its_activation(Some(at), press_at, now));
             diag::line(format!(
                 "tray click drained: visible={} dismissed={} absorbed={} active={}",
                 app.window().is_visible(),
@@ -2370,16 +2430,21 @@ fn drain_tray_clicks(app: &AppWindow, ctx: &Ctx) -> usize {
             ));
             if absorbed {
                 // The edge opened the panel before this click's `rect` was
-                // known — *if* that open placed the window, it sits wherever
-                // a stale or absent anchor put it, so move it under the item
-                // actually pressed. If the open left the window where the
-                // user parked it, the absorb must too: a mark this gesture
-                // did not cause is no licence to move their window.
-                if mark.is_some_and(|(_, moved)| moved) {
-                    position_popover(app, &ctx.anchor, Shown::ByTrayClick);
-                }
+                // known, so re-anchor it under the item actually pressed.
+                // The absorb itself already proved this gesture caused the
+                // open; in dock mode that open deliberately did *not* move
+                // the window, which would otherwise leave the panel at
+                // whatever parked position it last had — exactly the "opens
+                // somewhere else" this fixes. The cap re-syncs against the
+                // click's own monitor — a re-anchor across displays must not
+                // size the card for the screen it is leaving.
+                sync_providers_cap(app, &ctx.anchor);
+                position_popover(app, &ctx.anchor, &ctx.pending_position, Shown::ByTrayClick);
             } else if app.window().is_visible() {
                 let _ = app.window().hide();
+                // Hidden ends the presentation — no deferred or settling
+                // placement may outlive it into the next one.
+                ctx.pending_position.set(None);
             } else if !dismissed {
                 spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
                 if should_refresh_panel(app.window().is_visible(), true) {
@@ -2393,7 +2458,13 @@ fn drain_tray_clicks(app: &AppWindow, ctx: &Ctx) -> usize {
                         &ctx.history,
                     );
                 }
-                present_popover(app, &ctx.anchor, &ctx.shown_at, Shown::ByTrayClick);
+                present_popover(
+                    app,
+                    &ctx.anchor,
+                    &ctx.shown_at,
+                    &ctx.pending_position,
+                    Shown::ByTrayClick,
+                );
             }
             tray_clicks += 1;
         }
@@ -2475,19 +2546,23 @@ fn run_dock_reopen_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                         &ctx.history,
                     );
                 }
-                let moved =
-                    present_popover(&app, &ctx.anchor, &ctx.shown_at, Shown::ByAnythingElse);
+                present_popover(
+                    &app,
+                    &ctx.anchor,
+                    &ctx.shown_at,
+                    &ctx.pending_position,
+                    Shown::ByAnythingElse,
+                );
                 // An unexplained activation opened this panel: remember
-                // when — and whether it moved the window — so the
-                // status-item click that caused it, whose event can still
-                // be in flight, is absorbed as the same gesture rather than
-                // toggling the panel straight back off; and so the absorb
-                // knows whether a re-anchor is owed.
+                // when, so the status-item click that caused it, whose event
+                // can still be in flight, is absorbed as the same gesture
+                // rather than toggling the panel straight back off.
                 if became_active && clicks == 0 {
-                    ctx.opened_by_activation_at.set(Some((Instant::now(), moved)));
+                    ctx.opened_by_activation_at.set(Some(Instant::now()));
                 }
             } else if !want_visible && visible {
                 let _ = app.window().hide();
+                ctx.pending_position.set(None);
             }
         });
     }
@@ -5724,7 +5799,15 @@ fn sync_activity(app: &AppWindow, ctx: &Ctx) {
         .history_io
         .busy
         .load(std::sync::atomic::Ordering::Relaxed);
+    // The strip appearing or hiding changes the card's real height — the
+    // list's cap already paid for it only if it was visible when measured,
+    // so a toggle while the panel is open must re-measure before the bottom
+    // edge rides off the screen (or a dead 240px stays reserved).
+    let was_visible = app.get_activity().visible;
     app.set_activity(activity_data(sum.as_ref(), range, &plugins, scanning));
+    if app.get_activity().visible != was_visible {
+        sync_providers_cap(app, &ctx.anchor);
+    }
 }
 #[cfg(not(feature = "history"))]
 fn sync_activity(_: &AppWindow, _: &Ctx) {}
@@ -7009,24 +7092,36 @@ fn panel_target_visibility(became_active: bool, clicks: usize, visible: bool) ->
     base != (toggles % 2 == 1)
 }
 
-/// Fit the provider list's height budget to the monitor the window is on.
+/// Fit the provider list's height budget to the monitor the panel will sit
+/// on — the anchor's, not the window's: on a cross-screen move the window is
+/// still *leaving* its old monitor when this runs.
 ///
-/// The cap cannot live in the UI as a constant: 620px sized for a 768px
-/// display still overflows that same display at 125% scaling, and once the
-/// window extends past the screen the Flickable believes its whole viewport is
+/// The cap cannot live in the UI as a constant: sized for one display it
+/// still overflows the same display at another scaling, and once the window
+/// extends past the screen the Flickable believes its whole viewport is
 /// visible, so the overflow cannot even be scrolled to. Measured per show —
-/// the window can move between monitors.
-fn sync_providers_cap(app: &AppWindow) {
-    use slint::winit_030::{winit, WinitWindowAccessor};
+/// the window can move between monitors, and the ACTIVITY strip can appear
+/// or hide while the panel is open.
+fn sync_providers_cap(app: &AppWindow, anchor: &Anchor) {
     let mut cap = 620.0_f32;
-    app.window().with_winit_window(|w: &winit::window::Window| {
-        if let Some(monitor) = w.current_monitor() {
-            let logical_h = monitor.size().height as f64 / monitor.scale_factor();
-            // Leave room for the panel chrome around the list (~80) plus the
-            // menu bar / taskbar and the anchor gap the popover hangs from.
-            cap = ((logical_h - 200.0) as f32).clamp(240.0, 620.0);
-        }
-    });
+    // The anchor's own monitor first — placement is about to move the window
+    // there — else the monitor the window is on, else the primary.
+    let logical_h = target_monitor(app, sanitize_anchor(app, *anchor.borrow()))
+        .map(|((_, _, _, h), scale)| h / scale);
+    if let Some(logical_h) = logical_h {
+        // Leave room for the chrome around the list (~100: paddings, header,
+        // hairline) plus the menu bar / taskbar and the anchor gap the
+        // popover hangs off (~50). The ACTIVITY strip sits below the list
+        // and is not part of the cap, so a visible one takes its own ~240
+        // off the list's budget — otherwise the strip pushes the card's
+        // bottom edge off the screen.
+        let activity = if app.get_activity().visible {
+            240.0
+        } else {
+            0.0
+        };
+        cap = ((logical_h - 150.0 - activity) as f32).clamp(160.0, 620.0);
+    }
     app.set_providers_cap(cap);
 }
 
@@ -7055,29 +7150,45 @@ fn popover_moves(dock_mode: bool, placed_before: bool, shown: Shown) -> bool {
     !dock_mode || !placed_before || shown == Shown::ByTrayClick
 }
 
-/// Returns whether this presentation placed the window — the reopen tick's
-/// activation-open needs to know: only a presentation that actually moved
-/// the panel can have left it somewhere its click's anchor would not have
-/// put it, and only that case is worth re-anchoring when the click arrives.
+/// Show the panel and place it if this presentation's cause is one that
+/// places windows (see [`position_popover`] for the rules, and for the
+/// deferred placement a still-unrealized window takes).
 fn present_popover(
     app: &AppWindow,
     anchor: &Anchor,
     shown_at: &Rc<Cell<Instant>>,
+    pending: &Rc<Cell<Option<PendingPosition>>>,
     shown: Shown,
-) -> bool {
+) {
+    // A settling re-arm belongs to the presentation that landed it — this
+    // presentation owns the slot now. A non-settling deferral is a
+    // presentation still waiting on its first size: leave it for
+    // `position_popover_impl`'s click-priority merge to arbitrate, or an
+    // ambient show racing into the realize gap would destroy an unanswered
+    // `ByTrayClick` request — the anchor the whole replay exists for.
+    if matches!(pending.get(), Some(PendingPosition { settling: true, .. })) {
+        pending.set(None);
+    }
     // A new popover presentation always starts on the gauges, not a stale modal.
     app.set_settings_open(false);
     // Nor a stale tooltip. A bubble raised by hovering a bar has no leave
     // event coming once the panel is dismissed out from under the pointer, so
     // without this it is what greets the next presentation.
     app.set_tip(BarTip::default());
+    // Cap before placing: it is measured on the anchor's monitor, and the
+    // height the placement math then reads is the cap-applied one — syncing
+    // after would leave a just-shrunk card floating off a taskbar anchor.
+    sync_providers_cap(app, anchor);
     let _ = app.window().show();
-    let moved = position_popover(app, anchor, shown);
-    // Only after show + position: Slint creates the winit window lazily, so
-    // measuring before `show()` is a no-op on the first presentation, and
-    // measuring before `position_popover` reads the monitor the window is
-    // *leaving* when the anchor moved to another screen.
-    sync_providers_cap(app);
+    let moved = position_popover(app, anchor, pending, shown);
+    // "Leave a parked window parked" is only a courtesy while the parking
+    // spot is reachable — a dock-mode window last left on a monitor that has
+    // since gone away (or under a resolution change) is a window nobody can
+    // reach. A show that did not move it recovers that: back onto a screen
+    // it goes, anchor or no.
+    if !moved && window_off_screen(app) {
+        position_popover_forced(app, anchor, pending, shown);
+    }
     shown_at.set(Instant::now());
 
     use slint::winit_030::{winit, WinitWindowAccessor};
@@ -7095,13 +7206,94 @@ fn present_popover(
         w.focus_window();
     });
     platform::activate_app();
-    moved
 }
 
 /// A screen the popover has to stay inside: `(x, y, width, height)` in
 /// physical pixels, the same space the tray event's rect and `set_position`
 /// already speak.
 type ScreenRect = (f64, f64, f64, f64);
+
+/// A deferred placement is a request made by a presentation that found the
+/// window still 0×0; its `Resized` reply lands within a frame or two. One
+/// that is still unanswered after this long belongs to a window that was
+/// never realized at all — replaying it on whatever resize next comes along
+/// would move a parked window for a cause nobody remembers. The exception a
+/// stale request still gets: a window nothing has ever placed. *Settling*
+/// requests are exempt: they belong to a window that is already visible and
+/// still converging, so they live until the presentation ends (hide, drag,
+/// or the next `present_popover`) rather than on a clock.
+const PENDING_POSITION_TTL: Duration = Duration::from_secs(2);
+
+/// One deferred placement request. `settling` distinguishes the two kinds:
+/// a fresh request a still-0×0 window could not yet place, versus one a
+/// landed placement re-armed so the `Resized` the cap sync and platform
+/// layout still owe re-places against the real size. Settling replays
+/// bypass the dock-mode parking courtesy — they are the same presentation
+/// converging, not a new one.
+#[derive(Clone, Copy)]
+struct PendingPosition {
+    at: Instant,
+    shown: Shown,
+    settling: bool,
+}
+
+/// Replay the placement a presentation deferred while the window was 0×0 —
+/// called from the `Resized` hook, and once more a turn later when the hook
+/// ran ahead of the backend's own size update. Also where the *settling*
+/// re-arms land: each landed placement leaves the request armed one more
+/// window so the `Resized` produced by the cap sync and the platform's own
+/// layout re-places against whatever size actually materialized.
+fn replay_pending_position(ctx: &Ctx) {
+    use slint::winit_030::WinitWindowAccessor;
+    let Some(PendingPosition {
+        at,
+        shown,
+        settling,
+    }) = ctx.pending_position.take()
+    else {
+        return;
+    };
+    let Some(app) = ctx.weak.upgrade() else {
+        return;
+    };
+    // Hidden between request and replay: that presentation ended before the
+    // window existed — moving it now would also lie about PLACED. A
+    // non-settling deferral past the TTL is stale — unless the window was
+    // never placed at all, where the WM-default spot it sits on is the very
+    // bug this replay exists to undo. A settling request belongs to the
+    // still-visible window it is converging — late resizes (a slow first
+    // fetch growing the card, an activity-strip toggle) are exactly what it
+    // exists for, so while the window stays visible it stays owed; hide,
+    // drag, and the next presentation all clear it.
+    let usable = app.window().is_visible()
+        && (settling || at.elapsed() <= PENDING_POSITION_TTL || !popover_placed());
+    if !usable {
+        return;
+    }
+    // Cap first, on the anchor's monitor: the height the placement reads is
+    // the cap-applied one.
+    sync_providers_cap(&app, &ctx.anchor);
+    // A settling request already landed once — it replays to re-place
+    // against the size the cap and platform layout actually produced, so it
+    // bypasses the parking courtesy that would refuse it as a repeat.
+    let mut landed = if settling {
+        position_popover_forced(&app, &ctx.anchor, &ctx.pending_position, shown)
+    } else {
+        position_popover(&app, &ctx.anchor, &ctx.pending_position, shown)
+    };
+    // The same recovery present_popover owes a refused move — a parked
+    // window on a monitor that is gone does not become reachable just
+    // because its real size arrived late.
+    if !landed && window_off_screen(&app) {
+        landed = position_popover_forced(&app, &ctx.anchor, &ctx.pending_position, shown);
+    }
+    // The presentation's focus call raced the realization too — repeat it
+    // once, on the first landing only: settle replays refocusing on every
+    // resize would fight the user for the key window.
+    if landed && !settling {
+        app.window().with_winit_window(|w| w.focus_window());
+    }
+}
 
 /// Gap between the status item and the card hanging off it.
 const POPOVER_GAP: f64 = 6.0;
@@ -7179,18 +7371,89 @@ fn clamp_onto(pos: f64, len: f64, screen_pos: f64, screen_len: f64, margin: f64)
     pos.clamp(lo, (screen_pos + screen_len - len - margin).max(lo))
 }
 
-/// The screen the status item sits on.
-///
-/// Deliberately not `current_monitor()`: that answers where the *window* is,
-/// which on every show after the first is the screen the popover is about to
-/// leave when the tray lives on another one. The item's own centre picks the
-/// right screen directly. `None` when winit can name no monitor at all, which
-/// [`position_popover`] reads as "don't constrain".
-fn anchor_screen(app: &AppWindow, anchor: Option<(f64, f64, f64, f64)>) -> Option<ScreenRect> {
+/// Whether `(cx, cy)` — physical pixels — lands inside a screen rect.
+fn rect_contains((x, y, w, h): ScreenRect, (cx, cy): (f64, f64)) -> bool {
+    cx >= x && cx < x + w && cy >= y && cy < y + h
+}
+
+/// Every monitor's `(rect, scale_factor)`, in the same physical-pixel space
+/// as the tray event's rect. Empty while the winit window is still
+/// unrealized — [`sync_providers_cap`] reaches that state before `show()`
+/// and takes the default cap for it — or on a platform that cannot name
+/// monitors at all.
+fn monitors(app: &AppWindow) -> Vec<(ScreenRect, f64)> {
     use slint::winit_030::{winit, WinitWindowAccessor};
-    fn rect(m: &winit::monitor::MonitorHandle) -> ScreenRect {
+    let mut out = Vec::new();
+    app.window().with_winit_window(|w: &winit::window::Window| {
+        out = w
+            .available_monitors()
+            .map(|m| {
+                let (p, s) = (m.position(), m.size());
+                (
+                    (p.x as f64, p.y as f64, s.width as f64, s.height as f64),
+                    m.scale_factor(),
+                )
+            })
+            .collect();
+    });
+    out
+}
+
+/// Drop a status-item rect that names no real screen location.
+///
+/// The macOS status item reports `(0, screen_height)` — its window's frame
+/// before the bar has laid it out — for a moment after creation, and a click
+/// landing in that window anchors the card to a point *below* every monitor:
+/// `popover_origin` then picks the "above" side and the panel opens at the
+/// bottom-left of the screen, exactly the misplaced spot reported. An anchor
+/// whose centre is inside no monitor is not an anchor at all — better the
+/// anchorless fallback position than a corner case off a phantom rect. That
+/// is also the answer while no monitor is enumerable yet: keeping an
+/// unverifiable rect would re-admit the phantom.
+fn sanitize_anchor(
+    app: &AppWindow,
+    anchor: Option<(f64, f64, f64, f64)>,
+) -> Option<(f64, f64, f64, f64)> {
+    let (ax, ay, aw, ah) = anchor?;
+    let mons = monitors(app);
+    let rects: Vec<ScreenRect> = mons.iter().map(|m| m.0).collect();
+    if anchor_on_a_monitor((ax, ay, aw, ah), &rects) {
+        anchor
+    } else {
+        None
+    }
+}
+
+/// The centre test [`sanitize_anchor`] runs: an anchor counts only while its
+/// centre lands inside some known monitor's rect.
+fn anchor_on_a_monitor((ax, ay, aw, ah): (f64, f64, f64, f64), mons: &[ScreenRect]) -> bool {
+    let centre = (ax + aw / 2.0, ay + ah / 2.0);
+    mons.iter().any(|m| rect_contains(*m, centre))
+}
+
+/// The monitor the popover will sit on, as `(rect, scale_factor)` — the
+/// same physical-pixel space [`monitors`] reports in.
+///
+/// Deliberately not `current_monitor()` first: that answers where the
+/// *window* is, which on every show after the first is the screen the
+/// popover is about to leave when the tray lives on another one. The
+/// item's own centre picks the right screen directly; `current`/`primary`
+/// is only the fallback for an anchorless present. `None` when winit can
+/// name no monitor at all, which [`position_popover`] reads as "don't
+/// constrain". Returning the scale too lets callers measure — and scale
+/// the gap/margin constants — against the monitor being placed *onto*,
+/// not the one being left.
+fn target_monitor(
+    app: &AppWindow,
+    anchor: Option<(f64, f64, f64, f64)>,
+) -> Option<(ScreenRect, f64)> {
+    use slint::winit_030::{winit, WinitWindowAccessor};
+    fn pair(m: &winit::monitor::MonitorHandle) -> (ScreenRect, f64) {
         let (p, s) = (m.position(), m.size());
-        (p.x as f64, p.y as f64, s.width as f64, s.height as f64)
+        (
+            (p.x as f64, p.y as f64, s.width as f64, s.height as f64),
+            m.scale_factor(),
+        )
     }
     let mut found = None;
     app.window().with_winit_window(|w: &winit::window::Window| {
@@ -7199,16 +7462,16 @@ fn anchor_screen(app: &AppWindow, anchor: Option<(f64, f64, f64, f64)>) -> Optio
             found = w
                 .available_monitors()
                 .find(|m| {
-                    let (x, y, mw, mh) = rect(m);
+                    let ((x, y, mw, mh), _) = pair(m);
                     cx >= x && cx < x + mw && cy >= y && cy < y + mh
                 })
-                .map(|m| rect(&m));
+                .map(|m| pair(&m));
         }
         if found.is_none() {
             found = w
                 .current_monitor()
                 .or_else(|| w.primary_monitor())
-                .map(|m| rect(&m));
+                .map(|m| pair(&m));
         }
     });
     found
@@ -7217,27 +7480,100 @@ fn anchor_screen(app: &AppWindow, anchor: Option<(f64, f64, f64, f64)>) -> Optio
 /// Returns whether the window was actually moved — `popover_moves` can say
 /// no, and only the caller who asked for a placement (or compensates for
 /// one that landed on a stale anchor) needs the answer.
-fn position_popover(app: &AppWindow, anchor: &Anchor, shown: Shown) -> bool {
+///
+/// A presentation can arrive before winit has realized the window:
+/// `window().size()` then reads 0×0, `available_monitors()` is empty, and
+/// `set_position` lands on a frame that does not exist yet — the window
+/// ends up wherever the window manager defaults to rather than where this
+/// computed. That case is deferred: `pending` takes the request and the
+/// first `Resized` event replays it once the size is real.
+fn position_popover(
+    app: &AppWindow,
+    anchor: &Anchor,
+    pending: &Rc<Cell<Option<PendingPosition>>>,
+    shown: Shown,
+) -> bool {
+    position_popover_impl(app, anchor, pending, shown, false)
+}
+
+/// [`position_popover`] without the dock-mode parking courtesy — for a show
+/// that found the parked window entirely off-screen.
+fn position_popover_forced(
+    app: &AppWindow,
+    anchor: &Anchor,
+    pending: &Rc<Cell<Option<PendingPosition>>>,
+    shown: Shown,
+) -> bool {
+    position_popover_impl(app, anchor, pending, shown, true)
+}
+
+thread_local! {
+    /// Whether a placement has actually landed this run — read by the
+    /// dock-mode parking courtesy in [`popover_moves`] callers and by the
+    /// deferred-placement replay, for which a never-placed window overrides
+    /// the stale-request TTL (an unplaced panel parked at a window-manager
+    /// default is exactly the bug the deferral exists to undo).
+    static POPOVER_PLACED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn popover_placed() -> bool {
+    POPOVER_PLACED.with(|placed| placed.get())
+}
+
+fn position_popover_impl(
+    app: &AppWindow,
+    anchor: &Anchor,
+    pending: &Rc<Cell<Option<PendingPosition>>>,
+    shown: Shown,
+    force: bool,
+) -> bool {
     // Recorded whatever the mode, so that switching into dock mode mid-session
-    // does not count the window as never placed.
-    thread_local! {
-        static PLACED: Cell<bool> = const { Cell::new(false) };
-    }
-    let placed_before = PLACED.with(|placed| placed.replace(true));
-    if !popover_moves(platform::dock_mode(), placed_before, shown) {
+    // does not count the window as never placed. Read without setting: a
+    // deferred placement must not consume the flag, or the replay that lands
+    // it would see the window as already placed and refuse to move it in
+    // dock mode.
+    let placed_before = popover_placed();
+    if !force && !popover_moves(platform::dock_mode(), placed_before, shown) {
         return false;
     }
-    let scale = app.window().scale_factor() as f64;
     let size = app.window().size();
-    let anchor = *anchor.borrow();
-    // No monitor to be had: fall back to a screen so large that the *far*
-    // edge of `clamp_onto`'s range never bites — not fully unconstrained,
-    // since the near edge still pins anything below `POPOVER_MARGIN` (an
-    // anchor at or past `x = 0`/`y = 0`, which a real monitor with a negative
-    // origin in a multi-monitor layout could legitimately want) up to that
-    // margin. Good enough for "winit can name no monitor at all", a state
-    // this app cannot otherwise reason about anyway.
-    let screen = anchor_screen(app, anchor).unwrap_or((0.0, 0.0, f64::MAX, f64::MAX));
+    if size.width == 0 || size.height == 0 {
+        // A click already waiting for its window outranks an ambient cause —
+        // a reopen tick landing in the realize gap must not overwrite the
+        // `ByTrayClick` whose anchor is the whole reason the replay exists.
+        // Only a click still *waiting* on a size counts — a settled one is
+        // no longer owed the slot.
+        let click_waiting = matches!(
+            pending.get(),
+            Some(PendingPosition {
+                shown: Shown::ByTrayClick,
+                settling: false,
+                ..
+            })
+        );
+        if !(click_waiting && shown == Shown::ByAnythingElse) {
+            pending.set(Some(PendingPosition {
+                at: Instant::now(),
+                shown,
+                settling: false,
+            }));
+        }
+        return false;
+    }
+    POPOVER_PLACED.with(|placed| placed.set(true));
+    let anchor = sanitize_anchor(app, *anchor.borrow());
+    // Screen and scale both come from the monitor being placed *onto* —
+    // on a cross-screen move `window().scale_factor()` would still answer
+    // for the monitor the window is leaving. No monitor to be had: fall
+    // back to a screen so large that the *far* edge of `clamp_onto`'s
+    // range never bites — not fully unconstrained, since the near edge
+    // still pins anything below `POPOVER_MARGIN` (an anchor at or past
+    // `x = 0`/`y = 0`, which a real monitor with a negative origin in a
+    // multi-monitor layout could legitimately want) up to that margin.
+    // Good enough for "winit can name no monitor at all", a state this
+    // app cannot otherwise reason about anyway.
+    let (screen, scale) =
+        target_monitor(app, anchor).unwrap_or(((0.0, 0.0, f64::MAX, f64::MAX), 1.0));
     let (x, y) = popover_origin(
         anchor,
         (size.width as f64, size.height as f64),
@@ -7246,7 +7582,56 @@ fn position_popover(app: &AppWindow, anchor: &Anchor, shown: Shown) -> bool {
     );
     app.window()
         .set_position(PhysicalPosition::new(x as i32, y as i32));
+    // Keep the request armed as *settling*: the cap sync and the platform's
+    // own layout flush their resizes asynchronously, and content that only
+    // arrives after the first fetch can keep growing the card — so the size
+    // this placement used may not be final. Each later `Resized` replays it
+    // forced: the parking courtesy would read it as a new presentation when
+    // it is the same one converging. It stays owed while the window is
+    // visible — a hidden, dragged, or re-presented window clears it, which
+    // is also what protects a dock-mode window the user parked: it only
+    // ever got there by a drag, and the drag drops the request.
+    pending.set(Some(PendingPosition {
+        at: Instant::now(),
+        shown,
+        settling: true,
+    }));
     true
+}
+
+/// Whether the window's frame intersects no monitor — the parked-window
+/// recovery check. A 0×0 or monitorless answer is not a verdict: the first
+/// says the window is not realized yet (a pending placement covers it), the
+/// second that there is nothing to check against. Two deliberate
+/// simplifications: monitor *full* rects, not work areas — a window parked
+/// entirely under the Dock is still judged reachable (the user can see and
+/// grab enough of it); and `position()`/`size()` both speak physical
+/// pixels, the space the monitor rects already use. Framelessness keeps
+/// outer frame and client area equal, which is what makes the two getters
+/// commensurate.
+fn window_off_screen(app: &AppWindow) -> bool {
+    let size = app.window().size();
+    if size.width == 0 || size.height == 0 {
+        return false;
+    }
+    let mons = monitors(app);
+    if mons.is_empty() {
+        return false;
+    }
+    let pos = app.window().position();
+    let frame: ScreenRect = (
+        pos.x as f64,
+        pos.y as f64,
+        size.width as f64,
+        size.height as f64,
+    );
+    !mons.iter().any(|m| rects_overlap(m.0, frame))
+}
+
+/// Whether two rects share any area — the off-screen test's unit: a window
+/// that meets a monitor at an edge only (`==` on a side) does not overlap it.
+fn rects_overlap((ax, ay, aw, ah): ScreenRect, (bx, by, bw, bh): ScreenRect) -> bool {
+    ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by
 }
 
 /// The directories a provider CLI is looked for in — and, just as importantly,
@@ -10073,6 +10458,66 @@ mod popover_placement_tests {
         let screen = (-1920.0, 0.0, 1920.0, 1080.0);
         let (x, y) = popover_origin(None, CARD, screen, 1.0);
         assert_eq!((x, y), (-1920.0 + 240.0, 48.0));
+    }
+
+    use super::{anchor_on_a_monitor, rect_contains, rects_overlap};
+
+    // The status item reports `(0, screen_height)` for a moment after the
+    // tray is created — its frame before the menu bar has laid it out. A
+    // click drained in that window used to anchor the card to a point below
+    // every monitor, and `popover_origin`'s "above" side then parked it at
+    // the bottom-left of the screen.
+    #[test]
+    fn a_status_items_not_yet_laid_out_rect_is_not_an_anchor() {
+        let mons = [SCREEN];
+        // The transient rect macOS reported on the machine this was found on.
+        let transient = (0.0, 1440.0, 149.0, 30.0);
+        assert!(
+            !anchor_on_a_monitor(transient, &mons),
+            "below the screen's bottom edge — no monitor holds its centre"
+        );
+        // The same item once laid out: top of the screen, clearly inside.
+        let laid_out = (745.0, 0.0, 149.0, 30.0);
+        assert!(anchor_on_a_monitor(laid_out, &mons));
+        // Containment is inclusive at the top and exclusive past the bottom
+        // edge — a rect flush with the last row is still an anchor.
+        let last_row = (0.0, 1410.0, 149.0, 30.0);
+        assert!(anchor_on_a_monitor(last_row, &mons));
+    }
+
+    #[test]
+    fn an_anchor_counts_on_any_monitor_not_just_the_main_one() {
+        let left = (-1920.0, 0.0, 1920.0, 1080.0);
+        let mons = [SCREEN, left];
+        let item = (-40.0, 1040.0, 40.0, 40.0);
+        assert!(anchor_on_a_monitor(item, &mons));
+        assert!(!anchor_on_a_monitor(item, &[SCREEN]));
+    }
+
+    #[test]
+    fn rect_contains_is_inclusive_at_the_origin_and_exclusive_past_the_edge() {
+        assert!(rect_contains(SCREEN, (0.0, 0.0)));
+        assert!(rect_contains(SCREEN, (2559.0, 1439.0)));
+        assert!(!rect_contains(SCREEN, (2560.0, 0.0)));
+        assert!(!rect_contains(SCREEN, (0.0, 1440.0)));
+        assert!(!rect_contains(SCREEN, (-1.0, 700.0)));
+    }
+
+    #[test]
+    fn rects_overlap_only_when_they_share_area() {
+        let window = (240.0, 62.0, 420.0, 925.0);
+        assert!(rects_overlap(SCREEN, window));
+        // Parked entirely on the other monitor: no overlap with the main one.
+        let left = (-1920.0, 0.0, 1920.0, 1080.0);
+        assert!(!rects_overlap(left, window));
+        // Touching an edge is not overlapping it.
+        let flush_below = (0.0, 1440.0, 420.0, 100.0);
+        assert!(!rects_overlap(SCREEN, flush_below));
+        let flush_right = (2560.0, 0.0, 100.0, 100.0);
+        assert!(!rects_overlap(SCREEN, flush_right));
+        // A sliver across the boundary is still on the screen.
+        let straddling = (2500.0, 700.0, 420.0, 100.0);
+        assert!(rects_overlap(SCREEN, straddling));
     }
 }
 
