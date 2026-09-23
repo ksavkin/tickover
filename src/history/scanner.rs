@@ -344,12 +344,18 @@ pub fn scan_root(
             outcome.records += 1;
         }
         buckets.extend(grouped.into_values());
-        if source_empty && full {
+        if source_empty && full && extraction.skipped_unparsed == 0 {
             // A complete pass over a source with *no records* still owns
             // the coverage claim — without a carrier line the seal never
             // fires and stale lines of this (file, gen) sum forever.
             // The tombstone's own range tiles the prefix chain the same
             // way a bucket line would, so live coverage survives it.
+            //
+            // The `skipped_unparsed == 0` gate is load-bearing: a source
+            // whose every record failed to parse (format drift, a torn
+            // giant line, corruption) also yields `source_empty`, but its
+            // older lines hold the only copy of that usage — a tombstone
+            // there would purge history the pass could not read.
             buckets.push(DayLine {
                 v: crate::history::store::SCHEMA_VERSION,
                 hour: chrono::Utc::now().format("%Y-%m-%dT%H").to_string(),
@@ -869,6 +875,46 @@ mod tests {
             live.iter().map(|d| d.input).sum::<u64>(),
             25,
             "gen 1 = 5 (fresh) + 20 (re-derived shared); gen 0 filtered"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An extraction that read to EOF but failed every record: the
+    /// tombstone must stay gated — it would seal away coverage this
+    /// pass could not read.
+    struct CorruptStub;
+    impl HistoryExtractor for CorruptStub {
+        fn extract(
+            &self,
+            _path: &Path,
+            st: &mut FileState,
+            _byte_cap: u64,
+            _deadline: Instant,
+        ) -> io::Result<Extraction> {
+            Ok(Extraction {
+                cursor: st.size,
+                complete: true,
+                skipped_unparsed: 3,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[test]
+    fn a_fully_unparseable_pass_emits_no_tombstone() {
+        let root = tmpdir("corrupt-root");
+        let dir = tmpdir("corrupt-store");
+        fs::write(root.join("t.jsonl"), "garbage").unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let far = Instant::now() + Duration::from_secs(30);
+
+        scan_root(&mut store, "p", &root, "*.jsonl", &CorruptStub, far);
+        store.commit().unwrap();
+        assert_eq!(
+            store.live_days().count(),
+            0,
+            "skipped records are not an empty source — no tombstone line"
         );
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&dir);

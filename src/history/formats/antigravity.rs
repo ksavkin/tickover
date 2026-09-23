@@ -78,8 +78,13 @@ impl HistoryExtractor for AntigravityExtractor {
                 Ok(s) => s,
                 Err(_) => return Ok(out), // schema drift — skip the db entirely
             };
+        // Decode `idx` separately from the payload: a row whose index
+        // reads but whose blob doesn't is permanently unreadable (the
+        // committed bytes won't change), so the watermark must advance
+        // *past* it — leaving it short would retry the same bad row
+        // forever and starve every row after it.
         let Ok(rows) = stmt.query_map([watermark], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            Ok((r.get::<_, i64>(0), r.get::<_, Vec<u8>>(1)))
         }) else {
             return Ok(out);
         };
@@ -95,11 +100,20 @@ impl HistoryExtractor for AntigravityExtractor {
                 break;
             }
             let (idx, blob) = match row {
-                Ok(r) => r,
-                // A row error is unread coverage: `flatten()` would skip it
-                // silently and the seal would claim a file the pass never
-                // fully read.
-                Err(_) => {
+                Ok((Ok(idx), Ok(blob))) => (idx, blob),
+                Ok((Ok(idx), Err(_))) => {
+                    // Payload undecodable but the index read fine: skip
+                    // the row permanently so it can't wedge the scan.
+                    out.skipped_unparsed += 1;
+                    if idx > max_idx {
+                        max_idx = idx;
+                    }
+                    continue;
+                }
+                // An undecodable idx (or a row-level failure) is deeper
+                // corruption: the watermark can't step over an index it
+                // never learned, so the pass ends incomplete here.
+                _ => {
                     out.skipped_unparsed += 1;
                     completed = false;
                     break;
@@ -668,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn a_row_error_fails_the_pass_instead_of_sealing() {
+    fn a_row_error_skips_the_row_instead_of_starving_the_tail() {
         // A `data` column holding TEXT instead of a blob makes the row
         // decode fail. `flatten()` would have skipped it silently and
         // reported `complete` — the seal would then claim coverage the
@@ -702,6 +716,12 @@ mod tests {
                 [],
             )
             .unwrap();
+            // A good row after the bad one — it must not starve.
+            conn.execute(
+                "INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)",
+                [generation_blob_keyed(b"dedup-2")],
+            )
+            .unwrap();
         }
         let size = std::fs::metadata(&db).unwrap().len();
         let mut st = FileState::fresh("d".into(), size, 1);
@@ -709,12 +729,17 @@ mod tests {
         let out = AntigravityExtractor
             .extract(&db, &mut st, u64::MAX, far)
             .unwrap();
-        assert!(
-            !out.complete,
-            "a row error is unread coverage — no seal may fire"
-        );
-        assert_eq!(out.records.len(), 1, "idx = 0 still emitted");
+        // The bad row is skipped permanently: the pass completes, the
+        // tail row is emitted, and the watermark steps over the wreck so
+        // the next pass never retries it.
+        assert!(out.complete, "one bad row must not fail the whole pass");
+        assert_eq!(out.records.len(), 2, "rows 0 and 2 emitted");
         assert_eq!(out.skipped_unparsed, 1);
+        assert_eq!(st.aux["max_idx"].as_i64(), Some(2));
+        let out = AntigravityExtractor
+            .extract(&db, &mut st, u64::MAX, far)
+            .unwrap();
+        assert!(out.records.is_empty() && out.complete);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

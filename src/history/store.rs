@@ -571,72 +571,82 @@ impl HistoryStore {
         // ranges can neither overlap numerically nor share a bucket key,
         // but the rescan covers the same events) — except two kinds:
         //
-        //   * batch-mates (`old.b == d.b`) — lines the same append
-        //     produced for other buckets; they ARE the new coverage.
-        //   * the prefix chain — the earlier passes' lines that tile
+        //   * batch-mates — lines the same append produced for other
+        //     buckets; they ARE the new coverage. One append is one pass
+        //     and emits one shared range, so "same append" is exactly
+        //     `(b, lo, hi)` equality. Bare `b == d.b` would be wrong for
+        //     legacy lines, which all deserialize with `b = 0`: a legacy
+        //     seal would call every older line of the generation a mate
+        //     and kill nothing. Under the shape rule a legacy seal keeps
+        //     only same-range fan-out lines — indistinguishable from its
+        //     own append, which is the best available for them.
+        //   * the prefix chain — the earlier passes' lines inside
         //     `[0, lo)`; their bytes were already counted and this line
-        //     only completes them. The chain is a sequence of *range
-        //     steps*: one pass emits a line per bucket, all sharing the
-        //     pass's range, so membership is decided per distinct range —
-        //     the greedy minimal cover picks which steps form the chain
-        //     and every line of a selected step lives. A line whose range
-        //     isn't a selected step dies: a short stale prefix can't
-        //     steal the chain, and a stray segment inside covered span is
-        //     duplicate coverage.
+        //     only completes them. Honest passes never overlap: each
+        //     emits one shared range per batch and resumes where the
+        //     last cursor stopped, though spans that produced no records
+        //     leave gaps. So a candidate range that overlaps an
+        //     already-kept range is stale — an artifact of a pass that
+        //     appended but never committed, always *older* than the
+        //     re-derivation that replaced it. Candidates are tried
+        //     freshest-batch-first, and a kept step keeps every line of
+        //     its `(range, batch)` — one pass emits a line per bucket,
+        //     all sharing the pass's range and batch id.
         //
         // A `lo == hi == 0` tombstone — a complete pass that had nothing
-        // to emit — seals the same way: nothing tiles `[0, 0)`, so every
-        // older line of the generation dies. A truncated pass's line must
-        // not seal at all: it re-derived a prefix, nothing more.
+        // to emit — seals the same way: nothing covers `[0, 0)`, so
+        // every older line of the generation dies. A truncated pass's
+        // line must not seal at all: it re-derived a prefix, nothing
+        // more.
         if d.full {
             if let Some(idxs) = self.by_file.get_mut(&(d.file.clone(), d.gen)) {
                 let keep: std::collections::HashSet<usize> = idxs
                     .iter()
                     .copied()
-                    .filter(|&i| self.days[i].b == d.b)
-                    .collect();
-                let mut steps: Vec<(u64, u64)> = idxs
-                    .iter()
-                    .copied()
                     .filter(|&i| {
-                        !keep.contains(&i)
-                            && !self.dead.contains(&i)
-                            && self.days[i].hi > self.days[i].lo
-                            && self.days[i].hi <= d.lo
+                        let o = &self.days[i];
+                        o.b == d.b && o.lo == d.lo && o.hi == d.hi
                     })
-                    .map(|i| (self.days[i].lo, self.days[i].hi))
                     .collect();
-                steps.sort_unstable();
-                steps.dedup();
-                // Greedy minimal cover of `[0, d.lo)` over the distinct
-                // step ranges: repeatedly take the range starting at or
-                // before `covered` that reaches farthest. A range never
-                // selected is not part of the contiguous chain.
-                let mut selected: std::collections::HashSet<(u64, u64)> =
+                // Candidate steps: one per (batch, range) — a batch's
+                // lines all share the pass's range. Freshest first: the
+                // latest re-derivation owns contested bytes. Freshness is
+                // `(b, position)` — the batch id, then the line's append
+                // order — because legacy lines all share `b = 0` and only
+                // their position in the file still says which came last.
+                let mut steps: std::collections::BTreeMap<(u64, u64), (u64, usize)> =
+                    std::collections::BTreeMap::new();
+                for &i in idxs.iter() {
+                    let o = &self.days[i];
+                    if keep.contains(&i) || self.dead.contains(&i) || o.hi <= o.lo || o.hi > d.lo {
+                        continue;
+                    }
+                    steps
+                        .entry((o.lo, o.hi))
+                        .and_modify(|e| *e = (*e).max((o.b, i)))
+                        .or_insert((o.b, i));
+                }
+                let mut ordered: Vec<(u64, u64, u64, usize)> = steps
+                    .iter()
+                    .map(|(&(lo, hi), &(b, i))| (lo, hi, b, i))
+                    .collect();
+                ordered.sort_by_key(|&(_, _, b, i)| std::cmp::Reverse((b, i)));
+                let mut taken: Vec<(u64, u64)> = Vec::new();
+                let mut selected: std::collections::HashSet<(u64, u64, u64)> =
                     std::collections::HashSet::new();
-                let mut covered = 0u64;
-                let mut c = 0;
-                while c < steps.len() {
-                    let mut best: Option<(u64, u64)> = None;
-                    while c < steps.len() && steps[c].0 <= covered {
-                        let r = steps[c];
-                        c += 1;
-                        if r.1 > covered && best.is_none_or(|b| r.1 > b.1) {
-                            best = Some(r);
-                        }
+                for (lo, hi, b, _) in ordered {
+                    if taken.iter().any(|&(tlo, thi)| lo < thi && tlo < hi) {
+                        continue; // overlaps a fresher chain step — stale
                     }
-                    match best {
-                        Some(r) => {
-                            covered = r.1;
-                            selected.insert(r);
-                        }
-                        None => break,
-                    }
+                    taken.push((lo, hi));
+                    selected.insert((lo, hi, b));
                 }
                 idxs.retain(|&i| {
-                    if keep.contains(&i)
-                        || (!self.dead.contains(&i)
-                            && selected.contains(&(self.days[i].lo, self.days[i].hi)))
+                    if keep.contains(&i) {
+                        return true;
+                    }
+                    if !self.dead.contains(&i)
+                        && selected.contains(&(self.days[i].lo, self.days[i].hi, self.days[i].b))
                     {
                         return true;
                     }
@@ -877,7 +887,10 @@ impl HistoryStore {
     /// Day lines that still count: a line is stale only when its file is
     /// still tracked at a *newer* generation. Lines from a file that has
     /// since been deleted keep counting — the usage happened; the provider
-    /// removing its log does not un-spend the tokens.
+    /// removing its log does not un-spend the tokens — but only the
+    /// newest generation's: without the state entry nothing suppresses
+    /// superseded generations, so the file's latest *live* gen stands in
+    /// as its remembered watermark.
     pub fn live_days(&self) -> impl Iterator<Item = &DayLine> {
         let current: HashMap<&str, u32> = self
             .state
@@ -885,12 +898,25 @@ impl HistoryStore {
             .iter()
             .map(|(p, s)| (p.as_str(), s.gen))
             .collect();
+        let mut last_live: HashMap<&str, u32> = HashMap::new();
+        for (i, d) in self.days.iter().enumerate() {
+            if self.dead.contains(&i) {
+                continue;
+            }
+            let e = last_live.entry(d.file.as_str()).or_insert(d.gen);
+            if d.gen > *e {
+                *e = d.gen;
+            }
+        }
         self.days
             .iter()
             .enumerate()
             .filter(move |(i, d)| {
                 !self.dead.contains(i)
-                    && current.get(d.file.as_str()).is_none_or(|&gen| gen == d.gen)
+                    && match current.get(d.file.as_str()) {
+                        Some(&gen) => gen == d.gen,
+                        None => last_live.get(d.file.as_str()) == Some(&d.gen),
+                    }
             })
             .map(|(_, d)| d)
     }
@@ -1495,6 +1521,110 @@ mod tests {
             store.live_days().map(|d| d.input).sum::<u64>(),
             260,
             "50 + 60 (real chain) + 150 (seal); the stale 30-token prefix died"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_overlapping_step_loses_to_the_fresher_chain() {
+        // Crash-artifact shape: a pass appended S [0,60) but died before
+        // commit, so the retry re-derived the span as [0,50)+[50,100).
+        // The seal must keep the fresh disjoint chain and kill the stale
+        // overlapping step — keeping both would double-count [50,60).
+        let dir = tmpdir("stalestep");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let mut s = day("/f", 0, 60);
+        s.hour = "2026-09-22T09".into();
+        s.lo = 0;
+        s.hi = 60;
+        store.append_days(&[s]).unwrap(); // batch 1 — crashed pass
+        let mut l1 = day("/f", 0, 50);
+        l1.hour = "2026-09-22T10".into();
+        l1.lo = 0;
+        l1.hi = 50;
+        store.append_days(&[l1]).unwrap(); // batch 2
+        let mut l2 = day("/f", 0, 50);
+        l2.hour = "2026-09-22T11".into();
+        l2.lo = 50;
+        l2.hi = 100;
+        store.append_days(&[l2]).unwrap(); // batch 3
+        let mut seal = day("/f", 0, 100);
+        seal.lo = 100;
+        seal.hi = 200;
+        seal.full = true;
+        store.append_days(&[seal]).unwrap(); // batch 4
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            200,
+            "50 + 50 + 100; the stale overlapping [0,60) step died"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_seal_kills_stale_ranges_and_keeps_shape_mates() {
+        // Pre-batch-id lines all deserialize with `b = 0`. If mates were
+        // matched on `b` alone, a legacy seal would call every older line
+        // of the generation a batch-mate and never kill stale coverage.
+        // The mate test is the full `(b, lo, hi)` shape: one append emits
+        // one range, so equal shape is the best legacy proxy for
+        // "same append".
+        let dir = tmpdir("legacyseal");
+        fs::create_dir_all(&dir).unwrap();
+        let line = |hour: &str, lo: u64, hi: u64, full: bool, input: u64| {
+            format!(
+                r#"{{"v":{SCHEMA_VERSION},"hour":"{hour}","provider":"claude","project":"p","model":"m","session":"s","file":"/f","gen":0,"lo":{lo},"hi":{hi},"full":{full},"input":{input},"output":0,"cache_read":0,"cache_write":0,"thinking":0,"messages":1}}"#
+            )
+        };
+        fs::write(
+            dir.join("days.jsonl"),
+            [
+                line("2026-09-22T09", 0, 60, false, 60), // stale overlapping step
+                line("2026-09-22T10", 0, 50, false, 50), // the real chain
+                line("2026-09-22T11", 50, 100, false, 50),
+                line("2026-09-22T12", 100, 200, true, 100), // seal, bucket 1
+                line("2026-09-22T13", 100, 200, true, 100), // seal, bucket 2
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let store = HistoryStore::open(&dir).unwrap();
+        let live: Vec<_> = store.live_days().cloned().collect();
+        assert_eq!(
+            live.iter().map(|d| d.input).sum::<u64>(),
+            300,
+            "50 + 50 + 100 + 100: stale [0,60) dies, both seal shape-mates live"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_file_counts_only_its_latest_live_generation() {
+        // If a file leaves `state.files` (state rebuilt, roots narrowed),
+        // nothing suppresses its superseded generations anymore — counting
+        // them would double-spend rewritten history. The file's latest
+        // *live* generation stands in as its watermark; a same-gen file
+        // that was deleted still counts in full.
+        let dir = tmpdir("missinggen");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store.append_days(&[day("/f", 0, 10)]).unwrap();
+        store
+            .state
+            .files
+            .insert("/f".to_string(), FileState::fresh("d".into(), 1, 1));
+        store
+            .file_state_mut(Path::new("/f"))
+            .unwrap()
+            .reset("d2".into(), 2, 2);
+        store.append_days(&[day("/f", 1, 7)]).unwrap();
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 7);
+
+        store.state.files.remove("/f"); // the state entry is gone
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            7,
+            "the superseded gen-0 line must not revive without state"
         );
         let _ = fs::remove_dir_all(&dir);
     }

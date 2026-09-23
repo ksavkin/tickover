@@ -119,7 +119,10 @@ workspace name used as the project. (The `steps.step_payload` `"Cwd"`
 fragment an earlier build looked for is unreachable: that column is a
 BLOB, which SQLite `LIKE` never matches.) The session id is the database
 filename's UUID stem. A `max_idx` watermark in scanner state makes
-re-opened databases emit only new rows.
+re-opened databases emit only new rows. A row whose `idx` decodes but
+whose blob does not is skipped permanently — the watermark steps over
+it, because the committed bytes will not change and retrying the same
+row forever would starve every row after it.
 
 ## The shared invariants
 
@@ -160,14 +163,25 @@ created `0600`:
   pass reached the end of the source, so it supersedes every older
   line of the same `(file, gen)` — including ranges written in a
   different coordinate space by an older schema, and lines drifted
-  into other buckets — except its own batch-mates (`b`, one per
-  append, persisted so a reload recognizes them) and the live prefix
-  chain: the earlier lines that tile `[0, lo)` as the greedy minimal
-  cover, which is what lets a completing resume seal without
-  double-counting its own earlier passes. A truncated pass's line
-  supersedes only what it actually re-read, and a complete pass over
-  a source with no records writes a `full` tombstone so the seal
-  still fires.
+  into other buckets — except its own batch-mates and the live
+  prefix chain. Mates are matched on the full `(b, lo, hi)` shape,
+  not `b` alone: one append emits one range, so equal shape is the
+  best proxy for "same append" among legacy lines, which all
+  deserialize with `b = 0`. The chain is a *disjoint* cover of the
+  prefix — honest passes resume where the last cursor stopped, so
+  their ranges never overlap, though a span that produced only
+  deduped or non-usage records leaves a gap. Overlapping candidates
+  are stale artifacts of a pass that appended but never committed;
+  the freshest step wins, where freshness is `(b, append position)`
+  — the batch id, then the line's place in `days.jsonl`, which is
+  the only ordering legacy `b = 0` lines still carry. A kept step
+  keeps every line of its `(range, batch)`: one pass emits a line
+  per bucket, all sharing the pass's range and batch. A truncated
+  pass's line supersedes only what it actually re-read, and a
+  complete pass over a source with no records *and no skipped ones*
+  writes a `full` tombstone so the seal still fires — a source
+  whose every record failed to parse is not empty; its older lines
+  hold the only copy of that usage.
 - `state.json` — per-file cursor, size/mtime, prefix digest (with the
   span it covered), owning provider, generation, a recent dedup ring
   that remembers the usage each id last carried, the extractor's
@@ -188,3 +202,19 @@ file in the same directory, so the tray app and `tickover stats` can
 never interleave writes. Entries under none of the active history roots
 are pruned after each scan — their day lines stay counted, and a path
 that re-enters a root rescans into place via range supersession.
+
+Two edges are accepted rather than chased:
+
+- **Owner-rewrite loses a shared id.** If a dedup id lives in two
+  files, the first file to see it owns it; if that file is later
+  rewritten without it, the second file has already moved past the
+  id and never re-emits it. Releasing ownership on rewrite is what
+  makes the owner's own rescan correct, and no mechanism can know
+  which *other* file held the copy. Bounded to cross-file
+  duplicates whose owning file loses the content on rewrite.
+- **A file vanished from `state.json` counts only its latest live
+  generation.** With the state entry gone nothing marks superseded
+  generations stale, so `live_days` uses the file's newest
+  surviving gen as the remembered watermark — a rewritten-then-
+  deleted file keeps its final readings, not every generation it
+  ever had.
