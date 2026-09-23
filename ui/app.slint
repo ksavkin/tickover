@@ -95,8 +95,8 @@ export struct ActivityData {
     seg-input: float,
     seg-output: float,
     has-cache-write: bool,   // false → the write slot draws dashed/empty
-    missing-share: float,    // >0 → a [history] provider contributed nothing:
-                           // the bar keeps a dashed slot for it (state B)
+    missing-share: float,    // >0 → enabled providers without [history] exist:
+                           // share of providers, dashed slot in the bar (state B)
     legend-cached: string,   // "cached 85%" — "" when nothing was cached
     legend-in: string,       // "in 216K"
     legend-out: string,      // "out 96K"

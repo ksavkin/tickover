@@ -17,7 +17,7 @@ use std::io;
 use std::path::Path;
 use std::time::Instant;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::history::formats::{project_basename, read_new_lines, Extraction, HistoryExtractor};
 use crate::history::store::FileState;
@@ -64,10 +64,15 @@ struct Ctx {
 }
 
 /// Attribution collected from non-usage events, joined onto inference
-/// records by `sid`.
-#[derive(Default)]
+/// records by `sid`. Persisted in `FileState.aux` between passes —
+/// `session created`/`model changed` are written once near session start,
+/// so a resumed read mid-file would otherwise attribute every later turn
+/// to "unknown".
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct SessionInfo {
+    #[serde(default)]
     cwd: Option<String>,
+    #[serde(default)]
     model: Option<String>,
 }
 
@@ -88,7 +93,13 @@ impl HistoryExtractor for GrokExtractor {
         // Two passes over the same buffer: `session created`/`model
         // changed` can appear lines after the inference they describe, so
         // attribution is collected file-wide before records are built.
-        let mut sessions: HashMap<String, SessionInfo> = HashMap::new();
+        // The map is seeded from `aux` — events already consumed by earlier
+        // passes are behind the cursor and won't be re-read here.
+        let mut sessions: HashMap<String, SessionInfo> = st
+            .aux
+            .get("sess")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
         for raw in buf.split(|&b| b == b'\n') {
             if raw.is_empty() || raw.len() > MAX_LINE_BYTES {
                 continue;
@@ -127,6 +138,7 @@ impl HistoryExtractor for GrokExtractor {
                 continue;
             }
             let Ok(line) = serde_json::from_slice::<Line>(raw) else {
+                out.skipped_unparsed += 1;
                 continue;
             };
             if line.msg.as_deref() != Some("shell.turn.inference_done") {
@@ -142,7 +154,11 @@ impl HistoryExtractor for GrokExtractor {
                 out.skipped_unparsed += 1;
                 continue;
             };
-            let sid = line.sid.unwrap_or_default();
+            let sid = line
+                .sid
+                .clone()
+                .or_else(|| ctx.session_id.clone())
+                .unwrap_or_default();
             let info = sessions.get(&sid);
             out.records.push(UsageRecord {
                 ts,
@@ -164,6 +180,12 @@ impl HistoryExtractor for GrokExtractor {
                 ),
             });
         }
+        // Persist attribution for the next pass — the events that produced
+        // it sit behind the cursor by then.
+        st.aux.insert(
+            "sess".to_string(),
+            serde_json::to_value(&sessions).unwrap_or_default(),
+        );
         Ok(out)
     }
 }
@@ -209,5 +231,44 @@ mod tests {
         assert_eq!(r.project, "proj");
         assert_eq!(r.model, "grok-4.5");
         assert_eq!(r.session_id, "s1");
+    }
+
+    #[test]
+    fn a_resumed_pass_keeps_attribution_from_aux() {
+        // unified.jsonl is append-only; the `session created` line is read
+        // once. The next pass must still attribute later turns — from the
+        // persisted sessions map, not "unknown".
+        let tmp = TmpDir::new("grok-resume");
+        let head = concat!(
+            r#"{"ts":"2026-09-22T10:00:00.000Z","sid":"s1","msg":"session created","ctx":{"cwd":"/u/proj"}}"#,
+            "\n",
+            r#"{"ts":"2026-09-22T10:00:01.000Z","sid":"s1","msg":"model changed","ctx":{"model":"grok-4.5"}}"#,
+            "\n",
+        );
+        let p = tmp.write("unified.jsonl", head);
+        let mut st = fresh();
+        let first = GrokExtractor
+            .extract(&p, &mut st, u64::MAX, later())
+            .unwrap();
+        assert!(first.records.is_empty());
+        st.cursor = first.cursor;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&p)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(concat!(
+                    r#"{"ts":"2026-09-22T10:05:00.000Z","sid":"s1","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":100,"completion_tokens":20}}"#,
+                    "\n"
+                ).as_bytes())
+            })
+            .unwrap();
+        let second = GrokExtractor
+            .extract(&p, &mut st, u64::MAX, later())
+            .unwrap();
+        assert_eq!(second.records.len(), 1);
+        assert_eq!(second.records[0].project, "proj");
+        assert_eq!(second.records[0].model, "grok-4.5");
+        assert_eq!(second.records[0].session_id, "s1");
     }
 }

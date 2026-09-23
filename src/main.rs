@@ -5621,25 +5621,42 @@ fn spawn_history_scan(ctx: &Ctx) {
                     let _ = tx.send(());
                 }
             };
-            let Some(dir) = tickover::history::default_dir() else {
-                return report_done(false);
-            };
-            let Ok(mut store) = tickover::history::store::HistoryStore::open(&dir) else {
-                return report_done(false);
-            };
-            // Resumable ticks: a pass that stopped on its wall-clock budget
-            // reports `partial`, and a cold corpus takes a few of them.
-            for _ in 0..8 {
-                let scans = tickover::history::scan_tick(&mut store, &manifests, &plugin_options);
-                if let Err(e) = store.commit() {
-                    diag::line(format!("history: store commit failed: {e}"));
-                    return report_done(false);
+            // A panic in a scan must still release `busy` — otherwise the
+            // card would sit on "scanning…" forever and never scan again.
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let Some(dir) = tickover::history::default_dir() else {
+                    return false;
+                };
+                // `tickover stats` can scan this same store concurrently —
+                // the lock serializes open+scan+commit across processes.
+                let Ok(_lock) = tickover::history::store::lock_store(&dir) else {
+                    return false;
+                };
+                let Ok(mut store) = tickover::history::store::HistoryStore::open(&dir) else {
+                    return false;
+                };
+                // Resumable ticks: a pass that stopped on its wall-clock
+                // budget reports `partial`; a cold corpus takes a few.
+                for _ in 0..8 {
+                    let scans =
+                        tickover::history::scan_tick(&mut store, &manifests, &plugin_options);
+                    if let Err(e) = store.commit() {
+                        diag::line(format!("history: store commit failed: {e}"));
+                        return false;
+                    }
+                    if !scans.iter().any(|s| s.outcome.partial) {
+                        break;
+                    }
                 }
-                if !scans.iter().any(|s| s.outcome.partial) {
-                    break;
+                true
+            }));
+            match run {
+                Ok(moved) => report_done(moved),
+                Err(_) => {
+                    diag::line("history: scan thread panicked".into());
+                    report_done(false);
                 }
             }
-            report_done(true);
         })
         .is_err()
     {
@@ -5662,7 +5679,7 @@ fn sync_activity(app: &AppWindow, ctx: &Ctx) {
     let plugins = ctx.plugins.borrow();
     let history_providers: Vec<String> = plugins
         .iter()
-        .filter(|m| m.history.is_some())
+        .filter(|m| m.history.is_some() && plugin_enabled(m))
         .map(|m| m.id.clone())
         .collect();
     if history_providers.is_empty() {
@@ -5801,12 +5818,18 @@ fn activity_data(
     } else {
         String::new()
     };
-    // The dashed slot's width: the counted providers' shares leave it the
-    // rest of the bar, like the mock's flex-grow slot — a visible missing
-    // chunk, never a fabricated share.
-    let seg_sum: f32 = sum.segments.iter().sum();
+    // The dashed slot's width is the share of *providers* not counted —
+    // a real number (how many enabled providers publish no history), not
+    // an invented token share. Segment weights rescale so the bar still
+    // totals one: counted providers keep `counted/total` of it.
+    let counted_providers = plugins
+        .iter()
+        .filter(|m| m.history.is_some() && plugin_enabled(m))
+        .count();
+    let total_providers = (counted_providers + sum.not_counted.len()).max(1) as f32;
+    let seg_scale = counted_providers as f32 / total_providers;
     let missing_share = if partial {
-        (seg_sum * 0.5).max(0.15)
+        sum.not_counted.len() as f32 / total_providers
     } else {
         0.0
     };
@@ -5837,10 +5860,10 @@ fn activity_data(
                 })
                 .collect::<Vec<_>>(),
         )),
-        seg_cache_read: sum.segments[0],
-        seg_cache_write: sum.segments[1],
-        seg_input: sum.segments[2],
-        seg_output: sum.segments[3],
+        seg_cache_read: sum.segments[0] * seg_scale,
+        seg_cache_write: sum.segments[1] * seg_scale,
+        seg_input: sum.segments[2] * seg_scale,
+        seg_output: sum.segments[3] * seg_scale,
         has_cache_write: sum.segments[1] > 0.0,
         missing_share,
         legend_cached: ss(sum

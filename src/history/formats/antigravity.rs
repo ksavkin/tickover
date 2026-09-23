@@ -20,9 +20,8 @@
 //!        └─ field 19 string model name
 //! ```
 //!
-//! Attribution comes from two more tables: the session timestamp from
-//! `trajectory_metadata_blob` field 2 (a Timestamp), and the project from
-//! the first `steps.step_payload` containing a `"Cwd":"…"` JSON fragment.
+//! Attribution comes from `trajectory_metadata_blob`: field 2 is the
+//! session Timestamp, field 18 the workspace name used as the project.
 //! The session id is the database filename's UUID stem.
 //!
 //! The database is opened read-only (`mode=ro`, `query_only`); a busy or
@@ -36,7 +35,7 @@ use std::time::Instant;
 
 use rusqlite::{Connection, OpenFlags};
 
-use crate::history::formats::{project_basename, Extraction, HistoryExtractor};
+use crate::history::formats::{Extraction, HistoryExtractor};
 use crate::history::store::FileState;
 use crate::history::UsageRecord;
 
@@ -48,10 +47,10 @@ impl HistoryExtractor for AntigravityExtractor {
         path: &Path,
         st: &mut FileState,
         _byte_cap: u64,
-        _deadline: Instant,
+        deadline: Instant,
     ) -> io::Result<Extraction> {
         let mut out = Extraction::default();
-        let uri = format!("file:{}?mode=ro", path.to_string_lossy());
+        let uri = format!("file:{}?mode=ro", uri_encode(&path.to_string_lossy()));
         let conn = match Connection::open_with_flags(
             &uri,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -70,7 +69,7 @@ impl HistoryExtractor for AntigravityExtractor {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        let watermark = *st.aux.get("max_idx").unwrap_or(&0) as i64;
+        let watermark = st.aux.get("max_idx").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
         let mut stmt =
             match conn.prepare("SELECT idx, data FROM gen_metadata WHERE idx > ?1 ORDER BY idx") {
                 Ok(s) => s,
@@ -84,6 +83,11 @@ impl HistoryExtractor for AntigravityExtractor {
         let mut max_idx = watermark;
         let mut seen_keys = std::collections::HashSet::new();
         for row in rows.flatten() {
+            // Honour the pass deadline mid-scan: `max_idx` only covers the
+            // rows already emitted, so an early stop resumes correctly.
+            if Instant::now() >= deadline {
+                break;
+            }
             let (idx, blob) = row;
             if idx > max_idx {
                 max_idx = idx;
@@ -117,7 +121,7 @@ impl HistoryExtractor for AntigravityExtractor {
                 Gen::NoUsage => {}
             }
         }
-        st.aux.insert("max_idx".into(), max_idx as u64);
+        st.aux.insert("max_idx".into(), (max_idx as u64).into());
         out.cursor = st.size;
         Ok(out)
     }
@@ -184,44 +188,22 @@ fn session_timestamp(conn: &Connection) -> Option<i64> {
         .map(|t| t.timestamp())
 }
 
-/// First `steps.step_payload` carrying a `"Cwd":"…"` JSON fragment →
-/// project basename. The payload is a JSON-in-protobuf envelope, so a
-/// substring scan is cheaper and no less correct than full decoding.
+/// The workspace name lives in `trajectory_metadata_blob` field 18 of the
+/// `id='main'` row — the conversation's own statement of which project it
+/// ran in. (The `steps.step_payload` `"Cwd"` fragment an earlier build
+/// looked for is unreachable anyway: the column is a BLOB and SQLite
+/// `LIKE` never matches a blob, and on current builds it names agent
+/// scratch dirs rather than the workspace.)
 fn session_project(conn: &Connection) -> String {
-    let blob: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT step_payload FROM steps WHERE step_payload LIKE '%\"Cwd\":\"%' \
-             ORDER BY idx LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .ok();
-    let Some(blob) = blob else {
-        return "unknown".into();
-    };
-    let needle = b"\"Cwd\":\"";
-    let Some(start) = find_subslice(&blob, needle).map(|i| i + needle.len()) else {
-        return "unknown".into();
-    };
-    // Scan to the closing quote, honouring backslash escapes, then decode
-    // the JSON string literal to unescape the path.
-    let mut end = start;
-    let mut escaped = false;
-    while end < blob.len() {
-        match (blob[end], escaped) {
-            (b'\\', false) => escaped = true,
-            (b'"', false) => break,
-            _ => escaped = false,
-        }
-        end += 1;
-    }
-    let literal = format!("\"{}\"", String::from_utf8_lossy(&blob[start..end]));
-    let cwd = serde_json::from_str::<String>(&literal).unwrap_or_default();
-    project_basename((!cwd.is_empty()).then_some(cwd.as_str()))
-}
-
-fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
+    conn.query_row(
+        "SELECT data FROM trajectory_metadata_blob WHERE id = 'main' LIMIT 1",
+        [],
+        |r| r.get::<_, Vec<u8>>(0),
+    )
+    .ok()
+    .and_then(|blob| string_field(&blob, 18))
+    .filter(|s| !s.is_empty())
+    .unwrap_or_else(|| "unknown".into())
 }
 
 // ---- minimal protobuf wire decoder -------------------------------------
@@ -306,6 +288,21 @@ fn message_field(blob: &[u8], target: u64) -> Option<&[u8]> {
 
 fn string_field(blob: &[u8], target: u64) -> Option<String> {
     message_field(blob, target).and_then(|b| String::from_utf8(b.to_vec()).ok())
+}
+
+/// `file:` URI path escaping — `?`, `#` and `%` would corrupt the query
+/// string; everything else passes through as UTF-8.
+fn uri_encode(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for b in path.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Decode a `google.protobuf.Timestamp` (fields 1/2: seconds/nanos).

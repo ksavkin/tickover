@@ -36,7 +36,7 @@ name        = "Grok"
 version     = "1.1.0"
 description = "Grok CLI billing: credit usage window, prepaid balance and pay-as-you-go allowance."
 manifest    = "grok.toml"
-sha256      = "5fbb91ba23842128c6fe78a30c10e2c56bd76c99444f1b1bd90c2848771b255a"
+sha256      = "61a01a9c2d2c0fe94cf61964e7de754a9514681843d544dbd1c4a0a6bf7e154f"
 
 [[plugin]]
 id          = "antigravity"

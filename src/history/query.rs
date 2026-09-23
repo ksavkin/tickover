@@ -102,6 +102,9 @@ pub struct Stats {
     /// Consecutive local days ending today (or yesterday, if today has no
     /// usage yet) with nonzero totals.
     pub streak_days: u32,
+    /// All-time count of days with any usage — `daily` is bounded by the
+    /// `days` argument, so the report's all-time cards need this instead.
+    pub active_days: u64,
     /// Cumulative unparsed-line count across all tracked files.
     pub skipped_unparsed: u64,
 }
@@ -131,6 +134,7 @@ pub fn compute(store: &HistoryStore, days: u32) -> Stats {
         active_hours: [0; 24],
         sessions: Vec::new(),
         streak_days: 0,
+        active_days: 0,
         skipped_unparsed: store.state.files.values().map(|f| f.skipped_unparsed).sum(),
     };
 
@@ -212,6 +216,7 @@ pub fn compute(store: &HistoryStore, days: u32) -> Stats {
         v
     };
     st.streak_days = streak(&day_totals, today);
+    st.active_days = day_totals.len() as u64;
     st.heatmap = heatmap(&day_totals, today);
     st
 }
@@ -450,8 +455,10 @@ pub fn panel(
         ),
     };
     let mut base_total = 0u64;
-    // For 24h the baseline is a 7-day mean of daily totals.
-    let mut base_days = 0u64;
+    // The 24h baseline is a mean *daily* total over the window — bucket
+    // rows are per (hour × provider × project × model × session), so the
+    // denominator must be the window's day count, not the row count.
+    let mut base_days: std::collections::HashSet<NaiveDate> = std::collections::HashSet::new();
 
     let mut class_totals = Totals::default();
     let mut projects: HashMap<String, Totals> = HashMap::new();
@@ -470,7 +477,7 @@ pub fn panel(
         let day = local.date_naive();
         if day >= base_lo && day <= base_hi {
             base_total += d.sum();
-            base_days += 1;
+            base_days.insert(day);
         }
         let Some(slot) = slot_of(d) else { continue };
         slots[slot] += d.sum();
@@ -495,8 +502,8 @@ pub fn panel(
 
     out.delta = match range {
         PanelRange::Day => {
-            // Mean daily total over the 7 baseline days that had any data.
-            (base_days > 0).then(|| base_total as f64 / base_days as f64)
+            // Mean daily total over the baseline days that had any data.
+            (!base_days.is_empty()).then(|| base_total as f64 / base_days.len() as f64)
         }
         _ => (base_total > 0).then_some(base_total as f64),
     }
@@ -504,15 +511,18 @@ pub fn panel(
     .map(|b| (range_total as f64 - b) / b);
 
     let denom = range_total.max(1) as f32;
+    // `thinking` folds into the output segment, matching the report's
+    // mix bar — providers that report reasoning separately would otherwise
+    // leave that share of the range unaccounted in the bar.
     out.segments = [
         class_totals.cache_read as f32 / denom,
         class_totals.cache_write as f32 / denom,
         class_totals.input as f32 / denom,
-        class_totals.output as f32 / denom,
+        (class_totals.output + class_totals.thinking) as f32 / denom,
     ];
     out.cache_hit_pct = class_totals.cache_hit_pct();
     out.in_tokens = class_totals.input;
-    out.out_tokens = class_totals.output;
+    out.out_tokens = class_totals.output + class_totals.thinking;
     out.est_cost = cost_fn.and_then(|f| {
         let mut sum = 0.0;
         let mut any = false;
@@ -542,16 +552,10 @@ pub fn panel(
             m
         });
     out.streak_days = streak(&day_totals, today);
-    // "Ended" names the most recent *completed* run. An inactive today
-    // means `streak`'s yesterday-anchored run is exactly that; an active
-    // today means the live run doesn't count and the one before it does.
-    out.streak_ended = if day_totals.contains_key(&today) {
-        ended_streak(&day_totals, today, out.streak_days)
-    } else if out.streak_days > 0 {
-        out.streak_days
-    } else {
-        ended_streak(&day_totals, today, 0)
-    };
+    // "Ended" names the most recent *completed* run — the live run is
+    // skipped whether it is anchored at today or yesterday, since a run
+    // that could still grow has not ended.
+    out.streak_ended = ended_streak(&day_totals, today, out.streak_days);
     out.not_counted = quota_only.to_vec();
 
     out.state = if !any_history {
@@ -589,8 +593,12 @@ pub fn window_burn(store: &HistoryStore, provider: &str, since_unix: u64) -> Opt
     let tokens: u64 = store
         .live_days()
         .filter(|d| d.provider == provider)
-        .filter_map(|d| parse_bucket_hour(&d.hour).map(|h| (h, d.sum())))
-        .filter(|(h, _)| *h >= since)
+        // Burn excludes cache reads — a resent context is not fresh spend.
+        .filter_map(|d| parse_bucket_hour(&d.hour).map(|h| (h, d.active())))
+        // Buckets are hour-granular: the hour containing `since` counts
+        // whole — dropping it would zero out any window shorter than an
+        // hour or one that starts mid-hour.
+        .filter(|(h, _)| *h + Duration::hours(1) > since)
         .map(|(_, s)| s)
         .sum();
     (tokens > 0).then(|| (tokens, (now - since).num_seconds().max(1) as f64 / 3600.0))
@@ -626,6 +634,8 @@ mod tests {
             session: format!("s-{provider}"),
             file: "/f".into(),
             gen: 0,
+            lo: 0,
+            hi: 0,
             input,
             output: input / 4,
             cache_read: input * 2,

@@ -26,7 +26,7 @@ use std::io;
 use std::path::Path;
 use std::time::Instant;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::history::formats::{project_basename, read_new_lines, Extraction, HistoryExtractor};
 use crate::history::store::FileState;
@@ -102,9 +102,16 @@ impl TokenUsage {
     /// A counter that moved backwards (session compaction, restart) is
     /// reset: the delta is the new value itself rather than a wrapped
     /// negative.
-    fn delta(&self, aux: &mut std::collections::BTreeMap<String, u64>) -> TokenUsage {
-        fn diff(aux: &mut std::collections::BTreeMap<String, u64>, key: &str, now: u64) -> u64 {
-            let prev = aux.insert(key.to_string(), now).unwrap_or(0);
+    fn delta(&self, aux: &mut std::collections::BTreeMap<String, serde_json::Value>) -> TokenUsage {
+        fn diff(
+            aux: &mut std::collections::BTreeMap<String, serde_json::Value>,
+            key: &str,
+            now: u64,
+        ) -> u64 {
+            let prev = aux
+                .insert(key.to_string(), now.into())
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             // Counter moved backwards → compaction/restart, not a wrap:
             // the new value is the delta itself.
             if now >= prev {
@@ -121,15 +128,37 @@ impl TokenUsage {
             reasoning_output_tokens: diff(aux, AUX_THINKING, self.reasoning_output_tokens),
         }
     }
+
+    /// Advance the baseline without emitting a delta — for events that
+    /// carry `last_token_usage` beside the cumulative figures. A later
+    /// total-only event must diff against *this* reading, not the last
+    /// time the total alone was seen, or every earlier token counts twice.
+    fn advance(&self, aux: &mut std::collections::BTreeMap<String, serde_json::Value>) {
+        aux.insert(AUX_INPUT.to_string(), self.input_tokens.into());
+        aux.insert(AUX_CACHED.to_string(), self.cached_input_tokens.into());
+        aux.insert(
+            AUX_CACHE_WRITE.to_string(),
+            self.cache_write_input_tokens.into(),
+        );
+        aux.insert(AUX_OUTPUT.to_string(), self.output_tokens.into());
+        aux.insert(
+            AUX_THINKING.to_string(),
+            self.reasoning_output_tokens.into(),
+        );
+    }
 }
 
-/// Per-file session context, rebuilt within a pass from the lines
-/// themselves — `session_meta` sits at the top, `turn_context` refreshes
-/// model/cwd as the session goes.
-#[derive(Default)]
+/// Per-file session context — `session_meta` sits at the top, `turn_context`
+/// refreshes model/cwd as the session goes. Persisted in `FileState.aux`
+/// under `ctx`: a resumed read starts mid-file, past both line kinds, so
+/// without it every post-first-pass record would lose id, cwd and model.
+#[derive(Default, Serialize, Deserialize)]
 struct SessionCtx {
+    #[serde(default)]
     id: String,
+    #[serde(default)]
     cwd: Option<String>,
+    #[serde(default)]
     model: Option<String>,
 }
 
@@ -147,18 +176,22 @@ impl HistoryExtractor for CodexExtractor {
             cursor,
             ..Default::default()
         };
-        // A resumed read starts mid-file with no session_meta — recover the
-        // session id from the file name (`rollout-<ts>-<uuid>.jsonl` ends
-        // with the uuid) so records still dedup and group correctly.
-        let mut ctx = SessionCtx {
-            id: path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.rsplit('-').next())
-                .unwrap_or_default()
-                .to_string(),
-            ..Default::default()
-        };
+        // A resumed read starts mid-file, past `session_meta` — restore the
+        // session context persisted last pass, falling back to the file
+        // name's trailing uuid (`rollout-<ts>-<uuid>.jsonl`, 36 chars).
+        let mut ctx: SessionCtx = st
+            .aux
+            .get("ctx")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        if ctx.id.is_empty() {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                let tail = &stem[stem.len().saturating_sub(36)..];
+                if tail.len() == 36 {
+                    ctx.id = tail.to_string();
+                }
+            }
+        }
         let mut offset_in_buf = resume_from;
         for raw in buf.split(|&b| b == b'\n') {
             let line_start = offset_in_buf;
@@ -168,7 +201,10 @@ impl HistoryExtractor for CodexExtractor {
             }
             let line: Line = match serde_json::from_slice(raw) {
                 Ok(l) => l,
-                Err(_) => continue,
+                Err(_) => {
+                    out.skipped_unparsed += 1;
+                    continue;
+                }
             };
             let Some(payload) = line.payload else {
                 continue;
@@ -194,14 +230,18 @@ impl HistoryExtractor for CodexExtractor {
                 }
                 ("event_msg", "token_count") => {
                     let Some(info) = payload.info else { continue };
-                    // `last_token_usage` is the delta outright; only a
-                    // total-only `info` needs the cumulative diff.
-                    let usage = match info.last_token_usage {
-                        Some(u) => u,
-                        None => match info.total_token_usage {
-                            Some(t) => t.delta(&mut st.aux),
-                            None => continue,
-                        },
+                    // `last_token_usage` is the delta outright; a total-only
+                    // `info` needs the cumulative diff. Either way the
+                    // baseline advances to this event's total, so a later
+                    // total-only event diffs against the right watermark.
+                    let usage = match (info.last_token_usage, info.total_token_usage) {
+                        (Some(u), Some(t)) => {
+                            t.advance(&mut st.aux);
+                            u
+                        }
+                        (Some(u), None) => u,
+                        (None, Some(t)) => t.delta(&mut st.aux),
+                        (None, None) => continue,
                     };
                     let Some(ts) = line
                         .timestamp
@@ -232,6 +272,12 @@ impl HistoryExtractor for CodexExtractor {
                 _ => {}
             }
         }
+        // Persist the session context so a resumed pass reads records with
+        // the same attribution the first pass saw.
+        st.aux.insert(
+            "ctx".to_string(),
+            serde_json::to_value(&ctx).unwrap_or_default(),
+        );
         Ok(out)
     }
 }
@@ -360,6 +406,63 @@ mod tests {
             .extract(&p, &mut fresh(), u64::MAX, later())
             .unwrap();
         assert_eq!(ex.records[1].input, 800);
+    }
+
+    #[test]
+    fn last_usage_still_advances_the_cumulative_baseline() {
+        // A `last_token_usage` event followed by a totals-only event: the
+        // second must diff against the first's total, not zero — otherwise
+        // the whole session re-counts.
+        let tmp = TmpDir::new("codex-mixed");
+        let both = r#"{"timestamp":"2026-09-22T10:01:00.000Z","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":1000},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":1000}},"rate_limits":null}}"#;
+        let total_only = r#"{"timestamp":"2026-09-22T10:02:00.000Z","ordinal":3,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1500,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":1500}},"rate_limits":null}}"#;
+        let p = tmp.write(
+            "r.jsonl",
+            &([meta("s", "/u/p"), both.to_string(), total_only.to_string()].join("\n") + "\n"),
+        );
+        let ex = CodexExtractor
+            .extract(&p, &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert_eq!(
+            ex.records.iter().map(|r| r.input).collect::<Vec<_>>(),
+            vec![1000, 500],
+            "the totals-only event diffs against 1000, not 0"
+        );
+    }
+
+    #[test]
+    fn a_resumed_pass_keeps_the_persisted_session_context() {
+        // Two passes over one file through the same FileState: the second
+        // pass's bytes carry no session_meta, so attribution must come
+        // from aux — otherwise everything past the first scan lands under
+        // "unknown".
+        let tmp = TmpDir::new("codex-resume");
+        let p = tmp.write(
+            "rollout-x-sess1.jsonl",
+            &(meta("sess1", "/u/proj") + "\n" + &turn_ctx("gpt-5.2-codex") + "\n"),
+        );
+        let mut st = fresh();
+        let first = CodexExtractor
+            .extract(&p, &mut st, u64::MAX, later())
+            .unwrap();
+        assert!(first.records.is_empty());
+        st.cursor = first.cursor;
+        // The session's first token_count arrives in a later append.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&p)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all((token_count(7, 100, 40, 30) + "\n").as_bytes())
+            })
+            .unwrap();
+        let second = CodexExtractor
+            .extract(&p, &mut st, u64::MAX, later())
+            .unwrap();
+        assert_eq!(second.records.len(), 1);
+        assert_eq!(second.records[0].project, "proj");
+        assert_eq!(second.records[0].model, "gpt-5.2-codex");
+        assert_eq!(second.records[0].session_id, "sess1");
     }
 
     #[test]

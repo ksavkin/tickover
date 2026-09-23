@@ -32,10 +32,22 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// extractors dedup *within* a pass themselves.
 const RECENT_IDS_PER_FILE: usize = 512;
 
+/// How many dedup keys the store remembers across files — larger than the
+/// per-file ring because it is the only guard against a record arriving
+/// via a second file on a later pass.
+const GLOBAL_RECENT_IDS: usize = 8192;
+
+/// `serde` default for `digest_len` on state written before the field
+/// existed — those digests covered `min(PREFIX_BYTES, size)`, and the
+/// `.min(st.size)` at compare time restores the same span.
+fn default_digest_len() -> u64 {
+    PREFIX_BYTES as u64
+}
+
 /// First bytes of a file hashed into [`FileState::digest`] — enough to
 /// catch a rewrite that keeps size/mtime plausible (Claude transcripts and
 /// Codex rollouts both start with a header line naming their own ids).
-const PREFIX_BYTES: usize = 4096;
+pub(crate) const PREFIX_BYTES: usize = 4096;
 
 /// Rewrite `days.jsonl` once it passes this size — a lazy bound so a
 /// provider that rewrites its history constantly cannot grow the log
@@ -54,9 +66,17 @@ pub struct FileState {
     /// timestamp watermark (ms) for SQLite — either way it only ever moves
     /// forward within one `gen`.
     pub cursor: u64,
-    /// blake2b hex of the first [`PREFIX_BYTES`], recomputed when `mtime`
-    /// moves — a changed prefix means the file was rewritten, not appended.
+    /// blake2b hex of the file's first [`Self::digest_len`] bytes,
+    /// recomputed when `mtime` moves — a changed prefix means the file was
+    /// rewritten, not appended.
     pub digest: String,
+    /// How many bytes `digest` covers: `min(PREFIX_BYTES, size)` at the
+    /// time the digest was taken. For a file smaller than [`PREFIX_BYTES`]
+    /// this is the whole file, and it is what lets an *append* to such a
+    /// file still verify as append — comparing a fixed 4 KiB prefix would
+    /// re-digest the newly grown tail and look like a rewrite every pass.
+    #[serde(default = "default_digest_len")]
+    pub digest_len: u64,
     /// Incremented on every reset; [`DayLine::gen`] lines from an older
     /// generation stop counting the moment this bumps.
     pub gen: u32,
@@ -68,19 +88,24 @@ pub struct FileState {
     pub skipped_unparsed: u64,
     /// Format-specific extractor state that must survive between passes —
     /// e.g. Codex's cumulative `total_token_usage` baseline when a file's
-    /// events lack `last_token_usage` and deltas have to be diffed. Opaque
-    /// to the store; owned entirely by the extractor.
+    /// events lack `last_token_usage`, or the session-attribution map Grok
+    /// needs once the `session created` lines are behind the cursor.
+    /// `serde_json::Value` rather than a narrower shape: what a format
+    /// needs remembered is the format's business. Opaque to the store;
+    /// owned entirely by the extractor.
     #[serde(default)]
-    pub aux: BTreeMap<String, u64>,
+    pub aux: BTreeMap<String, serde_json::Value>,
 }
 
 impl FileState {
     /// A file seen for the first time — nothing consumed, generation 0.
+    /// `digest` must cover the first `min(PREFIX_BYTES, size)` bytes.
     pub fn fresh(digest: String, size: u64, mtime: i64) -> Self {
         FileState {
             size,
             mtime,
             cursor: 0,
+            digest_len: PREFIX_BYTES.min(size as usize) as u64,
             digest,
             gen: 0,
             recent_ids: VecDeque::new(),
@@ -96,6 +121,7 @@ impl FileState {
         self.size = size;
         self.mtime = mtime;
         self.cursor = 0;
+        self.digest_len = PREFIX_BYTES.min(size as usize) as u64;
         self.digest = digest;
         self.gen += 1;
         self.recent_ids.clear();
@@ -125,6 +151,13 @@ pub struct ScannerState {
     pub version: u32,
     #[serde(default)]
     pub files: BTreeMap<String, FileState>,
+    /// Cross-file dedup ring, oldest first. Per-file `recent_ids` covers a
+    /// record re-read from its own file; this one covers the same record
+    /// surfacing in a *second* file on a later pass (Grok's unified log and
+    /// a session's `updates.jsonl` carry the same turn, and the wall-clock
+    /// budget can put those files in different passes).
+    #[serde(default)]
+    pub global_ids: VecDeque<String>,
 }
 
 /// One aggregate line in `days.jsonl`. This is the *only* thing history
@@ -146,6 +179,14 @@ pub struct DayLine {
     /// file's older contributions are identifiable as stale.
     pub file: String,
     pub gen: u32,
+    /// Byte range of the file this bucket was extracted from:
+    /// `[cursor at pass start, cursor at pass end)`. Two lines with the
+    /// same bucket key and overlapping ranges are the same bytes parsed
+    /// twice — the crash-rescan artifact the load path supersedes.
+    #[serde(default)]
+    pub lo: u64,
+    #[serde(default)]
+    pub hi: u64,
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
@@ -155,10 +196,65 @@ pub struct DayLine {
     pub messages: u32,
 }
 
+/// Advisory exclusive lock on the store directory — held for a whole
+/// open→scan→commit cycle. The tray app and `tickover stats` share this
+/// store, and without it a lost-update race on `state.json` re-reads bytes
+/// the other process already committed. `File::lock` releases on drop and
+/// on process death, so a crashed scanner never leaves it held.
+pub struct StoreLock(#[allow(dead_code)] fs::File);
+
+/// Take the store lock for `dir`, blocking until a concurrent scan
+/// finishes. The returned guard keeps the lock; dropping releases it.
+pub fn lock_store(dir: &Path) -> io::Result<StoreLock> {
+    fs::create_dir_all(dir)?;
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join("lock"))?;
+    f.lock()?;
+    Ok(StoreLock(f))
+}
+
+/// `File::create` with 0600 on unix — the store's files hold project
+/// basenames and session ids; world-readable is not acceptable.
+#[cfg(unix)]
+fn enforce_private(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let world_readable = fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o077 != 0)
+        .unwrap_or(false);
+    if world_readable {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+}
+
+#[cfg(not(unix))]
+fn enforce_private(_path: &Path) {}
+
+/// `File::create` with 0600 on unix — the store's files hold project
+/// basenames and session ids; world-readable is not acceptable.
+fn create_private(path: &Path) -> io::Result<fs::File> {
+    let mut oo = fs::OpenOptions::new();
+    oo.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        oo.mode(0o600);
+    }
+    oo.open(path)
+}
+
 impl DayLine {
     /// Total tokens across every class in this bucket.
     pub fn sum(&self) -> u64 {
         self.input + self.output + self.cache_read + self.cache_write + self.thinking
+    }
+
+    /// Tokens that had to be generated — everything except cache reads.
+    /// The "burn" figure; a resent context must not count as fresh spend.
+    pub fn active(&self) -> u64 {
+        self.input + self.output + self.cache_write + self.thinking
     }
 }
 
@@ -187,6 +283,10 @@ impl HistoryStore {
     /// and a torn append is survivable.
     pub fn open(dir: &Path) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
+        // Files written by an older version may sit at the umask default —
+        // tighten them now rather than only at the next create.
+        enforce_private(&Self::state_path(dir));
+        enforce_private(&Self::days_path(dir));
         let state = match fs::read_to_string(Self::state_path(dir)) {
             Ok(text) => match serde_json::from_str::<ScannerState>(&text) {
                 Ok(s) if s.version == SCHEMA_VERSION => s,
@@ -202,27 +302,67 @@ impl HistoryStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => ScannerState::default(),
             Err(e) => return Err(e),
         };
-        let mut days = Vec::new();
+        let mut days: Vec<DayLine> = Vec::new();
+        let mut dead: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut seen_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Bucket key → live line indices. One bucket can legitimately hold
+        // several lines (consecutive passes covering disjoint byte ranges
+        // of the same file all count), so supersession is keyed by range
+        // overlap, not by key alone.
+        #[allow(clippy::type_complexity)]
+        let mut by_key: std::collections::HashMap<
+            (String, u32, String, String, String, String, String),
+            Vec<usize>,
+        > = std::collections::HashMap::new();
         match fs::read_to_string(Self::days_path(dir)) {
             Ok(text) => {
                 for line in text.lines() {
-                    // Exact-duplicate lines are the rescan artifact a crash
-                    // between `append_days` and `commit` leaves behind: the
-                    // bytes were appended, the cursor never moved, and the
-                    // next scan re-produces the same aggregate. Two *real*
-                    // events cannot land in the same bucket with identical
-                    // counts across every class without being the same
-                    // parse twice — so dropping the duplicate line is the
-                    // crash-consistency rule, not a data-losing shortcut.
+                    // A byte-identical line is the same parse twice — the
+                    // crash-rescan artifact; two genuinely identical
+                    // aggregates carry different `lo`/`hi` and serialize
+                    // differently, so real events survive this check.
                     if !seen_lines.insert(line.to_string()) {
                         continue;
                     }
-                    if let Ok(d) = serde_json::from_str::<DayLine>(line) {
-                        if d.v == SCHEMA_VERSION {
-                            days.push(d);
-                        }
+                    let Ok(d) = serde_json::from_str::<DayLine>(line) else {
+                        continue;
+                    };
+                    if d.v != SCHEMA_VERSION {
+                        continue;
                     }
+                    // A later line whose byte range overlaps an earlier
+                    // same-bucket line re-parses those bytes — the earlier
+                    // aggregate is superseded, not summed. This is what
+                    // makes the append-then-commit ordering crash-safe:
+                    // the uncommitted cursor re-reads and re-writes the
+                    // same range, and the newer line replaces the stale one.
+                    let key = (
+                        d.file.clone(),
+                        d.gen,
+                        d.hour.clone(),
+                        d.provider.clone(),
+                        d.project.clone(),
+                        d.model.clone(),
+                        d.session.clone(),
+                    );
+                    let idxs = by_key.entry(key).or_default();
+                    idxs.retain(|&i| {
+                        let old = &days[i];
+                        !(d.lo < old.hi && old.lo < d.hi) || {
+                            dead.insert(i);
+                            false
+                        }
+                    });
+                    idxs.push(days.len());
+                    days.push(d);
+                }
+                if !dead.is_empty() {
+                    days = days
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(i, _)| !dead.contains(i))
+                        .map(|(_, d)| d)
+                        .collect();
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -248,6 +388,19 @@ impl HistoryStore {
             .get_mut(&path.to_string_lossy().into_owned())
     }
 
+    /// Whether `id` was already emitted by any file in any earlier pass.
+    pub fn seen_globally(&self, id: &str) -> bool {
+        self.state.global_ids.iter().any(|k| k == id)
+    }
+
+    /// Record `id` in the cross-file ring, evicting the oldest once full.
+    pub fn mark_seen_globally(&mut self, id: String) {
+        if self.state.global_ids.len() >= GLOBAL_RECENT_IDS {
+            self.state.global_ids.pop_front();
+        }
+        self.state.global_ids.push_back(id);
+    }
+
     /// Register `path` at generation 0 (or return the existing entry).
     pub fn begin_file(&mut self, path: &Path, digest: String, size: u64, mtime: i64) {
         self.state
@@ -263,10 +416,16 @@ impl HistoryStore {
             return Ok(());
         }
         let path = Self::days_path(&self.dir);
-        let mut f = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut oo = fs::OpenOptions::new();
+        oo.create(true).append(true);
+        // Same 0600 as the report — these files carry project basenames
+        // and session ids, sensitive in exactly the same way.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            oo.mode(0o600);
+        }
+        let mut f = oo.open(&path)?;
         let mut buf = Vec::new();
         for d in new {
             serde_json::to_writer(&mut buf, d).map_err(io::Error::other)?;
@@ -285,7 +444,7 @@ impl HistoryStore {
         let tmp = self.dir.join("state.json.tmp");
         let target = Self::state_path(&self.dir);
         {
-            let mut f = fs::File::create(&tmp)?;
+            let mut f = create_private(&tmp)?;
             serde_json::to_writer(&mut f, &self.state).map_err(io::Error::other)?;
             f.write_all(b"\n")?;
             f.sync_data().ok();
@@ -324,7 +483,7 @@ impl HistoryStore {
         }
         let tmp = self.dir.join("days.jsonl.tmp");
         {
-            let mut f = fs::File::create(&tmp)?;
+            let mut f = create_private(&tmp)?;
             let mut buf = Vec::new();
             for d in &live {
                 serde_json::to_writer(&mut buf, *d).map_err(io::Error::other)?;
@@ -338,15 +497,26 @@ impl HistoryStore {
         Ok(())
     }
 
+    /// Drop state for paths under none of `roots` — a manifest edit that
+    /// narrowed the search leaves entries the walk can never reach again.
+    /// Their day lines keep counting (history once recorded stays); if a
+    /// path re-enters a root, the rescan's ranges supersede them at load.
+    pub fn prune_files_outside(&mut self, roots: &[PathBuf]) -> usize {
+        let before = self.state.files.len();
+        self.state
+            .files
+            .retain(|p, _| roots.iter().any(|r| Path::new(p).starts_with(r)));
+        before - self.state.files.len()
+    }
+
     /// blake2b hex of a file's first [`PREFIX_BYTES`] — the rewrite signal
     /// `mtime`/`size` alone can miss when a provider rewrites in place.
-    pub fn prefix_digest(path: &Path) -> Option<String> {
+    pub fn prefix_digest(path: &Path, len: u64) -> Option<String> {
         use blake2::Digest as _;
         use std::io::Read;
-        let mut f = fs::File::open(path).ok()?;
-        let mut buf = vec![0u8; PREFIX_BYTES];
-        let n = f.read(&mut buf).ok()?;
-        buf.truncate(n);
+        let f = fs::File::open(path).ok()?;
+        let mut buf = Vec::new();
+        f.take(len).read_to_end(&mut buf).ok()?;
         Some(hex_prefix(&blake2::Blake2b512::digest(&buf)))
     }
 }
@@ -382,6 +552,8 @@ mod tests {
             session: "s".to_string(),
             file: file.to_string(),
             gen,
+            lo: 0,
+            hi: 0,
             input,
             output: 0,
             cache_read: 0,
@@ -429,6 +601,84 @@ mod tests {
         assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 0);
         store.append_days(&[day("/f", 1, 7)]).unwrap();
         assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 7);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overlapping_byte_ranges_supersede_but_disjoint_ranges_sum() {
+        // Crash-rescan: a line covering [0,100) is superseded by a later
+        // re-parse of [0,150) — the stale aggregate is replaced, not added.
+        // Disjoint ranges in the same bucket are different bytes and both
+        // count; identical counts at different ranges are different events.
+        let dir = tmpdir("ranges");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let mut a = day("/f", 0, 100);
+        a.lo = 0;
+        a.hi = 100;
+        let mut b = day("/f", 0, 150);
+        b.lo = 0;
+        b.hi = 150;
+        let mut c = day("/f", 0, 60);
+        c.lo = 150;
+        c.hi = 200;
+        store.append_days(&[a, b, c]).unwrap();
+        // In-memory all three exist; the supersession happens at load.
+        drop(store);
+        let store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            210,
+            "[0,150) replaced [0,100); [150,200) summed: 150 + 60"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identical_aggregates_at_disjoint_ranges_both_survive() {
+        // The old exact-line dedup dropped a second identical aggregate;
+        // with lo/hi the lines serialize differently and both count.
+        let dir = tmpdir("identical");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let mut a = day("/f", 0, 42);
+        a.lo = 0;
+        a.hi = 100;
+        let mut b = day("/f", 0, 42);
+        b.lo = 100;
+        b.hi = 200;
+        store.append_days(&[a, b]).unwrap();
+        drop(store);
+        let store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 84);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_drops_only_paths_outside_the_active_roots() {
+        let dir = tmpdir("prune");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store.state.files.insert(
+            "/grok/memtrace/a.jsonl".into(),
+            FileState::fresh("d".into(), 1, 1),
+        );
+        store.state.files.insert(
+            "/grok/logs/unified.jsonl".into(),
+            FileState::fresh("d".into(), 1, 1),
+        );
+        store.state.files.insert(
+            "/codex/sessions/x.jsonl".into(),
+            FileState::fresh("d".into(), 1, 1),
+        );
+        let roots = vec![PathBuf::from("/grok/logs"), PathBuf::from("/codex")];
+        assert_eq!(store.prune_files_outside(&roots), 1);
+        assert!(store
+            .file_state(Path::new("/grok/logs/unified.jsonl"))
+            .is_some());
+        assert!(store
+            .file_state(Path::new("/codex/sessions/x.jsonl"))
+            .is_some());
+        assert!(store
+            .file_state(Path::new("/grok/memtrace/a.jsonl"))
+            .is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

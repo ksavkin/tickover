@@ -153,5 +153,5 @@ expiry_json_path  = "expires_at"
 # dedups on (session, timestamp, loop index).
 [history]
 format        = "grok-unified"
-root          = "~/.grok"
-glob          = "*.jsonl"
+root          = "~/.grok/logs"
+glob          = "unified.jsonl"

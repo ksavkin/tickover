@@ -122,7 +122,10 @@ impl HistoryExtractor for ClaudeExtractor {
                 // Not every line is a message — summaries, snapshots and
                 // user turns parse fine but carry no usage; a JSON syntax
                 // error mid-file is the drift case that counts.
-                Err(_) => continue,
+                Err(_) => {
+                    out.skipped_unparsed += 1;
+                    continue;
+                }
             };
             if line.kind != "assistant" || line.is_sidechain {
                 continue;

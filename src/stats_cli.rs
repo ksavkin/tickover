@@ -52,9 +52,26 @@ fn usage() -> &'static str {
 }
 
 fn run(json: bool, report: Option<Option<PathBuf>>, manifests: Vec<PluginManifest>) -> i32 {
+    // A provider the user disabled keeps its history files untouched and
+    // drops out of the report entirely — same filter the tray scan
+    // applies in `spawn_history_scan`.
+    let manifests: Vec<PluginManifest> = manifests
+        .into_iter()
+        .filter(crate::plugin_enabled)
+        .collect();
     let Some(dir) = tickover::history::default_dir() else {
         eprintln!("tickover stats: no config directory on this platform");
         return 1;
+    };
+    // The tray app scans this same store on its own timer — serialize
+    // open+scan+commit so neither process commits stale cursors over the
+    // other's work.
+    let _lock = match tickover::history::store::lock_store(&dir) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("tickover stats: could not lock history store: {e}");
+            return 1;
+        }
     };
     let mut store = match HistoryStore::open(&dir) {
         Ok(s) => s,
@@ -105,11 +122,12 @@ fn run(json: bool, report: Option<Option<PathBuf>>, manifests: Vec<PluginManifes
 }
 
 /// Providers whose manifests carry no `[history]` — shown as quota-only
-/// rather than averaged into anything.
-fn quota_only(manifests: &[PluginManifest], stats: &query::Stats) -> Vec<String> {
+/// rather than averaged into anything. A provider that declares history
+/// but simply had no usage in range is counted, not quota-only.
+fn quota_only(manifests: &[PluginManifest], _stats: &query::Stats) -> Vec<String> {
     manifests
         .iter()
-        .filter(|m| m.history.is_none() || !stats.providers.contains(&m.id))
+        .filter(|m| m.history.is_none())
         .map(|m| m.id.clone())
         .collect()
 }

@@ -101,6 +101,7 @@ pub fn scan_tick(
         scanner::SCAN_WALL_BUDGET / with_history as u32
     };
     let mut scans = Vec::new();
+    let mut active_roots: Vec<PathBuf> = Vec::new();
     for m in manifests {
         let Some(h) = &m.history else { continue };
         // A fresh deadline per provider: one that finishes early simply
@@ -113,6 +114,10 @@ pub fn scan_tick(
             &h.root_env_join,
             &options,
         );
+        // The root counts as coverage even when unreachable this tick —
+        // a temporarily unmounted directory must not drop its tracked
+        // files (their return would mean a full re-read for nothing).
+        active_roots.push(root.clone());
         if !root.is_dir() {
             scans.push(ProviderScan {
                 provider: m.id.clone(),
@@ -130,5 +135,11 @@ pub fn scan_tick(
             outcome,
         });
     }
+    // Manifest edits can narrow a provider's search (e.g. `~/.grok` →
+    // `~/.grok/logs`): entries under no active root are dead weight — the
+    // walk can never reach them again. Their day lines stay counted; if
+    // a path re-enters a root later, a fresh scan's overlapping ranges
+    // supersede them at load rather than double-counting.
+    store.prune_files_outside(&active_roots);
     scans
 }

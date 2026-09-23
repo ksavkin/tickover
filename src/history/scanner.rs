@@ -103,9 +103,16 @@ pub fn scan_root(
             }
             Some(_) => {
                 // Changed. A smaller size, or a different prefix digest,
-                // means rewrite rather than append.
-                let shrunk = sig.size < store.file_state(&sig.path).map_or(0, |s| s.cursor);
-                let digest = HistoryStore::prefix_digest(&sig.path);
+                // means rewrite rather than append. The digest covers the
+                // span it was computed over (`digest_len`), so an append to
+                // a small file verifies against the old span rather than
+                // re-digesting the grown tail.
+                let st_cursor = store.file_state(&sig.path).map_or(0, |s| s.cursor);
+                let span = store
+                    .file_state(&sig.path)
+                    .map_or(0, |s| s.digest_len.min(s.size));
+                let shrunk = sig.size < st_cursor || sig.size < span;
+                let digest = HistoryStore::prefix_digest(&sig.path, span);
                 let rewritten = match (shrunk, store.file_state(&sig.path)) {
                     (true, _) => true,
                     (_, Some(st)) => digest.as_deref() != Some(st.digest.as_str()),
@@ -113,26 +120,36 @@ pub fn scan_root(
                 };
                 match store.file_state_mut(&sig.path) {
                     Some(st) if rewritten => {
-                        st.reset(digest.unwrap_or_default(), sig.size, sig.mtime)
+                        // The digest stored with the reset must cover the
+                        // *new* span — the one just compared was over the
+                        // old file's prefix.
+                        let new_span = sig.size.min(crate::history::store::PREFIX_BYTES as u64);
+                        let fresh_digest =
+                            HistoryStore::prefix_digest(&sig.path, new_span).unwrap_or_default();
+                        st.reset(fresh_digest, sig.size, sig.mtime)
                     }
                     Some(st) => {
                         st.size = sig.size;
                         st.mtime = sig.mtime;
-                        if let Some(d) = digest {
-                            st.digest = d;
-                        }
                     }
                     None => {}
                 }
             }
             None => {
-                let digest = HistoryStore::prefix_digest(&sig.path).unwrap_or_default();
+                let span = (sig.size).min(crate::history::store::PREFIX_BYTES as u64);
+                let digest = HistoryStore::prefix_digest(&sig.path, span).unwrap_or_default();
                 store.begin_file(&sig.path, digest, sig.size, sig.mtime);
             }
         }
 
         let resume_from = store.file_state(&sig.path).map_or(0, |s| s.cursor);
         let gen = store.file_state(&sig.path).map_or(0, |s| s.gen);
+        // Extractors mutate `st.aux` while they read (Codex's cumulative
+        // baseline, Grok's session map, Antigravity's row watermark). If the
+        // append below fails, those advances must roll back too — otherwise
+        // the retry diffs against an already-advanced baseline and the
+        // records between are lost silently.
+        let aux_backup = store.file_state(&sig.path).map(|s| s.aux.clone());
         let extraction = {
             let Some(st) = store.file_state_mut(&sig.path) else {
                 continue;
@@ -152,26 +169,28 @@ pub fn scan_root(
         // not need to.
         let mut grouped: BTreeMap<(String, String, String, String), DayLine> = BTreeMap::new();
         let mut seen_keys: Vec<String> = Vec::new();
+        let mut global_keys: Vec<String> = Vec::new();
         for mut rec in extraction.records {
             if rec.provider.is_empty() {
                 rec.provider = provider.to_string();
             }
             // Dedup keys are globally meaningful (message ids, turn ids) —
-            // a bare-key pass set therefore also catches a record that
-            // shows up in a second file (Grok's unified log + session
-            // updates overlap exactly that way).
+            // so they are checked against the pass set, this file's ring,
+            // *and* the store-wide ring: the same record surfacing in a
+            // second file on a later pass (Grok's unified log + session
+            // updates overlap exactly that way) is still caught.
             if !rec.dedup_key.is_empty() {
-                if pass_seen.contains(&rec.dedup_key) {
-                    continue;
-                }
-                if store
-                    .file_state(&sig.path)
-                    .is_some_and(|st| st.seen(&rec.dedup_key))
+                if pass_seen.contains(&rec.dedup_key)
+                    || store
+                        .file_state(&sig.path)
+                        .is_some_and(|st| st.seen(&rec.dedup_key))
+                    || store.seen_globally(&rec.dedup_key)
                 {
                     pass_seen.insert(rec.dedup_key.clone());
                     continue;
                 }
                 pass_seen.insert(rec.dedup_key.clone());
+                global_keys.push(rec.dedup_key.clone());
                 seen_keys.push(rec.dedup_key.clone());
             }
             let hour = rec.ts.format("%Y-%m-%dT%H").to_string();
@@ -190,6 +209,8 @@ pub fn scan_root(
                 session: rec.session_id.clone(),
                 file: key.clone(),
                 gen,
+                lo: resume_from,
+                hi: extraction.cursor,
                 input: 0,
                 output: 0,
                 cache_read: 0,
@@ -211,6 +232,9 @@ pub fn scan_root(
         // re-append is dropped by `days.jsonl`'s exact-line dedup at load.
         if store.append_days(&buckets).is_err() {
             buckets.clear();
+            if let (Some(st), Some(aux)) = (store.file_state_mut(&sig.path), aux_backup) {
+                st.aux = aux;
+            }
             continue; // cursor stays — bytes are retried next pass
         }
         buckets.clear();
@@ -223,12 +247,18 @@ pub fn scan_root(
                 st.mark_seen(k.clone());
             }
         }
+        for k in global_keys {
+            store.mark_seen_globally(k);
+        }
     }
     outcome
 }
 
 /// Matching files under `root`, newest first — so a budgeted pass always
 /// covers the files still being written before it reaches cold history.
+/// The [`MAX_TRACKED_FILES`] cap applies *after* the sort: cutting the walk
+/// early would bound memory but could leave the newest file outside the
+/// tracked set entirely.
 fn collect(root: &Path, glob: &str) -> Vec<FileSig> {
     let mut files: Vec<FileSig> = Vec::new();
     for entry in walkdir::WalkDir::new(root)
@@ -236,9 +266,6 @@ fn collect(root: &Path, glob: &str) -> Vec<FileSig> {
         .into_iter()
         .filter_map(|e| e.ok())
     {
-        if files.len() >= MAX_TRACKED_FILES {
-            break;
-        }
         let ft = entry.file_type();
         if !ft.is_file() {
             continue;
@@ -262,5 +289,6 @@ fn collect(root: &Path, glob: &str) -> Vec<FileSig> {
         });
     }
     files.sort_by_key(|f| std::cmp::Reverse(f.mtime));
+    files.truncate(MAX_TRACKED_FILES);
     files
 }
