@@ -181,7 +181,21 @@ impl HistoryExtractor for GrokExtractor {
             });
         }
         // Persist attribution for the next pass — the events that produced
-        // it sit behind the cursor by then.
+        // it sit behind the cursor by then. The map is bounded: `unified.
+        // jsonl` accumulates a sid per session indefinitely, so past a cap
+        // a share is evicted (an evicted sid degrades to "unknown"
+        // attribution, never to dropped tokens).
+        const SESS_CAP: usize = 16_384;
+        if sessions.len() > SESS_CAP {
+            let drop: Vec<String> = sessions
+                .keys()
+                .take(sessions.len() - SESS_CAP * 3 / 4)
+                .cloned()
+                .collect();
+            for k in drop {
+                sessions.remove(&k);
+            }
+        }
         st.aux.insert(
             "sess".to_string(),
             serde_json::to_value(&sessions).unwrap_or_default(),

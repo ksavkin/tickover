@@ -96,7 +96,7 @@ sha2 = "0.10"
 unicode-normalization = "0.1"
 
 # Antigravity conversation history (`[history] format = "antigravity-sqlite"`):
-# read-only opens only (`mode=ro&immutable=1`), bundled so no system
+# read-only opens only (`mode=ro`), bundled so no system
 # libsqlite3 has to exist. Optional — gated behind the `history` feature,
 # which is the whole reason this crate is here.
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }

@@ -39,7 +39,7 @@ read-only — the scanner never writes into a provider's directory.
 | **Claude** | `~/.claude/projects/**/*.jsonl` (or `$CLAUDE_CONFIG_DIR/projects`) | one JSON object per line; `type = "assistant"` lines carry `message.usage` with input/output/cache classes |
 | **Codex** | `~/.codex/sessions/**/rollout-*.jsonl` + `archived_sessions/` (`$CODEX_HOME` honoured) | `token_count` events whose cumulative counters are differenced per session |
 | **Grok** | `~/.grok/logs/unified.jsonl` | `shell.turn.inference_done` events carrying per-turn token counts |
-| **Antigravity** | `~/.gemini/antigravity-cli/conversations/*.db` | per-conversation SQLite (opened `mode=ro&immutable=1`); protobuf-encoded generation records |
+| **Antigravity** | `~/.gemini/antigravity-cli/conversations/*.db` | per-conversation SQLite (opened `mode=ro`); protobuf-encoded generation records |
 | **Copilot** | none | Copilot publishes no local token history — it appears under "not counted" in the Activity card and `quota only` on its row |
 
 History is stored locally and nowhere else — under the app's own config

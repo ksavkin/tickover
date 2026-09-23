@@ -82,6 +82,10 @@ pub struct FileState {
     pub gen: u32,
     /// Bounded ring of recently seen dedup keys, oldest first.
     pub recent_ids: VecDeque<String>,
+    /// Membership mirror of `recent_ids` — checked per record, so O(1).
+    /// Rebuilt from `recent_ids` at store open.
+    #[serde(skip)]
+    recent_set: std::collections::HashSet<String>,
     /// Lines that looked like usage but did not parse, cumulative for this
     /// file's current generation — the format-drift signal `stats` shows.
     #[serde(default)]
@@ -109,6 +113,7 @@ impl FileState {
             digest,
             gen: 0,
             recent_ids: VecDeque::new(),
+            recent_set: std::collections::HashSet::new(),
             skipped_unparsed: 0,
             aux: BTreeMap::new(),
         }
@@ -125,22 +130,40 @@ impl FileState {
         self.digest = digest;
         self.gen += 1;
         self.recent_ids.clear();
+        self.recent_set.clear();
         self.skipped_unparsed = 0;
         self.aux.clear();
     }
 
     /// Whether `id` is still in the ring.
     pub fn seen(&self, id: &str) -> bool {
-        self.recent_ids.iter().any(|k| k == id)
+        self.recent_set.contains(id)
     }
 
     /// Record `id`, evicting the oldest once the ring is full.
     pub fn mark_seen(&mut self, id: String) {
         if self.recent_ids.len() >= RECENT_IDS_PER_FILE {
-            self.recent_ids.pop_front();
+            if let Some(old) = self.recent_ids.pop_front() {
+                self.recent_set.remove(&old);
+            }
         }
-        self.recent_ids.push_back(id);
+        if self.recent_set.insert(id.clone()) {
+            self.recent_ids.push_back(id);
+        }
     }
+}
+
+/// One entry of the cross-file dedup ring: which path first emitted this
+/// key. The path is what makes a rewrite rescan safe — a key re-emitted
+/// by its own file must count again (its old lines died with the gen
+/// bump), while the same key from a *different* file is the duplicate.
+/// `V1` accepts ring entries written before paths were tracked; they
+/// dedup as "another path" for everyone — conservative, self-evicting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GlobalKey {
+    V1(String),
+    V2 { k: String, p: String },
 }
 
 /// All remembered file positions. `BTreeMap` so `state.json` diffs read in
@@ -157,7 +180,11 @@ pub struct ScannerState {
     /// a session's `updates.jsonl` carry the same turn, and the wall-clock
     /// budget can put those files in different passes).
     #[serde(default)]
-    pub global_ids: VecDeque<String>,
+    pub global_ids: VecDeque<GlobalKey>,
+    /// `key → first path` mirror of `global_ids` — the ring is scanned at
+    /// every record, so membership has to be O(1), not O(8192).
+    #[serde(skip)]
+    global_map: std::collections::HashMap<String, String>,
 }
 
 /// One aggregate line in `days.jsonl`. This is the *only* thing history
@@ -258,13 +285,38 @@ impl DayLine {
     }
 }
 
+/// Bucket identity for range supersession: same file, generation, hour
+/// and attribution. Two lines sharing it with overlapping byte ranges
+/// are the same bytes parsed twice — the newer one wins.
+type BucketKey = (String, u32, String, String, String, String, String);
+
+fn bucket_key(d: &DayLine) -> BucketKey {
+    (
+        d.file.clone(),
+        d.gen,
+        d.hour.clone(),
+        d.provider.clone(),
+        d.project.clone(),
+        d.model.clone(),
+        d.session.clone(),
+    )
+}
+
 /// The pair of files plus the in-memory state between them.
 pub struct HistoryStore {
     dir: PathBuf,
     pub state: ScannerState,
-    /// Lines read from `days.jsonl` at open — kept so a compacting rewrite
-    /// doesn't have to re-parse what was already validated once.
+    /// Lines read from `days.jsonl`, including superseded ones — they
+    /// leave through `dead` until the next compacting rewrite.
     days: Vec<DayLine>,
+    /// Indices into `days` that a later overlapping line replaced.
+    dead: std::collections::HashSet<usize>,
+    /// `bucket key → live line indices`, maintained at open and append so
+    /// in-memory `live_days` reflects supersession, not just the next load.
+    by_key: std::collections::HashMap<BucketKey, Vec<usize>>,
+    /// Exact serialized lines — the crash-rescan artifact is a byte-
+    /// identical re-append, cheaper to catch as a string than by key.
+    seen_lines: std::collections::HashSet<String>,
 }
 
 impl HistoryStore {
@@ -302,18 +354,14 @@ impl HistoryStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => ScannerState::default(),
             Err(e) => return Err(e),
         };
-        let mut days: Vec<DayLine> = Vec::new();
-        let mut dead: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut seen_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // Bucket key → live line indices. One bucket can legitimately hold
-        // several lines (consecutive passes covering disjoint byte ranges
-        // of the same file all count), so supersession is keyed by range
-        // overlap, not by key alone.
-        #[allow(clippy::type_complexity)]
-        let mut by_key: std::collections::HashMap<
-            (String, u32, String, String, String, String, String),
-            Vec<usize>,
-        > = std::collections::HashMap::new();
+        let mut store = HistoryStore {
+            dir: dir.to_path_buf(),
+            state,
+            days: Vec::new(),
+            dead: std::collections::HashSet::new(),
+            by_key: std::collections::HashMap::new(),
+            seen_lines: std::collections::HashSet::new(),
+        };
         match fs::read_to_string(Self::days_path(dir)) {
             Ok(text) => {
                 for line in text.lines() {
@@ -321,7 +369,7 @@ impl HistoryStore {
                     // crash-rescan artifact; two genuinely identical
                     // aggregates carry different `lo`/`hi` and serialize
                     // differently, so real events survive this check.
-                    if !seen_lines.insert(line.to_string()) {
+                    if !store.seen_lines.insert(line.to_string()) {
                         continue;
                     }
                     let Ok(d) = serde_json::from_str::<DayLine>(line) else {
@@ -330,49 +378,67 @@ impl HistoryStore {
                     if d.v != SCHEMA_VERSION {
                         continue;
                     }
-                    // A later line whose byte range overlaps an earlier
-                    // same-bucket line re-parses those bytes — the earlier
-                    // aggregate is superseded, not summed. This is what
-                    // makes the append-then-commit ordering crash-safe:
-                    // the uncommitted cursor re-reads and re-writes the
-                    // same range, and the newer line replaces the stale one.
-                    let key = (
-                        d.file.clone(),
-                        d.gen,
-                        d.hour.clone(),
-                        d.provider.clone(),
-                        d.project.clone(),
-                        d.model.clone(),
-                        d.session.clone(),
-                    );
-                    let idxs = by_key.entry(key).or_default();
-                    idxs.retain(|&i| {
-                        let old = &days[i];
-                        !(d.lo < old.hi && old.lo < d.hi) || {
-                            dead.insert(i);
-                            false
-                        }
-                    });
-                    idxs.push(days.len());
-                    days.push(d);
-                }
-                if !dead.is_empty() {
-                    days = days
-                        .into_iter()
-                        .enumerate()
-                        .filter(|(i, _)| !dead.contains(i))
-                        .map(|(_, d)| d)
-                        .collect();
+                    store.fold_line(d);
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        Ok(HistoryStore {
-            dir: dir.to_path_buf(),
-            state,
-            days,
-        })
+        if !store.dead.is_empty() {
+            store.physically_drop_dead();
+        }
+        // Rebuild the O(1) mirrors serde skipped: per-file recent sets and
+        // the key→first-path map behind the global ring. V1 ring entries
+        // carry no path — they are left out of the map rather than treated
+        // as "another path" for everyone (the old bug), and they age out
+        // of the ring on their own.
+        for st in store.state.files.values_mut() {
+            st.recent_set = st.recent_ids.iter().cloned().collect();
+        }
+        let mut map = std::collections::HashMap::new();
+        for g in &store.state.global_ids {
+            if let GlobalKey::V2 { k, p } = g {
+                map.entry(k.clone()).or_insert_with(|| p.clone());
+            }
+        }
+        store.state.global_map = map;
+        Ok(store)
+    }
+
+    /// Fold one validated line into `days`/`by_key`: a later line whose
+    /// byte range overlaps an earlier same-bucket line re-parsed those
+    /// bytes — the earlier aggregate is superseded, not summed. This is
+    /// what makes append-then-commit crash-safe both at load *and* inside
+    /// a session (a state-loss rebuild rescans into the same ranges).
+    fn fold_line(&mut self, d: DayLine) {
+        let idxs = self.by_key.entry(bucket_key(&d)).or_default();
+        idxs.retain(|&i| {
+            let old = &self.days[i];
+            !(d.lo < old.hi && old.lo < d.hi) || {
+                self.dead.insert(i);
+                false
+            }
+        });
+        idxs.push(self.days.len());
+        self.days.push(d);
+    }
+
+    /// Drop `dead` indices from `days` and reindex — called after a load
+    /// that superseded lines, and after a compacting rewrite.
+    fn physically_drop_dead(&mut self) {
+        let mut days = Vec::with_capacity(self.days.len() - self.dead.len());
+        let mut by_key: std::collections::HashMap<BucketKey, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, d) in std::mem::take(&mut self.days).into_iter().enumerate() {
+            if self.dead.contains(&i) {
+                continue;
+            }
+            by_key.entry(bucket_key(&d)).or_default().push(days.len());
+            days.push(d);
+        }
+        self.days = days;
+        self.by_key = by_key;
+        self.dead.clear();
     }
 
     /// This file's remembered progress, if it was ever scanned.
@@ -388,17 +454,39 @@ impl HistoryStore {
             .get_mut(&path.to_string_lossy().into_owned())
     }
 
-    /// Whether `id` was already emitted by any file in any earlier pass.
-    pub fn seen_globally(&self, id: &str) -> bool {
-        self.state.global_ids.iter().any(|k| k == id)
+    /// Whether `id` was already emitted by a *different* file. The path
+    /// check is what keeps a rewrite rescan correct: the file's own keys
+    /// re-emitted under a bumped generation must count again — their old
+    /// lines are already dead — while a second file carrying the same
+    /// event is still the duplicate.
+    pub fn seen_globally(&self, path: &str, id: &str) -> bool {
+        self.state.global_map.get(id).is_some_and(|p| p != path)
     }
 
     /// Record `id` in the cross-file ring, evicting the oldest once full.
-    pub fn mark_seen_globally(&mut self, id: String) {
-        if self.state.global_ids.len() >= GLOBAL_RECENT_IDS {
-            self.state.global_ids.pop_front();
+    /// The first path to emit a key owns it for the ring's lifetime.
+    pub fn mark_seen_globally(&mut self, path: &str, id: String) {
+        if self.state.global_map.contains_key(&id) {
+            return;
         }
-        self.state.global_ids.push_back(id);
+        self.state.global_map.insert(id.clone(), path.to_string());
+        self.state.global_ids.push_back(GlobalKey::V2 {
+            k: id,
+            p: path.to_string(),
+        });
+        if self.state.global_ids.len() > GLOBAL_RECENT_IDS {
+            if let Some(old) = self.state.global_ids.pop_front() {
+                let (k, p) = match old {
+                    GlobalKey::V1(k) => (k, String::new()),
+                    GlobalKey::V2 { k, p } => (k, p),
+                };
+                // Only the map entry that still points at this occurrence
+                // is removed — a V1 placeholder never owned a map slot.
+                if self.state.global_map.get(&k).is_some_and(|mp| *mp == p) {
+                    self.state.global_map.remove(&k);
+                }
+            }
+        }
     }
 
     /// Register `path` at generation 0 (or return the existing entry).
@@ -411,8 +499,23 @@ impl HistoryStore {
 
     /// Append finished buckets to `days.jsonl` — the only write the log
     /// ever takes between compactions.
+    /// Append finished buckets to `days.jsonl` — the only write the log
+    /// ever takes between compactions. Each line is folded through the
+    /// same dedup/supersession the load path applies, so the in-memory
+    /// view never double-counts a re-append even before the next open.
     pub fn append_days(&mut self, new: &[DayLine]) -> io::Result<()> {
         if new.is_empty() {
+            return Ok(());
+        }
+        let mut accepted: Vec<(String, DayLine)> = Vec::with_capacity(new.len());
+        for d in new {
+            let line = serde_json::to_string(d).map_err(io::Error::other)?;
+            // Byte-identical = the crash-rescan artifact, already on disk.
+            if !self.seen_lines.contains(&line) {
+                accepted.push((line, d.clone()));
+            }
+        }
+        if accepted.is_empty() {
             return Ok(());
         }
         let path = Self::days_path(&self.dir);
@@ -427,13 +530,19 @@ impl HistoryStore {
         }
         let mut f = oo.open(&path)?;
         let mut buf = Vec::new();
-        for d in new {
-            serde_json::to_writer(&mut buf, d).map_err(io::Error::other)?;
+        for (line, _) in &accepted {
+            buf.extend_from_slice(line.as_bytes());
             buf.push(b'\n');
         }
         f.write_all(&buf)?;
         f.sync_data().ok();
-        self.days.extend(new.iter().cloned());
+        // Only after the bytes are on disk do the lines count in memory —
+        // a failed append leaves both views untouched, so the retry's
+        // identical re-append is caught by `seen_lines` on the next open.
+        for (line, d) in accepted {
+            self.seen_lines.insert(line);
+            self.fold_line(d);
+        }
         Ok(())
     }
 
@@ -466,7 +575,12 @@ impl HistoryStore {
             .collect();
         self.days
             .iter()
-            .filter(move |d| current.get(d.file.as_str()).is_none_or(|&gen| gen == d.gen))
+            .enumerate()
+            .filter(move |(i, d)| {
+                !self.dead.contains(i)
+                    && current.get(d.file.as_str()).is_none_or(|&gen| gen == d.gen)
+            })
+            .map(|(_, d)| d)
     }
 
     /// Rewrite `days.jsonl` dropping stale-generation lines, when it is big
@@ -494,6 +608,11 @@ impl HistoryStore {
         }
         fs::rename(&tmp, &path)?;
         self.days = live.into_iter().cloned().collect();
+        self.dead.clear();
+        self.by_key.clear();
+        for (i, d) in self.days.iter().enumerate() {
+            self.by_key.entry(bucket_key(d)).or_default().push(i);
+        }
         Ok(())
     }
 

@@ -184,7 +184,7 @@ pub fn scan_root(
                     || store
                         .file_state(&sig.path)
                         .is_some_and(|st| st.seen(&rec.dedup_key))
-                    || store.seen_globally(&rec.dedup_key)
+                    || store.seen_globally(&key, &rec.dedup_key)
                 {
                     pass_seen.insert(rec.dedup_key.clone());
                     continue;
@@ -248,7 +248,7 @@ pub fn scan_root(
             }
         }
         for k in global_keys {
-            store.mark_seen_globally(k);
+            store.mark_seen_globally(&key, k);
         }
     }
     outcome

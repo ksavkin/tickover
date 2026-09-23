@@ -83,9 +83,13 @@ fn read_new_lines(path: &Path, offset: u64, cap: u64) -> io::Result<(Vec<u8>, u6
         remaining -= n as u64;
     }
     // Keep only complete lines: the cursor stops at the last newline, so a
-    // torn tail is re-read next pass rather than parsed half-written.
+    // torn tail is re-read next pass rather than parsed half-written. The
+    // exception is a line longer than the whole window: it can never be
+    // complete, so the cap's worth of it is consumed now — leaving the
+    // cursor pinned would re-read the same bytes on every pass forever.
     let complete = match buf.iter().rposition(|&b| b == b'\n') {
         Some(pos) => pos + 1,
+        None if remaining == 0 => buf.len(),
         None => 0,
     };
     buf.truncate(complete);

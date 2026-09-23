@@ -129,6 +129,21 @@ impl TokenUsage {
         }
     }
 
+    /// `last_token_usage` with no sibling cumulative: the baseline can
+    /// only move forward by the delta itself, or a later total-only event
+    /// diffs against a stale watermark and re-counts these tokens.
+    fn accumulate(&self, aux: &mut std::collections::BTreeMap<String, serde_json::Value>) {
+        fn add(aux: &mut std::collections::BTreeMap<String, serde_json::Value>, key: &str, n: u64) {
+            let prev = aux.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+            aux.insert(key.to_string(), (prev + n).into());
+        }
+        add(aux, AUX_INPUT, self.input_tokens);
+        add(aux, AUX_CACHED, self.cached_input_tokens);
+        add(aux, AUX_CACHE_WRITE, self.cache_write_input_tokens);
+        add(aux, AUX_OUTPUT, self.output_tokens);
+        add(aux, AUX_THINKING, self.reasoning_output_tokens);
+    }
+
     /// Advance the baseline without emitting a delta — for events that
     /// carry `last_token_usage` beside the cumulative figures. A later
     /// total-only event must diff against *this* reading, not the last
@@ -230,6 +245,19 @@ impl HistoryExtractor for CodexExtractor {
                 }
                 ("event_msg", "token_count") => {
                     let Some(info) = payload.info else { continue };
+                    // Validate the timestamp before touching `aux`: a line
+                    // that can't be placed in an hour emits no record, so
+                    // advancing the baseline here would lose its tokens to
+                    // the next event's diff.
+                    let Some(ts) = line
+                        .timestamp
+                        .as_deref()
+                        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                        .map(|t| t.with_timezone(&chrono::Utc))
+                    else {
+                        out.skipped_unparsed += 1;
+                        continue;
+                    };
                     // `last_token_usage` is the delta outright; a total-only
                     // `info` needs the cumulative diff. Either way the
                     // baseline advances to this event's total, so a later
@@ -239,18 +267,12 @@ impl HistoryExtractor for CodexExtractor {
                             t.advance(&mut st.aux);
                             u
                         }
-                        (Some(u), None) => u,
+                        (Some(u), None) => {
+                            u.accumulate(&mut st.aux);
+                            u
+                        }
                         (None, Some(t)) => t.delta(&mut st.aux),
                         (None, None) => continue,
-                    };
-                    let Some(ts) = line
-                        .timestamp
-                        .as_deref()
-                        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                        .map(|t| t.with_timezone(&chrono::Utc))
-                    else {
-                        out.skipped_unparsed += 1;
-                        continue;
                     };
                     let ordinal = line.ordinal.unwrap_or(line_start);
                     out.records.push(UsageRecord {

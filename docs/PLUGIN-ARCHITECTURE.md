@@ -1126,7 +1126,7 @@ means something. Requires `requires_reader = ["reading-history"]`.
 
 The scanner (`src/history/scanner.rs`) treats the matched corpus as strictly
 read-only — it never writes into a provider's directory, and
-`antigravity-sqlite` opens each database with `mode=ro&immutable=1`. Work is
+`antigravity-sqlite` opens each database with `mode=ro`. Work is
 incremental and bounded: per-file cursors resume appends, a rewritten file is
 detected by a prefix-digest change and its derived records are replaced, a
 wall-clock budget ends a pass early (the next tick resumes where it stopped),

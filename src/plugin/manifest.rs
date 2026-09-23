@@ -4462,7 +4462,7 @@ pub enum HistoryFormat {
     /// `shell.turn.inference_done` events.
     GrokUnified,
     /// `~/.gemini/antigravity-cli/conversations/*.db`: read-only SQLite
-    /// (`mode=ro&immutable=1`), protobuf-encoded generation records.
+    /// (`mode=ro`), protobuf-encoded generation records.
     AntigravitySqlite,
 }
 

@@ -214,3 +214,93 @@ fn nothing_but_usage_metadata_leaves_the_extractor() {
         let _ = fs::remove_dir_all(d);
     }
 }
+
+/// The crash-rescan safety net: a file rewritten after its dedup keys
+/// landed in the global ring must re-emit and *replace* its contribution,
+/// not have every record dropped by the ring (the round-2 finding). Same
+/// message ids, different prefix — totals must end at exactly one pass's
+/// worth of usage.
+#[test]
+fn a_rewritten_file_replaces_its_contribution() {
+    let store_dir = tmpdir("store-rewrite");
+    let root = tmpdir("rewrite-src");
+    let file = root.join("s.jsonl");
+    fs::write(&file, claude_fixture()).unwrap();
+
+    let manifests = vec![manifest(
+        "claude",
+        "claude-transcripts",
+        &root,
+        "**/*.jsonl",
+    )];
+    let one_pass = |store: &mut HistoryStore| {
+        let _ = scan_tick(store, &manifests, &|_| BTreeMap::new());
+        store.commit().unwrap();
+    };
+    let mut store = HistoryStore::open(&store_dir).unwrap();
+    one_pass(&mut store);
+    let before: u64 = store.live_days().map(|d| d.sum()).sum();
+    assert!(before > 0, "first pass must count something");
+
+    // Rewrite in place: same message id, different first bytes so the
+    // prefix digest flips and the generation bumps.
+    let rewritten = claude_fixture().replacen("\"type\":\"user\"", "\"type\":\"user\",\"v\":2", 1);
+    fs::write(&file, rewritten).unwrap();
+    one_pass(&mut store);
+    let after: u64 = store.live_days().map(|d| d.sum()).sum();
+    assert_eq!(
+        after, before,
+        "rewrite must re-emit and supersede, not drop ({before} → {after})"
+    );
+
+    // And through a reopen — the on-disk view must agree with memory.
+    drop(store);
+    let store = HistoryStore::open(&store_dir).unwrap();
+    assert_eq!(store.live_days().map(|d| d.sum()).sum::<u64>(), before);
+
+    for d in [&store_dir, &root] {
+        let _ = fs::remove_dir_all(d);
+    }
+}
+
+/// State loss mid-flight: `state.json` quarantined/corrupt rebuilds from
+/// `days.jsonl`; the rescan re-emits identical lines and the in-memory
+/// store must not double-count them before the next open.
+#[test]
+fn a_state_loss_rebuild_does_not_double_count() {
+    let store_dir = tmpdir("store-loss");
+    let root = tmpdir("loss-src");
+    fs::write(root.join("s.jsonl"), claude_fixture()).unwrap();
+
+    let manifests = vec![manifest(
+        "claude",
+        "claude-transcripts",
+        &root,
+        "**/*.jsonl",
+    )];
+    let mut store = HistoryStore::open(&store_dir).unwrap();
+    let _ = scan_tick(&mut store, &manifests, &|_| BTreeMap::new());
+    store.commit().unwrap();
+    let before: u64 = store.live_days().map(|d| d.sum()).sum();
+    assert!(before > 0);
+
+    // Lose the state file entirely — the rebuild path.
+    fs::remove_file(store_dir.join("state.json")).unwrap();
+    let mut store = HistoryStore::open(&store_dir).unwrap();
+    let _ = scan_tick(&mut store, &manifests, &|_| BTreeMap::new());
+    // Same-process read, before any reopen — the doubling window.
+    let after: u64 = store.live_days().map(|d| d.sum()).sum();
+    assert_eq!(
+        after, before,
+        "rescan after state loss must not double count"
+    );
+    store.commit().unwrap();
+
+    drop(store);
+    let store = HistoryStore::open(&store_dir).unwrap();
+    assert_eq!(store.live_days().map(|d| d.sum()).sum::<u64>(), before);
+
+    for d in [&store_dir, &root] {
+        let _ = fs::remove_dir_all(d);
+    }
+}

@@ -81,11 +81,14 @@ impl HistoryExtractor for AntigravityExtractor {
             return Ok(out);
         };
         let mut max_idx = watermark;
+        let mut completed = true;
         let mut seen_keys = std::collections::HashSet::new();
         for row in rows.flatten() {
             // Honour the pass deadline mid-scan: `max_idx` only covers the
-            // rows already emitted, so an early stop resumes correctly.
+            // rows already emitted, so an early stop resumes correctly —
+            // but only because the cursor below stays short of `size`.
             if Instant::now() >= deadline {
+                completed = false;
                 break;
             }
             let (idx, blob) = row;
@@ -122,7 +125,11 @@ impl HistoryExtractor for AntigravityExtractor {
             }
         }
         st.aux.insert("max_idx".into(), (max_idx as u64).into());
-        out.cursor = st.size;
+        // A deadline-truncated pass must NOT report the file consumed:
+        // `cursor >= size` is the scanner's "unchanged" check, and a db
+        // that never changes again would keep its tail rows unread
+        // forever. The `max_idx` watermark does the real resuming.
+        out.cursor = if completed { st.size } else { 0 };
         Ok(out)
     }
 }

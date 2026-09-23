@@ -105,7 +105,7 @@ itself.
 Two invariants are not negotiable:
 
 - **A provider's corpus is read-only.** No extractor writes into it; the
-  SQLite format opens `mode=ro&immutable=1` for exactly this reason. A
+  SQLite format opens `mode=ro` for exactly this reason. A
   locked or busy file yields nothing this tick rather than blocking.
 - **Usage metadata only.** An extractor emits timestamps, project names,
   model names, and token counts — never prompt or message text. The

@@ -87,7 +87,8 @@ protocol log and carries no token counts.
 **Files:** `~/.gemini/antigravity-cli/conversations/*.db`.
 
 Each conversation is a WAL-mode SQLite database, live while the CLI runs.
-The file is opened read-only (`mode=ro&immutable=1`); a busy or locked
+The file is opened read-only (`mode=ro` — deliberately not `immutable=1`,
+which would hide rows still sitting in the WAL); a busy or locked
 database yields zero records for the tick rather than blocking — the next
 scan picks it up. Nothing is ever written to a provider database.
 
@@ -108,11 +109,13 @@ gen_metadata.data
        └─ field 19 string model name
 ```
 
-Two more tables supply attribution: the session timestamp from
-`trajectory_metadata_blob` field 2 (a `Timestamp`), and the project from
-the first `steps.step_payload` containing a `"Cwd":"…"` JSON fragment. The
-session id is the database filename's UUID stem. A `max_idx` watermark in
-scanner state makes re-opened databases emit only new rows.
+Two more fields of `trajectory_metadata_blob` (the `id='main'` row)
+supply attribution: field 2 is the session `Timestamp`, field 18 the
+workspace name used as the project. (The `steps.step_payload` `"Cwd"`
+fragment an earlier build looked for is unreachable: that column is a
+BLOB, which SQLite `LIKE` never matches.) The session id is the database
+filename's UUID stem. A `max_idx` watermark in scanner state makes
+re-opened databases emit only new rows.
 
 ## The shared invariants
 
@@ -128,3 +131,28 @@ Whatever the format, the same rules apply at the store boundary:
 - **A torn tail is deferred, not dropped.** A final line without its
   newline is a write in flight; the cursor holds so the next pass reads
   it complete.
+
+## The store
+
+Aggregates land in `<config>/tickover/history/` as two files, both
+created `0600`:
+
+- `days.jsonl` — append-only bucket lines: hour, provider, project,
+  model, session, the five token classes, message count, the source
+  file's generation, and the byte range `[lo, hi)` the bucket was
+  aggregated from. The range is what makes a crash between append and
+  commit safe: at load, a line whose range overlaps an earlier line in
+  the same bucket supersedes it, so a re-parse replaces instead of
+  double-counting — while identical aggregates at disjoint ranges
+  legitimately sum.
+- `state.json` — per-file cursor, size/mtime, prefix digest (with the
+  span it covered), generation, a recent dedup ring, the extractor's
+  persisted `aux` (Grok's session map, Codex's turn context and
+  cumulative baseline, Antigravity's `max_idx` watermark), plus a global
+  dedup ring for ids that can appear in more than one file.
+
+The whole open→scan→commit sequence runs under a `flock` on a `lock`
+file in the same directory, so the tray app and `tickover stats` can
+never interleave writes. Entries under none of the active history roots
+are pruned after each scan — their day lines stay counted, and a path
+that re-enters a root rescans into place via range supersession.
