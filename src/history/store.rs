@@ -247,6 +247,10 @@ pub struct ScannerState {
     /// every record, so membership has to be O(1), not O(8192).
     #[serde(skip)]
     global_map: std::collections::HashMap<String, String>,
+    /// Id the next `append_days` batch stamps on its lines — persisted so
+    /// a restart can't reissue a batch id older lines already carry.
+    #[serde(default)]
+    pub next_batch: u64,
 }
 
 /// One aggregate line in `days.jsonl`. This is the *only* thing history
@@ -276,12 +280,18 @@ pub struct DayLine {
     pub lo: u64,
     #[serde(default)]
     pub hi: u64,
-    /// The pass that wrote this line read its file from the origin to the
-    /// end — only such a line may supersede every older line in its
-    /// bucket (a truncated prefix must not claim coverage it didn't
-    /// re-derive). Persisted because supersession replays at load.
+    /// The pass that wrote this line read its file to the end — only such
+    /// a line may supersede every older line of its `(file, gen)` (a
+    /// truncated prefix must not claim coverage it didn't re-derive).
+    /// Persisted because supersession replays at load.
     #[serde(default)]
     pub full: bool,
+    /// Append-batch id — one per `append_days` call, persisted so that at
+    /// load the lines of one scan batch still recognise each other: a
+    /// seal kills stale coverage, never its own batch-mates (a file whose
+    /// records span several hours emits one `full` line per bucket).
+    #[serde(default)]
+    pub b: u64,
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
@@ -500,10 +510,7 @@ impl HistoryStore {
                     if d.v > SCHEMA_VERSION {
                         continue;
                     }
-                    // At load each line is its own batch: a seal may only
-                    // kill lines written earlier on disk.
-                    let floor = store.days.len();
-                    store.fold_line(d, floor);
+                    store.fold_line(d);
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -512,6 +519,17 @@ impl HistoryStore {
         if !store.dead.is_empty() {
             store.physically_drop_dead();
         }
+        // Batch ids must stay ahead of anything already on disk — a state
+        // rebuild resets the counter, and a reused id would let a stale
+        // line pose as a seal's batch-mate.
+        store.state.next_batch = store
+            .days
+            .iter()
+            .map(|d| d.b)
+            .max()
+            .unwrap_or(0)
+            .max(store.state.next_batch)
+            + 1;
         // Rebuild the O(1) mirrors serde skipped: per-file recent sets and
         // the key→first-path map behind the global ring. V1 ring entries
         // carry no path — they are left out of the map rather than treated
@@ -532,11 +550,10 @@ impl HistoryStore {
 
     /// Fold one validated line into `days`/the indexes: a later line whose
     /// range overlaps an earlier same-bucket line re-parsed those bytes —
-    /// the earlier aggregate is superseded, not summed. `batch_floor` is
-    /// the index the current append batch started at: a seal never kills
-    /// its own batch-mates (they are the fresh coverage, not the stale
-    /// past). At load every line folds as its own batch.
-    fn fold_line(&mut self, d: DayLine, batch_floor: usize) {
+    /// the earlier aggregate is superseded, not summed. Batch-mates
+    /// (`old.b == d.b`, one append — e.g. a multi-hour extraction emitting
+    /// several buckets) are fresh coverage, never stale.
+    fn fold_line(&mut self, d: DayLine) {
         // A line with `hi <= lo` never carried a real range: pre-range
         // writes deserialize to `lo = hi = 0`, and a buggy extractor can
         // persist an empty span. The rule is asymmetric: such a line
@@ -549,22 +566,79 @@ impl HistoryStore {
         // source, and because cursors/watermarks only advance past ranges
         // that were appended, the live lines of this file+generation now
         // re-derive its whole contribution. The seal therefore reaches
-        // *every* older line of the generation — buckets drifted by a
-        // schema change (v1 byte ranges vs. v2 row ranges can neither
-        // overlap numerically nor share a bucket key, but the rescan
-        // covers the same events) — except real-range lines inside the
-        // already-covered prefix `[0, lo)`: those are the chain this line
-        // completes, and their tokens were not re-emitted. A truncated
-        // pass's line must not seal: it re-derived a prefix, nothing more.
-        if d.full && d.hi > d.lo {
+        // *every* older line of the generation — even lines in drifted
+        // buckets or alien coordinate spaces (v1 byte ranges vs. v2 row
+        // ranges can neither overlap numerically nor share a bucket key,
+        // but the rescan covers the same events) — except two kinds:
+        //
+        //   * batch-mates (`old.b == d.b`) — lines the same append
+        //     produced for other buckets; they ARE the new coverage.
+        //   * the prefix chain — the earlier passes' lines that tile
+        //     `[0, lo)`; their bytes were already counted and this line
+        //     only completes them. The chain is a sequence of *range
+        //     steps*: one pass emits a line per bucket, all sharing the
+        //     pass's range, so membership is decided per distinct range —
+        //     the greedy minimal cover picks which steps form the chain
+        //     and every line of a selected step lives. A line whose range
+        //     isn't a selected step dies: a short stale prefix can't
+        //     steal the chain, and a stray segment inside covered span is
+        //     duplicate coverage.
+        //
+        // A `lo == hi == 0` tombstone — a complete pass that had nothing
+        // to emit — seals the same way: nothing tiles `[0, 0)`, so every
+        // older line of the generation dies. A truncated pass's line must
+        // not seal at all: it re-derived a prefix, nothing more.
+        if d.full {
             if let Some(idxs) = self.by_file.get_mut(&(d.file.clone(), d.gen)) {
-                idxs.retain(|&i| {
-                    if i >= batch_floor || self.dead.contains(&i) {
-                        return i >= batch_floor; // dead stays marked, out of the index
+                let keep: std::collections::HashSet<usize> = idxs
+                    .iter()
+                    .copied()
+                    .filter(|&i| self.days[i].b == d.b)
+                    .collect();
+                let mut steps: Vec<(u64, u64)> = idxs
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        !keep.contains(&i)
+                            && !self.dead.contains(&i)
+                            && self.days[i].hi > self.days[i].lo
+                            && self.days[i].hi <= d.lo
+                    })
+                    .map(|i| (self.days[i].lo, self.days[i].hi))
+                    .collect();
+                steps.sort_unstable();
+                steps.dedup();
+                // Greedy minimal cover of `[0, d.lo)` over the distinct
+                // step ranges: repeatedly take the range starting at or
+                // before `covered` that reaches farthest. A range never
+                // selected is not part of the contiguous chain.
+                let mut selected: std::collections::HashSet<(u64, u64)> =
+                    std::collections::HashSet::new();
+                let mut covered = 0u64;
+                let mut c = 0;
+                while c < steps.len() {
+                    let mut best: Option<(u64, u64)> = None;
+                    while c < steps.len() && steps[c].0 <= covered {
+                        let r = steps[c];
+                        c += 1;
+                        if r.1 > covered && best.is_none_or(|b| r.1 > b.1) {
+                            best = Some(r);
+                        }
                     }
-                    let old = &self.days[i];
-                    if old.hi > old.lo && old.hi <= d.lo {
-                        return true; // live prefix-chain segment
+                    match best {
+                        Some(r) => {
+                            covered = r.1;
+                            selected.insert(r);
+                        }
+                        None => break,
+                    }
+                }
+                idxs.retain(|&i| {
+                    if keep.contains(&i)
+                        || (!self.dead.contains(&i)
+                            && selected.contains(&(self.days[i].lo, self.days[i].hi)))
+                    {
+                        return true;
                     }
                     self.dead.insert(i);
                     false
@@ -645,10 +719,40 @@ impl HistoryStore {
     }
 
     /// Whether this very file owns `id` in the global ring — true on a
-    /// rewrite rescan (must count again) and on a mid-stream re-emission
-    /// whose ring entry aged out (must not count twice).
+    /// mid-stream re-emission whose ring entry aged out (must not count
+    /// twice). A rewrite rescan clears the file's ownership first, so a
+    /// resumed pass can't mistake re-derived records for evicted repeats.
     pub fn owns_globally(&self, path: &str, id: &str) -> bool {
         self.state.global_map.get(id).is_some_and(|p| p == path)
+    }
+
+    /// Drop every global-ring entry `path` owns — part of a rewrite reset:
+    /// the file's contribution is about to be re-derived under a bumped
+    /// generation, so its old ownership claims die with the old one.
+    pub fn release_owned(&mut self, path: &str) {
+        self.state.global_map.retain(|_, p| p != path);
+        self.state
+            .global_ids
+            .retain(|g| !matches!(g, GlobalKey::V2 { p, .. } if p == path));
+    }
+
+    /// Refresh `id`'s recency in the global ring — a duplicate sighting
+    /// proves the key is still live, and a still-live owner shouldn't age
+    /// out while repeats keep arriving.
+    pub fn touch_globally(&mut self, id: &str) {
+        if !self.state.global_map.contains_key(id) {
+            return;
+        }
+        if let Some(pos) = self
+            .state
+            .global_ids
+            .iter()
+            .position(|g| matches!(g, GlobalKey::V2 { k, .. } if k == id))
+        {
+            if let Some(g) = self.state.global_ids.remove(pos) {
+                self.state.global_ids.push_back(g);
+            }
+        }
     }
 
     /// Record `id` in the cross-file ring, evicting the oldest once full.
@@ -706,12 +810,19 @@ impl HistoryStore {
         if new.is_empty() {
             return Ok(());
         }
+        let batch = self.state.next_batch;
+        self.state.next_batch = self.state.next_batch.saturating_add(1);
         let mut accepted: Vec<(String, DayLine)> = Vec::with_capacity(new.len());
         for d in new {
-            let line = serde_json::to_string(d).map_err(io::Error::other)?;
+            let mut d = d.clone();
+            d.b = batch;
+            let line = serde_json::to_string(&d).map_err(io::Error::other)?;
             // Byte-identical = the crash-rescan artifact, already on disk.
+            // A post-crash retry carries a fresh `b`, so it serializes
+            // differently — but its identical range still supersedes the
+            // copy that made it to disk, so the duplicate can't count.
             if !self.seen_lines.contains(&line) {
-                accepted.push((line, d.clone()));
+                accepted.push((line, d));
             }
         }
         if accepted.is_empty() {
@@ -738,12 +849,11 @@ impl HistoryStore {
         // Only after the bytes are on disk do the lines count in memory —
         // a failed append leaves both views untouched, so the retry's
         // identical re-append is caught by `seen_lines` on the next open.
-        // The whole batch shares one floor: a seal line may kill anything
+        // The whole batch shares one id: a seal line may kill anything
         // older, but never its own batch-mates.
-        let floor = self.days.len();
         for (line, d) in accepted {
             self.seen_lines.insert(line);
-            self.fold_line(d, floor);
+            self.fold_line(d);
         }
         Ok(())
     }
@@ -876,6 +986,7 @@ mod tests {
             lo: 0,
             hi: 0,
             full: false,
+            b: 0,
             input,
             output: 0,
             cache_read: 0,
@@ -1208,6 +1319,59 @@ mod tests {
     }
 
     #[test]
+    fn seal_batch_mates_survive_a_reload() {
+        // A file whose records span two hours emits one `full` line per
+        // bucket in a single append. On reload each line folds in file
+        // order — without the batch id the second seal would mistake the
+        // first for stale coverage and kill it.
+        let dir = tmpdir("batchmates");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let mut h10 = day("/f", 0, 100);
+        h10.hour = "2026-09-22T10".into();
+        h10.lo = 0;
+        h10.hi = 500;
+        h10.full = true;
+        let mut h11 = day("/f", 0, 60);
+        h11.hour = "2026-09-22T11".into();
+        h11.lo = 500;
+        h11.hi = 1000;
+        h11.full = true;
+        store.append_days(&[h10, h11]).unwrap();
+        store.commit().unwrap();
+        drop(store);
+        let store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            160,
+            "both hour buckets survive the reload fold"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_seal_still_kills_older_batches() {
+        // Batch-mates are protected; an earlier batch's lines are not —
+        // even when a line sits in a different bucket of the same file.
+        let dir = tmpdir("batchkill");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let mut stale = day("/f", 0, 70);
+        stale.hour = "2026-09-22T09".into();
+        stale.lo = 5000;
+        stale.hi = 9000;
+        store.append_days(&[stale]).unwrap();
+        let mut cur = day("/f", 0, 120);
+        cur.lo = 0;
+        cur.hi = 1000;
+        cur.full = true;
+        store.append_days(&[cur]).unwrap();
+        store.commit().unwrap();
+        drop(store);
+        let store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 120);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_full_seal_reaches_stale_lines_in_other_buckets_of_the_file() {
         // Attribution can drift between schema versions: the same file's
         // v1 line can sit in a different hour/model bucket than the v2
@@ -1261,6 +1425,99 @@ mod tests {
             store.live_days().map(|d| d.input).sum::<u64>(),
             200,
             "50 (prefix chain) + 150 (completing tail); the alien line died"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tombstone_seals_a_source_that_now_has_no_records() {
+        // A complete pass that found zero records emits no bucket — but
+        // still owns the coverage claim. The tombstone carries the seal,
+        // so stale lines of the same (file, gen) die instead of summing
+        // forever.
+        let dir = tmpdir("tombstone");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let mut stale = day("/f", 0, 80);
+        stale.lo = 0;
+        stale.hi = 100;
+        store.append_days(&[stale]).unwrap();
+        let mut tomb = day("/f", 0, 0);
+        tomb.messages = 0;
+        tomb.lo = 0;
+        tomb.hi = 0;
+        tomb.full = true;
+        store.append_days(&[tomb]).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            0,
+            "the stale line dies under the empty-source seal"
+        );
+        store.commit().unwrap();
+        drop(store);
+        let store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            0,
+            "and stays dead across a reload"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_line_inside_the_prefix_span_cannot_steal_the_chain() {
+        // Sort order must not decide which `[0, hi)` line is the "real"
+        // chain head: the greedy cover takes the farthest-reaching tile,
+        // so a stale short prefix dies and the true chain survives whole.
+        let dir = tmpdir("chaincover");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        // Stale drifted-bucket line that sorts *before* the real chain.
+        let mut stale = day("/f", 0, 30);
+        stale.hour = "2026-09-22T09".into();
+        stale.lo = 0;
+        stale.hi = 30;
+        store.append_days(&[stale]).unwrap();
+        // The real prefix chain: [0,50) + [50,100).
+        let mut c1 = day("/f", 0, 50);
+        c1.lo = 0;
+        c1.hi = 50;
+        store.append_days(&[c1]).unwrap();
+        let mut c2 = day("/f", 0, 60);
+        c2.lo = 50;
+        c2.hi = 100;
+        store.append_days(&[c2]).unwrap();
+        // The completing pass seals at [100, 200).
+        let mut seal = day("/f", 0, 150);
+        seal.lo = 100;
+        seal.hi = 200;
+        seal.full = true;
+        store.append_days(&[seal]).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            260,
+            "50 + 60 (real chain) + 150 (seal); the stale 30-token prefix died"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mid_file_seal_still_keeps_its_chain() {
+        // A complete pass resumed mid-file seals with `lo > 0`: the chain
+        // tiling `[0, lo)` survives, anything else of the generation dies.
+        let dir = tmpdir("midseal");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let mut c1 = day("/f", 0, 40);
+        c1.lo = 0;
+        c1.hi = 40;
+        store.append_days(&[c1]).unwrap();
+        let mut seal = day("/f", 0, 160);
+        seal.lo = 40;
+        seal.hi = 200;
+        seal.full = true;
+        store.append_days(&[seal]).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            200,
+            "40 (chain) + 160 (seal)"
         );
         let _ = fs::remove_dir_all(&dir);
     }

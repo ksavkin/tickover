@@ -86,7 +86,7 @@ impl HistoryExtractor for AntigravityExtractor {
         let mut max_idx = watermark;
         let mut completed = true;
         let mut seen_keys = std::collections::HashSet::new();
-        for row in rows.flatten() {
+        for row in rows {
             // Honour the pass deadline mid-scan: `max_idx` only covers the
             // rows already emitted, so an early stop resumes correctly —
             // but only because the cursor below stays short of `size`.
@@ -94,7 +94,17 @@ impl HistoryExtractor for AntigravityExtractor {
                 completed = false;
                 break;
             }
-            let (idx, blob) = row;
+            let (idx, blob) = match row {
+                Ok(r) => r,
+                // A row error is unread coverage: `flatten()` would skip it
+                // silently and the seal would claim a file the pass never
+                // fully read.
+                Err(_) => {
+                    out.skipped_unparsed += 1;
+                    completed = false;
+                    break;
+                }
+            };
             if idx > max_idx {
                 max_idx = idx;
             }
@@ -654,6 +664,57 @@ mod tests {
             .extract(&db, &mut st, u64::MAX, far)
             .unwrap();
         assert_eq!(out.records.len(), 1, "idx = 0 read after a restart");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_row_error_fails_the_pass_instead_of_sealing() {
+        // A `data` column holding TEXT instead of a blob makes the row
+        // decode fail. `flatten()` would have skipped it silently and
+        // reported `complete` — the seal would then claim coverage the
+        // pass never read. The pass must report incomplete instead.
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-agy-rowerr-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("conv.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO gen_metadata (idx, data) VALUES (0, ?1)",
+                [generation_blob_keyed(b"dedup-0")],
+            )
+            .unwrap();
+            // SQLite is dynamically typed: a TEXT lands in the BLOB
+            // column and the `Vec<u8>` decode errors per-row.
+            conn.execute(
+                "INSERT INTO gen_metadata (idx, data) VALUES (1, 'not-a-blob')",
+                [],
+            )
+            .unwrap();
+        }
+        let size = std::fs::metadata(&db).unwrap().len();
+        let mut st = FileState::fresh("d".into(), size, 1);
+        let far = Instant::now() + std::time::Duration::from_secs(30);
+        let out = AntigravityExtractor
+            .extract(&db, &mut st, u64::MAX, far)
+            .unwrap();
+        assert!(
+            !out.complete,
+            "a row error is unread coverage — no seal may fire"
+        );
+        assert_eq!(out.records.len(), 1, "idx = 0 still emitted");
+        assert_eq!(out.skipped_unparsed, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

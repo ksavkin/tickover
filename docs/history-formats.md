@@ -131,7 +131,10 @@ Whatever the format, the same rules apply at the store boundary:
   counts toward the file's drift tally instead of being guessed at.
 - **Rewritten files are rescanned whole.** A changed prefix digest marks
   the file's generation; the store replaces its derived records rather
-  than adding to them.
+  than adding to them. The reset also drops the file's global-ring
+  ownership — otherwise the second pass of a large rescan, resumed from
+  mid-file, would mistake the file's own re-derived records for
+  ring-evicted repeats and skip them all.
 - **A torn tail is deferred, not dropped.** A final line without its
   newline is a write in flight; the cursor holds so the next pass reads
   it complete. The same rule applied to the store's own `days.jsonl`: a
@@ -148,16 +151,23 @@ created `0600`:
 - `days.jsonl` — append-only bucket lines: hour, provider, project,
   model, session, the five token classes, message count, the source
   file's generation, the source range `[lo, hi)` the bucket was
-  aggregated from (bytes for JSONL, row indices for SQLite), and a
-  `full` seal flag. The range is what makes a crash between append and
-  commit safe: at load, a line whose range overlaps an earlier line in
-  the same bucket supersedes it, so a re-parse replaces instead of
-  double-counting — while identical aggregates at disjoint ranges
-  legitimately sum. A `full` line goes further: its pass reached the
-  end of the source, so it supersedes every older bucket line outside
-  the live prefix chain — including ranges written in a different
-  coordinate space by an older schema — while a truncated pass's line
-  supersedes only what it actually re-read.
+  aggregated from (bytes for JSONL, row indices for SQLite), a `full`
+  seal flag, and a `b` batch id. The range is what makes a crash
+  between append and commit safe: at load, a line whose range overlaps
+  an earlier line in the same bucket supersedes it, so a re-parse
+  replaces instead of double-counting — while identical aggregates at
+  disjoint ranges legitimately sum. A `full` line goes further: its
+  pass reached the end of the source, so it supersedes every older
+  line of the same `(file, gen)` — including ranges written in a
+  different coordinate space by an older schema, and lines drifted
+  into other buckets — except its own batch-mates (`b`, one per
+  append, persisted so a reload recognizes them) and the live prefix
+  chain: the earlier lines that tile `[0, lo)` as the greedy minimal
+  cover, which is what lets a completing resume seal without
+  double-counting its own earlier passes. A truncated pass's line
+  supersedes only what it actually re-read, and a complete pass over
+  a source with no records writes a `full` tombstone so the seal
+  still fires.
 - `state.json` — per-file cursor, size/mtime, prefix digest (with the
   span it covered), owning provider, generation, a recent dedup ring
   that remembers the usage each id last carried, the extractor's

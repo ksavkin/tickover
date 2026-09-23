@@ -106,6 +106,13 @@ fn read_new_lines(path: &Path, offset: u64, cap: u64) -> io::Result<(Vec<u8>, u6
         buf.extend_from_slice(&chunk[..n]);
         remaining -= n as u64;
     }
+    // The cap can be exhausted exactly at EOF — `read` then never returns
+    // 0 and `eof` would stay false forever (a pass that consumed the whole
+    // file must seal). One probe byte settles it.
+    if !eof && remaining == 0 {
+        let mut probe = [0u8; 1];
+        eof = f.read(&mut probe)? == 0;
+    }
     // Keep only complete lines: the cursor stops at the last newline, so a
     // torn tail is re-read next pass rather than parsed half-written. The
     // exception is a line longer than the whole window: it can never be
@@ -116,7 +123,13 @@ fn read_new_lines(path: &Path, offset: u64, cap: u64) -> io::Result<(Vec<u8>, u6
         None if remaining == 0 => buf.len(),
         None => 0,
     };
+    let raw_len = buf.len();
     buf.truncate(complete);
+    // `eof` must mean "the file's content was consumed to the end". A torn
+    // tail (bytes past the last newline) is left for the next pass, so the
+    // file was NOT fully read — reporting `eof` here would let a seal kill
+    // coverage the pass never actually produced.
+    let eof = eof && complete == raw_len;
     Ok((buf, offset + complete as u64, eof))
 }
 

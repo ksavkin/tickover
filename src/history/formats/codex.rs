@@ -231,16 +231,16 @@ impl HistoryExtractor for CodexExtractor {
                 .map(str::to_string)
                 .unwrap_or_else(|| path.to_string_lossy().into_owned());
         } else if ctx.key.is_empty() {
-            // A ctx persisted before `key` existed: if its `id` came from
-            // the filename rather than `session_meta`, it's a stem — and
-            // stems collide across session dirs. Re-derive the key the
-            // same way the fresh path does.
+            // A ctx persisted before `key` existed. Old code derived `id`
+            // as the filename's uuid tail (or the whole stem when there
+            // was none), or took it from `session_meta`. Only the
+            // bare-stem case must be rebuilt from the path — a uuid tail
+            // (which is also what `session_meta` carries for uuid-named
+            // rollouts) is already the key fresh scans produce, so
+            // keeping it preserves ring continuity (`{id}:N` entries
+            // written before the upgrade still match).
             let stem = path.file_stem().and_then(|s| s.to_str());
-            let stem_uuid = stem.and_then(|s| {
-                s.get(s.len().saturating_sub(36)..)
-                    .filter(|t| t.len() == 36)
-            });
-            ctx.key = if Some(ctx.id.as_str()) == stem_uuid || Some(ctx.id.as_str()) == stem {
+            ctx.key = if stem.is_some_and(|s| s == ctx.id) {
                 path.to_string_lossy().into_owned()
             } else {
                 ctx.id.clone()
@@ -482,6 +482,24 @@ mod tests {
             .extract(&p, &mut st2, u64::MAX, later())
             .unwrap();
         assert_eq!(ex2.records[0].dedup_key, "sess-abc:2");
+
+        // A uuid-tailed rollout: the persisted `id` is the uuid — which
+        // is also the key a fresh scan derives — so it must NOT be
+        // rewritten to the path.
+        let uuid = "12345678-1234-4234-9234-123456789abc";
+        let p3 = tmp.write(
+            &format!("rollout-2026-09-22T10-00-00-{uuid}.jsonl"),
+            &(token_count(2, 100, 40, 30) + "\n"),
+        );
+        let mut st3 = fresh();
+        st3.aux.insert(
+            "ctx".into(),
+            serde_json::json!({"id": uuid, "cwd": "/u/proj"}),
+        );
+        let ex3 = CodexExtractor
+            .extract(&p3, &mut st3, u64::MAX, later())
+            .unwrap();
+        assert_eq!(ex3.records[0].dedup_key, format!("{uuid}:2"));
     }
 
     #[test]

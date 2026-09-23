@@ -136,21 +136,24 @@ pub fn scan_root(
                     (_, Some(st)) => digest.as_deref() != Some(st.digest.as_str()),
                     (_, None) => false,
                 };
-                match store.file_state_mut(&sig.path) {
-                    Some(st) if rewritten => {
-                        // The digest stored with the reset must cover the
-                        // *new* span — the one just compared was over the
-                        // old file's prefix.
-                        let new_span = sig.size.min(crate::history::store::PREFIX_BYTES as u64);
-                        let fresh_digest =
-                            HistoryStore::prefix_digest(&sig.path, new_span).unwrap_or_default();
-                        st.reset(fresh_digest, sig.size, sig.mtime)
+                if rewritten {
+                    // The digest stored with the reset must cover the
+                    // *new* span — the one just compared was over the
+                    // old file's prefix.
+                    let new_span = sig.size.min(crate::history::store::PREFIX_BYTES as u64);
+                    let fresh_digest =
+                        HistoryStore::prefix_digest(&sig.path, new_span).unwrap_or_default();
+                    // The file's global-ring ownership dies with the old
+                    // generation — otherwise pass 2+ of a large rescan
+                    // (resume_from > 0) would skip every re-derived record
+                    // as a "ring-evicted repeat".
+                    store.release_owned(&key);
+                    if let Some(st) = store.file_state_mut(&sig.path) {
+                        st.reset(fresh_digest, sig.size, sig.mtime);
                     }
-                    Some(st) => {
-                        st.size = sig.size;
-                        st.mtime = sig.mtime;
-                    }
-                    None => {}
+                } else if let Some(st) = store.file_state_mut(&sig.path) {
+                    st.size = sig.size;
+                    st.mtime = sig.mtime;
                 }
             }
             None => {
@@ -160,7 +163,12 @@ pub fn scan_root(
             }
         }
 
-        let resume_from = store.file_state(&sig.path).map_or(0, |s| s.cursor);
+        // `min(sig.size)`: a cursor past EOF means the file shrank without
+        // tripping the rewrite detector — clamping keeps the pass honest
+        // (the seal must never claim bytes that aren't there).
+        let resume_from = store
+            .file_state(&sig.path)
+            .map_or(0, |s| s.cursor.min(sig.size));
         let gen = store.file_state(&sig.path).map_or(0, |s| s.gen);
         // Extractors mutate `st.aux` while they read (Codex's cumulative
         // baseline, Grok's session map, Antigravity's row watermark). If the
@@ -206,6 +214,11 @@ pub fn scan_root(
         // file. A cap- or deadline-truncated pass re-derived a prefix and
         // must not claim coverage it hasn't emitted.
         let full = extraction.complete;
+        // Whether the source carried any records at all — an empty
+        // *extraction* can seal stale coverage via a tombstone, but an
+        // extraction whose records were all deduped must not: their
+        // tokens already live in the lines the seal would kill.
+        let source_empty = extraction.records.is_empty();
         for mut rec in extraction.records {
             if rec.provider.is_empty() {
                 rec.provider = provider.to_string();
@@ -312,6 +325,7 @@ pub fn scan_root(
                 lo: range_lo,
                 hi: range_hi,
                 full,
+                b: 0, // `append_days` stamps the real batch id
                 input: 0,
                 output: 0,
                 cache_read: 0,
@@ -330,6 +344,33 @@ pub fn scan_root(
             outcome.records += 1;
         }
         buckets.extend(grouped.into_values());
+        if source_empty && full {
+            // A complete pass over a source with *no records* still owns
+            // the coverage claim — without a carrier line the seal never
+            // fires and stale lines of this (file, gen) sum forever.
+            // The tombstone's own range tiles the prefix chain the same
+            // way a bucket line would, so live coverage survives it.
+            buckets.push(DayLine {
+                v: crate::history::store::SCHEMA_VERSION,
+                hour: chrono::Utc::now().format("%Y-%m-%dT%H").to_string(),
+                provider: provider.to_string(),
+                project: String::new(),
+                model: String::new(),
+                session: String::new(),
+                file: key.clone(),
+                gen,
+                lo: range_lo,
+                hi: range_hi,
+                full: true,
+                b: 0,
+                input: 0,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+                thinking: 0,
+                messages: 0,
+            });
+        }
         // Persist buckets *before* moving the cursor: crash between append
         // and commit leaves the old cursor, and the next pass's identical
         // re-append is dropped by `days.jsonl`'s exact-line dedup at load.
@@ -361,6 +402,9 @@ pub fn scan_root(
         }
         for k in global_keys {
             store.mark_seen_globally(&key, k);
+        }
+        for k in &touches {
+            store.touch_globally(k);
         }
     }
     outcome
@@ -469,6 +513,7 @@ mod tests {
     use super::*;
     use crate::history::formats::Extraction;
     use crate::history::store::{FileState, HistoryStore};
+    use crate::history::UsageRecord;
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -734,6 +779,139 @@ mod tests {
         let live: Vec<_> = store.live_days().cloned().collect();
         assert_eq!(live.iter().map(|d| d.input).sum::<u64>(), 100);
         assert_eq!(live.iter().map(|d| d.messages).sum::<u32>(), 1);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A scripted extractor that plays the multi-pass rewrite rescan:
+    /// gen 0 emits `shared` and completes; after the rewrite the new
+    /// generation's first pass stops mid-file and its finishing pass
+    /// re-derives `shared` — a key the *old* generation still owned
+    /// globally until `release_owned` ran.
+    struct RescanStub {
+        calls: AtomicUsize,
+    }
+    impl HistoryExtractor for RescanStub {
+        fn extract(
+            &self,
+            _path: &Path,
+            st: &mut FileState,
+            _byte_cap: u64,
+            _deadline: Instant,
+        ) -> io::Result<Extraction> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let rec = |key: &str, input: u64| UsageRecord {
+                ts: chrono::Utc::now(),
+                provider: String::new(),
+                project: "p".into(),
+                session_id: "s".into(),
+                model: "m".into(),
+                input,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+                thinking: 0,
+                dedup_key: key.into(),
+            };
+            let mid = st.size / 2;
+            Ok(match n {
+                0 => Extraction {
+                    records: vec![rec("shared", 10)],
+                    cursor: st.size,
+                    complete: true,
+                    ..Default::default()
+                },
+                1 => Extraction {
+                    records: vec![rec("fresh", 5)],
+                    cursor: mid,
+                    range: Some((0, mid)),
+                    complete: false,
+                    ..Default::default()
+                },
+                _ => Extraction {
+                    records: vec![rec("shared", 20)],
+                    cursor: st.size,
+                    range: Some((mid, st.size)),
+                    complete: true,
+                    ..Default::default()
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn a_rewrites_later_passes_are_not_ring_evicted_self() {
+        // A rewritten file rescans from origin, but a large rescan spans
+        // passes: pass 2+ resumes with `resume_from > 0`, where a key the
+        // *old* generation still owned globally would read as a
+        // ring-evicted repeat and be eaten. `release_owned` on reset must
+        // let the rescan re-own its keys.
+        let root = tmpdir("rescan-root");
+        let dir = tmpdir("rescan-store");
+        fs::write(root.join("t.jsonl"), "first generation bytes").unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let ex = RescanStub {
+            calls: AtomicUsize::new(0),
+        };
+        let far = Instant::now() + Duration::from_secs(30);
+
+        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 10);
+
+        // Rewrite: new bytes, new generation.
+        fs::write(root.join("t.jsonl"), "second generation bytes, different").unwrap();
+        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far); // truncated pass 1
+        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far); // completing pass 2
+        store.commit().unwrap();
+        let live: Vec<_> = store.live_days().cloned().collect();
+        assert_eq!(
+            live.iter().map(|d| d.input).sum::<u64>(),
+            25,
+            "gen 1 = 5 (fresh) + 20 (re-derived shared); gen 0 filtered"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_torn_tail_at_eof_does_not_seal() {
+        // A writer mid-line at EOF leaves bytes past the last newline:
+        // the pass didn't consume the file's content, so its line must
+        // not carry `full` — the seal would kill coverage the pass never
+        // produced.
+        let root = tmpdir("torn-root");
+        let dir = tmpdir("torn-store");
+        let first = claude_line("m1", 100, 10);
+        let second = claude_line("m2", 200, 20);
+        // `second` is deliberately missing its newline — a torn tail.
+        fs::write(root.join("t.jsonl"), format!("{first}\n{second}")).unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let ex = crate::history::formats::claude::ClaudeExtractor;
+        let far = Instant::now() + Duration::from_secs(30);
+
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        let live: Vec<_> = store.live_days().cloned().collect();
+        assert_eq!(live.iter().map(|d| d.input).sum::<u64>(), 100);
+        assert!(
+            live.iter().all(|d| !d.full),
+            "a torn tail must not seal coverage"
+        );
+
+        // The writer finishes the line: the next pass reads it and seals.
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("t.jsonl"))
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f).unwrap();
+        drop(f);
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        let live: Vec<_> = store.live_days().cloned().collect();
+        assert_eq!(live.iter().map(|d| d.input).sum::<u64>(), 300);
+        assert!(live.iter().any(|d| d.full));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&dir);
     }

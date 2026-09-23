@@ -672,6 +672,7 @@ mod tests {
             lo: 0,
             hi: 0,
             full: false,
+            b: 0,
             input,
             output: input / 4,
             cache_read: input * 2,
