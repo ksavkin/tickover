@@ -154,14 +154,17 @@ created `0600`:
   double-counting — while identical aggregates at disjoint ranges
   legitimately sum.
 - `state.json` — per-file cursor, size/mtime, prefix digest (with the
-  span it covered), owning provider, generation, a recent dedup ring,
-  the extractor's persisted `aux` (Grok's session map, Codex's turn
-  context and cumulative baseline, Antigravity's `max_idx` watermark and
-  WAL signature), plus a global dedup ring for ids that can appear in
-  more than one file. The per-file rings persist across commits on
-  purpose: a provider can re-log an id at a later byte offset (Claude
-  rewrites an assistant message as it streams), and the ring is the only
-  thing that recognizes the repeat on a later pass.
+  span it covered), owning provider, generation, a recent dedup ring
+  that remembers the usage each id last carried, the extractor's
+  persisted `aux` (Grok's session map, Codex's turn context and
+  cumulative baseline, Antigravity's `max_idx` watermark and WAL
+  signature), plus a global dedup ring for ids that can appear in more
+  than one file. The per-file rings persist across commits on purpose:
+  a provider can re-log an id at a later byte offset (Claude rewrites an
+  assistant message as it streams), and the ring is the only thing that
+  recognizes the repeat on a later pass. A re-emission that carries a
+  larger count emits only its growth — totals converge on the last
+  observation of the id, not the first.
 
 The whole open→scan→commit sequence runs under a `flock` on a `lock`
 file in the same directory, so the tray app and `tickover stats` can

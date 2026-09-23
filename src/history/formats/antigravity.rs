@@ -123,12 +123,14 @@ impl HistoryExtractor for AntigravityExtractor {
                         });
                     }
                 }
-                Gen::NoDedupKey => out.skipped_unparsed += 1,
+                Gen::NoDedupKey | Gen::Corrupt => out.skipped_unparsed += 1,
                 Gen::NoUsage => {}
             }
         }
-        st.aux
-            .insert("max_idx".into(), (max_idx.max(0) as u64).into());
+        // Signed, not clamped: an empty db leaves `max_idx` at -1, and
+        // storing 0 would re-poison the watermark — the next pass would
+        // skip the `idx = 0` row this whole change exists to read.
+        st.aux.insert("max_idx".into(), max_idx.into());
         // A deadline-truncated pass must NOT report the file consumed:
         // `cursor >= size` is the scanner's "unchanged" check, and a db
         // that never changes again would keep its tail rows unread
@@ -159,6 +161,9 @@ enum Gen {
     },
     /// Usage-shaped but missing the dedup key — counted as drift.
     NoDedupKey,
+    /// A usage-bearing blob whose decoded counters are absurd — corrupt
+    /// data, counted as drift rather than silently dropped.
+    Corrupt,
     /// Not a usage-bearing generation.
     NoUsage,
 }
@@ -182,7 +187,7 @@ fn parse_generation(blob: &[u8]) -> Gen {
         .iter()
         .any(|&v| v >= 1 << 62)
     {
-        return Gen::NoUsage;
+        return Gen::Corrupt;
     }
     if system
         .saturating_add(new_input)
@@ -460,7 +465,7 @@ mod tests {
             (11, 2, B(b"d")),
         ]);
         let blob = proto(&[(1, 2, B(&proto(&[(4, 2, B(&usage))])))]);
-        assert!(matches!(parse_generation(&blob), Gen::NoUsage));
+        assert!(matches!(parse_generation(&blob), Gen::Corrupt));
     }
 
     #[test]
@@ -544,6 +549,57 @@ mod tests {
             .unwrap();
         assert_eq!(out.records.len(), 1);
         assert_eq!(out.range, Some((2, 3)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_first_pass_does_not_skip_row_zero_later() {
+        // First scan sees an empty db: the persisted watermark must stay
+        // -1, or the row inserted at idx = 0 afterwards is skipped forever.
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-agy-empty-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("conv.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
+                [],
+            )
+            .unwrap();
+        }
+        let size = std::fs::metadata(&db).unwrap().len();
+        let mut st = FileState::fresh("d".into(), size, 1);
+        let far = Instant::now() + std::time::Duration::from_secs(30);
+        let out = AntigravityExtractor
+            .extract(&db, &mut st, u64::MAX, far)
+            .unwrap();
+        assert!(out.records.is_empty());
+        // The row arrives after the first pass — it must still be read.
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "INSERT INTO gen_metadata (idx, data) VALUES (0, ?1)",
+                [generation_blob_keyed(b"dedup-0")],
+            )
+            .unwrap();
+        }
+        let far = Instant::now() + std::time::Duration::from_secs(30);
+        let out = AntigravityExtractor
+            .extract(&db, &mut st, u64::MAX, far)
+            .unwrap();
+        assert_eq!(
+            out.records.len(),
+            1,
+            "idx = 0 must survive an empty first pass"
+        );
+        assert_eq!(out.range, Some((0, 1)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

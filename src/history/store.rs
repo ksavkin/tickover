@@ -90,6 +90,15 @@ pub struct FileState {
     /// offset (Claude rewrites an assistant message as it streams), and
     /// the ring is what tells that repeat from a new event next pass.
     pub recent_ids: VecDeque<String>,
+    /// The usage each ring id last carried. A re-emission is not a new
+    /// event, but it is not always identical either — Claude streams a
+    /// growing `output_tokens` under one `message.id`. The scanner emits
+    /// only the delta, so totals converge on the *last* observation of
+    /// the id rather than the first. Membership without a usage row
+    /// (entries persisted before this field existed) still dedups
+    /// outright — a repeat of unknown growth can't be priced.
+    #[serde(default)]
+    pub recent_usage: std::collections::HashMap<String, [u64; 5]>,
     /// Membership mirror of `recent_ids` — checked per record, so O(1).
     /// Rebuilt from `recent_ids` at store open.
     #[serde(skip)]
@@ -126,6 +135,7 @@ impl FileState {
             digest,
             gen: 0,
             recent_ids: VecDeque::new(),
+            recent_usage: std::collections::HashMap::new(),
             recent_set: std::collections::HashSet::new(),
             skipped_unparsed: 0,
             provider: String::new(),
@@ -144,6 +154,7 @@ impl FileState {
         self.digest = digest;
         self.gen += 1;
         self.recent_ids.clear();
+        self.recent_usage.clear();
         self.recent_set.clear();
         self.skipped_unparsed = 0;
         self.aux.clear();
@@ -154,16 +165,25 @@ impl FileState {
         self.recent_set.contains(id)
     }
 
-    /// Record `id`, evicting the oldest once the ring is full.
-    pub fn mark_seen(&mut self, id: String) {
+    /// The usage `id` last reported, if the ring remembers it.
+    pub fn last_usage(&self, id: &str) -> Option<[u64; 5]> {
+        self.recent_usage.get(id).copied()
+    }
+
+    /// Record `id` with the usage it carried, evicting the oldest once
+    /// the ring is full. A repeat updates the remembered usage — the next
+    /// re-emission diffs against the newest, not the first.
+    pub fn mark_seen(&mut self, id: String, usage: [u64; 5]) {
         if self.recent_ids.len() >= RECENT_IDS_PER_FILE {
             if let Some(old) = self.recent_ids.pop_front() {
                 self.recent_set.remove(&old);
+                self.recent_usage.remove(&old);
             }
         }
         if self.recent_set.insert(id.clone()) {
-            self.recent_ids.push_back(id);
+            self.recent_ids.push_back(id.clone());
         }
+        self.recent_usage.insert(id, usage);
     }
 }
 
@@ -426,12 +446,14 @@ impl HistoryStore {
                     // crash-rescan artifact; two genuinely identical
                     // aggregates carry different `lo`/`hi` and serialize
                     // differently, so real events survive this check.
-                    if !store.seen_lines.insert(line.to_string()) {
-                        continue;
-                    }
+                    // Parse first: a torn fragment that fails serde must
+                    // not occupy a `seen_lines` slot it can't defend.
                     let Ok(d) = serde_json::from_str::<DayLine>(line) else {
                         continue;
                     };
+                    if !store.seen_lines.insert(line.to_string()) {
+                        continue;
+                    }
                     // Lines from *older* schemas still count — a rescan
                     // supersedes what it can re-derive, and lines whose
                     // files no longer exist are the only record of that
@@ -480,10 +502,23 @@ impl HistoryStore {
         // lines of one bucket must still sum), but counts as covering its
         // bucket's whole span *as the old line*, so any re-emitted real
         // range replaces it.
+        //
+        // A line with `lo == 0` is a from-origin rescan of its file — the
+        // only paths that produce one (first scan, state-loss rebuild,
+        // post-rewrite reset) re-derive the file's whole contribution, so
+        // it supersedes *every* older line of the bucket, even ones whose
+        // range lives in a different coordinate space (a byte-range v1
+        // line vs. a row-range v2 line can never overlap numerically, but
+        // the rescan covers the same events).
         let idxs = self.by_key.entry(bucket_key(&d)).or_default();
         if d.hi > d.lo {
+            let from_origin = d.lo == 0;
             idxs.retain(|&i| {
                 let old = &self.days[i];
+                if from_origin {
+                    self.dead.insert(i);
+                    return false;
+                }
                 let (olo, ohi) = if old.hi <= old.lo {
                     (0, u64::MAX)
                 } else {
@@ -566,11 +601,22 @@ impl HistoryStore {
     }
 
     /// Register `path` at generation 0 (or return the existing entry).
-    pub fn begin_file(&mut self, path: &Path, digest: String, size: u64, mtime: i64) {
+    pub fn begin_file(
+        &mut self,
+        path: &Path,
+        provider: &str,
+        digest: String,
+        size: u64,
+        mtime: i64,
+    ) {
         self.state
             .files
             .entry(path.to_string_lossy().into_owned())
-            .or_insert_with(|| FileState::fresh(digest, size, mtime));
+            .or_insert_with(|| {
+                let mut st = FileState::fresh(digest, size, mtime);
+                st.provider = provider.to_string();
+                st
+            });
     }
 
     /// Append finished buckets to `days.jsonl` — the only write the log
@@ -974,7 +1020,7 @@ mod tests {
         store
             .file_state_mut(Path::new("/f"))
             .unwrap()
-            .mark_seen("k1".into());
+            .mark_seen("k1".into(), [1, 2, 3, 4, 5]);
         store.commit().unwrap();
         assert!(store.file_state(Path::new("/f")).unwrap().seen("k1"));
         drop(store);

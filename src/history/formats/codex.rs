@@ -171,6 +171,13 @@ impl TokenUsage {
 struct SessionCtx {
     #[serde(default)]
     id: String,
+    /// The dedup prefix — a uuid or session id when the format provides
+    /// one, otherwise the full path. Stems alone are not enough: two
+    /// meta-less `rollout.jsonl` files in different session dirs share
+    /// one, and a shared prefix would dedup the second file's usage out
+    /// of the cross-file ring.
+    #[serde(default)]
+    key: String,
     #[serde(default)]
     cwd: Option<String>,
     #[serde(default)]
@@ -202,19 +209,26 @@ impl HistoryExtractor for CodexExtractor {
         if ctx.id.is_empty() {
             // `get` rather than `[]`: a 36-byte cut can land inside a
             // multi-byte char on a renamed file — and with no uuid the
-            // stem itself is the id, still unique per file, which is
-            // all the dedup key needs (`":{ordinal}"` would collide
-            // across files in the cross-file ring). A non-UTF-8 or
-            // missing stem falls back to the full path for the same
-            // reason.
-            ctx.id = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(stem) => stem
-                    .get(stem.len().saturating_sub(36)..)
-                    .filter(|t| t.len() == 36)
-                    .unwrap_or(stem)
-                    .to_string(),
-                None => path.to_string_lossy().into_owned(),
-            };
+            // stem itself is the display id. The dedup key is stricter:
+            // a stem repeats across session dirs, so the key falls back
+            // to the whole path instead (`":{ordinal}"` would collide
+            // worst of all in the cross-file ring).
+            let stem = path.file_stem().and_then(|s| s.to_str());
+            ctx.id = stem
+                .and_then(|stem| {
+                    stem.get(stem.len().saturating_sub(36)..)
+                        .filter(|t| t.len() == 36)
+                })
+                .or(stem)
+                .unwrap_or_default()
+                .to_string();
+            ctx.key = stem
+                .and_then(|stem| {
+                    stem.get(stem.len().saturating_sub(36)..)
+                        .filter(|t| t.len() == 36)
+                })
+                .map(str::to_string)
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
         }
         let mut offset_in_buf = resume_from;
         for raw in buf.split(|&b| b == b'\n') {
@@ -239,12 +253,15 @@ impl HistoryExtractor for CodexExtractor {
                     // the fallback chain or `Some("")` would shadow a
                     // valid `id`, and keep the stem so the dedup key never
                     // degenerates to ":{ordinal}".
-                    ctx.id = payload
+                    let meta_id = payload
                         .session_id
                         .clone()
                         .filter(|s| !s.is_empty())
-                        .or_else(|| payload.id.clone().filter(|s| !s.is_empty()))
-                        .unwrap_or(ctx.id);
+                        .or_else(|| payload.id.clone().filter(|s| !s.is_empty()));
+                    if let Some(id) = meta_id {
+                        ctx.id = id.clone();
+                        ctx.key = id;
+                    }
                     if payload.cwd.is_some() {
                         ctx.cwd = payload.cwd.clone();
                     }
@@ -302,7 +319,17 @@ impl HistoryExtractor for CodexExtractor {
                         cache_read: usage.cached_input_tokens,
                         cache_write: usage.cache_write_input_tokens,
                         thinking: usage.reasoning_output_tokens,
-                        dedup_key: format!("{}:{ordinal}", ctx.id),
+                        // `key`, not `id`: a persisted ctx from before the
+                        // field existed deserializes with `key` empty —
+                        // `id` is the safe fallback for exactly that case.
+                        dedup_key: format!(
+                            "{}:{ordinal}",
+                            if ctx.key.is_empty() {
+                                &ctx.id
+                            } else {
+                                &ctx.key
+                            }
+                        ),
                     });
                 }
                 _ => {}
@@ -375,13 +402,15 @@ mod tests {
         assert_eq!(r.project, "proj");
         assert_eq!(r.model, "gpt-5.2-codex");
         assert_eq!(r.session_id, "sess1");
+        assert_eq!(r.dedup_key, "sess1:2");
     }
 
     #[test]
-    fn a_file_without_session_meta_keys_by_its_stem() {
+    fn a_file_without_session_meta_keys_by_its_path() {
         // Renamed/archived rollouts lose the uuid tail; the dedup key
-        // must still be unique per file — `":{ordinal}"` would collide
-        // with every other meta-less file in the cross-file ring.
+        // falls back to the whole path — two meta-less `rollout.jsonl`
+        // files in different dirs share a stem, and stem keys would
+        // collide in the cross-file ring. The display id keeps the stem.
         let tmp = TmpDir::new("codex-nometa");
         let p = tmp.write(
             "renamed-日本語.jsonl",
@@ -392,7 +421,10 @@ mod tests {
             .unwrap();
         assert_eq!(ex.records.len(), 1);
         let r = &ex.records[0];
-        assert!(r.dedup_key.starts_with("renamed-日本語:"));
+        assert!(r
+            .dedup_key
+            .starts_with(&p.with_extension("").to_string_lossy().into_owned()));
+        assert!(r.dedup_key.ends_with(":2"));
         assert!(!r.dedup_key.starts_with(':'));
         assert_eq!(r.session_id, "renamed-日本語");
     }

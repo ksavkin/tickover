@@ -144,8 +144,14 @@ impl HistoryExtractor for GrokExtractor {
                         provider: String::new(),
                         project: project_basename(info.and_then(|i| i.cwd.as_deref())),
                         session_id: sid.clone(),
-                        model: info
-                            .and_then(|i| i.model.clone())
+                        // An inference that carries its own model wins over
+                        // the session map — today's log never writes one,
+                        // but a future format that does must not be
+                        // flattened to the remembered value.
+                        model: ctx
+                            .model
+                            .clone()
+                            .or_else(|| info.and_then(|i| i.model.clone()))
                             .unwrap_or_else(|| "unknown".into()),
                         input: ctx.prompt_tokens,
                         output: ctx.completion_tokens,

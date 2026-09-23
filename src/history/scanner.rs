@@ -17,7 +17,7 @@
 //!   them by default and files are re-checked as regular files before any
 //!   byte is read.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -80,9 +80,6 @@ pub fn scan_root(
     let files = collect(root, glob);
     outcome.files_seen = files.len();
 
-    // Cross-file dedup within a single pass (Grok's unified log and its
-    // per-session updates can carry the same turn).
-    let mut pass_seen: HashSet<String> = HashSet::new();
     // Buckets accumulate per file and flush once the file's extraction
     // succeeds — a failed append leaves the cursor unmoved so the bytes
     // are retried next pass rather than silently lost.
@@ -159,7 +156,7 @@ pub fn scan_root(
             None => {
                 let span = (sig.size).min(crate::history::store::PREFIX_BYTES as u64);
                 let digest = HistoryStore::prefix_digest(&sig.path, span).unwrap_or_default();
-                store.begin_file(&sig.path, digest, sig.size, sig.mtime);
+                store.begin_file(&sig.path, provider, digest, sig.size, sig.mtime);
             }
         }
 
@@ -189,8 +186,12 @@ pub fn scan_root(
         // file's own ring — the ring persists across passes, the set does
         // not need to.
         let mut grouped: BTreeMap<(String, String, String, String), DayLine> = BTreeMap::new();
-        let mut seen_keys: Vec<String> = Vec::new();
+        let mut seen_keys: Vec<(String, [u64; 5])> = Vec::new();
         let mut global_keys: Vec<String> = Vec::new();
+        // Last usage per dedup key this pass — a repeat inside the same
+        // pass diffs against the newest observation, not the first.
+        let mut pass_usage: std::collections::HashMap<String, [u64; 5]> =
+            std::collections::HashMap::new();
         // Byte range for JSONL; a row-watermark span for SQLite — whatever
         // the extractor reports is what supersession compares.
         let (range_lo, range_hi) = extraction.range.unwrap_or((resume_from, extraction.cursor));
@@ -198,24 +199,66 @@ pub fn scan_root(
             if rec.provider.is_empty() {
                 rec.provider = provider.to_string();
             }
+            let usage = [
+                rec.input,
+                rec.output,
+                rec.cache_read,
+                rec.cache_write,
+                rec.thinking,
+            ];
+            // Whether this record is a re-emission of an already-counted
+            // event: its tokens still fold, but it must not add a second
+            // message to the bucket.
+            let mut is_update = false;
             // Dedup keys are globally meaningful (message ids, turn ids) —
-            // so they are checked against the pass set, this file's ring,
+            // checked against this pass's map, the file's persisted ring,
             // *and* the store-wide ring: the same record surfacing in a
             // second file on a later pass (Grok's unified log + session
             // updates overlap exactly that way) is still caught.
             if !rec.dedup_key.is_empty() {
-                if pass_seen.contains(&rec.dedup_key)
-                    || store
+                let prior = pass_usage.get(&rec.dedup_key).copied().or_else(|| {
+                    store
+                        .file_state(&sig.path)
+                        .and_then(|st| st.last_usage(&rec.dedup_key))
+                });
+                if let Some(old) = prior {
+                    // Re-emission of an already-counted event (Claude
+                    // streams a message's usage as it grows): count only
+                    // the growth, and remember the newest totals.
+                    let delta = [
+                        rec.input.saturating_sub(old[0]),
+                        rec.output.saturating_sub(old[1]),
+                        rec.cache_read.saturating_sub(old[2]),
+                        rec.cache_write.saturating_sub(old[3]),
+                        rec.thinking.saturating_sub(old[4]),
+                    ];
+                    pass_usage.insert(rec.dedup_key.clone(), usage);
+                    if delta.iter().all(|&d| d == 0) {
+                        continue;
+                    }
+                    rec.input = delta[0];
+                    rec.output = delta[1];
+                    rec.cache_read = delta[2];
+                    rec.cache_write = delta[3];
+                    rec.thinking = delta[4];
+                    is_update = true;
+                    seen_keys.push((rec.dedup_key.clone(), usage));
+                } else {
+                    // Seen before but the ring holds no usage for it
+                    // (pre-field entry), or first seen by a *different*
+                    // file — a true duplicate either way.
+                    if store
                         .file_state(&sig.path)
                         .is_some_and(|st| st.seen(&rec.dedup_key))
-                    || store.seen_globally(&key, &rec.dedup_key)
-                {
-                    pass_seen.insert(rec.dedup_key.clone());
-                    continue;
+                        || store.seen_globally(&key, &rec.dedup_key)
+                    {
+                        pass_usage.insert(rec.dedup_key.clone(), usage);
+                        continue;
+                    }
+                    pass_usage.insert(rec.dedup_key.clone(), usage);
+                    global_keys.push(rec.dedup_key.clone());
+                    seen_keys.push((rec.dedup_key.clone(), usage));
                 }
-                pass_seen.insert(rec.dedup_key.clone());
-                global_keys.push(rec.dedup_key.clone());
-                seen_keys.push(rec.dedup_key.clone());
             }
             let hour = rec.ts.format("%Y-%m-%dT%H").to_string();
             let gkey = (
@@ -247,7 +290,9 @@ pub fn scan_root(
             bucket.cache_read += rec.cache_read;
             bucket.cache_write += rec.cache_write;
             bucket.thinking += rec.thinking;
-            bucket.messages += 1;
+            if !is_update {
+                bucket.messages += 1;
+            }
             outcome.records += 1;
         }
         buckets.extend(grouped.into_values());
@@ -273,8 +318,8 @@ pub fn scan_root(
                     serde_json::json!([wal_now.0, wal_now.1, wal_now.2]),
                 );
             }
-            for k in &seen_keys {
-                st.mark_seen(k.clone());
+            for (k, usage) in &seen_keys {
+                st.mark_seen(k.clone(), *usage);
             }
         }
         for k in global_keys {
@@ -284,32 +329,42 @@ pub fn scan_root(
     outcome
 }
 
-/// `(size, mtime-nanos, header-mix)` of a SQLite `<file>-wal` sibling —
+/// `(size, mtime-nanos, edge-mix)` of a SQLite `<file>-wal` sibling —
 /// `(0, 0, 0)` when no WAL exists, which is also the signature an
 /// extractor stores for one. Nanosecond resolution matters: a passive
 /// checkpoint can leave the WAL the same size and let the next write land
 /// within the same second — a seconds-granular sig would call that
-/// "unchanged" and skip live rows. The header mix covers the residual
-/// hole (same size *and* same mtime, e.g. an in-place frame overwrite):
-/// the 32-byte WAL header's salts/checksums change on every checkpoint
-/// reset, so mixing it catches what stat cannot.
+/// "unchanged" and skip live rows. The edge mix covers the residual hole
+/// (same size *and* same mtime): the 32-byte header's salts change on
+/// every checkpoint reset, and the trailing bytes move with any appended
+/// or rewritten frame, so mixing both edges catches what stat cannot.
 fn wal_sig(path: &Path) -> (u64, u64, u64) {
-    let wal = PathBuf::from(format!("{}-wal", path.display()));
+    // OsString append — `path.display()` would corrupt non-UTF8 names.
+    let mut wal_os = path.as_os_str().to_os_string();
+    wal_os.push("-wal");
+    let wal = PathBuf::from(wal_os);
     fs::metadata(&wal)
         .ok()
         .map(|m| {
-            let mut header = [0u8; 32];
-            let header_mix = fs::File::open(&wal)
+            let edge_mix = fs::File::open(&wal)
                 .ok()
-                .and_then(|mut f| {
-                    use std::io::Read as _;
-                    f.read(&mut header).ok()
-                })
-                .map(|n| {
-                    // Mix the bytes actually read; a shorter file just
-                    // mixes fewer — still a valid change signal.
+                .map(|mut f| {
+                    use std::io::{Read as _, Seek as _, SeekFrom};
+                    let mut edges = Vec::with_capacity(64);
+                    let mut head = [0u8; 32];
+                    let n = f.read(&mut head).unwrap_or(0);
+                    edges.extend_from_slice(&head[..n]);
+                    let len = m.len();
+                    if len > 32 {
+                        let mut tail = [0u8; 32];
+                        let start = len.saturating_sub(32);
+                        if f.seek(SeekFrom::Start(start)).is_ok() {
+                            let n = f.read(&mut tail).unwrap_or(0);
+                            edges.extend_from_slice(&tail[..n]);
+                        }
+                    }
                     use blake2::Digest as _;
-                    let h = blake2::Blake2b512::digest(&header[..n]);
+                    let h = blake2::Blake2b512::digest(&edges);
                     u64::from_le_bytes(h[..8].try_into().unwrap())
                 })
                 .unwrap_or(0);
@@ -319,7 +374,7 @@ fn wal_sig(path: &Path) -> (u64, u64, u64) {
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map_or(0, |d| d.as_nanos() as u64),
-                header_mix,
+                edge_mix,
             )
         })
         .unwrap_or((0, 0, 0))
@@ -443,6 +498,50 @@ mod tests {
         scan_root(&mut store, "agy", &root, "*.db", &ex, far);
         scan_root(&mut store, "agy", &root, "*.db", &ex, far);
         assert_eq!(ex.calls.load(Ordering::SeqCst), 3);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A Claude transcript line: `id`, `input`, `output` are the knobs
+    /// the delta tests turn.
+    fn claude_line(id: &str, input: u64, output: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","isSidechain":false,"sessionId":"s1","cwd":"/u/proj","timestamp":"2026-09-22T14:30:00.000Z","message":{{"id":"{id}","model":"m","usage":{{"input_tokens":{input},"output_tokens":{output}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_reemitted_id_reports_only_its_growth() {
+        // Claude streams a message's usage under one message.id: the
+        // persisted ring must emit the *delta* of the later re-emission,
+        // not drop it (first-wins) and not re-count it (naive).
+        let root = tmpdir("delta-root");
+        let dir = tmpdir("delta-store");
+        fs::write(root.join("t.jsonl"), claude_line("m1", 100, 10) + "\n").unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let ex = crate::history::formats::claude::ClaudeExtractor;
+        let far = Instant::now() + Duration::from_secs(30);
+
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        // The stream continues: same id, output grew 10 -> 25.
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("t.jsonl"))
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{}", claude_line("m1", 100, 25)).unwrap();
+        drop(f);
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+
+        let live: Vec<_> = store.live_days().cloned().collect();
+        let total_out: u64 = live.iter().map(|d| d.output).sum();
+        let total_in: u64 = live.iter().map(|d| d.input).sum();
+        let total_msgs: u32 = live.iter().map(|d| d.messages).sum();
+        assert_eq!(total_out, 25, "the final observation wins");
+        assert_eq!(total_in, 100, "input did not grow — no delta");
+        assert_eq!(total_msgs, 1, "a re-emission is not a second message");
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&dir);
     }
