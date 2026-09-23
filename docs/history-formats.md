@@ -218,6 +218,14 @@ Two edges are accepted rather than chased:
   surviving gen as the remembered watermark — a rewritten-then-
   deleted file keeps its final readings, not every generation it
   ever had.
+- **A crash artifact in a drifted bucket outlives a deleted file.**
+  A pass that appended but never committed leaves a stale duplicate;
+  the retry's same-range lines kill it in-bucket, and the next seal
+  kills it anywhere. If the retry attributed the re-derived records to
+  a *different* bucket and the file leaves every root before a
+  completing pass runs, nothing ever folds the stale copy away — the
+  overlap counts twice, permanently. Narrow: needs crash, drifted
+  attribution, and removal before a clean pass.
 - **A rescan that partially fails to parse still seals what it read.**
   `skipped_unparsed` doubles as the drift counter — it also counts
   records that parsed fine but carry no usable usage (a Grok event of
