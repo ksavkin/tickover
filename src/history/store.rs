@@ -945,11 +945,20 @@ impl HistoryStore {
             f.sync_data().ok();
         }
         fs::rename(&tmp, &path)?;
+        // Reindex in place — compaction changes every index, so both
+        // maps must be rebuilt, not just `by_key`: a stale `by_file`
+        // index either points past the shortened `days` (panic) or at
+        // an unrelated line (a seal then kills coverage it never read).
         self.days = live.into_iter().cloned().collect();
         self.dead.clear();
         self.by_key.clear();
+        self.by_file.clear();
         for (i, d) in self.days.iter().enumerate() {
             self.by_key.entry(bucket_key(d)).or_default().push(i);
+            self.by_file
+                .entry((d.file.clone(), d.gen))
+                .or_default()
+                .push(i);
         }
         Ok(())
     }
@@ -1596,6 +1605,44 @@ mod tests {
             300,
             "50 + 50 + 100 + 100: stale [0,60) dies, both seal shape-mates live"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compaction_reindexes_by_file_before_the_next_seal() {
+        // `maybe_compact_days` shortens `days`; a `by_file` index left
+        // pointing at pre-compaction positions either indexes out of
+        // bounds or folds a seal against unrelated lines. Pad the file
+        // past the 16 MB threshold, kill a line in-session so the
+        // compaction actually drops rows, then seal — the fold must see
+        // the compacted layout, not the old one.
+        let dir = tmpdir("compact");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let mut a = day("/f", 0, 100);
+        a.lo = 0;
+        a.hi = 100;
+        let mut b = day("/f", 0, 150);
+        b.lo = 0;
+        b.hi = 150;
+        store.append_days(&[a, b]).unwrap(); // b supersedes a → dead
+                                             // Padding: a single unparseable line past the compact threshold.
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("days.jsonl"))
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{}", "x".repeat(17 * 1024 * 1024)).unwrap();
+        drop(f);
+        store.commit().unwrap(); // compacts
+        assert_eq!(store.days.len(), 1, "dead line + junk compacted away");
+        // The seal's fold touches by_file — stale indexes panic or
+        // corrupt here.
+        let mut seal = day("/f", 0, 1000);
+        seal.lo = 150;
+        seal.hi = 1000;
+        seal.full = true;
+        store.append_days(&[seal]).unwrap();
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 1150);
         let _ = fs::remove_dir_all(&dir);
     }
 

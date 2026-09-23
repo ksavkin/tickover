@@ -218,3 +218,11 @@ Two edges are accepted rather than chased:
   surviving gen as the remembered watermark — a rewritten-then-
   deleted file keeps its final readings, not every generation it
   ever had.
+- **A rescan that partially fails to parse still seals what it read.**
+  `skipped_unparsed` doubles as the drift counter — it also counts
+  records that parsed fine but carry no usable usage (a Grok event of
+  an unknown kind, an Antigravity row with no dedup key) — so it
+  cannot gate `full` without freezing seals for ordinary drifted
+  files. The tombstone gate is the narrow exception: an extraction
+  that produced *zero* records while skipping some is treated as
+  unreadable, not empty.
