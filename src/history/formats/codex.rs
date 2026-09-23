@@ -193,9 +193,10 @@ impl HistoryExtractor for CodexExtractor {
         _deadline: Instant,
     ) -> io::Result<Extraction> {
         let resume_from = st.cursor;
-        let (buf, cursor) = read_new_lines(path, resume_from, byte_cap)?;
+        let (buf, cursor, eof) = read_new_lines(path, resume_from, byte_cap)?;
         let mut out = Extraction {
             cursor,
+            complete: eof,
             ..Default::default()
         };
         // A resumed read starts mid-file, past `session_meta` — restore the
@@ -229,6 +230,21 @@ impl HistoryExtractor for CodexExtractor {
                 })
                 .map(str::to_string)
                 .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        } else if ctx.key.is_empty() {
+            // A ctx persisted before `key` existed: if its `id` came from
+            // the filename rather than `session_meta`, it's a stem — and
+            // stems collide across session dirs. Re-derive the key the
+            // same way the fresh path does.
+            let stem = path.file_stem().and_then(|s| s.to_str());
+            let stem_uuid = stem.and_then(|s| {
+                s.get(s.len().saturating_sub(36)..)
+                    .filter(|t| t.len() == 36)
+            });
+            ctx.key = if Some(ctx.id.as_str()) == stem_uuid || Some(ctx.id.as_str()) == stem {
+                path.to_string_lossy().into_owned()
+            } else {
+                ctx.id.clone()
+            };
         }
         let mut offset_in_buf = resume_from;
         for raw in buf.split(|&b| b == b'\n') {
@@ -421,12 +437,51 @@ mod tests {
             .unwrap();
         assert_eq!(ex.records.len(), 1);
         let r = &ex.records[0];
-        assert!(r
-            .dedup_key
-            .starts_with(&p.with_extension("").to_string_lossy().into_owned()));
-        assert!(r.dedup_key.ends_with(":2"));
+        // The whole path is the key, not just the stem.
+        assert_eq!(r.dedup_key, format!("{}:2", p.to_string_lossy()));
         assert!(!r.dedup_key.starts_with(':'));
         assert_eq!(r.session_id, "renamed-日本語");
+    }
+
+    #[test]
+    fn a_ctx_persisted_before_the_key_field_recovers_it() {
+        // State written by a build that keyed dedup on `id` alone: a
+        // meta-derived id keeps keying on itself (ring entries written as
+        // `{id}:N` still match), while a filename-derived stem is rebuilt
+        // from the path — stems collide across session dirs.
+        let tmp = TmpDir::new("codex-ctxmig");
+        let p = tmp.write(
+            "renamed-rollout.jsonl",
+            &(token_count(2, 100, 40, 30) + "\n"),
+        );
+        let mut st = fresh();
+        // The old shape: `id` present, no `key` at all.
+        st.aux.insert(
+            "ctx".into(),
+            serde_json::json!({"id": "renamed-rollout", "cwd": "/u/proj"}),
+        );
+        st.cursor = 0;
+        let ex = CodexExtractor
+            .extract(&p, &mut st, u64::MAX, later())
+            .unwrap();
+        assert_eq!(ex.records.len(), 1);
+        assert_eq!(
+            ex.records[0].dedup_key,
+            format!("{}:2", p.to_string_lossy()),
+            "a stem-derived id upgrades to the full-path key"
+        );
+
+        // A session_meta-derived id is already a proper key — kept as-is
+        // so rings written before the field existed still dedup.
+        let mut st2 = fresh();
+        st2.aux.insert(
+            "ctx".into(),
+            serde_json::json!({"id": "sess-abc", "cwd": "/u/proj"}),
+        );
+        let ex2 = CodexExtractor
+            .extract(&p, &mut st2, u64::MAX, later())
+            .unwrap();
+        assert_eq!(ex2.records[0].dedup_key, "sess-abc:2");
     }
 
     #[test]

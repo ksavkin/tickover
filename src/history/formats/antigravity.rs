@@ -136,6 +136,7 @@ impl HistoryExtractor for AntigravityExtractor {
         // that never changes again would keep its tail rows unread
         // forever. The `max_idx` watermark does the real resuming.
         out.cursor = if completed { st.size } else { 0 };
+        out.complete = completed;
         // Supersession needs a monotonic span, not the byte cursor: row
         // idx ranges are what a re-emit overlaps. The span is half-open
         // `[wm+1, max_idx+1)` so a single-row pass still writes `hi > 0` —
@@ -600,6 +601,59 @@ mod tests {
             "idx = 0 must survive an empty first pass"
         );
         assert_eq!(out.range, Some((0, 1)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_negative_watermark_survives_a_disk_round_trip() {
+        // The empty-first-pass fix is only real if `-1` persists through
+        // `state.json`: a restart between the empty pass and the first
+        // row must not re-poison the watermark.
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-agy-rt-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("conv.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
+                [],
+            )
+            .unwrap();
+        }
+        let size = std::fs::metadata(&db).unwrap().len();
+        let far = Instant::now() + std::time::Duration::from_secs(30);
+        let mut st = FileState::fresh("d".into(), size, 1);
+        let out = AntigravityExtractor
+            .extract(&db, &mut st, u64::MAX, far)
+            .unwrap();
+        assert!(out.records.is_empty());
+        // The state.json boundary: serialize + deserialize the FileState.
+        let st_json = serde_json::to_string(&st).unwrap();
+        let mut st: FileState = serde_json::from_str(&st_json).unwrap();
+        assert_eq!(
+            st.aux.get("max_idx").and_then(|v| v.as_i64()),
+            Some(-1),
+            "the watermark must deserialize as -1, not clamp to 0"
+        );
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "INSERT INTO gen_metadata (idx, data) VALUES (0, ?1)",
+                [generation_blob_keyed(b"dedup-0")],
+            )
+            .unwrap();
+        }
+        let out = AntigravityExtractor
+            .extract(&db, &mut st, u64::MAX, far)
+            .unwrap();
+        assert_eq!(out.records.len(), 1, "idx = 0 read after a restart");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

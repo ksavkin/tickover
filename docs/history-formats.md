@@ -147,12 +147,17 @@ created `0600`:
 
 - `days.jsonl` — append-only bucket lines: hour, provider, project,
   model, session, the five token classes, message count, the source
-  file's generation, and the byte range `[lo, hi)` the bucket was
-  aggregated from. The range is what makes a crash between append and
+  file's generation, the source range `[lo, hi)` the bucket was
+  aggregated from (bytes for JSONL, row indices for SQLite), and a
+  `full` seal flag. The range is what makes a crash between append and
   commit safe: at load, a line whose range overlaps an earlier line in
   the same bucket supersedes it, so a re-parse replaces instead of
   double-counting — while identical aggregates at disjoint ranges
-  legitimately sum.
+  legitimately sum. A `full` line goes further: its pass reached the
+  end of the source, so it supersedes every older bucket line outside
+  the live prefix chain — including ranges written in a different
+  coordinate space by an older schema — while a truncated pass's line
+  supersedes only what it actually re-read.
 - `state.json` — per-file cursor, size/mtime, prefix digest (with the
   span it covered), owning provider, generation, a recent dedup ring
   that remembers the usage each id last carried, the extractor's
@@ -163,8 +168,10 @@ created `0600`:
   a provider can re-log an id at a later byte offset (Claude rewrites an
   assistant message as it streams), and the ring is the only thing that
   recognizes the repeat on a later pass. A re-emission that carries a
-  larger count emits only its growth — totals converge on the last
-  observation of the id, not the first.
+  larger count emits only its growth — totals converge on the high-water
+  mark of the id *within its owning file* (a regressed snapshot never
+  lowers the baseline, and a duplicate sighted by a second file is
+  skipped outright rather than delta'd).
 
 The whole open→scan→commit sequence runs under a `flock` on a `lock`
 file in the same directory, so the tray app and `tickover stats` can

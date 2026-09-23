@@ -188,6 +188,10 @@ pub fn scan_root(
         let mut grouped: BTreeMap<(String, String, String, String), DayLine> = BTreeMap::new();
         let mut seen_keys: Vec<(String, [u64; 5])> = Vec::new();
         let mut global_keys: Vec<String> = Vec::new();
+        // Skipped repeats that still prove an id is live — applied as LRU
+        // touches after the append succeeds, so an actively re-emitted id
+        // can't be evicted while the provider is still writing it.
+        let mut touches: Vec<String> = Vec::new();
         // Last usage per dedup key this pass — a repeat inside the same
         // pass diffs against the newest observation, not the first.
         let mut pass_usage: std::collections::HashMap<String, [u64; 5]> =
@@ -195,6 +199,13 @@ pub fn scan_root(
         // Byte range for JSONL; a row-watermark span for SQLite — whatever
         // the extractor reports is what supersession compares.
         let (range_lo, range_hi) = extraction.range.unwrap_or((resume_from, extraction.cursor));
+        // A pass that reached the end of its source seals coverage: the
+        // cursor/watermark only ever advances past bytes that were
+        // appended, so `complete` means every line of this file's bucket —
+        // this one plus the live prefix chain — re-derives the whole
+        // file. A cap- or deadline-truncated pass re-derived a prefix and
+        // must not claim coverage it hasn't emitted.
+        let full = extraction.complete;
         for mut rec in extraction.records {
             if rec.provider.is_empty() {
                 rec.provider = provider.to_string();
@@ -224,7 +235,10 @@ pub fn scan_root(
                 if let Some(old) = prior {
                     // Re-emission of an already-counted event (Claude
                     // streams a message's usage as it grows): count only
-                    // the growth, and remember the newest totals.
+                    // the growth. The baseline is the componentwise
+                    // high-water mark, not the newest observation — a
+                    // regressed reading must not lower it, or the next
+                    // partial recovery would emit phantom growth.
                     let delta = [
                         rec.input.saturating_sub(old[0]),
                         rec.output.saturating_sub(old[1]),
@@ -232,8 +246,16 @@ pub fn scan_root(
                         rec.cache_write.saturating_sub(old[3]),
                         rec.thinking.saturating_sub(old[4]),
                     ];
-                    pass_usage.insert(rec.dedup_key.clone(), usage);
+                    let high_water = [
+                        old[0].max(rec.input),
+                        old[1].max(rec.output),
+                        old[2].max(rec.cache_read),
+                        old[3].max(rec.cache_write),
+                        old[4].max(rec.thinking),
+                    ];
+                    pass_usage.insert(rec.dedup_key.clone(), high_water);
                     if delta.iter().all(|&d| d == 0) {
+                        touches.push(rec.dedup_key.clone());
                         continue;
                     }
                     rec.input = delta[0];
@@ -242,17 +264,28 @@ pub fn scan_root(
                     rec.cache_write = delta[3];
                     rec.thinking = delta[4];
                     is_update = true;
-                    seen_keys.push((rec.dedup_key.clone(), usage));
+                    seen_keys.push((rec.dedup_key.clone(), high_water));
                 } else {
                     // Seen before but the ring holds no usage for it
-                    // (pre-field entry), or first seen by a *different*
-                    // file — a true duplicate either way.
+                    // (pre-field entry or an evicted baseline), or first
+                    // seen by a *different* file — a true duplicate either
+                    // way. No `pass_usage` insert: the baseline is
+                    // unknown, so a later repeat in this pass must skip
+                    // again rather than emit a delta priced off this
+                    // record. The self-owned exception: a key this file
+                    // owns globally but whose ring entry aged out reads as
+                    // "re-emission mid-stream" only when the pass resumed
+                    // mid-file — a from-origin pass is a rewrite/state-loss
+                    // rescan, where the same keys must count again.
+                    let ring_evicted_self =
+                        resume_from > 0 && store.owns_globally(&key, &rec.dedup_key);
                     if store
                         .file_state(&sig.path)
                         .is_some_and(|st| st.seen(&rec.dedup_key))
                         || store.seen_globally(&key, &rec.dedup_key)
+                        || ring_evicted_self
                     {
-                        pass_usage.insert(rec.dedup_key.clone(), usage);
+                        touches.push(rec.dedup_key.clone());
                         continue;
                     }
                     pass_usage.insert(rec.dedup_key.clone(), usage);
@@ -278,6 +311,7 @@ pub fn scan_root(
                 gen,
                 lo: range_lo,
                 hi: range_hi,
+                full,
                 input: 0,
                 output: 0,
                 cache_read: 0,
@@ -320,6 +354,9 @@ pub fn scan_root(
             }
             for (k, usage) in &seen_keys {
                 st.mark_seen(k.clone(), *usage);
+            }
+            for k in &touches {
+                st.touch(k);
             }
         }
         for k in global_keys {
@@ -576,6 +613,127 @@ mod tests {
         .unwrap();
         scan_root(&mut store, "agy", &root, "*.db", &ex, far);
         assert_eq!(ex.calls.load(Ordering::SeqCst), 3);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_regressed_reemission_does_not_lower_the_baseline() {
+        // Claude re-emits usage as it streams; a provider hiccup can send
+        // a *smaller* snapshot. If that lowered the baseline, the next
+        // partial recovery would emit phantom growth — so the baseline
+        // must track the componentwise high-water mark.
+        let root = tmpdir("regress-root");
+        let dir = tmpdir("regress-store");
+        fs::write(root.join("t.jsonl"), claude_line("m1", 100, 30) + "\n").unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let ex = crate::history::formats::claude::ClaudeExtractor;
+        let far = Instant::now() + Duration::from_secs(30);
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+
+        // The stream regresses to (100,20) then partially recovers to
+        // (100,25): both are below the high-water output of 30, so
+        // neither may emit.
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("t.jsonl"))
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{}", claude_line("m1", 100, 20)).unwrap();
+        writeln!(f, "{}", claude_line("m1", 100, 25)).unwrap();
+        drop(f);
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        let total_out: u64 = store.live_days().map(|d| d.output).sum();
+        assert_eq!(total_out, 30, "regressed snapshots emit no growth");
+
+        // Genuine growth past the high-water mark still counts.
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("t.jsonl"))
+            .unwrap();
+        writeln!(f, "{}", claude_line("m1", 100, 40)).unwrap();
+        drop(f);
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        let total_out: u64 = store.live_days().map(|d| d.output).sum();
+        assert_eq!(total_out, 40, "growth past the high-water mark counts");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_key_shared_across_files_counts_once_and_stays_owned() {
+        // Grok's unified log and the session file carry the same turn;
+        // whichever file emits first owns the key globally. The second
+        // file's sightings — including grown ones — are duplicates of the
+        // owner's event, not new usage: they must skip outright and never
+        // acquire a baseline to delta from.
+        let root = tmpdir("xfile-root");
+        let dir = tmpdir("xfile-store");
+        fs::write(root.join("a.jsonl"), claude_line("m1", 100, 10) + "\n").unwrap();
+        fs::write(root.join("b.jsonl"), claude_line("m1", 100, 10) + "\n").unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let ex = crate::history::formats::claude::ClaudeExtractor;
+        let far = Instant::now() + Duration::from_secs(30);
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            100,
+            "one event, one count"
+        );
+
+        // The stream keeps updating under the same id in *both* files:
+        // only the owner's delta may land.
+        for name in ["a.jsonl", "b.jsonl"] {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(root.join(name))
+                .unwrap();
+            use std::io::Write as _;
+            writeln!(f, "{}", claude_line("m1", 100, 40)).unwrap();
+        }
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        let live: Vec<_> = store.live_days().cloned().collect();
+        assert_eq!(
+            live.iter().map(|d| d.output).sum::<u64>(),
+            40,
+            "the growth is counted once, by the owner"
+        );
+        assert_eq!(live.iter().map(|d| d.messages).sum::<u32>(), 1);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_append_retries_the_file_in_full() {
+        // If `days.jsonl` can't be written, nothing may move: cursor,
+        // dedup rings and the global ring all gate the retry — a mark
+        // that survived a failed append would eat the re-emission.
+        let root = tmpdir("fail-root");
+        let dir = tmpdir("fail-store");
+        fs::write(root.join("t.jsonl"), claude_line("m1", 100, 10) + "\n").unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let ex = crate::history::formats::claude::ClaudeExtractor;
+        let far = Instant::now() + Duration::from_secs(30);
+
+        // Poison the sink: a directory where the file must be.
+        fs::create_dir(dir.join("days.jsonl")).unwrap();
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        let key = root.join("t.jsonl").to_string_lossy().into_owned();
+        let st = store.file_state(Path::new(&key)).unwrap();
+        assert_eq!(st.cursor, 0, "a failed append must not move the cursor");
+        assert!(!st.seen("m1"), "the ring must not mark a lost record");
+
+        fs::remove_dir(dir.join("days.jsonl")).unwrap();
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        let live: Vec<_> = store.live_days().cloned().collect();
+        assert_eq!(live.iter().map(|d| d.input).sum::<u64>(), 100);
+        assert_eq!(live.iter().map(|d| d.messages).sum::<u32>(), 1);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&dir);
     }

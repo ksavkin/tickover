@@ -34,6 +34,12 @@ pub struct Extraction {
     /// Lines/records that looked like they should carry usage but did not
     /// parse — the format-drift observability counter.
     pub skipped_unparsed: u64,
+    /// The pass read to the end of the file's current content — `false`
+    /// when a byte cap or deadline stopped it early. Supersession needs
+    /// this: only a completed pass that started at the origin may claim
+    /// the file's whole contribution and kill every older line in its
+    /// buckets; a truncated one covers a prefix, nothing more.
+    pub complete: bool,
 }
 
 /// One history format's parser. Implemented per provider file shape; the
@@ -77,8 +83,10 @@ pub fn extractor_for(format: HistoryFormat) -> Box<dyn HistoryExtractor> {
 /// Read `path` starting at byte `offset`, at most `cap` bytes, and cut the
 /// buffer at the last complete `\n` — the torn tail a writer is still
 /// appending stays unconsumed for the next pass. Returns `(complete_bytes,
-/// cursor)` where `cursor` is `offset + complete_bytes.len()`.
-fn read_new_lines(path: &Path, offset: u64, cap: u64) -> io::Result<(Vec<u8>, u64)> {
+/// cursor, eof)` where `cursor` is `offset + complete_bytes.len()` and
+/// `eof` is true only when the read reached the end of file rather than
+/// exhausting the cap.
+fn read_new_lines(path: &Path, offset: u64, cap: u64) -> io::Result<(Vec<u8>, u64, bool)> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = fs_open_readonly(path)?;
     if offset > 0 {
@@ -87,10 +95,12 @@ fn read_new_lines(path: &Path, offset: u64, cap: u64) -> io::Result<(Vec<u8>, u6
     let mut buf = Vec::new();
     let mut chunk = [0u8; 64 * 1024];
     let mut remaining = cap;
+    let mut eof = false;
     while remaining > 0 {
         let want = remaining.min(chunk.len() as u64) as usize;
         let n = f.read(&mut chunk[..want])?;
         if n == 0 {
+            eof = true;
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
@@ -107,7 +117,7 @@ fn read_new_lines(path: &Path, offset: u64, cap: u64) -> io::Result<(Vec<u8>, u6
         None => 0,
     };
     buf.truncate(complete);
-    Ok((buf, offset + complete as u64))
+    Ok((buf, offset + complete as u64, eof))
 }
 
 /// Open a provider file read-only with the same FIFO/device guard the rest

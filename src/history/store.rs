@@ -93,10 +93,10 @@ pub struct FileState {
     /// The usage each ring id last carried. A re-emission is not a new
     /// event, but it is not always identical either — Claude streams a
     /// growing `output_tokens` under one `message.id`. The scanner emits
-    /// only the delta, so totals converge on the *last* observation of
-    /// the id rather than the first. Membership without a usage row
-    /// (entries persisted before this field existed) still dedups
-    /// outright — a repeat of unknown growth can't be priced.
+    /// only the delta against the componentwise high-water mark, so a
+    /// regressed snapshot never lowers the baseline. Membership without
+    /// a usage row (entries persisted before this field existed) still
+    /// dedups outright — a repeat of unknown growth can't be priced.
     #[serde(default)]
     pub recent_usage: std::collections::HashMap<String, [u64; 5]>,
     /// Membership mirror of `recent_ids` — checked per record, so O(1).
@@ -170,20 +170,47 @@ impl FileState {
         self.recent_usage.get(id).copied()
     }
 
+    /// Refresh `id`'s recency without touching its usage — for repeats
+    /// that emit nothing (zero-delta, membership-only skip) but prove the
+    /// id is still live and shouldn't age out of the ring.
+    pub fn touch(&mut self, id: &str) {
+        if self.recent_set.contains(id) {
+            self.recent_ids.retain(|k| k != id);
+            self.recent_ids.push_back(id.to_string());
+        }
+    }
+
     /// Record `id` with the usage it carried, evicting the oldest once
-    /// the ring is full. A repeat updates the remembered usage — the next
-    /// re-emission diffs against the newest, not the first.
+    /// the ring is full. A repeat stores the componentwise high-water
+    /// mark — the next re-emission diffs against it — and moves `id` to
+    /// the back: a plain FIFO would evict an actively re-emitted id while
+    /// the ring is full, and the next repeat would then read as brand-new
+    /// usage and count twice.
     pub fn mark_seen(&mut self, id: String, usage: [u64; 5]) {
-        if self.recent_ids.len() >= RECENT_IDS_PER_FILE {
+        if self.recent_set.contains(&id) {
+            self.recent_ids.retain(|k| k != &id);
+        } else if self.recent_ids.len() >= RECENT_IDS_PER_FILE {
             if let Some(old) = self.recent_ids.pop_front() {
                 self.recent_set.remove(&old);
                 self.recent_usage.remove(&old);
             }
         }
-        if self.recent_set.insert(id.clone()) {
-            self.recent_ids.push_back(id.clone());
-        }
-        self.recent_usage.insert(id, usage);
+        self.recent_set.insert(id.clone());
+        self.recent_ids.push_back(id.clone());
+        // Keep the componentwise high-water mark, not the raw snapshot:
+        // a regressed re-emission must not lower the baseline the next
+        // repeat diffs against.
+        let merged = match self.recent_usage.get(&id) {
+            Some(old) => [
+                old[0].max(usage[0]),
+                old[1].max(usage[1]),
+                old[2].max(usage[2]),
+                old[3].max(usage[3]),
+                old[4].max(usage[4]),
+            ],
+            None => usage,
+        };
+        self.recent_usage.insert(id, merged);
     }
 }
 
@@ -249,6 +276,12 @@ pub struct DayLine {
     pub lo: u64,
     #[serde(default)]
     pub hi: u64,
+    /// The pass that wrote this line read its file from the origin to the
+    /// end — only such a line may supersede every older line in its
+    /// bucket (a truncated prefix must not claim coverage it didn't
+    /// re-derive). Persisted because supersession replays at load.
+    #[serde(default)]
+    pub full: bool,
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
@@ -391,6 +424,10 @@ pub struct HistoryStore {
     /// `bucket key → live line indices`, maintained at open and append so
     /// in-memory `live_days` reflects supersession, not just the next load.
     by_key: std::collections::HashMap<BucketKey, Vec<usize>>,
+    /// `(file, gen) → line indices` — the seal's reach: a complete pass
+    /// re-derived the file's whole contribution, so its scope is every
+    /// bucket of this generation, not only the one the line landed in.
+    by_file: std::collections::HashMap<(String, u32), Vec<usize>>,
     /// Exact serialized lines — the crash-rescan artifact is a byte-
     /// identical re-append, cheaper to catch as a string than by key.
     seen_lines: std::collections::HashSet<String>,
@@ -437,6 +474,7 @@ impl HistoryStore {
             days: Vec::new(),
             dead: std::collections::HashSet::new(),
             by_key: std::collections::HashMap::new(),
+            by_file: std::collections::HashMap::new(),
             seen_lines: std::collections::HashSet::new(),
         };
         match fs::read_to_string(Self::days_path(dir)) {
@@ -462,7 +500,10 @@ impl HistoryStore {
                     if d.v > SCHEMA_VERSION {
                         continue;
                     }
-                    store.fold_line(d);
+                    // At load each line is its own batch: a seal may only
+                    // kill lines written earlier on disk.
+                    let floor = store.days.len();
+                    store.fold_line(d, floor);
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -489,12 +530,13 @@ impl HistoryStore {
         Ok(store)
     }
 
-    /// Fold one validated line into `days`/`by_key`: a later line whose
-    /// byte range overlaps an earlier same-bucket line re-parsed those
-    /// bytes — the earlier aggregate is superseded, not summed. This is
-    /// what makes append-then-commit crash-safe both at load *and* inside
-    /// a session (a state-loss rebuild rescans into the same ranges).
-    fn fold_line(&mut self, d: DayLine) {
+    /// Fold one validated line into `days`/the indexes: a later line whose
+    /// range overlaps an earlier same-bucket line re-parsed those bytes —
+    /// the earlier aggregate is superseded, not summed. `batch_floor` is
+    /// the index the current append batch started at: a seal never kills
+    /// its own batch-mates (they are the fresh coverage, not the stale
+    /// past). At load every line folds as its own batch.
+    fn fold_line(&mut self, d: DayLine, batch_floor: usize) {
         // A line with `hi <= lo` never carried a real range: pre-range
         // writes deserialize to `lo = hi = 0`, and a buggy extractor can
         // persist an empty span. The rule is asymmetric: such a line
@@ -503,22 +545,38 @@ impl HistoryStore {
         // bucket's whole span *as the old line*, so any re-emitted real
         // range replaces it.
         //
-        // A line with `lo == 0` is a from-origin rescan of its file — the
-        // only paths that produce one (first scan, state-loss rebuild,
-        // post-rewrite reset) re-derive the file's whole contribution, so
-        // it supersedes *every* older line of the bucket, even ones whose
-        // range lives in a different coordinate space (a byte-range v1
-        // line vs. a row-range v2 line can never overlap numerically, but
-        // the rescan covers the same events).
-        let idxs = self.by_key.entry(bucket_key(&d)).or_default();
-        if d.hi > d.lo {
-            let from_origin = d.lo == 0;
-            idxs.retain(|&i| {
-                let old = &self.days[i];
-                if from_origin {
+        // A `full` line seals coverage: its pass reached the end of the
+        // source, and because cursors/watermarks only advance past ranges
+        // that were appended, the live lines of this file+generation now
+        // re-derive its whole contribution. The seal therefore reaches
+        // *every* older line of the generation — buckets drifted by a
+        // schema change (v1 byte ranges vs. v2 row ranges can neither
+        // overlap numerically nor share a bucket key, but the rescan
+        // covers the same events) — except real-range lines inside the
+        // already-covered prefix `[0, lo)`: those are the chain this line
+        // completes, and their tokens were not re-emitted. A truncated
+        // pass's line must not seal: it re-derived a prefix, nothing more.
+        if d.full && d.hi > d.lo {
+            if let Some(idxs) = self.by_file.get_mut(&(d.file.clone(), d.gen)) {
+                idxs.retain(|&i| {
+                    if i >= batch_floor || self.dead.contains(&i) {
+                        return i >= batch_floor; // dead stays marked, out of the index
+                    }
+                    let old = &self.days[i];
+                    if old.hi > old.lo && old.hi <= d.lo {
+                        return true; // live prefix-chain segment
+                    }
                     self.dead.insert(i);
+                    false
+                });
+            }
+        } else if d.hi > d.lo {
+            let idxs = self.by_key.entry(bucket_key(&d)).or_default();
+            idxs.retain(|&i| {
+                if self.dead.contains(&i) {
                     return false;
                 }
+                let old = &self.days[i];
                 let (olo, ohi) = if old.hi <= old.lo {
                     (0, u64::MAX)
                 } else {
@@ -530,7 +588,12 @@ impl HistoryStore {
                 }
             });
         }
-        idxs.push(self.days.len());
+        let i = self.days.len();
+        self.by_key.entry(bucket_key(&d)).or_default().push(i);
+        self.by_file
+            .entry((d.file.clone(), d.gen))
+            .or_default()
+            .push(i);
         self.days.push(d);
     }
 
@@ -540,14 +603,21 @@ impl HistoryStore {
         let mut days = Vec::with_capacity(self.days.len() - self.dead.len());
         let mut by_key: std::collections::HashMap<BucketKey, Vec<usize>> =
             std::collections::HashMap::new();
+        let mut by_file: std::collections::HashMap<(String, u32), Vec<usize>> =
+            std::collections::HashMap::new();
         for (i, d) in std::mem::take(&mut self.days).into_iter().enumerate() {
             if self.dead.contains(&i) {
                 continue;
             }
             by_key.entry(bucket_key(&d)).or_default().push(days.len());
+            by_file
+                .entry((d.file.clone(), d.gen))
+                .or_default()
+                .push(days.len());
             days.push(d);
         }
         self.days = days;
+        self.by_file = by_file;
         self.by_key = by_key;
         self.dead.clear();
     }
@@ -572,6 +642,13 @@ impl HistoryStore {
     /// event is still the duplicate.
     pub fn seen_globally(&self, path: &str, id: &str) -> bool {
         self.state.global_map.get(id).is_some_and(|p| p != path)
+    }
+
+    /// Whether this very file owns `id` in the global ring — true on a
+    /// rewrite rescan (must count again) and on a mid-stream re-emission
+    /// whose ring entry aged out (must not count twice).
+    pub fn owns_globally(&self, path: &str, id: &str) -> bool {
+        self.state.global_map.get(id).is_some_and(|p| p == path)
     }
 
     /// Record `id` in the cross-file ring, evicting the oldest once full.
@@ -661,9 +738,12 @@ impl HistoryStore {
         // Only after the bytes are on disk do the lines count in memory —
         // a failed append leaves both views untouched, so the retry's
         // identical re-append is caught by `seen_lines` on the next open.
+        // The whole batch shares one floor: a seal line may kill anything
+        // older, but never its own batch-mates.
+        let floor = self.days.len();
         for (line, d) in accepted {
             self.seen_lines.insert(line);
-            self.fold_line(d);
+            self.fold_line(d, floor);
         }
         Ok(())
     }
@@ -795,6 +875,7 @@ mod tests {
             gen,
             lo: 0,
             hi: 0,
+            full: false,
             input,
             output: 0,
             cache_read: 0,
@@ -1030,6 +1111,28 @@ mod tests {
     }
 
     #[test]
+    fn a_re_emitted_id_is_not_evicted_by_ring_pressure() {
+        // With a plain FIFO, an actively streaming id gets pushed out by
+        // newer ids while the ring is full; the next re-emission then
+        // reads as brand-new usage and double-counts. Refreshing recency
+        // on repeat (LRU) keeps it alive.
+        let mut st = FileState::fresh("d".into(), 1, 1);
+        st.mark_seen("hot".into(), [1, 0, 0, 0, 0]);
+        for i in 0..crate::history::store::RECENT_IDS_PER_FILE {
+            st.mark_seen(format!("cold-{i}"), [9, 9, 9, 9, 9]);
+            if i == 3 {
+                // Re-emit "hot" while the ring still has cold ids queued
+                // ahead of it — the repeat must move it to the back.
+                st.mark_seen("hot".into(), [2, 0, 0, 0, 0]);
+            }
+        }
+        assert!(st.seen("hot"), "the active id outlived the filler");
+        assert_eq!(st.last_usage("hot"), Some([2, 0, 0, 0, 0]));
+        // And the ring still evicts genuinely-old entries.
+        assert!(!st.seen("cold-0"), "the oldest filler was evicted");
+    }
+
+    #[test]
     fn lines_from_an_older_schema_still_count() {
         // A v1 day line is data the current schema can still read — and
         // for a file that no longer exists it is the only record left.
@@ -1043,6 +1146,122 @@ mod tests {
         drop(store);
         let store = HistoryStore::open(&dir).unwrap();
         assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 33);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_full_from_origin_line_supersedes_across_range_spaces() {
+        // v1 Antigravity lines carry *byte* ranges; v2 lines carry row
+        // indices. They can never overlap numerically, yet a complete
+        // rescan re-derives the same events — `full` is what lets the
+        // row-range line kill the alien byte-range line.
+        let dir = tmpdir("spaces");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let mut byte_line = day("/f", 0, 100);
+        byte_line.lo = 5000;
+        byte_line.hi = 9000;
+        store.append_days(&[byte_line]).unwrap();
+        let mut row_line = day("/f", 0, 100);
+        row_line.lo = 0;
+        row_line.hi = 10;
+        row_line.full = true;
+        store.append_days(&[row_line]).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            100,
+            "the full rescan replaced the byte-range aggregate"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_truncated_from_origin_line_supersedes_only_what_it_read() {
+        // A deadline-truncated first scan emits [0,k) with `full=false`:
+        // it must kill the overlapping part of the old coverage but leave
+        // ranges beyond what it re-read untouched — the completing pass
+        // will supersede the rest later.
+        let dir = tmpdir("trunc");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let mut old = day("/f", 0, 100);
+        old.lo = 100;
+        old.hi = 200;
+        store.append_days(&[old]).unwrap();
+        let mut partial = day("/f", 0, 50);
+        partial.lo = 0;
+        partial.hi = 50;
+        // `full` left false: [0,50) doesn't overlap [100,200), so the old
+        // line must survive the truncated pass.
+        store.append_days(&[partial]).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            150,
+            "100 (unread tail) + 50 (re-derived prefix)"
+        );
+        // The completing pass covers the whole file and claims it.
+        let mut complete = day("/f", 0, 150);
+        complete.lo = 0;
+        complete.hi = 200;
+        complete.full = true;
+        store.append_days(&[complete]).unwrap();
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 150);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_full_seal_reaches_stale_lines_in_other_buckets_of_the_file() {
+        // Attribution can drift between schema versions: the same file's
+        // v1 line can sit in a different hour/model bucket than the v2
+        // rescan emits. A seal is file-scoped — it re-derived the whole
+        // contribution, so the drifted bucket dies with the rest.
+        let dir = tmpdir("xseal");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let mut drifted = day("/f", 0, 60);
+        drifted.hour = "2026-09-22T10".into();
+        drifted.lo = 5000;
+        drifted.hi = 9000;
+        let mut prefix = day("/f", 0, 50);
+        prefix.lo = 0;
+        prefix.hi = 50;
+        store.append_days(&[drifted, prefix]).unwrap();
+        let mut tail = day("/f", 0, 150);
+        tail.lo = 50;
+        tail.hi = 200;
+        tail.full = true;
+        store.append_days(&[tail]).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            200,
+            "50 (prefix) + 150 (tail); the drifted-bucket line died too"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_completing_resume_seals_coverage_and_keeps_its_prefix_chain() {
+        // The truncated-first-scan split: pass 1 emitted [0,50), pass 2
+        // resumed and reached the end with [50,200). Together they
+        // re-derive the file — the seal must keep the chain segment
+        // [0,50) (its tokens are not re-emitted) while killing stale
+        // lines in any coordinate space, like a v1 byte-range leftover.
+        let dir = tmpdir("seal");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let mut alien = day("/f", 0, 70);
+        alien.lo = 5000;
+        alien.hi = 9000; // a v1 byte range — never overlaps row ranges
+        let mut prefix = day("/f", 0, 50);
+        prefix.lo = 0;
+        prefix.hi = 50;
+        store.append_days(&[alien, prefix]).unwrap();
+        let mut tail = day("/f", 0, 150);
+        tail.lo = 50;
+        tail.hi = 200;
+        tail.full = true;
+        store.append_days(&[tail]).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            200,
+            "50 (prefix chain) + 150 (completing tail); the alien line died"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

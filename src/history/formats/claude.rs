@@ -105,9 +105,10 @@ impl HistoryExtractor for ClaudeExtractor {
         _deadline: Instant,
     ) -> io::Result<Extraction> {
         let resume_from = st.cursor;
-        let (buf, cursor) = read_new_lines(path, resume_from, byte_cap)?;
+        let (buf, cursor, eof) = read_new_lines(path, resume_from, byte_cap)?;
         let mut out = Extraction {
             cursor,
+            complete: eof,
             ..Default::default()
         };
         let mut offset_in_buf = 0u64;
