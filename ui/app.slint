@@ -804,10 +804,6 @@ export component AppWindow inherits Window {
                                 ProviderCard {
                                     data: p;
                                     card-index: i;
-                                    // Density variant (§5): the 30d range
-                                    // gives Activity the room — providers
-                                    // collapse to one line each.
-                                    compact: root.activity.visible && root.activity-range == 2;
                                     tip-changed(t) => { root.take-tip(t); }
                                 }
                             }
