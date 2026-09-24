@@ -2441,10 +2441,22 @@ fn drain_tray_clicks(app: &AppWindow, ctx: &Ctx) -> usize {
                 sync_providers_cap(app, &ctx.anchor);
                 position_popover(app, &ctx.anchor, &ctx.pending_position, Shown::ByTrayClick);
             } else if app.window().is_visible() {
-                let _ = app.window().hide();
-                // Hidden ends the presentation — no deferred or settling
-                // placement may outlive it into the next one.
-                ctx.pending_position.set(None);
+                // Visible — but hanging off this icon, or parked somewhere
+                // else? "Click the icon" means "the panel, here": a panel
+                // already under the item toggles closed, while one parked
+                // away from it (the launch open's fallback spot, or a dock
+                // window the user dragged aside) re-anchors — hiding a
+                // window the user was not looking at reads as "nothing
+                // happened", the click that "did not open" the panel.
+                if window_at_anchor(app, &ctx.anchor) {
+                    let _ = app.window().hide();
+                    // Hidden ends the presentation — no deferred or
+                    // settling placement may outlive it into the next one.
+                    ctx.pending_position.set(None);
+                } else {
+                    sync_providers_cap(app, &ctx.anchor);
+                    position_popover(app, &ctx.anchor, &ctx.pending_position, Shown::ByTrayClick);
+                }
             } else if !dismissed {
                 spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
                 if should_refresh_panel(app.window().is_visible(), true) {
@@ -7179,8 +7191,13 @@ fn present_popover(
     // height the placement math then reads is the cap-applied one — syncing
     // after would leave a just-shrunk card floating off a taskbar anchor.
     sync_providers_cap(app, anchor);
-    let _ = app.window().show();
+    // Position while still hidden: a hidden winit window keeps its old spot
+    // and takes `set_position` fine, so showing first would flash the panel
+    // where it last was and visibly jump to the anchor. A window that does
+    // not exist yet (size 0×0) still defers through `pending` — its first
+    // placement lands on a `Resized` replay like before.
     let moved = position_popover(app, anchor, pending, shown);
+    let _ = app.window().show();
     // "Leave a parked window parked" is only a courtesy while the parking
     // spot is reachable — a dock-mode window last left on a monitor that has
     // since gone away (or under a resolution change) is a window nobody can
@@ -7516,6 +7533,135 @@ thread_local! {
     static POPOVER_PLACED: Cell<bool> = const { Cell::new(false) };
 }
 
+/// macOS: winit's `Window::is_maximized()` reaches `is_zoomed()`, which —
+/// because `isZoomed` does not answer for borderless windows — *temporarily
+/// swaps the window's styleMask to `Titled | Resizable`* and then restores
+/// it (winit#4071, still open upstream). Slint's `window_state_event` calls
+/// `is_maximized()` on every `Resized`, and content growth resizes this
+/// window whenever usage data lands. While the mask is titled the frame
+/// keeps the *content* pinned and grows a title-bar's height upward; if
+/// that frame would dip under the menu bar, `constrainFrameRect` clamps it —
+/// and when the mask is restored the window keeps the pushed-down position.
+/// Net effect, repeated per resize: the popover visibly jumps ~30px down
+/// some time after it opened, which is exactly the reported bug.
+///
+/// The probe always writes the same verbatim mask — `Titled | Resizable` —
+/// and a borderless popover is never legitimately zoomed, so the fix is
+/// surgical: a `class_addMethod` override of `setStyleMask:` on `WinitWindow`
+/// itself, swallowing exactly that mask while the window is borderless. The
+/// probe then reads `isZoomed` on the still-borderless window (false — the
+/// correct answer), restores the current mask (a harmless no-op write), and
+/// nothing ever moves. A class-level override — not an `object_setClass`
+/// instance swizzle — so AppKit's own isa-swizzling (KVO notification
+/// subclasses) is left alone; an instance reclass on an AppKit-swizzled
+/// window collapsed this window to 0×0 and crashed appearance lookups.
+#[cfg(target_os = "macos")]
+mod mask_shield {
+    use objc::runtime::{class_addMethod, Class, Object, Sel};
+    use objc::{msg_send, sel, sel_impl};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// `NSUInteger` — the ObjC `styleMask`/`setStyleMask:` argument type.
+    type ULong = usize;
+    /// `NSWindowStyleMaskTitled | NSWindowStyleMaskResizable` — the exact
+    /// mask winit's `is_zoomed` installs as its probe.
+    const ZOOM_PROBE: ULong = 0x1 | 0x8;
+    const TITLED: ULong = 0x1;
+
+    /// `NSWindow`'s own `setStyleMask:` IMP, captured at install so the shim
+    /// can forward every mask it does not swallow.
+    static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+    /// Set only after the method is actually on the class — a caller that
+    /// arrives before winit has registered `WinitWindow` retries next pass
+    /// instead of latching "done" on a no-op.
+    static DONE: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn shielded_set_style_mask(this: &mut Object, _cmd: Sel, mask: ULong) {
+        let current: ULong = unsafe { msg_send![this, styleMask] };
+        if mask == ZOOM_PROBE && current & TITLED == 0 {
+            // Borderless window, verbatim probe mask: only `is_zoomed` ever
+            // writes this. Swallow it — a borderless window cannot be zoomed,
+            // so dropping the probe cannot change the answer it was read for.
+            // `winit::WindowDelegate::set_style_mask` still runs its
+            // `makeFirstResponder` on the view afterwards — which is where
+            // Slint's canvas belongs anyway, so nothing is lost there.
+            return;
+        }
+        let orig: extern "C" fn(&mut Object, Sel, ULong) =
+            unsafe { std::mem::transmute(ORIGINAL.load(Ordering::Relaxed)) };
+        orig(this, _cmd, mask);
+    }
+
+    extern "C" {
+        fn method_getTypeEncoding(m: *const objc::runtime::Method) -> *const i8;
+        fn method_setImplementation(
+            m: *mut objc::runtime::Method,
+            imp: objc::runtime::Imp,
+        ) -> objc::runtime::Imp;
+    }
+
+    /// Add the `setStyleMask:` shim as an override on `WinitWindow` itself —
+    /// a class-level `class_addMethod`, not an instance `object_setClass`,
+    /// so AppKit's own isa-swizzling (KVO notifications and friends) is left
+    /// alone. Idempotent: one class, one method, per process.
+    ///
+    /// One latent edge is accepted and documented: `set_decorations(true)`
+    /// on a window carrying `Resizable` but not `Miniaturizable` computes the
+    /// same `0x9` mask this shim swallows. Nothing in this app ever re-enables
+    /// decorations — the popover is frameless by design — so the overlap is
+    /// unreachable; if that ever changes, the guard needs a caller check, not
+    /// a value check.
+    pub fn install() {
+        if DONE.load(Ordering::SeqCst) {
+            return;
+        }
+        unsafe {
+            // The class is registered by winit at window creation, so this
+            // only succeeds once a window exists — DONE is therefore set only
+            // after the method really landed, and a too-early call retries.
+            let Some(cls) = Class::get("WinitWindow") else {
+                return;
+            };
+            let sel = sel!(setStyleMask:);
+            let Some(m) = cls.instance_method(sel) else {
+                return;
+            };
+            let orig = m.implementation() as usize;
+            if orig == 0 {
+                return;
+            }
+            ORIGINAL.store(orig, Ordering::SeqCst);
+            let shim: objc::runtime::Imp = std::mem::transmute(
+                shielded_set_style_mask as extern "C" fn(&mut Object, Sel, ULong),
+            );
+            // The type string is copied off the live method rather than
+            // hand-spelled (`v@:Q` vs `v@:L` for NSUInteger) — whatever Apple
+            // declared is what the override advertises.
+            let types = method_getTypeEncoding(m as *const _ as *mut _);
+            if class_addMethod(cls as *const Class as *mut Class, sel, shim, types)
+                == objc::runtime::NO
+            {
+                // `addMethod` refuses when the class already implements the
+                // selector itself — e.g. a future winit fixing #4071 on
+                // `WinitWindow`. Replacing that IMP keeps the override scoped
+                // to winit's class, and `ORIGINAL` captured above is exactly
+                // the impl being replaced, so the shim still chains correctly.
+                let replaced = method_setImplementation(m as *const _ as *mut _, shim);
+                if replaced as usize == 0 {
+                    return;
+                }
+                ORIGINAL.store(replaced as usize, Ordering::SeqCst);
+            }
+            DONE.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod mask_shield {
+    pub fn install() {}
+}
+
 fn popover_placed() -> bool {
     POPOVER_PLACED.with(|placed| placed.get())
 }
@@ -7574,6 +7720,11 @@ fn position_popover_impl(
     // app cannot otherwise reason about anyway.
     let (screen, scale) =
         target_monitor(app, anchor).unwrap_or(((0.0, 0.0, f64::MAX, f64::MAX), 1.0));
+    // Shield the window before any placement near the menu bar: the next
+    // content resize would otherwise let winit's `is_zoomed` probe flash a
+    // titlebar on the borderless window and `constrainFrameRect` would push
+    // it down mid-toggle — the delayed downward jump. See `mask_shield`.
+    mask_shield::install();
     let (x, y) = popover_origin(
         anchor,
         (size.width as f64, size.height as f64),
@@ -7626,6 +7777,39 @@ fn window_off_screen(app: &AppWindow) -> bool {
         size.height as f64,
     );
     !mons.iter().any(|m| rects_overlap(m.0, frame))
+}
+
+/// Whether the window already sits where this anchor would put it — the
+/// popover hanging off the status item, not a window parked somewhere else
+/// (the launch open's fallback spot, or a dock-mode window the user dragged
+/// aside). A status-item click reads "the panel, here": only an
+/// already-anchored panel toggles closed. Unanswerable cases — no valid
+/// anchor, no monitors, no size — call it anchored, so the click keeps its
+/// ordinary toggle.
+fn window_at_anchor(app: &AppWindow, anchor: &Anchor) -> bool {
+    let Some(anchor) = sanitize_anchor(app, *anchor.borrow()) else {
+        return true;
+    };
+    let Some((screen, scale)) = target_monitor(app, Some(anchor)) else {
+        return true;
+    };
+    let size = app.window().size();
+    if size.width == 0 || size.height == 0 {
+        return true;
+    }
+    let (tx, ty) = popover_origin(
+        Some(anchor),
+        (size.width as f64, size.height as f64),
+        screen,
+        scale,
+    );
+    let pos = app.window().position();
+    // Modest slack: a live status item drifts a few px as the bar reflows and
+    // scale rounding adds a couple more — but wide enough to forgive a real
+    // displacement would also forgive the ~26px menu-bar push this check
+    // exists to notice, so it stays below that.
+    const ANCHOR_SLACK: f64 = 20.0;
+    (pos.x as f64 - tx).abs() <= ANCHOR_SLACK && (pos.y as f64 - ty).abs() <= ANCHOR_SLACK
 }
 
 /// Whether two rects share any area — the off-screen test's unit: a window
