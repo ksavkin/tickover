@@ -39,8 +39,8 @@ order        = 30
 # what lets the window below read its own length off `currentPeriod`'s
 # stated start/end instead of a number typed into this file. See
 # docs/PLUGIN-ARCHITECTURE.md, "Reader capabilities".
-requires_reader = ["window-identity", "reading-balances", "credentials-map", "keychain-expiry", "window-period-bounds"]
-version      = "1.0.3"
+requires_reader = ["window-identity", "reading-balances", "credentials-map", "keychain-expiry", "window-period-bounds", "reading-history"]
+version      = "1.1.0"
 engine       = "http-api"
 refresh_secs = 60
 
@@ -146,3 +146,12 @@ path              = "~/.grok/auth.json"
 key_prefix        = "https://auth.x.ai::"
 token_json_path   = "key"
 expiry_json_path  = "expires_at"
+
+# Token usage history: `~/.grok/logs/unified.jsonl` carries one
+# `shell.turn.inference_done` event per model call; session `updates.jsonl`
+# files under `~/.grok/sessions/` can repeat the same turn, so the extractor
+# dedups on (session, timestamp, loop index).
+[history]
+format        = "grok-unified"
+root          = "~/.grok/logs"
+glob          = "unified.jsonl"

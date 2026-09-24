@@ -44,6 +44,11 @@
 //! glob          = "**/rollout-*.jsonl"
 //! container_key = "rate_limits"
 //!
+//! [history]                        # optional; needs `reading-history`
+//! format        = "codex-rollouts" # see HistoryFormat
+//! root          = "~/.codex/sessions"
+//! glob          = "**/*.jsonl"
+//!
 //! [http]                           # required when engine = "http-api"
 //! [[http.request]]
 //! url = "https://api.anthropic.com/api/oauth/usage"
@@ -143,6 +148,17 @@ pub struct PluginManifest {
     pub logfile: Option<LogFileConfig>,
     /// `[http]` — required when `engine = "http-api"`.
     pub http: Option<HttpConfig>,
+
+    /// `[history]` — where this provider's local usage *history* lives,
+    /// independent of the quota reading `engine`/`[logfile]`/`[http]`
+    /// describe. Absent is a real answer: the provider simply has no local
+    /// token history this app knows how to read (Copilot ships that way),
+    /// and the UI marks it "quota only" rather than inventing a zero.
+    ///
+    /// Needs `requires_reader = ["reading-history"]` — an older build
+    /// ignores the section entirely, which is exactly the silent-misread
+    /// the capability gate exists to refuse.
+    pub history: Option<HistoryConfig>,
 
     /// `[[surface]]` — the surfaces (accounts/installs) this provider can be
     /// read from. Defaults to a single opt-out "default" surface with no
@@ -351,6 +367,7 @@ impl PluginManifest {
         // own fn rather than stretching either neighbour's name to cover it).
         self.validate_identity()?;
         self.validate_engine_sections()?;
+        self.validate_history()?;
         self.validate_windows()?;
         self.validate_balances()?;
         self.validate_window_period_mode()?;
@@ -730,6 +747,13 @@ impl PluginManifest {
             }
             option_templates.push(("`[logfile] glob`".to_string(), lf.glob.as_str()));
         }
+        if let Some(h) = &self.history {
+            option_templates.push(("`[history] root`".to_string(), h.root.as_str()));
+            if let Some(join) = &h.root_env_join {
+                option_templates.push(("`[history] root_env_join`".to_string(), join.as_str()));
+            }
+            option_templates.push(("`[history] glob`".to_string(), h.glob.as_str()));
+        }
         if let Some(url) = &self.account.url {
             option_templates.push(("`[account] url`".to_string(), url.as_str()));
         }
@@ -744,6 +768,58 @@ impl PluginManifest {
                  before its name is ever read, so the field would be used verbatim, \
                  braces and all, instead of resolving"
             ));
+        }
+        Ok(())
+    }
+
+    /// `[history]` — the same checks `[logfile]` gets for the same fields:
+    /// non-blank `root`/`glob`, a named `root_env`, and a `root_env_join`
+    /// that is a relative subdirectory of the override with no `..`. The
+    /// capability side (`reading-history` declared) is enforced by the
+    /// raw-TOML gate in [`PluginManifest::from_str`], not here — this fn
+    /// answers "is the section usable", not "was it allowed".
+    fn validate_history(&self) -> Result<(), String> {
+        let Some(h) = &self.history else {
+            return Ok(());
+        };
+        for (field, empty) in [
+            ("root", h.root.trim().is_empty()),
+            ("glob", h.glob.trim().is_empty()),
+        ] {
+            if empty {
+                return Err(format!("`[history] {field}` must not be empty"));
+            }
+        }
+        if h.root_env.as_deref().is_some_and(|e| e.trim().is_empty()) {
+            return Err("`[history] root_env` names no environment variable".to_string());
+        }
+        if h.root_env.is_none() && h.root_env_join.is_some() {
+            return Err(
+                "`[history] root_env_join` needs `root_env` — it joins onto the variable's \
+                 value, and without one it is never read"
+                    .to_string(),
+            );
+        }
+        if let Some(join) = &h.root_env_join {
+            if join.trim().is_empty() {
+                return Err(
+                    "`[history] root_env_join` must not be empty — an empty join resolves \
+                     to the directory `root_env` names, not a file in it"
+                        .to_string(),
+                );
+            }
+            if is_absolute_on_any_platform(Path::new(join)) {
+                return Err(format!(
+                    "`[history] root_env_join = \"{join}\"` must be a relative subdirectory \
+                     — it is appended to `root_env`'s value, not used in its place"
+                ));
+            }
+            if has_dotdot_component(join) {
+                return Err(format!(
+                    "`[history] root_env_join = \"{join}\"` must not contain a `..` component \
+                     — it would search outside the directory `root_env` named"
+                ));
+            }
         }
         Ok(())
     }
@@ -4331,6 +4407,65 @@ pub enum LogFileSelect {
     Last,
 }
 
+// ── [history] ─────────────────────────────────────────────────────────────
+
+/// `[history]` — where a provider's local token-usage history lives.
+///
+/// This is the *history* half of what `[logfile]` is for quota: a root, a
+/// glob, and the same `root_env`/`root_env_join` override convention —
+/// `CLAUDE_CONFIG_DIR` relocates Claude's transcript tree exactly the way
+/// it relocates its credentials file. What it deliberately does **not**
+/// carry is any parsing detail: `format` names a typed extractor in
+/// `crate::history::formats`, and a manifest cannot spell out a field
+/// mapping of its own — a mapping DSL in TOML would be a mini-ETL nobody
+/// can validate. A format this build does not know is refused at load
+/// (`serde` denies the variant), not read as something else.
+///
+/// Needs `requires_reader = ["reading-history"]`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct HistoryConfig {
+    /// Which extractor parses the matched files. Required — there is no
+    /// default because every format's correctness rules differ (dedup
+    /// keys, cumulative counters, sub-agent filtering); guessing one is
+    /// how double-counted histories are born.
+    pub format: HistoryFormat,
+    /// Root directory the history scanner walks (subject to `root_env`
+    /// override and `~` expansion — see [`crate::plugin::expand_home`]).
+    pub root: String,
+    /// Glob (relative to `root`) matching history files. For
+    /// `antigravity-sqlite` this matches the `*.db` conversation stores;
+    /// for the JSONL formats it matches transcript/rollout files.
+    pub glob: String,
+    /// Env var that, if set, overrides `root` — same semantics as
+    /// `[logfile] root_env`.
+    #[serde(default)]
+    pub root_env: Option<String>,
+    /// Subdirectory appended onto the `root_env` override — same rules as
+    /// `[logfile] root_env_join`: refused without `root_env`, must be a
+    /// relative path, no `..`.
+    #[serde(default)]
+    pub root_env_join: Option<String>,
+}
+
+/// The extractor a `[history]` section selects. Parsing is code — the
+/// manifest chooses *which* parser, never *how* to parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HistoryFormat {
+    /// `~/.claude/projects/**` transcripts: one JSON object per line,
+    /// `type = "assistant"` lines carry `message.usage`.
+    ClaudeTranscripts,
+    /// `~/.codex/sessions/**` rollout JSONL: `token_count` events are
+    /// cumulative per session and get diffed into deltas.
+    CodexRollouts,
+    /// `~/.grok/logs/unified.jsonl` + `sessions/*/updates.jsonl`:
+    /// `shell.turn.inference_done` events.
+    GrokUnified,
+    /// `~/.gemini/antigravity-cli/conversations/*.db`: read-only SQLite
+    /// (`mode=ro`), protobuf-encoded generation records.
+    AntigravitySqlite,
+}
+
 fn default_classify_threshold_minutes() -> u64 {
     720
 }
@@ -7103,6 +7238,65 @@ mod tests {
             .expect_err("a JSON-shaped root_env_join swallows its own placeholder");
         assert!(err.contains("{option.<key>}"), "{err}");
         assert!(err.contains("`[logfile] root_env_join`"), "{err}");
+    }
+
+    /// `[history]` — the whole section parses, including the `root_env`
+    /// override convention it shares with `[logfile]`.
+    #[test]
+    fn parses_a_history_section() {
+        // `requires_reader` goes beside `engine`, up top — appended at the
+        // end it would land inside the last table and never be read.
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format        = \"codex-rollouts\"\n        \
+             root          = \"~/.codex/sessions\"\n        \
+             glob          = \"**/*.jsonl\"\n        \
+             root_env      = \"CODEX_HOME\"\n        \
+             root_env_join = \"sessions\"\n";
+        let m = PluginManifest::from_str(&toml).expect("history manifest parses");
+        let h = m.history.expect("[history] carried");
+        assert_eq!(h.format, HistoryFormat::CodexRollouts);
+        assert_eq!(h.root, "~/.codex/sessions");
+        assert_eq!(h.glob, "**/*.jsonl");
+        assert_eq!(h.root_env.as_deref(), Some("CODEX_HOME"));
+        assert_eq!(h.root_env_join.as_deref(), Some("sessions"));
+    }
+
+    /// The gate half: `[history]` keys with no `reading-history` declared is
+    /// refused by the capability check before the schema ever sees it.
+    #[test]
+    fn a_history_section_without_the_capability_is_refused() {
+        let toml = format!(
+            "{CODEX_LIKE}\n        \
+             [history]\n        \
+             format = \"codex-rollouts\"\n        \
+             root   = \"~/.codex/sessions\"\n        \
+             glob   = \"**/*.jsonl\"\n"
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("[history] without reading-history must be refused");
+        assert!(err.contains("reading-history"), "{err}");
+    }
+
+    /// A format this build does not know is refused at load — `format` is
+    /// an enum precisely so a manifest cannot spell out a parser of its own.
+    #[test]
+    fn an_unknown_history_format_is_refused() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        [history]\n        \
+             format = \"yaml-pipe-dreams\"\n        \
+             root   = \"~/.codex/sessions\"\n        \
+             glob   = \"**/*.jsonl\"\n";
+        let err =
+            PluginManifest::from_str(&toml).expect_err("an unknown history format must be refused");
+        assert!(err.contains("yaml-pipe-dreams"), "{err}");
     }
 
     /// And `[account] url`, which `resolve_account_url` substitutes exactly

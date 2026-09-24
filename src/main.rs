@@ -11,6 +11,8 @@ mod autostart;
 mod config;
 mod diag;
 mod platform;
+#[cfg(feature = "history")]
+mod stats_cli;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -188,6 +190,31 @@ struct BalanceModel {
     model: Rc<VecModel<BalanceData>>,
     keys: Vec<String>,
 }
+
+/// The UI-side handle to the history store: a reopened-after-each-scan
+/// snapshot the refresh path reads for the quota-projection hatch and the
+/// Activity card. Scanning itself runs on a worker thread against its own
+/// store instance — this one is only ever read. `()` in a build without the
+/// feature, so the refresh signatures below stay uniform either way.
+#[cfg(feature = "history")]
+type HistoryShared = Rc<RefCell<Option<tickover::history::store::HistoryStore>>>;
+#[cfg(not(feature = "history"))]
+type HistoryShared = ();
+
+/// The scan-worker's plumbing: a sender it reports each commit on, and a
+/// busy flag so a slow scan is never stacked with a second one (the same
+/// one-thread-at-a-time rule [`Fetching`] gives provider fetches — the
+/// scanner walks provider directories, and two concurrent walks double the
+/// IO for nothing).
+#[cfg(feature = "history")]
+#[derive(Clone)]
+struct HistoryIo {
+    tx: mpsc::Sender<()>,
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+#[cfg(not(feature = "history"))]
+#[derive(Clone)]
+struct HistoryIo;
 /// The plugin-manager rows shown in the settings sheet, one per loaded
 /// manifest (rebuilt from config on every relevant change).
 type PluginRows = Rc<VecModel<PluginRow>>;
@@ -281,10 +308,29 @@ struct Ctx {
     install_tx: mpsc::Sender<(PendingKind, RegistryEntry, InstallOutcome)>,
     anchor: Anchor,
     shown_at: Rc<Cell<Instant>>,
+    /// See [`HistoryShared`]. `()` when the feature is compiled out — the
+    /// field exists either way so refresh plumbing doesn't fork on the flag.
+    history: HistoryShared,
+    /// See [`HistoryIo`]. Empty unit struct when the feature is compiled out.
+    #[cfg_attr(not(feature = "history"), allow(dead_code))]
+    history_io: HistoryIo,
     tray_click_at: Rc<Cell<Option<Instant>>>,
     tray_press_at: Rc<Cell<Option<Instant>>>,
     hidden_by_focus_at: Rc<Cell<Option<Instant>>>,
-    opened_by_activation_at: Rc<Cell<Option<(Instant, bool)>>>,
+    opened_by_activation_at: Rc<Cell<Option<Instant>>>,
+    /// A [`present_popover`] that asked for a placement before the winit
+    /// window had a size — `window().size()` reads 0×0 until the first
+    /// `Resized` event lands, and positioning a 0×0 frame drops it wherever
+    /// the window manager defaults to. The winit-event hook replays this
+    /// when the real size arrives. Timestamped so a request whose `Resized`
+    /// never came (the window was never realized — that presentation never
+    /// happened) cannot surface later and move a window the user has since
+    /// parked somewhere. The flag marks a *settling* request — one a landed
+    /// placement re-armed so the next `Resized` re-places against whatever
+    /// size the cap sync and platform layout actually produced; settling
+    /// replays bypass the dock-mode parking courtesy because they are the
+    /// same presentation still converging, not a new one.
+    pending_position: Rc<Cell<Option<PendingPosition>>>,
 }
 
 /// The refresh triple nearly every settings-sheet callback below closes
@@ -302,6 +348,7 @@ fn refresh_all(ctx: &Ctx) {
             &ctx.cache,
             &ctx.window_models,
             &ctx.balance_models,
+            &ctx.history,
         );
         sync_tray_indicator(
             &ctx.tray,
@@ -383,6 +430,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
+    // `tickover stats` is a CLI invocation, not a tray launch — it runs
+    // here, before the single-instance claim and any Slint/tray setup, so
+    // `tickover stats` in a terminal while the app is running prints stats
+    // rather than signalling the running copy to open its panel.
+    #[cfg(feature = "history")]
+    if let Some(code) = stats_cli::maybe_run(|| {
+        seed_and_upgrade_builtins(&seed::plugins_dir());
+        load_plugins()
+    }) {
+        std::process::exit(code);
+    }
+
     // Only when a pre-rename install was actually found and moved — a fresh
     // install never held the old login item this retires, and asking macOS
     // to touch one it does not hold can raise the same permission prompt
@@ -461,14 +520,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dismissed and absorbed checks both reason causally from (see
     // `tray_click_dismissed_panel`, `click_absorbed_by_its_activation`).
     let tray_press_at: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
-    // When an unexplained activation edge last opened the panel, and whether
-    // that open actually *placed* the window. The status-item click that
-    // caused it can still be in flight to the click drain — when it arrives
-    // it is the same gesture's other half and must be absorbed, not toggled;
-    // and only a placement is worth re-anchoring to the click's `rect` (a
-    // window the user parked should stay put). See
+    // When an unexplained activation edge last opened the panel. The
+    // status-item click that caused it can still be in flight to the click
+    // drain — when it arrives it is the same gesture's other half and must
+    // be absorbed, not toggled; and since the edge opened before the click's
+    // `rect` was known, the absorb also re-anchors the panel under the item
+    // actually pressed (a click the user made is licence enough — in dock
+    // mode the open itself deliberately did not move the window). See
     // `click_absorbed_by_its_activation`.
-    let opened_by_activation_at: Rc<Cell<Option<(Instant, bool)>>> = Rc::new(Cell::new(None));
+    let opened_by_activation_at: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
+    // A presentation that wanted to place the window but found it still
+    // 0×0 — winit realizes the window asynchronously after `show()`, so the
+    // size (and with it `set_position`'s frame math) is not yet real. The
+    // winit-event hook replays the placement on the first `Resized`.
+    let pending_position: Rc<Cell<Option<PendingPosition>>> = Rc::new(Cell::new(None));
     // Change-detection key for the tray indicator (avoids icon churn).
     // `sync_tray_indicator_from` treats an unchanged key as "nothing to draw"
     // and returns before ever setting the icon or tooltip — `None` here means
@@ -527,12 +592,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // trust dialog and the actual disk write both need the UI thread, so
     // only the network+sha256 half runs off it.
     let (install_tx, install_rx) = mpsc::channel::<(PendingKind, RegistryEntry, InstallOutcome)>();
+    // History scan worker → UI: "the store changed on disk, reopen your
+    // snapshot". The scan itself runs off the UI thread (IO under a
+    // wall-clock budget); the receiver lives in `run_slow_timer`.
+    #[cfg(feature = "history")]
+    let (history_tx, history_rx) = mpsc::channel::<()>();
 
     // Slint creates the native macOS application lazily. Deferring tray
     // construction by one event-loop turn (`setup_tray`, below) makes the
     // status item durable even when the popover has not been shown yet —
     // declared here, ahead of that, so `Ctx` can carry it from the start.
     let tray: TraySlot = Rc::new(RefCell::new(None));
+
+    // The UI-side history snapshot (see [`HistoryShared`]): reopened after
+    // each scan-worker commit; `()` when the feature is compiled out.
+    #[cfg(feature = "history")]
+    let history_cell: HistoryShared = Rc::new(RefCell::new(None));
+    #[cfg(not(feature = "history"))]
+    let history_cell: HistoryShared = ();
 
     let ctx = Ctx {
         weak: app.as_weak(),
@@ -556,10 +633,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         install_tx: install_tx.clone(),
         anchor: anchor.clone(),
         shown_at: shown_at.clone(),
+        history: history_cell,
+        #[cfg(feature = "history")]
+        history_io: HistoryIo {
+            tx: history_tx,
+            busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+        #[cfg(not(feature = "history"))]
+        history_io: HistoryIo,
         tray_click_at: tray_click_at.clone(),
         hidden_by_focus_at: hidden_by_focus_at.clone(),
         tray_press_at: tray_press_at.clone(),
         opened_by_activation_at: opened_by_activation_at.clone(),
+        pending_position: pending_position.clone(),
     };
 
     wire_ui_callbacks(&app, &ctx);
@@ -571,6 +657,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     wire_frameless_chrome(&app, &ctx);
 
     let (tray_menu, tray_init_timer) = setup_tray(&app, &ctx, menubar_on)?;
+
+    // Local usage history: the store the panel reads (projections + the
+    // Activity card) lives on the UI side and is reopened whenever the scan
+    // worker reports a commit. First open is synchronous — the panel can be
+    // raised before the first scan finishes, and "no store yet" must not
+    // read as "no history".
+    #[cfg(feature = "history")]
+    spawn_history_scan(&ctx);
+    #[cfg(feature = "history")]
+    {
+        *ctx.history.borrow_mut() = tickover::history::default_dir()
+            .and_then(|d| tickover::history::store::HistoryStore::open(&d).ok());
+        sync_activity(&app, &ctx);
+    }
 
     wire_plugin_manager_callbacks(&app, &ctx);
 
@@ -595,15 +695,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cache,
         &window_models,
         &balance_models,
+        &ctx.history,
     );
     sync_tray_indicator(&tray, menubar_on, &plugins.borrow(), &cache, &tray_key);
 
     if std::env::var_os("TICKOVER_SHOW_ON_START").is_some() || platform::dock_mode() {
-        present_popover(&app, &anchor, &shown_at, Shown::ByAnythingElse);
+        present_popover(
+            &app,
+            &anchor,
+            &shown_at,
+            &pending_position,
+            Shown::ByAnythingElse,
+        );
     }
 
     if let Some(path) = snapshot_path {
-        present_popover(&app, &anchor, &shown_at, Shown::ByAnythingElse);
+        present_popover(
+            &app,
+            &anchor,
+            &shown_at,
+            &pending_position,
+            Shown::ByAnythingElse,
+        );
         // Snapshot the settings sheet instead of the gauges when asked.
         if std::env::var_os("TICKOVER_SNAPSHOT_SETTINGS").is_some() {
             app.set_settings_open(true);
@@ -673,6 +786,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Timers ──────────────────────────────────────────────────────────
     let _event_timer = run_fast_timer(&app, &ctx, tray_menu, plugin_rx, registry_rx, install_rx);
+    #[cfg(feature = "history")]
+    let _tick_timer = run_slow_timer(&app, &ctx, history_rx);
+    #[cfg(not(feature = "history"))]
     let _tick_timer = run_slow_timer(&app, &ctx);
 
     Timer::single_shot(Duration::from_millis(60), platform::set_accessory_policy);
@@ -691,20 +807,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// The panel's own "Refresh" button: a fetch of every plugin, and — once it
 /// lands — a rebuild of the provider rows.
 fn wire_ui_callbacks(app: &AppWindow, ctx: &Ctx) {
-    let ctx = ctx.clone();
-    app.on_refresh(move || {
-        spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
-        if let Some(app) = ctx.weak.upgrade() {
-            refresh_model(
-                &app,
-                &ctx.model,
-                &ctx.plugins.borrow(),
-                &ctx.cache,
-                &ctx.window_models,
-                &ctx.balance_models,
-            );
-        }
-    });
+    {
+        let ctx = ctx.clone();
+        app.on_refresh(move || {
+            spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
+            if let Some(app) = ctx.weak.upgrade() {
+                refresh_model(
+                    &app,
+                    &ctx.model,
+                    &ctx.plugins.borrow(),
+                    &ctx.cache,
+                    &ctx.window_models,
+                    &ctx.balance_models,
+                    &ctx.history,
+                );
+            }
+        });
+    }
+    // Activity card: the range toggle re-renders from the same snapshot,
+    // "Full report" opens the generated HTML, and the first-run button
+    // kicks a scan rather than waiting for the slow timer's cadence.
+    {
+        let ctx = ctx.clone();
+        let weak = app.as_weak();
+        app.on_activity_range_changed(move |_| {
+            if let Some(app) = weak.upgrade() {
+                sync_activity(&app, &ctx);
+            }
+        });
+    }
+    {
+        let ctx2 = ctx.clone();
+        app.on_open_report(move || open_history_report(&ctx2));
+        let ctx2 = ctx.clone();
+        app.on_check_log_paths(move || spawn_history_scan(&ctx2));
+    }
 }
 
 /// Only platforms that draw their own edge around a frameless window want
@@ -737,10 +874,28 @@ fn wire_frameless_chrome(app: &AppWindow, ctx: &Ctx) {
                 if auto_hide && ctx.shown_at.get().elapsed() > Duration::from_millis(250) {
                     if let Some(app) = ctx.weak.upgrade() {
                         let _ = app.window().hide();
+                        // A hidden window's placement requests die with the
+                        // presentation — a settling re-arm must not survive
+                        // to re-place whatever opens next.
+                        ctx.pending_position.set(None);
                         // Remember *when*, so the click that took this focus
                         // away is not then read as a request to re-open.
                         ctx.hidden_by_focus_at.set(Some(Instant::now()));
                     }
+                }
+            }
+            // A placement deferred because the window was still 0×0 — its
+            // real size arrives as the first `Resized`. Replay it then, with
+            // the freshest anchor the click drain has since recorded — but
+            // never from inside this hook: it can run before the backend has
+            // stored the size the event carries, so `window().size()` here
+            // reads the *previous* size — 0×0 on the very first resize and
+            // the stale old frame on every settling one. Replaying one turn
+            // later always sees the size this resize installed.
+            if let WindowEvent::Resized(size) = event {
+                if size.width > 0 && size.height > 0 && ctx.pending_position.get().is_some() {
+                    let ctx = ctx.clone();
+                    Timer::single_shot(Duration::ZERO, move || replay_pending_position(&ctx));
                 }
             }
             EventResult::Propagate
@@ -755,6 +910,12 @@ fn wire_frameless_chrome(app: &AppWindow, ctx: &Ctx) {
     {
         let ctx = ctx.clone();
         app.on_start_drag(move || {
+            // The user just took manual control of the position — any
+            // deferred or settling placement must not yank it back, and a
+            // dragged window counts as placed: dock mode must not later
+            // move it as "never positioned".
+            ctx.pending_position.set(None);
+            POPOVER_PLACED.with(|placed| placed.set(true));
             if let Some(app) = ctx.weak.upgrade() {
                 app.window().with_winit_window(|win| {
                     let _ = win.drag_window();
@@ -1274,6 +1435,7 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                         &ctx.cache,
                         &ctx.window_models,
                         &ctx.balance_models,
+                        &ctx.history,
                     );
                     sync_tray_indicator(
                         &ctx.tray,
@@ -1437,6 +1599,7 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                     &ctx.cache,
                     &ctx.window_models,
                     &ctx.balance_models,
+                    &ctx.history,
                 );
                 sync_tray_indicator(
                     &ctx.tray,
@@ -1770,6 +1933,7 @@ fn run_fast_timer(
                 &ctx.cache,
                 &ctx.window_models,
                 &ctx.balance_models,
+                &ctx.history,
             );
             sync_tray_indicator(
                 &ctx.tray,
@@ -1792,6 +1956,7 @@ fn run_fast_timer(
                     &ctx.cache,
                     &ctx.window_models,
                     &ctx.balance_models,
+                    &ctx.history,
                 );
                 sync_tray_indicator(
                     &ctx.tray,
@@ -1827,10 +1992,16 @@ fn run_fast_timer(
 /// `refresh_secs` cadence, and auto-ping shortly after a 5-hour window
 /// resets. `main` must keep the returned [`Timer`] alive for the rest of
 /// the run.
-fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
+fn run_slow_timer(
+    app: &AppWindow,
+    ctx: &Ctx,
+    #[cfg(feature = "history")] history_rx: mpsc::Receiver<()>,
+) -> Timer {
     let tick_timer = Timer::default();
     let weak = app.as_weak();
     let ctx = ctx.clone();
+    #[cfg(feature = "history")]
+    let history_rx = history_rx;
     let ticks = Cell::new(0u32);
     tick_timer.start(
         TimerMode::Repeated,
@@ -1861,6 +2032,27 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                 }
             }
 
+            // Local usage history: a committed scan means the on-disk store
+            // moved — reopen the UI's snapshot and redraw, so Activity and
+            // the quota hatches pick the new buckets up within a second.
+            // Rescans run on a slow cadence of their own: the scanner is
+            // incremental, but every pass still stats the provider trees.
+            #[cfg(feature = "history")]
+            {
+                let mut committed = false;
+                while history_rx.try_recv().is_ok() {
+                    committed = true;
+                }
+                if committed {
+                    *ctx.history.borrow_mut() = tickover::history::default_dir()
+                        .and_then(|d| tickover::history::store::HistoryStore::open(&d).ok());
+                    sync_activity(&app, &ctx);
+                }
+                if n % 120 == 17 {
+                    spawn_history_scan(&ctx);
+                }
+            }
+
             // Built once and threaded through the rest of this tick —
             // `refresh_model_from`, `sync_tray_indicator_from`, and the
             // ping loop below all read the same `current` rather than
@@ -1886,6 +2078,7 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                     &current,
                     &ctx.window_models,
                     &ctx.balance_models,
+                    &ctx.history,
                 );
             }
             // Cheap no-op unless data, theme, or the toggle actually changed.
@@ -1911,9 +2104,16 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                         &current,
                         &ctx.window_models,
                         &ctx.balance_models,
+                        &ctx.history,
                     );
                 }
-                present_popover(&app, &ctx.anchor, &ctx.shown_at, Shown::ByAnythingElse);
+                present_popover(
+                    &app,
+                    &ctx.anchor,
+                    &ctx.shown_at,
+                    &ctx.pending_position,
+                    Shown::ByAnythingElse,
+                );
             }
 
             // Keep "· checked <registry-checked-at>" live (Slint only ever
@@ -2220,9 +2420,7 @@ fn drain_tray_clicks(app: &AppWindow, ctx: &Ctx) -> usize {
             // is dead on purpose.)
             let mark = ctx.opened_by_activation_at.take();
             let absorbed = app.window().is_visible()
-                && mark.is_some_and(|(at, _)| {
-                    click_absorbed_by_its_activation(Some(at), press_at, now)
-                });
+                && mark.is_some_and(|at| click_absorbed_by_its_activation(Some(at), press_at, now));
             diag::line(format!(
                 "tray click drained: visible={} dismissed={} absorbed={} active={}",
                 app.window().is_visible(),
@@ -2232,16 +2430,33 @@ fn drain_tray_clicks(app: &AppWindow, ctx: &Ctx) -> usize {
             ));
             if absorbed {
                 // The edge opened the panel before this click's `rect` was
-                // known — *if* that open placed the window, it sits wherever
-                // a stale or absent anchor put it, so move it under the item
-                // actually pressed. If the open left the window where the
-                // user parked it, the absorb must too: a mark this gesture
-                // did not cause is no licence to move their window.
-                if mark.is_some_and(|(_, moved)| moved) {
-                    position_popover(app, &ctx.anchor, Shown::ByTrayClick);
-                }
+                // known, so re-anchor it under the item actually pressed.
+                // The absorb itself already proved this gesture caused the
+                // open; in dock mode that open deliberately did *not* move
+                // the window, which would otherwise leave the panel at
+                // whatever parked position it last had — exactly the "opens
+                // somewhere else" this fixes. The cap re-syncs against the
+                // click's own monitor — a re-anchor across displays must not
+                // size the card for the screen it is leaving.
+                sync_providers_cap(app, &ctx.anchor);
+                position_popover(app, &ctx.anchor, &ctx.pending_position, Shown::ByTrayClick);
             } else if app.window().is_visible() {
-                let _ = app.window().hide();
+                // Visible — but hanging off this icon, or parked somewhere
+                // else? "Click the icon" means "the panel, here": a panel
+                // already under the item toggles closed, while one parked
+                // away from it (the launch open's fallback spot, or a dock
+                // window the user dragged aside) re-anchors — hiding a
+                // window the user was not looking at reads as "nothing
+                // happened", the click that "did not open" the panel.
+                if window_at_anchor(app, &ctx.anchor) {
+                    let _ = app.window().hide();
+                    // Hidden ends the presentation — no deferred or
+                    // settling placement may outlive it into the next one.
+                    ctx.pending_position.set(None);
+                } else {
+                    sync_providers_cap(app, &ctx.anchor);
+                    position_popover(app, &ctx.anchor, &ctx.pending_position, Shown::ByTrayClick);
+                }
             } else if !dismissed {
                 spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
                 if should_refresh_panel(app.window().is_visible(), true) {
@@ -2252,9 +2467,16 @@ fn drain_tray_clicks(app: &AppWindow, ctx: &Ctx) -> usize {
                         &ctx.cache,
                         &ctx.window_models,
                         &ctx.balance_models,
+                        &ctx.history,
                     );
                 }
-                present_popover(app, &ctx.anchor, &ctx.shown_at, Shown::ByTrayClick);
+                present_popover(
+                    app,
+                    &ctx.anchor,
+                    &ctx.shown_at,
+                    &ctx.pending_position,
+                    Shown::ByTrayClick,
+                );
             }
             tray_clicks += 1;
         }
@@ -2333,21 +2555,26 @@ fn run_dock_reopen_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                         &ctx.cache,
                         &ctx.window_models,
                         &ctx.balance_models,
+                        &ctx.history,
                     );
                 }
-                let moved =
-                    present_popover(&app, &ctx.anchor, &ctx.shown_at, Shown::ByAnythingElse);
+                present_popover(
+                    &app,
+                    &ctx.anchor,
+                    &ctx.shown_at,
+                    &ctx.pending_position,
+                    Shown::ByAnythingElse,
+                );
                 // An unexplained activation opened this panel: remember
-                // when — and whether it moved the window — so the
-                // status-item click that caused it, whose event can still
-                // be in flight, is absorbed as the same gesture rather than
-                // toggling the panel straight back off; and so the absorb
-                // knows whether a re-anchor is owed.
+                // when, so the status-item click that caused it, whose event
+                // can still be in flight, is absorbed as the same gesture
+                // rather than toggling the panel straight back off.
                 if became_active && clicks == 0 {
-                    ctx.opened_by_activation_at.set(Some((Instant::now(), moved)));
+                    ctx.opened_by_activation_at.set(Some(Instant::now()));
                 }
             } else if !want_visible && visible {
                 let _ = app.window().hide();
+                ctx.pending_position.set(None);
             }
         });
     }
@@ -3603,6 +3830,20 @@ fn owning_manifest<'a>(
     claimants.next().is_none().then_some(only)
 }
 
+/// Whether the reading's provider gets the "quota only" badge — true when
+/// its manifest declares no `[history]` section. Always false without the
+/// feature: that build has no Activity card for the badge to refer to.
+#[cfg(feature = "history")]
+fn quota_only_badge(plugins: &[PluginManifest], reading_id: &str) -> bool {
+    owning_manifest(plugins, reading_id)
+        .map(|m| m.history.is_none())
+        .unwrap_or(false)
+}
+#[cfg(not(feature = "history"))]
+fn quota_only_badge(_: &[PluginManifest], _: &str) -> bool {
+    false
+}
+
 /// All provider readings, merged from each plugin's cached fetch result, in
 /// plugin-manifest order (`plugins` is already sorted by `order`, ties by
 /// `id` — see `plugin::manifest::load_dir`). This is the single source for
@@ -4784,6 +5025,7 @@ fn refresh_model(
     cache: &PluginCache,
     window_models: &WindowModels,
     balance_models: &BalanceModels,
+    hist: &HistoryShared,
 ) {
     let readings = readings(plugins, &cache.borrow());
     refresh_model_from(
@@ -4793,6 +5035,7 @@ fn refresh_model(
         &readings,
         window_models,
         balance_models,
+        hist,
     );
 }
 
@@ -4808,6 +5051,7 @@ fn refresh_model_from(
     readings: &[ProviderReading],
     window_models: &WindowModels,
     balance_models: &BalanceModels,
+    hist: &HistoryShared,
 ) {
     let now = now_unix();
 
@@ -4825,9 +5069,16 @@ fn refresh_model_from(
                     // `seen_window_for` with the manifest just resolved one
                     // line up — looking up by reading id instead would rerun
                     // `owning_manifest` for every window this row asks about.
-                    let rows = window_rows(m, r, now, &|key| {
-                        m.and_then(|m| seen_window_for(m, &r.id, key))
-                    });
+                    let rows = window_rows(
+                        m,
+                        r,
+                        now,
+                        &|key| m.and_then(|m| seen_window_for(m, &r.id, key)),
+                        &|w, used| {
+                            m.map(|mm| mm.id.as_str())
+                                .and_then(|p| quota_projection(hist, p, w, used, now))
+                        },
+                    );
                     let windows = reconcile_window_model(&mut win_models, &r.id, rows);
                     let brows = balance_rows(r, now);
                     let balances = reconcile_balance_model(&mut bal_models, &r.id, brows);
@@ -4835,7 +5086,14 @@ fn refresh_model_from(
                 }
                 Some(_) => (ModelRc::default(), ModelRc::default()),
             };
-            provider_data_from_reading(r, windows, balances)
+            let mut d = provider_data_from_reading(r, windows, balances);
+            // "quota only" badge (design §6-B): the manifest carries no
+            // `[history]` section, so Activity's totals never include this
+            // provider — the card's coverage note says as much; the badge
+            // says it at the row. A build without the feature has no Activity
+            // card to contradict, so it shows no badge either.
+            d.quota_only = quota_only_badge(plugins, &r.id);
+            d
         })
         .collect();
 
@@ -5221,6 +5479,10 @@ fn window_rows(
     r: &ProviderReading,
     now: u64,
     seen: &dyn Fn(&str) -> Option<config::SeenWindow>,
+    // Burn projection per window, from the history store — `None` answers
+    // draw no hatch. Tests pass [`no_projection`]; production passes a
+    // closure over the shared snapshot.
+    proj: &ProjectionFn<'_>,
 ) -> Vec<(String, WindowData)> {
     // A window the provider reported no percentage for is left out rather than
     // drawn as an empty bar over "no data": it occupies a block's worth of
@@ -5231,8 +5493,13 @@ fn window_rows(
         .windows
         .iter()
         .filter_map(|w| {
-            w.used_percent
-                .map(|used| (w.role, w.key.clone(), window_data(now, w, used)))
+            w.used_percent.map(|used| {
+                (
+                    w.role,
+                    w.key.clone(),
+                    window_data(now, w, used, proj(w, used)),
+                )
+            })
         })
         .collect();
     // Stable, and the reason the `slot` search below is allowed to assume
@@ -5324,8 +5591,498 @@ fn not_started_row(label: &str, role: Role, period_minutes: u64) -> WindowData {
         reset_rel_kind: ResetRelKind::Unknown,
         reset_at: ss(""),
         tooltip: ss(""),
+        proj_pct: 0.0,
+        proj_tone: 1,
+        burn_line: ss(""),
     }
 }
+
+/// The quota-projection hatch's one input (design §4): where the burn rate
+/// lands the window at reset, its tone, and the right-hand caption.
+/// `None` — nothing drawn — when there is no history to project from, no
+/// window bounds, or nothing spent yet; a projection never fabricates.
+#[cfg(feature = "history")]
+fn quota_projection(
+    hist: &HistoryShared,
+    provider: &str,
+    w: &Window,
+    used: f64,
+    now: u64,
+) -> Option<(f32, i32, String)> {
+    let guard = hist.borrow();
+    let store = guard.as_ref()?;
+    let reset = w.resets_at?;
+    let period_secs = w.period_minutes?.checked_mul(60)?;
+    let start = reset.checked_sub(period_secs)?;
+    // Only an open window projects: before its start there is no burn to
+    // measure, past its reset the percentage belongs to the next window.
+    if now <= start || now >= reset {
+        return None;
+    }
+    let (tokens, elapsed_h) = tickover::history::query::window_burn(store, provider, start)?;
+    if used <= 0.0 || elapsed_h <= 0.0 {
+        return None;
+    }
+    let hours_left = (reset - now) as f64 / 3600.0;
+    // The window's own reading implies % per token — no provider-stated cap
+    // needed: tokens so far bought `used` percent, so the same pace over the
+    // hours left buys burn·hours_left·pct_per_token more.
+    let pct_per_token = used / tokens as f64;
+    let burn_per_h = tokens as f64 / elapsed_h;
+    let projected = used + burn_per_h * hours_left * pct_per_token;
+    if projected >= 100.0 {
+        // Reaching the cap before reset is the crit state — it names when.
+        let pct_per_h = used / elapsed_h;
+        let caps_at = if pct_per_h > 0.0 {
+            now + (((100.0 - used) / pct_per_h) * 3600.0) as u64
+        } else {
+            reset
+        };
+        let at = chrono::DateTime::from_timestamp(caps_at as i64, 0)
+            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+            .unwrap_or_default();
+        Some((100.0, 3, format!("caps ~{at}")))
+    } else {
+        let tone = if projected >= 90.0 { 2 } else { 1 };
+        Some((
+            projected as f32,
+            tone,
+            format!(
+                "burn {}/h → ~{:.0}%",
+                stats_cli::fmt_tokens(burn_per_h.round() as u64),
+                projected
+            ),
+        ))
+    }
+}
+
+#[cfg(not(feature = "history"))]
+fn quota_projection(
+    _: &HistoryShared,
+    _: &str,
+    _: &Window,
+    _: f64,
+    _: u64,
+) -> Option<(f32, i32, String)> {
+    None
+}
+
+/// Spawn the one-at-a-time history scan: the worker opens its own store
+/// handle, ticks the incremental scanner over every `[history]` manifest —
+/// each manifest's declared `[[option]]`s resolving its own `root` — and
+/// commits, then signals the slow timer, which reopens the UI's snapshot.
+/// The `busy` cell is the one-thread-at-a-time rule [`Fetching`] gives
+/// provider fetches: a still-running scan is left to finish, never stacked
+/// with a second walker on the same directories.
+#[cfg(feature = "history")]
+fn spawn_history_scan(ctx: &Ctx) {
+    if ctx
+        .history_io
+        .busy
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    let manifests: Vec<PluginManifest> = ctx
+        .plugins
+        .borrow()
+        .iter()
+        .filter(|m| m.history.is_some() && plugin_enabled(m))
+        .cloned()
+        .collect();
+    if manifests.is_empty() {
+        ctx.history_io
+            .busy
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
+    let tx = ctx.history_io.tx.clone();
+    let busy = ctx.history_io.busy.clone();
+    // `Builder::spawn` rather than `thread::spawn`: a refused spawn must
+    // not panic with `busy` already raised — see `spawn_plugin_fetch`.
+    if std::thread::Builder::new()
+        .spawn(move || {
+            let report_done = |store_moved: bool| {
+                busy.store(false, std::sync::atomic::Ordering::SeqCst);
+                if store_moved {
+                    let _ = tx.send(());
+                }
+            };
+            // A panic in a scan must still release `busy` — otherwise the
+            // card would sit on "scanning…" forever and never scan again.
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let Some(dir) = tickover::history::default_dir() else {
+                    return false;
+                };
+                // `tickover stats` can scan this same store concurrently —
+                // the lock serializes open+scan+commit across processes.
+                let Ok(_lock) = tickover::history::store::lock_store(&dir) else {
+                    return false;
+                };
+                let Ok(mut store) = tickover::history::store::HistoryStore::open(&dir) else {
+                    return false;
+                };
+                // Resumable ticks: a pass that stopped on its wall-clock
+                // budget reports `partial`; a cold corpus takes a few.
+                for _ in 0..8 {
+                    let scans =
+                        tickover::history::scan_tick(&mut store, &manifests, &plugin_options);
+                    if let Err(e) = store.commit() {
+                        diag::line(format!("history: store commit failed: {e}"));
+                        return false;
+                    }
+                    if !scans.iter().any(|s| s.outcome.partial) {
+                        break;
+                    }
+                }
+                true
+            }));
+            match run {
+                Ok(moved) => report_done(moved),
+                Err(_) => {
+                    diag::line("history: scan thread panicked".into());
+                    report_done(false);
+                }
+            }
+        })
+        .is_err()
+    {
+        ctx.history_io
+            .busy
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        diag::line("history: could not spawn the scan thread".into());
+    }
+}
+#[cfg(not(feature = "history"))]
+fn spawn_history_scan(_: &Ctx) {}
+
+/// Push the Activity card's data to the window for whichever range its
+/// toggle currently shows. Start-up, each scan commit, and
+/// `activity-range-changed` all come through here — one code path, so a
+/// toggle and fresh data can never disagree about what the card means.
+#[cfg(feature = "history")]
+fn sync_activity(app: &AppWindow, ctx: &Ctx) {
+    use tickover::history::query::{PanelRange, Totals};
+    let plugins = ctx.plugins.borrow();
+    let history_providers: Vec<String> = plugins
+        .iter()
+        .filter(|m| m.history.is_some() && plugin_enabled(m))
+        .map(|m| m.id.clone())
+        .collect();
+    if history_providers.is_empty() {
+        return; // no [history] manifest — the card stays hidden
+    }
+    // Design §6: "not counted" names providers that cannot publish local
+    // history — the ones with no `[history]` section, like Copilot. A
+    // provider that declares history but saw no usage in range is counted;
+    // its contribution is simply zero.
+    let quota_only: Vec<String> = plugins
+        .iter()
+        .filter(|m| m.history.is_none() && plugin_enabled(m))
+        .map(|m| m.id.clone())
+        .collect();
+    // Buckets from a disabled provider stay on disk but leave every
+    // figure — same rule the scan and the card's coverage apply.
+    let enabled: std::collections::HashSet<String> = plugins
+        .iter()
+        .filter(|m| plugin_enabled(m))
+        .map(|m| m.id.clone())
+        .collect();
+    let range = match app.get_activity_range() {
+        1 => PanelRange::Week,
+        2 => PanelRange::Month,
+        _ => PanelRange::Day,
+    };
+    let cost_fn: tickover::history::query::CostFn = config::history_cost_estimate()
+        .then_some(&|_: &str, m: &str, t: &Totals| tickover::history::pricing::cost_usd(m, t));
+    let sum =
+        ctx.history.borrow().as_ref().map(|store| {
+            tickover::history::query::panel(store, range, &quota_only, &enabled, cost_fn)
+        });
+    if std::env::var_os("TICKOVER_DEBUG_ACTIVITY").is_some() {
+        if let Some(s) = &sum {
+            eprintln!(
+                "activity: state={:?} headline={} spark={:?} segs={:?} delta={:?}",
+                s.state, s.headline, s.spark, s.segments, s.delta,
+            );
+        }
+    }
+    let scanning = ctx
+        .history_io
+        .busy
+        .load(std::sync::atomic::Ordering::Relaxed);
+    // The strip appearing or hiding changes the card's real height — the
+    // list's cap already paid for it only if it was visible when measured,
+    // so a toggle while the panel is open must re-measure before the bottom
+    // edge rides off the screen (or a dead 240px stays reserved).
+    let was_visible = app.get_activity().visible;
+    app.set_activity(activity_data(sum.as_ref(), range, &plugins, scanning));
+    if app.get_activity().visible != was_visible {
+        sync_providers_cap(app, &ctx.anchor);
+    }
+}
+#[cfg(not(feature = "history"))]
+fn sync_activity(_: &AppWindow, _: &Ctx) {}
+
+/// Render a [`PanelSummary`] into the card's Slint struct — every string
+/// and fraction the UI needs, so `ui/app.slint` draws and never computes.
+#[cfg(feature = "history")]
+fn activity_data(
+    sum: Option<&tickover::history::query::PanelSummary>,
+    range: tickover::history::query::PanelRange,
+    plugins: &[PluginManifest],
+    scanning: bool,
+) -> ActivityData {
+    use tickover::history::query::{PanelRange, PanelState, PanelSummary};
+    let empty = PanelSummary::default();
+    let sum = sum.unwrap_or(&empty);
+    let delta_tail = match range {
+        PanelRange::Day => "vs 7d avg",
+        PanelRange::Week => "vs prev 7d",
+        PanelRange::Month => "vs prev 30d",
+    };
+    let range_name = match range {
+        PanelRange::Day => "the last 24h",
+        PanelRange::Week => "the last 7 days",
+        PanelRange::Month => "the last 30 days",
+    };
+    let (first_run, empty_range) = match sum.state {
+        PanelState::FirstRun => (true, false),
+        PanelState::EmptyRange => (false, true),
+        PanelState::Data => (false, false),
+    };
+    let caption = if empty_range {
+        format!("tokens in {range_name}")
+    } else {
+        "tokens".to_string()
+    };
+    let (empty_line1, empty_line2, last_when, last_where) = match sum.state {
+        PanelState::FirstRun => (
+            "No local history yet.".to_string(),
+            "Quota tracking already works above. Token history appears after \
+             your first CLI session — tickover reads it from log files on \
+             this machine and never uploads anything."
+                .to_string(),
+            String::new(),
+            String::new(),
+        ),
+        PanelState::EmptyRange => {
+            let (when, wher) = sum
+                .last_seen
+                .as_ref()
+                .map(|(t, p)| (t.format("%b %-d %H:%M").to_string(), p.clone()))
+                .unwrap_or_default();
+            (
+                if when.is_empty() {
+                    "Quiet stretch.".to_string()
+                } else {
+                    "Quiet day. Last session was".to_string()
+                },
+                String::new(),
+                when,
+                wher,
+            )
+        }
+        PanelState::Data => Default::default(),
+    };
+    // Partial coverage (design §6-B): the uncounted providers are named in
+    // the legend's right side, a warn-icon note says why, and the token bar
+    // keeps a dashed slot where their share would sit.
+    let missing_names: Vec<String> = sum
+        .not_counted
+        .iter()
+        .map(|id| {
+            plugins
+                .iter()
+                .find(|m| &m.id == id)
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| id.clone())
+        })
+        .collect();
+    let partial = !missing_names.is_empty();
+    let not_counted = if partial {
+        format!("{} not counted", missing_names.join(", "))
+    } else {
+        String::new()
+    };
+    let note = if partial {
+        format!(
+            "{} publish{} no local token history — totals here exclude {}.",
+            missing_names.join(", "),
+            if missing_names.len() == 1 { "es" } else { "" },
+            if missing_names.len() == 1 {
+                "it"
+            } else {
+                "them"
+            },
+        )
+    } else {
+        String::new()
+    };
+    // The dashed slot's width is the share of *providers* not counted —
+    // a real number (how many enabled providers publish no history), not
+    // an invented token share. Segment weights rescale so the bar still
+    // totals one: counted providers keep `counted/total` of it.
+    let counted_providers = plugins
+        .iter()
+        .filter(|m| m.history.is_some() && plugin_enabled(m))
+        .count();
+    let total_providers = (counted_providers + sum.not_counted.len()).max(1) as f32;
+    let seg_scale = counted_providers as f32 / total_providers;
+    let missing_share = if partial {
+        sum.not_counted.len() as f32 / total_providers
+    } else {
+        0.0
+    };
+    let footer_left = match sum.state {
+        PanelState::EmptyRange => format!("streak ended at {}d", sum.streak_ended),
+        _ => format!("{}-day streak · {} sessions", sum.streak_days, sum.sessions),
+    };
+    ActivityData {
+        visible: true,
+        first_run,
+        scanning,
+        empty_range,
+        headline: ss(stats_cli::fmt_tokens(sum.headline)),
+        caption: ss(caption),
+        delta: ss(sum
+            .delta
+            .map(|d| format!("{:+.0}%", d * 100.0))
+            .unwrap_or_default()),
+        delta_good: sum.delta.map(|d| d >= 0.0).unwrap_or(true),
+        delta_tail: ss(delta_tail),
+        spark: ModelRc::new(VecModel::from(
+            sum.spark
+                .iter()
+                .enumerate()
+                .map(|(i, h)| SparkBar {
+                    h: *h,
+                    current: i + 1 == sum.spark.len(),
+                })
+                .collect::<Vec<_>>(),
+        )),
+        seg_cache_read: sum.segments[0] * seg_scale,
+        seg_cache_write: sum.segments[1] * seg_scale,
+        seg_input: sum.segments[2] * seg_scale,
+        seg_output: sum.segments[3] * seg_scale,
+        has_cache_write: sum.segments[1] > 0.0,
+        missing_share,
+        legend_cached: ss(sum
+            .cache_hit_pct
+            .map(|p| format!("cached {p:.0}%"))
+            .unwrap_or_default()),
+        legend_in: ss(format!("in {}", stats_cli::fmt_tokens(sum.in_tokens))),
+        legend_out: ss(format!("out {}", stats_cli::fmt_tokens(sum.out_tokens))),
+        legend_cost: ss(sum
+            .est_cost
+            .map(|c| format!("est. ${c:.2}"))
+            .unwrap_or_default()),
+        // The bright figure — the Slint row adds the dim "counted" word.
+        legend_counted: ss(if partial {
+            stats_cli::fmt_tokens(sum.headline)
+        } else {
+            String::new()
+        }),
+        not_counted: ss(not_counted),
+        note: ss(note),
+        projects: ModelRc::new(VecModel::from(
+            sum.projects
+                .iter()
+                .map(|(name, share, tokens)| ActivityProject {
+                    name: ss(name.clone()),
+                    share: *share,
+                    value: ss(stats_cli::fmt_tokens(*tokens)),
+                })
+                .collect::<Vec<_>>(),
+        )),
+        footer_left: ss(footer_left),
+        empty_line1: ss(empty_line1),
+        empty_line2: ss(empty_line2),
+        last_when: ss(last_when),
+        last_where: ss(last_where),
+    }
+}
+
+/// "Full report ↗": render the HTML report from the in-memory snapshot and
+/// hand it to the browser. Runs on the callback — `compute` is a single
+/// pass over buckets the store already holds, so no worker is worth the
+/// plumbing. A failed write is a diag line, not a panel error.
+#[cfg(feature = "history")]
+fn open_history_report(ctx: &Ctx) {
+    let store = ctx.history.borrow();
+    let Some(store) = store.as_ref() else { return };
+    let enabled: std::collections::HashSet<String> = ctx
+        .plugins
+        .borrow()
+        .iter()
+        .filter(|m| plugin_enabled(m))
+        .map(|m| m.id.clone())
+        .collect();
+    let stats = tickover::history::query::compute(store, 30, &enabled);
+    let now = now_unix();
+    // The panel's live readings become the report's RIGHT NOW cards — same
+    // primary window, same projection math the quota blocks already drew.
+    let quota: Vec<tickover::history::report::QuotaNow> =
+        readings(&ctx.plugins.borrow(), &ctx.cache.borrow())
+            .iter()
+            .filter_map(|r| {
+                let w = r.primary_window()?;
+                let used = w.used_percent?;
+                let proj = quota_projection(&ctx.history, &r.id, w, used, now);
+                let weekly = w
+                    .period_minutes
+                    .map_or(w.role == Role::Secondary, |m| m > 720);
+                let name = window_title(w);
+                let (_, rel, at, ..) =
+                    window_view(now, used, w.resets_at, w.period_minutes, weekly, &name);
+                let reset_hint = if rel.is_empty() {
+                    at.clone()
+                } else if at.is_empty() {
+                    rel
+                } else {
+                    format!("{rel} · {at}")
+                };
+                let burn_per_hour = w
+                    .resets_at
+                    .zip(w.period_minutes)
+                    .and_then(|(reset, m)| reset.checked_sub(m * 60))
+                    .and_then(|start| tickover::history::query::window_burn(store, &r.id, start))
+                    .map(|(tokens, h)| (tokens as f64 / h).round() as u64);
+                Some(tickover::history::report::QuotaNow {
+                    provider: r.id.clone(),
+                    label: name,
+                    used_pct: used,
+                    projected_pct: proj.map(|p| p.0 as f64),
+                    reset_hint,
+                    burn_per_hour,
+                })
+            })
+            .collect();
+    let sources: Vec<String> = ctx
+        .plugins
+        .borrow()
+        .iter()
+        .filter_map(|m| m.history.as_ref().map(|h| h.root.clone()))
+        .collect();
+    match tickover::history::report::write(
+        &stats,
+        None,
+        config::history_cost_estimate(),
+        &quota,
+        &sources,
+    ) {
+        Ok(path) => stats_cli::open_in_browser(&path),
+        Err(e) => diag::line(format!("history: report write failed: {e}")),
+    }
+}
+#[cfg(not(feature = "history"))]
+fn open_history_report(_: &Ctx) {}
+
+/// The projection closure `window_rows` consults per window — returns
+/// `(projected_pct, tone, burn_line)` or `None` when history offers no
+/// honest answer. The `+ 'a` bound keeps a borrowed closure legal — a bare
+/// `dyn Fn` alias defaults to `'static` and only `'static` closures pass.
+type ProjectionFn<'a> = dyn Fn(&Window, f64) -> Option<(f32, i32, String)> + 'a;
 
 /// Build one `WindowData` row from a reading window and the percentage it
 /// reported. The window's `role` decides the tooltip name and clock format
@@ -5336,7 +6093,7 @@ fn not_started_row(label: &str, role: Role, period_minutes: u64) -> WindowData {
 /// that reported one becomes a row at all — the caller establishes that, and
 /// taking it as an argument keeps this from carrying a second, unreachable
 /// shape for the case it has already excluded.
-fn window_data(now: u64, w: &Window, used: f64) -> WindowData {
+fn window_data(now: u64, w: &Window, used: f64, proj: Option<(f32, i32, String)>) -> WindowData {
     // Whether the reset clock carries a date. A week away needs one; five
     // hours away does not. Decided by length when the window states one —
     // the same rule `window_title`/`window_title_of` already use to choose
@@ -5363,6 +6120,9 @@ fn window_data(now: u64, w: &Window, used: f64) -> WindowData {
         reset_rel_kind: kind,
         reset_at: ss(at),
         tooltip: ss(tooltip),
+        proj_pct: proj.as_ref().map(|p| p.0).unwrap_or(0.0),
+        proj_tone: proj.as_ref().map(|p| p.1).unwrap_or(1),
+        burn_line: ss(proj.as_ref().map(|p| p.2.as_str()).unwrap_or("")),
     }
 }
 
@@ -6344,24 +7104,36 @@ fn panel_target_visibility(became_active: bool, clicks: usize, visible: bool) ->
     base != (toggles % 2 == 1)
 }
 
-/// Fit the provider list's height budget to the monitor the window is on.
+/// Fit the provider list's height budget to the monitor the panel will sit
+/// on — the anchor's, not the window's: on a cross-screen move the window is
+/// still *leaving* its old monitor when this runs.
 ///
-/// The cap cannot live in the UI as a constant: 620px sized for a 768px
-/// display still overflows that same display at 125% scaling, and once the
-/// window extends past the screen the Flickable believes its whole viewport is
+/// The cap cannot live in the UI as a constant: sized for one display it
+/// still overflows the same display at another scaling, and once the window
+/// extends past the screen the Flickable believes its whole viewport is
 /// visible, so the overflow cannot even be scrolled to. Measured per show —
-/// the window can move between monitors.
-fn sync_providers_cap(app: &AppWindow) {
-    use slint::winit_030::{winit, WinitWindowAccessor};
+/// the window can move between monitors, and the ACTIVITY strip can appear
+/// or hide while the panel is open.
+fn sync_providers_cap(app: &AppWindow, anchor: &Anchor) {
     let mut cap = 620.0_f32;
-    app.window().with_winit_window(|w: &winit::window::Window| {
-        if let Some(monitor) = w.current_monitor() {
-            let logical_h = monitor.size().height as f64 / monitor.scale_factor();
-            // Leave room for the panel chrome around the list (~80) plus the
-            // menu bar / taskbar and the anchor gap the popover hangs from.
-            cap = ((logical_h - 200.0) as f32).clamp(240.0, 620.0);
-        }
-    });
+    // The anchor's own monitor first — placement is about to move the window
+    // there — else the monitor the window is on, else the primary.
+    let logical_h = target_monitor(app, sanitize_anchor(app, *anchor.borrow()))
+        .map(|((_, _, _, h), scale)| h / scale);
+    if let Some(logical_h) = logical_h {
+        // Leave room for the chrome around the list (~100: paddings, header,
+        // hairline) plus the menu bar / taskbar and the anchor gap the
+        // popover hangs off (~50). The ACTIVITY strip sits below the list
+        // and is not part of the cap, so a visible one takes its own ~240
+        // off the list's budget — otherwise the strip pushes the card's
+        // bottom edge off the screen.
+        let activity = if app.get_activity().visible {
+            240.0
+        } else {
+            0.0
+        };
+        cap = ((logical_h - 150.0 - activity) as f32).clamp(160.0, 620.0);
+    }
     app.set_providers_cap(cap);
 }
 
@@ -6390,29 +7162,50 @@ fn popover_moves(dock_mode: bool, placed_before: bool, shown: Shown) -> bool {
     !dock_mode || !placed_before || shown == Shown::ByTrayClick
 }
 
-/// Returns whether this presentation placed the window — the reopen tick's
-/// activation-open needs to know: only a presentation that actually moved
-/// the panel can have left it somewhere its click's anchor would not have
-/// put it, and only that case is worth re-anchoring when the click arrives.
+/// Show the panel and place it if this presentation's cause is one that
+/// places windows (see [`position_popover`] for the rules, and for the
+/// deferred placement a still-unrealized window takes).
 fn present_popover(
     app: &AppWindow,
     anchor: &Anchor,
     shown_at: &Rc<Cell<Instant>>,
+    pending: &Rc<Cell<Option<PendingPosition>>>,
     shown: Shown,
-) -> bool {
+) {
+    // A settling re-arm belongs to the presentation that landed it — this
+    // presentation owns the slot now. A non-settling deferral is a
+    // presentation still waiting on its first size: leave it for
+    // `position_popover_impl`'s click-priority merge to arbitrate, or an
+    // ambient show racing into the realize gap would destroy an unanswered
+    // `ByTrayClick` request — the anchor the whole replay exists for.
+    if matches!(pending.get(), Some(PendingPosition { settling: true, .. })) {
+        pending.set(None);
+    }
     // A new popover presentation always starts on the gauges, not a stale modal.
     app.set_settings_open(false);
     // Nor a stale tooltip. A bubble raised by hovering a bar has no leave
     // event coming once the panel is dismissed out from under the pointer, so
     // without this it is what greets the next presentation.
     app.set_tip(BarTip::default());
+    // Cap before placing: it is measured on the anchor's monitor, and the
+    // height the placement math then reads is the cap-applied one — syncing
+    // after would leave a just-shrunk card floating off a taskbar anchor.
+    sync_providers_cap(app, anchor);
+    // Position while still hidden: a hidden winit window keeps its old spot
+    // and takes `set_position` fine, so showing first would flash the panel
+    // where it last was and visibly jump to the anchor. A window that does
+    // not exist yet (size 0×0) still defers through `pending` — its first
+    // placement lands on a `Resized` replay like before.
+    let moved = position_popover(app, anchor, pending, shown);
     let _ = app.window().show();
-    let moved = position_popover(app, anchor, shown);
-    // Only after show + position: Slint creates the winit window lazily, so
-    // measuring before `show()` is a no-op on the first presentation, and
-    // measuring before `position_popover` reads the monitor the window is
-    // *leaving* when the anchor moved to another screen.
-    sync_providers_cap(app);
+    // "Leave a parked window parked" is only a courtesy while the parking
+    // spot is reachable — a dock-mode window last left on a monitor that has
+    // since gone away (or under a resolution change) is a window nobody can
+    // reach. A show that did not move it recovers that: back onto a screen
+    // it goes, anchor or no.
+    if !moved && window_off_screen(app) {
+        position_popover_forced(app, anchor, pending, shown);
+    }
     shown_at.set(Instant::now());
 
     use slint::winit_030::{winit, WinitWindowAccessor};
@@ -6430,13 +7223,94 @@ fn present_popover(
         w.focus_window();
     });
     platform::activate_app();
-    moved
 }
 
 /// A screen the popover has to stay inside: `(x, y, width, height)` in
 /// physical pixels, the same space the tray event's rect and `set_position`
 /// already speak.
 type ScreenRect = (f64, f64, f64, f64);
+
+/// A deferred placement is a request made by a presentation that found the
+/// window still 0×0; its `Resized` reply lands within a frame or two. One
+/// that is still unanswered after this long belongs to a window that was
+/// never realized at all — replaying it on whatever resize next comes along
+/// would move a parked window for a cause nobody remembers. The exception a
+/// stale request still gets: a window nothing has ever placed. *Settling*
+/// requests are exempt: they belong to a window that is already visible and
+/// still converging, so they live until the presentation ends (hide, drag,
+/// or the next `present_popover`) rather than on a clock.
+const PENDING_POSITION_TTL: Duration = Duration::from_secs(2);
+
+/// One deferred placement request. `settling` distinguishes the two kinds:
+/// a fresh request a still-0×0 window could not yet place, versus one a
+/// landed placement re-armed so the `Resized` the cap sync and platform
+/// layout still owe re-places against the real size. Settling replays
+/// bypass the dock-mode parking courtesy — they are the same presentation
+/// converging, not a new one.
+#[derive(Clone, Copy)]
+struct PendingPosition {
+    at: Instant,
+    shown: Shown,
+    settling: bool,
+}
+
+/// Replay the placement a presentation deferred while the window was 0×0 —
+/// called from the `Resized` hook, and once more a turn later when the hook
+/// ran ahead of the backend's own size update. Also where the *settling*
+/// re-arms land: each landed placement leaves the request armed one more
+/// window so the `Resized` produced by the cap sync and the platform's own
+/// layout re-places against whatever size actually materialized.
+fn replay_pending_position(ctx: &Ctx) {
+    use slint::winit_030::WinitWindowAccessor;
+    let Some(PendingPosition {
+        at,
+        shown,
+        settling,
+    }) = ctx.pending_position.take()
+    else {
+        return;
+    };
+    let Some(app) = ctx.weak.upgrade() else {
+        return;
+    };
+    // Hidden between request and replay: that presentation ended before the
+    // window existed — moving it now would also lie about PLACED. A
+    // non-settling deferral past the TTL is stale — unless the window was
+    // never placed at all, where the WM-default spot it sits on is the very
+    // bug this replay exists to undo. A settling request belongs to the
+    // still-visible window it is converging — late resizes (a slow first
+    // fetch growing the card, an activity-strip toggle) are exactly what it
+    // exists for, so while the window stays visible it stays owed; hide,
+    // drag, and the next presentation all clear it.
+    let usable = app.window().is_visible()
+        && (settling || at.elapsed() <= PENDING_POSITION_TTL || !popover_placed());
+    if !usable {
+        return;
+    }
+    // Cap first, on the anchor's monitor: the height the placement reads is
+    // the cap-applied one.
+    sync_providers_cap(&app, &ctx.anchor);
+    // A settling request already landed once — it replays to re-place
+    // against the size the cap and platform layout actually produced, so it
+    // bypasses the parking courtesy that would refuse it as a repeat.
+    let mut landed = if settling {
+        position_popover_forced(&app, &ctx.anchor, &ctx.pending_position, shown)
+    } else {
+        position_popover(&app, &ctx.anchor, &ctx.pending_position, shown)
+    };
+    // The same recovery present_popover owes a refused move — a parked
+    // window on a monitor that is gone does not become reachable just
+    // because its real size arrived late.
+    if !landed && window_off_screen(&app) {
+        landed = position_popover_forced(&app, &ctx.anchor, &ctx.pending_position, shown);
+    }
+    // The presentation's focus call raced the realization too — repeat it
+    // once, on the first landing only: settle replays refocusing on every
+    // resize would fight the user for the key window.
+    if landed && !settling {
+        app.window().with_winit_window(|w| w.focus_window());
+    }
+}
 
 /// Gap between the status item and the card hanging off it.
 const POPOVER_GAP: f64 = 6.0;
@@ -6514,18 +7388,89 @@ fn clamp_onto(pos: f64, len: f64, screen_pos: f64, screen_len: f64, margin: f64)
     pos.clamp(lo, (screen_pos + screen_len - len - margin).max(lo))
 }
 
-/// The screen the status item sits on.
-///
-/// Deliberately not `current_monitor()`: that answers where the *window* is,
-/// which on every show after the first is the screen the popover is about to
-/// leave when the tray lives on another one. The item's own centre picks the
-/// right screen directly. `None` when winit can name no monitor at all, which
-/// [`position_popover`] reads as "don't constrain".
-fn anchor_screen(app: &AppWindow, anchor: Option<(f64, f64, f64, f64)>) -> Option<ScreenRect> {
+/// Whether `(cx, cy)` — physical pixels — lands inside a screen rect.
+fn rect_contains((x, y, w, h): ScreenRect, (cx, cy): (f64, f64)) -> bool {
+    cx >= x && cx < x + w && cy >= y && cy < y + h
+}
+
+/// Every monitor's `(rect, scale_factor)`, in the same physical-pixel space
+/// as the tray event's rect. Empty while the winit window is still
+/// unrealized — [`sync_providers_cap`] reaches that state before `show()`
+/// and takes the default cap for it — or on a platform that cannot name
+/// monitors at all.
+fn monitors(app: &AppWindow) -> Vec<(ScreenRect, f64)> {
     use slint::winit_030::{winit, WinitWindowAccessor};
-    fn rect(m: &winit::monitor::MonitorHandle) -> ScreenRect {
+    let mut out = Vec::new();
+    app.window().with_winit_window(|w: &winit::window::Window| {
+        out = w
+            .available_monitors()
+            .map(|m| {
+                let (p, s) = (m.position(), m.size());
+                (
+                    (p.x as f64, p.y as f64, s.width as f64, s.height as f64),
+                    m.scale_factor(),
+                )
+            })
+            .collect();
+    });
+    out
+}
+
+/// Drop a status-item rect that names no real screen location.
+///
+/// The macOS status item reports `(0, screen_height)` — its window's frame
+/// before the bar has laid it out — for a moment after creation, and a click
+/// landing in that window anchors the card to a point *below* every monitor:
+/// `popover_origin` then picks the "above" side and the panel opens at the
+/// bottom-left of the screen, exactly the misplaced spot reported. An anchor
+/// whose centre is inside no monitor is not an anchor at all — better the
+/// anchorless fallback position than a corner case off a phantom rect. That
+/// is also the answer while no monitor is enumerable yet: keeping an
+/// unverifiable rect would re-admit the phantom.
+fn sanitize_anchor(
+    app: &AppWindow,
+    anchor: Option<(f64, f64, f64, f64)>,
+) -> Option<(f64, f64, f64, f64)> {
+    let (ax, ay, aw, ah) = anchor?;
+    let mons = monitors(app);
+    let rects: Vec<ScreenRect> = mons.iter().map(|m| m.0).collect();
+    if anchor_on_a_monitor((ax, ay, aw, ah), &rects) {
+        anchor
+    } else {
+        None
+    }
+}
+
+/// The centre test [`sanitize_anchor`] runs: an anchor counts only while its
+/// centre lands inside some known monitor's rect.
+fn anchor_on_a_monitor((ax, ay, aw, ah): (f64, f64, f64, f64), mons: &[ScreenRect]) -> bool {
+    let centre = (ax + aw / 2.0, ay + ah / 2.0);
+    mons.iter().any(|m| rect_contains(*m, centre))
+}
+
+/// The monitor the popover will sit on, as `(rect, scale_factor)` — the
+/// same physical-pixel space [`monitors`] reports in.
+///
+/// Deliberately not `current_monitor()` first: that answers where the
+/// *window* is, which on every show after the first is the screen the
+/// popover is about to leave when the tray lives on another one. The
+/// item's own centre picks the right screen directly; `current`/`primary`
+/// is only the fallback for an anchorless present. `None` when winit can
+/// name no monitor at all, which [`position_popover`] reads as "don't
+/// constrain". Returning the scale too lets callers measure — and scale
+/// the gap/margin constants — against the monitor being placed *onto*,
+/// not the one being left.
+fn target_monitor(
+    app: &AppWindow,
+    anchor: Option<(f64, f64, f64, f64)>,
+) -> Option<(ScreenRect, f64)> {
+    use slint::winit_030::{winit, WinitWindowAccessor};
+    fn pair(m: &winit::monitor::MonitorHandle) -> (ScreenRect, f64) {
         let (p, s) = (m.position(), m.size());
-        (p.x as f64, p.y as f64, s.width as f64, s.height as f64)
+        (
+            (p.x as f64, p.y as f64, s.width as f64, s.height as f64),
+            m.scale_factor(),
+        )
     }
     let mut found = None;
     app.window().with_winit_window(|w: &winit::window::Window| {
@@ -6534,16 +7479,16 @@ fn anchor_screen(app: &AppWindow, anchor: Option<(f64, f64, f64, f64)>) -> Optio
             found = w
                 .available_monitors()
                 .find(|m| {
-                    let (x, y, mw, mh) = rect(m);
+                    let ((x, y, mw, mh), _) = pair(m);
                     cx >= x && cx < x + mw && cy >= y && cy < y + mh
                 })
-                .map(|m| rect(&m));
+                .map(|m| pair(&m));
         }
         if found.is_none() {
             found = w
                 .current_monitor()
                 .or_else(|| w.primary_monitor())
-                .map(|m| rect(&m));
+                .map(|m| pair(&m));
         }
     });
     found
@@ -6552,27 +7497,234 @@ fn anchor_screen(app: &AppWindow, anchor: Option<(f64, f64, f64, f64)>) -> Optio
 /// Returns whether the window was actually moved — `popover_moves` can say
 /// no, and only the caller who asked for a placement (or compensates for
 /// one that landed on a stale anchor) needs the answer.
-fn position_popover(app: &AppWindow, anchor: &Anchor, shown: Shown) -> bool {
-    // Recorded whatever the mode, so that switching into dock mode mid-session
-    // does not count the window as never placed.
-    thread_local! {
-        static PLACED: Cell<bool> = const { Cell::new(false) };
+///
+/// A presentation can arrive before winit has realized the window:
+/// `window().size()` then reads 0×0, `available_monitors()` is empty, and
+/// `set_position` lands on a frame that does not exist yet — the window
+/// ends up wherever the window manager defaults to rather than where this
+/// computed. That case is deferred: `pending` takes the request and the
+/// first `Resized` event replays it once the size is real.
+fn position_popover(
+    app: &AppWindow,
+    anchor: &Anchor,
+    pending: &Rc<Cell<Option<PendingPosition>>>,
+    shown: Shown,
+) -> bool {
+    position_popover_impl(app, anchor, pending, shown, false)
+}
+
+/// [`position_popover`] without the dock-mode parking courtesy — for a show
+/// that found the parked window entirely off-screen.
+fn position_popover_forced(
+    app: &AppWindow,
+    anchor: &Anchor,
+    pending: &Rc<Cell<Option<PendingPosition>>>,
+    shown: Shown,
+) -> bool {
+    position_popover_impl(app, anchor, pending, shown, true)
+}
+
+thread_local! {
+    /// Whether a placement has actually landed this run — read by the
+    /// dock-mode parking courtesy in [`popover_moves`] callers and by the
+    /// deferred-placement replay, for which a never-placed window overrides
+    /// the stale-request TTL (an unplaced panel parked at a window-manager
+    /// default is exactly the bug the deferral exists to undo).
+    static POPOVER_PLACED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// macOS: winit's `Window::is_maximized()` reaches `is_zoomed()`, which —
+/// because `isZoomed` does not answer for borderless windows — *temporarily
+/// swaps the window's styleMask to `Titled | Resizable`* and then restores
+/// it (winit#4071, still open upstream). Slint's `window_state_event` calls
+/// `is_maximized()` on every `Resized`, and content growth resizes this
+/// window whenever usage data lands. While the mask is titled the frame
+/// keeps the *content* pinned and grows a title-bar's height upward; if
+/// that frame would dip under the menu bar, `constrainFrameRect` clamps it —
+/// and when the mask is restored the window keeps the pushed-down position.
+/// Net effect, repeated per resize: the popover visibly jumps ~30px down
+/// some time after it opened, which is exactly the reported bug.
+///
+/// The probe always writes the same verbatim mask — `Titled | Resizable` —
+/// and a borderless popover is never legitimately zoomed, so the fix is
+/// surgical: a `class_addMethod` override of `setStyleMask:` on `WinitWindow`
+/// itself, swallowing exactly that mask while the window is borderless. The
+/// probe then reads `isZoomed` on the still-borderless window (false — the
+/// correct answer), restores the current mask (a harmless no-op write), and
+/// nothing ever moves. A class-level override — not an `object_setClass`
+/// instance swizzle — so AppKit's own isa-swizzling (KVO notification
+/// subclasses) is left alone; an instance reclass on an AppKit-swizzled
+/// window collapsed this window to 0×0 and crashed appearance lookups.
+#[cfg(target_os = "macos")]
+mod mask_shield {
+    use objc::runtime::{class_addMethod, Class, Object, Sel};
+    use objc::{msg_send, sel, sel_impl};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// `NSUInteger` — the ObjC `styleMask`/`setStyleMask:` argument type.
+    type ULong = usize;
+    /// `NSWindowStyleMaskTitled | NSWindowStyleMaskResizable` — the exact
+    /// mask winit's `is_zoomed` installs as its probe.
+    const ZOOM_PROBE: ULong = 0x1 | 0x8;
+    const TITLED: ULong = 0x1;
+
+    /// `NSWindow`'s own `setStyleMask:` IMP, captured at install so the shim
+    /// can forward every mask it does not swallow.
+    static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+    /// Set only after the method is actually on the class — a caller that
+    /// arrives before winit has registered `WinitWindow` retries next pass
+    /// instead of latching "done" on a no-op.
+    static DONE: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn shielded_set_style_mask(this: &mut Object, _cmd: Sel, mask: ULong) {
+        let current: ULong = unsafe { msg_send![this, styleMask] };
+        if mask == ZOOM_PROBE && current & TITLED == 0 {
+            // Borderless window, verbatim probe mask: only `is_zoomed` ever
+            // writes this. Swallow it — a borderless window cannot be zoomed,
+            // so dropping the probe cannot change the answer it was read for.
+            // `winit::WindowDelegate::set_style_mask` still runs its
+            // `makeFirstResponder` on the view afterwards — which is where
+            // Slint's canvas belongs anyway, so nothing is lost there.
+            return;
+        }
+        let orig: extern "C" fn(&mut Object, Sel, ULong) =
+            unsafe { std::mem::transmute(ORIGINAL.load(Ordering::Relaxed)) };
+        orig(this, _cmd, mask);
     }
-    let placed_before = PLACED.with(|placed| placed.replace(true));
-    if !popover_moves(platform::dock_mode(), placed_before, shown) {
+
+    extern "C" {
+        fn method_getTypeEncoding(m: *const objc::runtime::Method) -> *const i8;
+        fn method_setImplementation(
+            m: *mut objc::runtime::Method,
+            imp: objc::runtime::Imp,
+        ) -> objc::runtime::Imp;
+    }
+
+    /// Add the `setStyleMask:` shim as an override on `WinitWindow` itself —
+    /// a class-level `class_addMethod`, not an instance `object_setClass`,
+    /// so AppKit's own isa-swizzling (KVO notifications and friends) is left
+    /// alone. Idempotent: one class, one method, per process.
+    ///
+    /// One latent edge is accepted and documented: `set_decorations(true)`
+    /// on a window carrying `Resizable` but not `Miniaturizable` computes the
+    /// same `0x9` mask this shim swallows. Nothing in this app ever re-enables
+    /// decorations — the popover is frameless by design — so the overlap is
+    /// unreachable; if that ever changes, the guard needs a caller check, not
+    /// a value check.
+    pub fn install() {
+        if DONE.load(Ordering::SeqCst) {
+            return;
+        }
+        unsafe {
+            // The class is registered by winit at window creation, so this
+            // only succeeds once a window exists — DONE is therefore set only
+            // after the method really landed, and a too-early call retries.
+            let Some(cls) = Class::get("WinitWindow") else {
+                return;
+            };
+            let sel = sel!(setStyleMask:);
+            let Some(m) = cls.instance_method(sel) else {
+                return;
+            };
+            let orig = m.implementation() as usize;
+            if orig == 0 {
+                return;
+            }
+            ORIGINAL.store(orig, Ordering::SeqCst);
+            let shim: objc::runtime::Imp = std::mem::transmute(
+                shielded_set_style_mask as extern "C" fn(&mut Object, Sel, ULong),
+            );
+            // The type string is copied off the live method rather than
+            // hand-spelled (`v@:Q` vs `v@:L` for NSUInteger) — whatever Apple
+            // declared is what the override advertises.
+            let types = method_getTypeEncoding(m as *const _ as *mut _);
+            if class_addMethod(cls as *const Class as *mut Class, sel, shim, types)
+                == objc::runtime::NO
+            {
+                // `addMethod` refuses when the class already implements the
+                // selector itself — e.g. a future winit fixing #4071 on
+                // `WinitWindow`. Replacing that IMP keeps the override scoped
+                // to winit's class, and `ORIGINAL` captured above is exactly
+                // the impl being replaced, so the shim still chains correctly.
+                let replaced = method_setImplementation(m as *const _ as *mut _, shim);
+                if replaced as usize == 0 {
+                    return;
+                }
+                ORIGINAL.store(replaced as usize, Ordering::SeqCst);
+            }
+            DONE.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod mask_shield {
+    pub fn install() {}
+}
+
+fn popover_placed() -> bool {
+    POPOVER_PLACED.with(|placed| placed.get())
+}
+
+fn position_popover_impl(
+    app: &AppWindow,
+    anchor: &Anchor,
+    pending: &Rc<Cell<Option<PendingPosition>>>,
+    shown: Shown,
+    force: bool,
+) -> bool {
+    // Recorded whatever the mode, so that switching into dock mode mid-session
+    // does not count the window as never placed. Read without setting: a
+    // deferred placement must not consume the flag, or the replay that lands
+    // it would see the window as already placed and refuse to move it in
+    // dock mode.
+    let placed_before = popover_placed();
+    if !force && !popover_moves(platform::dock_mode(), placed_before, shown) {
         return false;
     }
-    let scale = app.window().scale_factor() as f64;
     let size = app.window().size();
-    let anchor = *anchor.borrow();
-    // No monitor to be had: fall back to a screen so large that the *far*
-    // edge of `clamp_onto`'s range never bites — not fully unconstrained,
-    // since the near edge still pins anything below `POPOVER_MARGIN` (an
-    // anchor at or past `x = 0`/`y = 0`, which a real monitor with a negative
-    // origin in a multi-monitor layout could legitimately want) up to that
-    // margin. Good enough for "winit can name no monitor at all", a state
-    // this app cannot otherwise reason about anyway.
-    let screen = anchor_screen(app, anchor).unwrap_or((0.0, 0.0, f64::MAX, f64::MAX));
+    if size.width == 0 || size.height == 0 {
+        // A click already waiting for its window outranks an ambient cause —
+        // a reopen tick landing in the realize gap must not overwrite the
+        // `ByTrayClick` whose anchor is the whole reason the replay exists.
+        // Only a click still *waiting* on a size counts — a settled one is
+        // no longer owed the slot.
+        let click_waiting = matches!(
+            pending.get(),
+            Some(PendingPosition {
+                shown: Shown::ByTrayClick,
+                settling: false,
+                ..
+            })
+        );
+        if !(click_waiting && shown == Shown::ByAnythingElse) {
+            pending.set(Some(PendingPosition {
+                at: Instant::now(),
+                shown,
+                settling: false,
+            }));
+        }
+        return false;
+    }
+    POPOVER_PLACED.with(|placed| placed.set(true));
+    let anchor = sanitize_anchor(app, *anchor.borrow());
+    // Screen and scale both come from the monitor being placed *onto* —
+    // on a cross-screen move `window().scale_factor()` would still answer
+    // for the monitor the window is leaving. No monitor to be had: fall
+    // back to a screen so large that the *far* edge of `clamp_onto`'s
+    // range never bites — not fully unconstrained, since the near edge
+    // still pins anything below `POPOVER_MARGIN` (an anchor at or past
+    // `x = 0`/`y = 0`, which a real monitor with a negative origin in a
+    // multi-monitor layout could legitimately want) up to that margin.
+    // Good enough for "winit can name no monitor at all", a state this
+    // app cannot otherwise reason about anyway.
+    let (screen, scale) =
+        target_monitor(app, anchor).unwrap_or(((0.0, 0.0, f64::MAX, f64::MAX), 1.0));
+    // Shield the window before any placement near the menu bar: the next
+    // content resize would otherwise let winit's `is_zoomed` probe flash a
+    // titlebar on the borderless window and `constrainFrameRect` would push
+    // it down mid-toggle — the delayed downward jump. See `mask_shield`.
+    mask_shield::install();
     let (x, y) = popover_origin(
         anchor,
         (size.width as f64, size.height as f64),
@@ -6581,7 +7733,89 @@ fn position_popover(app: &AppWindow, anchor: &Anchor, shown: Shown) -> bool {
     );
     app.window()
         .set_position(PhysicalPosition::new(x as i32, y as i32));
+    // Keep the request armed as *settling*: the cap sync and the platform's
+    // own layout flush their resizes asynchronously, and content that only
+    // arrives after the first fetch can keep growing the card — so the size
+    // this placement used may not be final. Each later `Resized` replays it
+    // forced: the parking courtesy would read it as a new presentation when
+    // it is the same one converging. It stays owed while the window is
+    // visible — a hidden, dragged, or re-presented window clears it, which
+    // is also what protects a dock-mode window the user parked: it only
+    // ever got there by a drag, and the drag drops the request.
+    pending.set(Some(PendingPosition {
+        at: Instant::now(),
+        shown,
+        settling: true,
+    }));
     true
+}
+
+/// Whether the window's frame intersects no monitor — the parked-window
+/// recovery check. A 0×0 or monitorless answer is not a verdict: the first
+/// says the window is not realized yet (a pending placement covers it), the
+/// second that there is nothing to check against. Two deliberate
+/// simplifications: monitor *full* rects, not work areas — a window parked
+/// entirely under the Dock is still judged reachable (the user can see and
+/// grab enough of it); and `position()`/`size()` both speak physical
+/// pixels, the space the monitor rects already use. Framelessness keeps
+/// outer frame and client area equal, which is what makes the two getters
+/// commensurate.
+fn window_off_screen(app: &AppWindow) -> bool {
+    let size = app.window().size();
+    if size.width == 0 || size.height == 0 {
+        return false;
+    }
+    let mons = monitors(app);
+    if mons.is_empty() {
+        return false;
+    }
+    let pos = app.window().position();
+    let frame: ScreenRect = (
+        pos.x as f64,
+        pos.y as f64,
+        size.width as f64,
+        size.height as f64,
+    );
+    !mons.iter().any(|m| rects_overlap(m.0, frame))
+}
+
+/// Whether the window already sits where this anchor would put it — the
+/// popover hanging off the status item, not a window parked somewhere else
+/// (the launch open's fallback spot, or a dock-mode window the user dragged
+/// aside). A status-item click reads "the panel, here": only an
+/// already-anchored panel toggles closed. Unanswerable cases — no valid
+/// anchor, no monitors, no size — call it anchored, so the click keeps its
+/// ordinary toggle.
+fn window_at_anchor(app: &AppWindow, anchor: &Anchor) -> bool {
+    let Some(anchor) = sanitize_anchor(app, *anchor.borrow()) else {
+        return true;
+    };
+    let Some((screen, scale)) = target_monitor(app, Some(anchor)) else {
+        return true;
+    };
+    let size = app.window().size();
+    if size.width == 0 || size.height == 0 {
+        return true;
+    }
+    let (tx, ty) = popover_origin(
+        Some(anchor),
+        (size.width as f64, size.height as f64),
+        screen,
+        scale,
+    );
+    let pos = app.window().position();
+    // Modest slack: a live status item drifts a few px as the bar reflows and
+    // scale rounding adds a couple more — but wide enough to forgive a real
+    // displacement would also forgive the ~26px menu-bar push this check
+    // exists to notice, so it stays below that.
+    const ANCHOR_SLACK: f64 = 20.0;
+    (pos.x as f64 - tx).abs() <= ANCHOR_SLACK && (pos.y as f64 - ty).abs() <= ANCHOR_SLACK
+}
+
+/// Whether two rects share any area — the off-screen test's unit: a window
+/// that meets a monitor at an edge only (`==` on a side) does not overlap it.
+fn rects_overlap((ax, ay, aw, ah): ScreenRect, (bx, by, bw, bh): ScreenRect) -> bool {
+    ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by
 }
 
 /// The directories a provider CLI is looked for in — and, just as importantly,
@@ -9409,6 +10643,66 @@ mod popover_placement_tests {
         let (x, y) = popover_origin(None, CARD, screen, 1.0);
         assert_eq!((x, y), (-1920.0 + 240.0, 48.0));
     }
+
+    use super::{anchor_on_a_monitor, rect_contains, rects_overlap};
+
+    // The status item reports `(0, screen_height)` for a moment after the
+    // tray is created — its frame before the menu bar has laid it out. A
+    // click drained in that window used to anchor the card to a point below
+    // every monitor, and `popover_origin`'s "above" side then parked it at
+    // the bottom-left of the screen.
+    #[test]
+    fn a_status_items_not_yet_laid_out_rect_is_not_an_anchor() {
+        let mons = [SCREEN];
+        // The transient rect macOS reported on the machine this was found on.
+        let transient = (0.0, 1440.0, 149.0, 30.0);
+        assert!(
+            !anchor_on_a_monitor(transient, &mons),
+            "below the screen's bottom edge — no monitor holds its centre"
+        );
+        // The same item once laid out: top of the screen, clearly inside.
+        let laid_out = (745.0, 0.0, 149.0, 30.0);
+        assert!(anchor_on_a_monitor(laid_out, &mons));
+        // Containment is inclusive at the top and exclusive past the bottom
+        // edge — a rect flush with the last row is still an anchor.
+        let last_row = (0.0, 1410.0, 149.0, 30.0);
+        assert!(anchor_on_a_monitor(last_row, &mons));
+    }
+
+    #[test]
+    fn an_anchor_counts_on_any_monitor_not_just_the_main_one() {
+        let left = (-1920.0, 0.0, 1920.0, 1080.0);
+        let mons = [SCREEN, left];
+        let item = (-40.0, 1040.0, 40.0, 40.0);
+        assert!(anchor_on_a_monitor(item, &mons));
+        assert!(!anchor_on_a_monitor(item, &[SCREEN]));
+    }
+
+    #[test]
+    fn rect_contains_is_inclusive_at_the_origin_and_exclusive_past_the_edge() {
+        assert!(rect_contains(SCREEN, (0.0, 0.0)));
+        assert!(rect_contains(SCREEN, (2559.0, 1439.0)));
+        assert!(!rect_contains(SCREEN, (2560.0, 0.0)));
+        assert!(!rect_contains(SCREEN, (0.0, 1440.0)));
+        assert!(!rect_contains(SCREEN, (-1.0, 700.0)));
+    }
+
+    #[test]
+    fn rects_overlap_only_when_they_share_area() {
+        let window = (240.0, 62.0, 420.0, 925.0);
+        assert!(rects_overlap(SCREEN, window));
+        // Parked entirely on the other monitor: no overlap with the main one.
+        let left = (-1920.0, 0.0, 1920.0, 1080.0);
+        assert!(!rects_overlap(left, window));
+        // Touching an edge is not overlapping it.
+        let flush_below = (0.0, 1440.0, 420.0, 100.0);
+        assert!(!rects_overlap(SCREEN, flush_below));
+        let flush_right = (2560.0, 0.0, 100.0, 100.0);
+        assert!(!rects_overlap(SCREEN, flush_right));
+        // A sliver across the boundary is still on the screen.
+        let straddling = (2500.0, 700.0, 420.0, 100.0);
+        assert!(rects_overlap(SCREEN, straddling));
+    }
 }
 
 #[cfg(test)]
@@ -9536,7 +10830,7 @@ mod title_tests {
         // regardless of length, so the caption and the clock underneath it
         // told two different stories.
         let w = win("5H", Role::Primary, 50.0, 3 * 86400, 10_080);
-        let data = window_data(NOW, &w, 50.0);
+        let data = window_data(NOW, &w, 50.0, None);
         assert_eq!(data.label, "Weekly limit");
         assert!(
             data.reset_at.contains(' '),
@@ -9558,7 +10852,7 @@ mod title_tests {
             resets_at: Some(NOW + 3 * 86400),
             period_minutes: None,
         };
-        let data = window_data(NOW, &w, 50.0);
+        let data = window_data(NOW, &w, 50.0, None);
         assert!(
             data.reset_at.contains(' '),
             "a Secondary window with no stated length must still fall back to a dated clock: {:?}",
@@ -9572,7 +10866,7 @@ mod title_tests {
         // a `Primary` window at its ordinary 5-hour length keeps the bare
         // time it always had.
         let w = win("5H", Role::Primary, 50.0, 3 * 3600, 300);
-        let data = window_data(NOW, &w, 50.0);
+        let data = window_data(NOW, &w, 50.0, None);
         assert!(
             !data.reset_at.contains(' '),
             "a same-day reset needs no date: {:?}",
@@ -11371,7 +12665,7 @@ mod title_tests {
             at: NOW - 600,
             period_minutes: Some(300),
         };
-        let rows = window_rows(Some(&m), &reading, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(Some(&m), &reading, NOW, &seen_only("w0:", seen), &NO_PROJ);
 
         assert_eq!(
             labels(&rows),
@@ -11967,6 +13261,10 @@ mod title_tests {
         move |asked| (asked == key).then_some(seen)
     }
 
+    /// The tests here predate the quota×history projection and exercise
+    /// rows/hysteresis, not burn math — they all want "no projection".
+    const NO_PROJ: &ProjectionFn<'static> = &|_, _| None;
+
     fn labels(rows: &[(String, WindowData)]) -> Vec<String> {
         rows.iter().map(|(_, w)| w.label.to_string()).collect()
     }
@@ -11989,7 +13287,13 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &weekly_only, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(
+            Some(&m),
+            &weekly_only,
+            NOW,
+            &seen_only("w0:", seen),
+            &NO_PROJ,
+        );
 
         assert_eq!(
             labels(&rows),
@@ -12031,7 +13335,7 @@ mod title_tests {
                 at: NOW - elapsed,
                 period_minutes: Some(300),
             };
-            window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", seen))
+            window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", seen), &NO_PROJ)
         };
 
         assert_eq!(
@@ -12066,7 +13370,7 @@ mod title_tests {
                 at: NOW - elapsed,
                 period_minutes: Some(10_080),
             };
-            window_rows(Some(&m), &nothing, NOW, &seen_only("w1:", seen))
+            window_rows(Some(&m), &nothing, NOW, &seen_only("w1:", seen), &NO_PROJ)
         };
 
         assert_eq!(labels(&rows_at(0)), vec!["Weekly limit"]);
@@ -12107,7 +13411,7 @@ mod title_tests {
             at: NOW + 600,
             period_minutes: Some(300),
         };
-        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", seen)).is_empty());
+        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", seen), &NO_PROJ).is_empty());
     }
 
     /// A reading we could not take is not evidence that a window is empty. The
@@ -12123,7 +13427,7 @@ mod title_tests {
             at: NOW - 600,
             period_minutes: Some(300),
         };
-        assert!(window_rows(Some(&m), &broken, NOW, &seen_only("w0:", seen)).is_empty());
+        assert!(window_rows(Some(&m), &broken, NOW, &seen_only("w0:", seen), &NO_PROJ).is_empty());
     }
 
     /// A window nobody ever saw is not a window we can say anything about —
@@ -12133,7 +13437,7 @@ mod title_tests {
     fn a_window_never_seen_gets_no_row() {
         let m = two_window_manifest();
         let nothing = reading_with(Vec::new(), None);
-        assert!(window_rows(Some(&m), &nothing, NOW, &|_| None).is_empty());
+        assert!(window_rows(Some(&m), &nothing, NOW, &|_| None, &NO_PROJ).is_empty());
     }
 
     /// Graceful degradation on the first launch after an upgrade: the
@@ -12149,12 +13453,26 @@ mod title_tests {
             at: NOW - 600,
             period_minutes: None,
         };
-        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", no_length)).is_empty());
+        assert!(window_rows(
+            Some(&m),
+            &nothing,
+            NOW,
+            &seen_only("w0:", no_length),
+            &NO_PROJ
+        )
+        .is_empty());
         let zero_length = config::SeenWindow {
             at: NOW - 600,
             period_minutes: Some(0),
         };
-        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", zero_length)).is_empty());
+        assert!(window_rows(
+            Some(&m),
+            &nothing,
+            NOW,
+            &seen_only("w0:", zero_length),
+            &NO_PROJ
+        )
+        .is_empty());
     }
 
     /// A window the provider *is* reporting is drawn from what it reported.
@@ -12169,7 +13487,7 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &live, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(Some(&m), &live, NOW, &seen_only("w0:", seen), &NO_PROJ);
         assert_eq!(labels(&rows), vec!["5-hour limit"]);
         assert!(!rows[0].1.not_started);
         assert_eq!(rows[0].1.pct, 12.0);
@@ -12193,7 +13511,7 @@ mod title_tests {
             None,
         );
 
-        let rows = window_rows(Some(&m), &scrambled, NOW, &|_| None);
+        let rows = window_rows(Some(&m), &scrambled, NOW, &|_| None, &NO_PROJ);
         assert_eq!(
             labels(&rows),
             vec!["5-hour limit", "Weekly limit", "GPT-5.3-Codex-Spark"],
@@ -12230,7 +13548,13 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &figureless, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(
+            Some(&m),
+            &figureless,
+            NOW,
+            &seen_only("w0:", seen),
+            &NO_PROJ,
+        );
         assert!(
             rows.is_empty(),
             "no row to draw, and no claim that the window is empty: {:?}",
@@ -12260,7 +13584,7 @@ mod title_tests {
             })
         };
 
-        let rows = window_rows(Some(&m), &nothing, NOW, &seen);
+        let rows = window_rows(Some(&m), &nothing, NOW, &seen, &NO_PROJ);
         assert_eq!(
             labels(&rows),
             vec!["5-hour limit", "Weekly limit"],
@@ -12301,7 +13625,7 @@ mod title_tests {
             _ => None,
         };
 
-        let rows = window_rows(Some(&m), &extra_only, NOW, &seen);
+        let rows = window_rows(Some(&m), &extra_only, NOW, &seen, &NO_PROJ);
         assert_eq!(
             labels(&rows),
             vec!["5-hour limit", "Weekly limit", "GPT-5.3-Codex-Spark"],
@@ -12322,7 +13646,7 @@ mod title_tests {
             at: NOW - 600,
             period_minutes: Some(300),
         };
-        let rows = window_rows(None, &live, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(None, &live, NOW, &seen_only("w0:", seen), &NO_PROJ);
         assert_eq!(labels(&rows), vec!["Weekly limit"]);
     }
 
@@ -12340,7 +13664,7 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &empty, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(Some(&m), &empty, NOW, &seen_only("w0:", seen), &NO_PROJ);
         assert!(
             rows.iter()
                 .any(|(_, w)| w.label == "5-hour limit" && w.not_started),
@@ -12913,14 +14237,14 @@ mod title_tests {
         };
 
         let live = reading_with(vec![win("5H", Role::Primary, 42.0, 600, 300)], None);
-        let before = window_rows(Some(&m), &live, NOW, &|_| None);
+        let before = window_rows(Some(&m), &live, NOW, &|_| None, &NO_PROJ);
         let model = reconcile_window_model(&mut models, "codex", before);
         let was = model.row_data(0).expect("one row");
         assert!(!was.not_started);
         assert_ne!(was.reset_rel, "");
 
         let gone = reading_with(Vec::new(), None);
-        let after = window_rows(Some(&m), &gone, NOW, &seen_only("w0:", seen));
+        let after = window_rows(Some(&m), &gone, NOW, &seen_only("w0:", seen), &NO_PROJ);
         let model = reconcile_window_model(&mut models, "codex", after);
         assert_eq!(
             model.row_count(),
@@ -12969,6 +14293,9 @@ mod title_tests {
                     reset_rel_kind: ResetRelKind::Unknown,
                     reset_at: ss(""),
                     tooltip: ss(""),
+                    proj_pct: 0.0,
+                    proj_tone: 1,
+                    burn_line: ss(""),
                 },
             )
         };

@@ -50,6 +50,33 @@ export struct BarTip {
 // tick and a signed pace figure competed with both, so answering "how much is
 // left" meant first sorting out which number was the answer. The tick and the
 // pace live on in the bar's hover tooltip, where they cost nothing to ignore.
+// ── Diagonal hatch fill ───────────────────────────────────────────────────
+// The design's `repeating-linear-gradient` hatches (45° for the cache-read
+// segment, 135° for quota projection) drawn as one stroked Path per stripe —
+// Slint has no repeating gradient, and Image tiling enums aren't visible to
+// user .slint files. 4px pitch, 1.6px stroke matches the spec's 2px-on-4px.
+export component HatchFill inherits Rectangle {
+    in property <color> tint;
+    // 1 = "/" rising stripes (the 45° token-class hatch), -1 = "\" falling
+    // (the 135° quota-projection hatch).
+    in property <float> dir: 1;
+    clip: true;
+    property <float> vbw: self.width / 1px;
+    property <float> vbh: self.height / 1px;
+    for i in max(0, round(root.vbw / 4 + root.vbh / 4)) + 1 : Path {
+        width: root.width;
+        height: root.height;
+        viewbox-width: root.vbw;
+        viewbox-height: root.vbh;
+        fill: transparent;
+        stroke: root.tint;
+        stroke-width: 1.6px;
+        commands: root.dir > 0
+            ? "M \{i * 4.0 - root.vbh} \{root.vbh} L \{i * 4.0} 0"
+            : "M \{i * 4.0 - root.vbh} 0 L \{i * 4.0} \{root.vbh}";
+    }
+}
+
 export component QuotaBlock inherits VerticalLayout {
     in property <string> win-label;      // "5H" / "WK"
     in property <float> pct;             // used %
@@ -74,8 +101,17 @@ export component QuotaBlock inherits VerticalLayout {
 
     // Severity follows the *displayed* value, not the raw one: 89.6 shows as
     // "90%", and a 90 printed in amber contradicts the palette's own legend.
+    // Quota × history join (design §4): burn-rate projection drawn as a
+    // 135° hatch continuing the bar past the solid fill — measured is solid,
+    // projected is hatched, and the hatch never counts as quota.
+    in property <float> proj-pct: 0;   // where the projection lands; 0 = none
+    in property <int> proj-tone: 1;    // 1 ok / 2 warn / 3 crit
+    in property <string> burn-line: "";// "burn 41.2K/h → ~74%" / "caps ~20:12"
+
     // The 0.4pp this shifts the bar's colour boundary by is invisible.
     property <color> accent: Theme.sev(root.used-rounded);
+    property <color> proj-color: root.proj-tone == 3 ? Theme.crit
+        : root.proj-tone == 2 ? Theme.warn : Theme.ok;
 
     spacing: 7px;
 
@@ -118,7 +154,26 @@ export component QuotaBlock inherits VerticalLayout {
             background: Theme.track;
             border-width: 1px;
             border-color: Theme.hairline;
+            clip: true;
 
+            // The projection hatch goes in first so the solid fill always
+            // sits on top of it (z-order per the design): a projection that
+            // overshoots the fill is still visibly *behind* the measured part.
+            if root.proj-pct > root.pct : Rectangle {
+                x: parent.width * min(root.pct, 100) / 100;
+                y: 0;
+                height: parent.height;
+                width: parent.width * (min(root.proj-pct, 100) - min(root.pct, 100)) / 100;
+                HatchFill {
+                    width: parent.width;
+                    height: parent.height;
+                    dir: -1;
+                    tint: root.proj-color;
+                    opacity: 0.55;
+                }
+                animate x { duration: 700ms; easing: ease-out-quart; }
+                animate width { duration: 700ms; easing: ease-out-quart; }
+            }
             Rectangle {
                 x: 0;
                 y: 0;
@@ -176,6 +231,14 @@ export component QuotaBlock inherits VerticalLayout {
             vertical-alignment: center;
         }
         Rectangle { horizontal-stretch: 1; min-width: 4px; }
+        // Right side of the resets line: the burn projection the hatch
+        // above draws ("burn 41.2K/h → ~74%", or "caps ~20:12" in crit).
+        if root.burn-line != "" : Text {
+            text: root.burn-line;
+            font-size: 10px;
+            color: root.proj-tone == 1 ? Theme.text-faint : root.proj-color;
+            vertical-alignment: center;
+        }
     }
 }
 

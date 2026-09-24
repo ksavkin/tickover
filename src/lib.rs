@@ -8,6 +8,8 @@
 //! lives here (no UI deps) so it can be unit- and integration-tested without
 //! building the whole Slint/tray binary — see `crate::plugin`'s module docs.
 
+#[cfg(feature = "history")]
+pub mod history;
 pub mod menubar;
 pub mod model;
 pub mod plugin;

@@ -1249,6 +1249,67 @@ fn rules() -> Vec<Rule> {
             ),
             names: "root_env_join` must not be empty",
         },
+        // ── [history] — the same fields, the same rules ──────────────────
+        // Every row declares `reading-history` so the capability gate passes
+        // and `validate_history`'s own check is the one that fires. The
+        // no-declaration case is the generic backward-check row below, not
+        // one of these — it trips a `check_against` site, not a
+        // `validate_history` one.
+        Rule {
+            // `root` here; a blank `glob` trips the same `return Err` in
+            // `validate_history`'s loop and is not a second row of its own.
+            says: "a [history] section can be present and still say nothing",
+            broken_by: plus(
+                &declaring("[\"reading-history\"]"),
+                "[history]\nformat = \"codex-rollouts\"\nroot = \"  \"\nglob = \"*.jsonl\"",
+            ),
+            names: "`[history] root`",
+        },
+        Rule {
+            says: "a blank [history] root_env names no environment variable",
+            broken_by: plus(
+                &declaring("[\"reading-history\"]"),
+                "[history]\nformat = \"codex-rollouts\"\nroot = \"~/h\"\nglob = \"*.jsonl\"\n\
+                 root_env = \"  \"",
+            ),
+            names: "names no environment variable",
+        },
+        Rule {
+            says: "[history] root_env_join with no root_env has nothing to join onto",
+            broken_by: plus(
+                &declaring("[\"reading-history\"]"),
+                "[history]\nformat = \"codex-rollouts\"\nroot = \"~/h\"\nglob = \"*.jsonl\"\n\
+                 root_env_join = \"sessions\"",
+            ),
+            names: "needs `root_env`",
+        },
+        Rule {
+            says: "[history] root_env_join is appended to root_env's value, not used in its place",
+            broken_by: plus(
+                &declaring("[\"reading-history\"]"),
+                "[history]\nformat = \"codex-rollouts\"\nroot = \"~/h\"\nglob = \"*.jsonl\"\n\
+                 root_env = \"SAMPLE_DIR\"\nroot_env_join = \"/absolute\"",
+            ),
+            names: "must be a relative subdirectory",
+        },
+        Rule {
+            says: "[history] root_env_join must not walk outside the directory root_env named",
+            broken_by: plus(
+                &declaring("[\"reading-history\"]"),
+                "[history]\nformat = \"codex-rollouts\"\nroot = \"~/h\"\nglob = \"*.jsonl\"\n\
+                 root_env = \"SAMPLE_DIR\"\nroot_env_join = \"../escape\"",
+            ),
+            names: "must not contain a `..`",
+        },
+        Rule {
+            says: "a blank [history] root_env_join resolves to the directory root_env names",
+            broken_by: plus(
+                &declaring("[\"reading-history\"]"),
+                "[history]\nformat = \"codex-rollouts\"\nroot = \"~/h\"\nglob = \"*.jsonl\"\n\
+                 root_env = \"SAMPLE_DIR\"\nroot_env_join = \"  \"",
+            ),
+            names: "root_env_join` must not be empty",
+        },
         Rule {
             // A blank `container_field` compares against no field of any
             // container, ever — `[logfile] account_match`'s own doc calls
@@ -2122,13 +2183,14 @@ fn the_shipped_grok_manifest_is_accepted() {
         "credentials-map",
         "keychain-expiry",
         "window-period-bounds",
+        "reading-history",
     ] {
         assert!(
             m.requires_reader.iter().any(|c| c == capability),
             "{capability} is load-bearing here"
         );
     }
-    assert_eq!(m.requires_reader.len(), 5, "and nothing else is claimed");
+    assert_eq!(m.requires_reader.len(), 6, "and nothing else is claimed");
 
     // The golden half: a manifest that parses is not a manifest that reads the
     // right fields. Every path this provider depends on is asserted, because a
@@ -2384,13 +2446,14 @@ fn the_shipped_antigravity_manifest_is_accepted() {
         "http-post",
         "remaining-fraction",
         "window-identity",
+        "reading-history",
     ] {
         assert!(
             m.requires_reader.iter().any(|c| c == capability),
             "{capability} is load-bearing here"
         );
     }
-    assert_eq!(m.requires_reader.len(), 6, "and nothing else is claimed");
+    assert_eq!(m.requires_reader.len(), 7, "and nothing else is claimed");
 
     // Four windows, each addressed by its stable bucketId — a typo in a
     // selector reads nothing and the row silently vanishes.
@@ -2931,6 +2994,7 @@ fn the_corpus_has_a_line_for_every_rule_the_validator_enforces() {
         "pub fn validate(&self)",
         "fn validate_identity(&self)",
         "fn validate_engine_sections(&self)",
+        "fn validate_history(&self)",
         "fn validate_windows(&self)",
         "fn validate_balances(&self)",
         "fn validate_window_period_mode(&self)",

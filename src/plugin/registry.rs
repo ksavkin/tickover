@@ -1252,6 +1252,22 @@ fn logfile_scope(lf: &LogFileConfig) -> String {
     format!("{root}/{}", lf.glob)
 }
 
+/// [`logfile_scope`] for `[history]` — the same `root`/`root_env`/
+/// `root_env_join`/`glob` shape, disclosed the same way. A history root
+/// names a tree the app reads *every byte of over time* (rather than the
+/// newest handful of files a quota glob touches), which is if anything
+/// more worth naming plainly, not less.
+fn history_scope(h: &crate::plugin::manifest::HistoryConfig) -> String {
+    let root = match &h.root_env {
+        Some(env_name) => match &h.root_env_join {
+            Some(join) => format!("${env_name}/{join}"),
+            None => format!("${env_name}"),
+        },
+        None => h.root.clone(),
+    };
+    format!("{root}/{}", h.glob)
+}
+
 /// [`TrustDisclosure::credential_sources`] entries for one `[[surface.auth]]`
 /// step — see that field's own doc for the full rationale, including why
 /// `credentials-file`/`credentials-map`/`reject-when`/`oauth-refresh` return
@@ -1348,6 +1364,12 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
     // plainly, ahead of any narrower path below.
     if let Some(lf) = &m.logfile {
         let scope = logfile_scope(lf);
+        if !local_files.contains(&scope) {
+            local_files.push(scope);
+        }
+    }
+    if let Some(h) = &m.history {
+        let scope = history_scope(h);
         if !local_files.contains(&scope) {
             local_files.push(scope);
         }
@@ -2761,6 +2783,55 @@ mod tests {
             "reading a credential out of a map is reading a credential"
         );
         assert_eq!(disclosure.auth_types, vec![AuthType::CredentialsMap]);
+    }
+
+    /// `[history]` names a tree this app reads over time — disclosed like
+    /// `[logfile]`'s scope is, `root_env` spelled as `$VAR` when set.
+    #[test]
+    fn a_history_root_is_disclosed_as_a_local_file_scope() {
+        let toml = r#"
+            id         = "x"
+            name       = "X"
+            menu_label = "X"
+            order      = 1
+            engine     = "log-file"
+            requires_reader = ["reading-history"]
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [logfile]
+            root = "~/.x/quota"
+            glob = "*.jsonl"
+            container_key = "k"
+            [history]
+            format = "codex-rollouts"
+            root = "~/.x/sessions"
+            glob = "**/*.jsonl"
+            root_env = "X_HOME"
+            root_env_join = "sessions"
+        "#;
+        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert!(
+            disclosure
+                .local_files
+                .contains(&"$X_HOME/sessions/**/*.jsonl".to_string()),
+            "history scope disclosed as the env-override spelling: {:?}",
+            disclosure.local_files
+        );
+        assert!(
+            disclosure
+                .local_files
+                .contains(&"~/.x/quota/*.jsonl".to_string()),
+            "the logfile scope is still disclosed beside it: {:?}",
+            disclosure.local_files
+        );
     }
 
     #[test]

@@ -153,16 +153,28 @@ fn default_surface_in_menu_bar(m: &PluginManifest) -> bool {
 /// archived ones), which could make mtime-based freshness pick the wrong
 /// one.
 fn resolve_root(lf: &LogFileConfig, options: &BTreeMap<String, bool>) -> PathBuf {
-    if let Some(env_name) = &lf.root_env {
+    resolve_root_fields(&lf.root, &lf.root_env, &lf.root_env_join, options)
+}
+
+/// `root`/`root_env`/`root_env_join` resolution shared by `[logfile]` and
+/// `[history]` — both describe a provider-owned directory tree the app
+/// only reads.
+pub(crate) fn resolve_root_fields(
+    root: &str,
+    root_env: &Option<String>,
+    root_env_join: &Option<String>,
+    options: &BTreeMap<String, bool>,
+) -> PathBuf {
+    if let Some(env_name) = root_env {
         if let Some(v) = std::env::var_os(env_name) {
             let base = PathBuf::from(v);
-            return match &lf.root_env_join {
+            return match root_env_join {
                 Some(sub) => base.join(crate::plugin::substitute_options(sub, options)),
                 None => base,
             };
         }
     }
-    crate::plugin::expand_home(&crate::plugin::substitute_options(&lf.root, options))
+    crate::plugin::expand_home(&crate::plugin::substitute_options(root, options))
 }
 
 /// The root-injectable core of the engine — everything [`fetch`] does except
@@ -1010,7 +1022,7 @@ pub fn take_pending_diagnostics() -> Vec<String> {
 /// at least the whole string back, so the `unwrap_or` below never actually
 /// falls through — kept because the type still asks for it, not because the
 /// `None` arm is reachable.
-fn glob_matches(glob: &str, name: &str) -> bool {
+pub(crate) fn glob_matches(glob: &str, name: &str) -> bool {
     let separators: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
     let name_pattern = glob.rsplit(separators).next().unwrap_or(glob);
     match_wildcard(name_pattern, name)

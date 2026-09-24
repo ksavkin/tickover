@@ -253,7 +253,7 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "codex.toml",
         id: "codex",
-        to_version: "2.5.3",
+        to_version: "2.6.0",
         // Every codex.toml this app has shipped, so an untouched copy of any of
         // them is recognised as one rather than mistaken for the user's own work.
         // A version that is missing from this list is a version whose installs
@@ -267,6 +267,10 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
         // version it is the hash of, which is the only check left available for
         // a value nothing in this tree can reproduce.
         previous_sha256: &[
+            // 2.5.3 — before `[history]`, so an install left on it never
+            // collects token usage from `~/.codex/sessions`.
+            // sha256 of codex.toml as shipped at manifest version 2.5.3.
+            "4dbfcc31a288cb4ddd14aae8ea2bd293a5f741e2e6903b268de073e7a968734b",
             // 1.0.0 — the log-file reader.
             // sha256 of codex.toml as shipped at manifest version 1.0.0.
             "44596a24d4a6c699e01b41b386edcfb6602b31c9bd3f5473261e9b3d3f5bcf21",
@@ -319,8 +323,12 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "claude.toml",
         id: "claude",
-        to_version: "1.4.6",
+        to_version: "1.5.0",
         previous_sha256: &[
+            // 1.4.6 — before `[history]`, so an install left on it never
+            // collects token usage from `~/.claude/projects` transcripts.
+            // sha256 of claude.toml as shipped at manifest version 1.4.6.
+            "36b735a6d0c6b3ad64ded8da2ab9f84b9a4e92b66c74eaa1bb50a98490640162",
             // 1.4.5 — comments only: the comparison to Codex named a field
             // (`window_minutes`) that manifest has never read.
             // sha256 of claude.toml as shipped at manifest version 1.4.5.
@@ -404,8 +412,12 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "grok.toml",
         id: "grok",
-        to_version: "1.0.3",
+        to_version: "1.1.0",
         previous_sha256: &[
+            // 1.0.3 — before `[history]`, so an install left on it never
+            // collects token usage from `~/.grok` logs.
+            // sha256 of grok.toml as shipped at manifest version 1.0.3.
+            "dbb266008decadd6e468c41e8da7456fe2346e9208d3d9dce27d68dfce376ec0",
             // 1.0.2 — comments only: the header still called the window
             // "the weekly one above" when it sits below and reads its
             // period from the response's own `currentPeriod` bounds.
@@ -447,8 +459,12 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "antigravity.toml",
         id: "antigravity",
-        to_version: "1.1.4",
+        to_version: "1.2.0",
         previous_sha256: &[
+            // 1.1.4 — before `[history]`, so an install left on it never
+            // collects token usage from `conversations/*.db`.
+            // sha256 of antigravity.toml as shipped at manifest version 1.1.4.
+            "80bb17c2555c0aea2d59b4d5743f5e450dc9760698c6be942589f20356435443",
             // 1.1.3 — the quota groups were addressed by array position,
             // so a Google-side reorder of `groups` silently zeroed every
             // row; 1.1.4 addresses them by `displayName` instead.
@@ -781,7 +797,7 @@ mod tests {
         assert_eq!(m.order, 10);
         assert_eq!(m.refresh_secs, 60, "one request a minute, matching Claude");
         assert_eq!(
-            m.version, "2.5.3",
+            m.version, "2.6.0",
             "the version BUILTIN_UPGRADES migrates to"
         );
 
@@ -840,6 +856,7 @@ mod tests {
             "window-identity",
             "reading-status",
             "reading-balances",
+            "reading-history",
         ] {
             assert!(
                 m.requires_reader.iter().any(|d| d == name),
@@ -1279,7 +1296,7 @@ mod tests {
         assert_eq!(m.id, "claude");
         assert_eq!(m.engine, EngineKind::HttpApi);
         assert_eq!(
-            m.version, "1.4.6",
+            m.version, "1.5.0",
             "the version BUILTIN_UPGRADES migrates to"
         );
         assert_eq!(m.surface.len(), 2, "cli + desktop surfaces");
@@ -1292,13 +1309,14 @@ mod tests {
             "balance-conditional",
             "credentials-file-path-env",
             "keychain-service-env",
+            "reading-history",
         ] {
             assert!(
                 m.requires_reader.iter().any(|c| c == capability),
                 "{capability} is load-bearing here"
             );
         }
-        assert_eq!(m.requires_reader.len(), 8, "and nothing else is claimed");
+        assert_eq!(m.requires_reader.len(), 9, "and nothing else is claimed");
 
         assert_eq!(
             m.windows.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(),

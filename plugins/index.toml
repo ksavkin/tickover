@@ -17,34 +17,34 @@ schema_version = 1
 [[plugin]]
 id          = "codex"
 name        = "Codex"
-version     = "2.5.3"
+version     = "2.6.0"
 description = "OpenAI Codex CLI usage: 5h/weekly windows plus a credits balance."
 manifest    = "codex.toml"
-sha256      = "4dbfcc31a288cb4ddd14aae8ea2bd293a5f741e2e6903b268de073e7a968734b"
+sha256      = "ee3e7a947d49a03f8f4f91fb70ff4cf888171ad23c7887479a6819f26bdeeded"
 
 [[plugin]]
 id          = "claude"
 name        = "Claude"
-version     = "1.4.6"
+version     = "1.5.0"
 description = "Claude Code CLI and desktop app usage: 5h/weekly windows, per model."
 manifest    = "claude.toml"
-sha256      = "36b735a6d0c6b3ad64ded8da2ab9f84b9a4e92b66c74eaa1bb50a98490640162"
+sha256      = "00a750f77839828a69aa4597813b8c62b1353e3de28ca5acbf4db6852d3227ce"
 
 [[plugin]]
 id          = "grok"
 name        = "Grok"
-version     = "1.0.3"
+version     = "1.1.0"
 description = "Grok CLI billing: credit usage window, prepaid balance and pay-as-you-go allowance."
 manifest    = "grok.toml"
-sha256      = "dbb266008decadd6e468c41e8da7456fe2346e9208d3d9dce27d68dfce376ec0"
+sha256      = "61a01a9c2d2c0fe94cf61964e7de754a9514681843d544dbd1c4a0a6bf7e154f"
 
 [[plugin]]
 id          = "antigravity"
 name        = "Antigravity"
-version     = "1.1.4"
+version     = "1.2.0"
 description = "Antigravity CLI (Google Gemini Code Assist) quota."
 manifest    = "antigravity.toml"
-sha256      = "80bb17c2555c0aea2d59b4d5743f5e450dc9760698c6be942589f20356435443"
+sha256      = "5edef9870d52f32d3c17514018cda5747fb3dedee58c67fe70f0b00afc207f53"
 
 [[plugin]]
 id          = "copilot"

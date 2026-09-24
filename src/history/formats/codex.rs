@@ -1,0 +1,660 @@
+//! `codex-rollouts` — `~/.codex/sessions/**/*.jsonl` +
+//! `~/.codex/archived_sessions/*.jsonl`.
+//!
+//! One JSON object per line, `ordinal`-numbered. The shapes that matter:
+//!
+//! * `type = "session_meta"` — `payload.session_id`, `payload.cwd`, the
+//!   session's own timestamp.
+//! * `type = "turn_context"` — `payload.model`/`payload.cwd`, re-emitted
+//!   when the user switches model mid-session, so the latest seen wins.
+//! * `type = "event_msg"` with `payload.type = "token_count"` —
+//!   `info.last_token_usage` is the per-turn delta (preferred), while
+//!   `info.total_token_usage` is cumulative per session and needs diffing
+//!   against the baseline kept in `FileState.aux`. `info` can be `null`.
+//!
+//! Token classes map as: `cached_input_tokens` → `cache_read`,
+//! `cache_write_input_tokens` → `cache_write`, `reasoning_output_tokens`
+//! → `thinking`. Codex follows the OpenAI Responses convention where the
+//! parent count *includes* the detailed subset — `input_tokens` contains
+//! `cached_input_tokens`, `output_tokens` contains
+//! `reasoning_output_tokens` (checked against real rollouts:
+//! `total_tokens` equals `input + output` exactly, and each subset never
+//! exceeds its parent) — so the uncached remainder and the non-reasoning
+//! output are the differences, not the raw fields.
+
+use std::io;
+use std::path::Path;
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
+
+use crate::history::formats::{project_basename, read_new_lines, Extraction, HistoryExtractor};
+use crate::history::store::FileState;
+use crate::history::UsageRecord;
+
+const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+/// `FileState.aux` keys for the cumulative baseline, one per counter.
+const AUX_INPUT: &str = "ti";
+const AUX_CACHED: &str = "tc";
+const AUX_CACHE_WRITE: &str = "tw";
+const AUX_OUTPUT: &str = "to";
+const AUX_THINKING: &str = "tt";
+
+pub struct CodexExtractor;
+
+#[derive(Debug, Default, Deserialize)]
+struct Line {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    ordinal: Option<u64>,
+    #[serde(default)]
+    timestamp: Option<String>,
+    #[serde(default)]
+    payload: Option<Payload>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Payload {
+    #[serde(rename = "type", default)]
+    kind: String,
+    // session_meta
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    // session_meta + turn_context
+    #[serde(default)]
+    cwd: Option<String>,
+    // turn_context
+    #[serde(default)]
+    model: Option<String>,
+    // token_count
+    #[serde(default)]
+    info: Option<TokenInfo>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TokenInfo {
+    #[serde(default)]
+    total_token_usage: Option<TokenUsage>,
+    #[serde(default)]
+    last_token_usage: Option<TokenUsage>,
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+struct TokenUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    cached_input_tokens: u64,
+    #[serde(default)]
+    cache_write_input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    reasoning_output_tokens: u64,
+}
+
+impl TokenUsage {
+    /// This reading minus the baseline in `aux`, which is then advanced.
+    /// A counter that moved backwards (session compaction, restart) is
+    /// reset: the delta is the new value itself rather than a wrapped
+    /// negative.
+    fn delta(&self, aux: &mut std::collections::BTreeMap<String, serde_json::Value>) -> TokenUsage {
+        fn diff(
+            aux: &mut std::collections::BTreeMap<String, serde_json::Value>,
+            key: &str,
+            now: u64,
+        ) -> u64 {
+            let prev = aux
+                .insert(key.to_string(), now.into())
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            // Counter moved backwards → compaction/restart, not a wrap:
+            // the new value is the delta itself.
+            if now >= prev {
+                now - prev
+            } else {
+                now
+            }
+        }
+        TokenUsage {
+            input_tokens: diff(aux, AUX_INPUT, self.input_tokens),
+            cached_input_tokens: diff(aux, AUX_CACHED, self.cached_input_tokens),
+            cache_write_input_tokens: diff(aux, AUX_CACHE_WRITE, self.cache_write_input_tokens),
+            output_tokens: diff(aux, AUX_OUTPUT, self.output_tokens),
+            reasoning_output_tokens: diff(aux, AUX_THINKING, self.reasoning_output_tokens),
+        }
+    }
+
+    /// `last_token_usage` with no sibling cumulative: the baseline can
+    /// only move forward by the delta itself, or a later total-only event
+    /// diffs against a stale watermark and re-counts these tokens.
+    fn accumulate(&self, aux: &mut std::collections::BTreeMap<String, serde_json::Value>) {
+        fn add(aux: &mut std::collections::BTreeMap<String, serde_json::Value>, key: &str, n: u64) {
+            let prev = aux.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+            aux.insert(key.to_string(), (prev + n).into());
+        }
+        add(aux, AUX_INPUT, self.input_tokens);
+        add(aux, AUX_CACHED, self.cached_input_tokens);
+        add(aux, AUX_CACHE_WRITE, self.cache_write_input_tokens);
+        add(aux, AUX_OUTPUT, self.output_tokens);
+        add(aux, AUX_THINKING, self.reasoning_output_tokens);
+    }
+
+    /// Advance the baseline without emitting a delta — for events that
+    /// carry `last_token_usage` beside the cumulative figures. A later
+    /// total-only event must diff against *this* reading, not the last
+    /// time the total alone was seen, or every earlier token counts twice.
+    fn advance(&self, aux: &mut std::collections::BTreeMap<String, serde_json::Value>) {
+        aux.insert(AUX_INPUT.to_string(), self.input_tokens.into());
+        aux.insert(AUX_CACHED.to_string(), self.cached_input_tokens.into());
+        aux.insert(
+            AUX_CACHE_WRITE.to_string(),
+            self.cache_write_input_tokens.into(),
+        );
+        aux.insert(AUX_OUTPUT.to_string(), self.output_tokens.into());
+        aux.insert(
+            AUX_THINKING.to_string(),
+            self.reasoning_output_tokens.into(),
+        );
+    }
+}
+
+/// Per-file session context — `session_meta` sits at the top, `turn_context`
+/// refreshes model/cwd as the session goes. Persisted in `FileState.aux`
+/// under `ctx`: a resumed read starts mid-file, past both line kinds, so
+/// without it every post-first-pass record would lose id, cwd and model.
+#[derive(Default, Serialize, Deserialize)]
+struct SessionCtx {
+    #[serde(default)]
+    id: String,
+    /// The dedup prefix — a uuid or session id when the format provides
+    /// one, otherwise the full path. Stems alone are not enough: two
+    /// meta-less `rollout.jsonl` files in different session dirs share
+    /// one, and a shared prefix would dedup the second file's usage out
+    /// of the cross-file ring.
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+impl HistoryExtractor for CodexExtractor {
+    fn extract(
+        &self,
+        path: &Path,
+        st: &mut FileState,
+        byte_cap: u64,
+        _deadline: Instant,
+    ) -> io::Result<Extraction> {
+        let resume_from = st.cursor;
+        let (buf, cursor, eof) = read_new_lines(path, resume_from, byte_cap)?;
+        let mut out = Extraction {
+            cursor,
+            complete: eof,
+            ..Default::default()
+        };
+        // A resumed read starts mid-file, past `session_meta` — restore the
+        // session context persisted last pass, falling back to the file
+        // name's trailing uuid (`rollout-<ts>-<uuid>.jsonl`, 36 chars).
+        let mut ctx: SessionCtx = st
+            .aux
+            .get("ctx")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        if ctx.id.is_empty() {
+            // `get` rather than `[]`: a 36-byte cut can land inside a
+            // multi-byte char on a renamed file — and with no uuid the
+            // stem itself is the display id. The dedup key is stricter:
+            // a stem repeats across session dirs, so the key falls back
+            // to the whole path instead (`":{ordinal}"` would collide
+            // worst of all in the cross-file ring).
+            let stem = path.file_stem().and_then(|s| s.to_str());
+            ctx.id = stem
+                .and_then(|stem| {
+                    stem.get(stem.len().saturating_sub(36)..)
+                        .filter(|t| t.len() == 36)
+                })
+                .or(stem)
+                .unwrap_or_default()
+                .to_string();
+            ctx.key = stem
+                .and_then(|stem| {
+                    stem.get(stem.len().saturating_sub(36)..)
+                        .filter(|t| t.len() == 36)
+                })
+                .map(str::to_string)
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        } else if ctx.key.is_empty() {
+            // A ctx persisted before `key` existed. Old code derived `id`
+            // as the filename's uuid tail (or the whole stem when there
+            // was none), or took it from `session_meta`. Only the
+            // bare-stem case must be rebuilt from the path — a uuid tail
+            // (which is also what `session_meta` carries for uuid-named
+            // rollouts) is already the key fresh scans produce, so
+            // keeping it preserves ring continuity (`{id}:N` entries
+            // written before the upgrade still match).
+            let stem = path.file_stem().and_then(|s| s.to_str());
+            ctx.key = if stem.is_some_and(|s| s == ctx.id) {
+                path.to_string_lossy().into_owned()
+            } else {
+                ctx.id.clone()
+            };
+        }
+        let mut offset_in_buf = resume_from;
+        for raw in buf.split(|&b| b == b'\n') {
+            let line_start = offset_in_buf;
+            offset_in_buf += raw.len() as u64 + 1;
+            if raw.is_empty() || raw.len() > MAX_LINE_BYTES {
+                continue;
+            }
+            let line: Line = match serde_json::from_slice(raw) {
+                Ok(l) => l,
+                Err(_) => {
+                    out.skipped_unparsed += 1;
+                    continue;
+                }
+            };
+            let Some(payload) = line.payload else {
+                continue;
+            };
+            match (line.kind.as_str(), payload.kind.as_str()) {
+                ("session_meta", _) => {
+                    // An explicitly empty id is no id — filter *before*
+                    // the fallback chain or `Some("")` would shadow a
+                    // valid `id`, and keep the stem so the dedup key never
+                    // degenerates to ":{ordinal}".
+                    let meta_id = payload
+                        .session_id
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| payload.id.clone().filter(|s| !s.is_empty()));
+                    if let Some(id) = meta_id {
+                        ctx.id = id.clone();
+                        ctx.key = id;
+                    }
+                    if payload.cwd.is_some() {
+                        ctx.cwd = payload.cwd.clone();
+                    }
+                }
+                ("turn_context", _) => {
+                    if payload.model.is_some() {
+                        ctx.model = payload.model.clone();
+                    }
+                    if payload.cwd.is_some() {
+                        ctx.cwd = payload.cwd.clone();
+                    }
+                }
+                ("event_msg", "token_count") => {
+                    let Some(info) = payload.info else { continue };
+                    // Validate the timestamp before touching `aux`: a line
+                    // that can't be placed in an hour emits no record, so
+                    // advancing the baseline here would lose its tokens to
+                    // the next event's diff.
+                    let Some(ts) = line
+                        .timestamp
+                        .as_deref()
+                        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                        .map(|t| t.with_timezone(&chrono::Utc))
+                    else {
+                        out.skipped_unparsed += 1;
+                        continue;
+                    };
+                    // `last_token_usage` is the delta outright; a total-only
+                    // `info` needs the cumulative diff. Either way the
+                    // baseline advances to this event's total, so a later
+                    // total-only event diffs against the right watermark.
+                    let usage = match (info.last_token_usage, info.total_token_usage) {
+                        (Some(u), Some(t)) => {
+                            t.advance(&mut st.aux);
+                            u
+                        }
+                        (Some(u), None) => {
+                            u.accumulate(&mut st.aux);
+                            u
+                        }
+                        (None, Some(t)) => t.delta(&mut st.aux),
+                        (None, None) => continue,
+                    };
+                    let ordinal = line.ordinal.unwrap_or(line_start);
+                    out.records.push(UsageRecord {
+                        ts,
+                        provider: String::new(),
+                        project: project_basename(ctx.cwd.as_deref()),
+                        session_id: ctx.id.clone(),
+                        model: ctx.model.clone().unwrap_or_else(|| "unknown".into()),
+                        input: usage.input_tokens.saturating_sub(usage.cached_input_tokens),
+                        output: usage
+                            .output_tokens
+                            .saturating_sub(usage.reasoning_output_tokens),
+                        cache_read: usage.cached_input_tokens,
+                        cache_write: usage.cache_write_input_tokens,
+                        thinking: usage.reasoning_output_tokens,
+                        // `key`, not `id`: a persisted ctx from before the
+                        // field existed deserializes with `key` empty —
+                        // `id` is the safe fallback for exactly that case.
+                        dedup_key: format!(
+                            "{}:{ordinal}",
+                            if ctx.key.is_empty() {
+                                &ctx.id
+                            } else {
+                                &ctx.key
+                            }
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
+        // Persist the session context so a resumed pass reads records with
+        // the same attribution the first pass saw.
+        st.aux.insert(
+            "ctx".to_string(),
+            serde_json::to_value(&ctx).unwrap_or_default(),
+        );
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::formats::testutil::TmpDir;
+    use std::time::Duration;
+
+    fn fresh() -> FileState {
+        FileState::fresh(String::new(), 0, 0)
+    }
+
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
+    fn meta(session: &str, cwd: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-09-22T10:00:00.000Z","ordinal":0,"type":"session_meta","payload":{{"session_id":"{session}","id":"{session}","cwd":"{cwd}","model_provider":"openai"}}}}"#
+        )
+    }
+
+    fn turn_ctx(model: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-09-22T10:00:01.000Z","ordinal":1,"type":"turn_context","payload":{{"cwd":"/u/proj","model":"{model}"}}}}"#
+        )
+    }
+
+    fn token_count(ordinal: u64, input: u64, cached: u64, output: u64) -> String {
+        format!(
+            r#"{{"timestamp":"2026-09-22T10:01:0{o}.000Z","ordinal":{o},"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"cache_write_input_tokens":0,"output_tokens":{output},"reasoning_output_tokens":0,"total_tokens":0}},"last_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"cache_write_input_tokens":0,"output_tokens":{output},"reasoning_output_tokens":0,"total_tokens":0}}}},"rate_limits":null}}}}"#,
+            o = ordinal
+        )
+    }
+
+    #[test]
+    fn last_token_usage_is_the_delta() {
+        let tmp = TmpDir::new("codex-basic");
+        let p = tmp.write(
+            "rollout-x-sess1.jsonl",
+            &([
+                meta("sess1", "/u/proj"),
+                turn_ctx("gpt-5.2-codex"),
+                token_count(2, 100, 40, 30),
+            ]
+            .join("\n")
+                + "\n"),
+        );
+        let ex = CodexExtractor
+            .extract(&p, &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert_eq!(ex.records.len(), 1);
+        let r = &ex.records[0];
+        // input_tokens includes the cached part, so `input` is the
+        // uncached remainder; `cache_read` holds the cached share.
+        assert_eq!((r.input, r.cache_read, r.output), (60, 40, 30));
+        assert_eq!(r.project, "proj");
+        assert_eq!(r.model, "gpt-5.2-codex");
+        assert_eq!(r.session_id, "sess1");
+        assert_eq!(r.dedup_key, "sess1:2");
+    }
+
+    #[test]
+    fn a_file_without_session_meta_keys_by_its_path() {
+        // Renamed/archived rollouts lose the uuid tail; the dedup key
+        // falls back to the whole path — two meta-less `rollout.jsonl`
+        // files in different dirs share a stem, and stem keys would
+        // collide in the cross-file ring. The display id keeps the stem.
+        let tmp = TmpDir::new("codex-nometa");
+        let p = tmp.write(
+            "renamed-日本語.jsonl",
+            &(token_count(2, 100, 40, 30) + "\n"),
+        );
+        let ex = CodexExtractor
+            .extract(&p, &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert_eq!(ex.records.len(), 1);
+        let r = &ex.records[0];
+        // The whole path is the key, not just the stem.
+        assert_eq!(r.dedup_key, format!("{}:2", p.to_string_lossy()));
+        assert!(!r.dedup_key.starts_with(':'));
+        assert_eq!(r.session_id, "renamed-日本語");
+    }
+
+    #[test]
+    fn a_ctx_persisted_before_the_key_field_recovers_it() {
+        // State written by a build that keyed dedup on `id` alone: a
+        // meta-derived id keeps keying on itself (ring entries written as
+        // `{id}:N` still match), while a filename-derived stem is rebuilt
+        // from the path — stems collide across session dirs.
+        let tmp = TmpDir::new("codex-ctxmig");
+        let p = tmp.write(
+            "renamed-rollout.jsonl",
+            &(token_count(2, 100, 40, 30) + "\n"),
+        );
+        let mut st = fresh();
+        // The old shape: `id` present, no `key` at all.
+        st.aux.insert(
+            "ctx".into(),
+            serde_json::json!({"id": "renamed-rollout", "cwd": "/u/proj"}),
+        );
+        st.cursor = 0;
+        let ex = CodexExtractor
+            .extract(&p, &mut st, u64::MAX, later())
+            .unwrap();
+        assert_eq!(ex.records.len(), 1);
+        assert_eq!(
+            ex.records[0].dedup_key,
+            format!("{}:2", p.to_string_lossy()),
+            "a stem-derived id upgrades to the full-path key"
+        );
+
+        // A session_meta-derived id is already a proper key — kept as-is
+        // so rings written before the field existed still dedup.
+        let mut st2 = fresh();
+        st2.aux.insert(
+            "ctx".into(),
+            serde_json::json!({"id": "sess-abc", "cwd": "/u/proj"}),
+        );
+        let ex2 = CodexExtractor
+            .extract(&p, &mut st2, u64::MAX, later())
+            .unwrap();
+        assert_eq!(ex2.records[0].dedup_key, "sess-abc:2");
+
+        // A uuid-tailed rollout: the persisted `id` is the uuid — which
+        // is also the key a fresh scan derives — so it must NOT be
+        // rewritten to the path.
+        let uuid = "12345678-1234-4234-9234-123456789abc";
+        let p3 = tmp.write(
+            &format!("rollout-2026-09-22T10-00-00-{uuid}.jsonl"),
+            &(token_count(2, 100, 40, 30) + "\n"),
+        );
+        let mut st3 = fresh();
+        st3.aux.insert(
+            "ctx".into(),
+            serde_json::json!({"id": uuid, "cwd": "/u/proj"}),
+        );
+        let ex3 = CodexExtractor
+            .extract(&p3, &mut st3, u64::MAX, later())
+            .unwrap();
+        assert_eq!(ex3.records[0].dedup_key, format!("{uuid}:2"));
+    }
+
+    #[test]
+    fn an_empty_session_id_falls_through_to_the_id_field() {
+        // `session_id: ""` must not shadow a valid `payload.id` — and
+        // must not fall back to the file stem either.
+        let tmp = TmpDir::new("codex-emptyid");
+        let meta = r#"{"timestamp":"2026-09-22T10:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"session_id":"","id":"sess9","cwd":"/u/proj","model_provider":"openai"}}"#;
+        let p = tmp.write(
+            "rollout-x.jsonl",
+            &(meta.to_string() + "\n" + &token_count(2, 100, 40, 30) + "\n"),
+        );
+        let ex = CodexExtractor
+            .extract(&p, &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert_eq!(ex.records.len(), 1);
+        assert_eq!(ex.records[0].session_id, "sess9");
+        assert_eq!(ex.records[0].dedup_key, "sess9:2");
+    }
+
+    #[test]
+    fn reasoning_is_split_out_of_output_not_doubled() {
+        // Real-rollout semantics: `output_tokens` already contains
+        // `reasoning_output_tokens` (total = input + output exactly), so
+        // reporting both raw would count reasoning twice.
+        let tmp = TmpDir::new("codex-reasoning");
+        let p = tmp.write(
+            "rollout-r.jsonl",
+            &(meta("s1", "/u/p")
+                + "\n"
+                + &turn_ctx("gpt-5.2-codex")
+                + "\n"
+                + r#"{"timestamp":"2026-09-22T10:01:00.000Z","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":103036,"cached_input_tokens":96000,"cache_write_input_tokens":0,"output_tokens":331,"reasoning_output_tokens":209,"total_tokens":103367},"last_token_usage":{"input_tokens":103036,"cached_input_tokens":96000,"cache_write_input_tokens":0,"output_tokens":331,"reasoning_output_tokens":209,"total_tokens":103367}},"rate_limits":null}}"#
+                + "\n"),
+        );
+        let ex = CodexExtractor
+            .extract(&p, &mut fresh(), u64::MAX, later())
+            .unwrap();
+        let r = &ex.records[0];
+        assert_eq!(
+            (r.input, r.cache_read, r.output, r.thinking),
+            (7036, 96000, 122, 209)
+        );
+    }
+
+    #[test]
+    fn cumulative_totals_are_diffed_when_last_is_absent() {
+        let tmp = TmpDir::new("codex-cumul");
+        let tc = |ord: u64, ti: u64| {
+            format!(
+                r#"{{"timestamp":"2026-09-22T10:0{ord}:00.000Z","ordinal":{ord},"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{ti},"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":{ti}}}}},"rate_limits":null}}}}"#
+            )
+        };
+        let p = tmp.write(
+            "r.jsonl",
+            &([meta("s", "/u/p"), tc(5, 1000), tc(6, 2500)].join("\n") + "\n"),
+        );
+        let ex = CodexExtractor
+            .extract(&p, &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert_eq!(
+            ex.records.iter().map(|r| r.input).collect::<Vec<_>>(),
+            vec![1000, 1500],
+            "deltas: 1000 first, then 2500-1000"
+        );
+    }
+
+    #[test]
+    fn a_counter_reset_emits_the_new_value() {
+        let tmp = TmpDir::new("codex-reset");
+        let tc = |ord: u64, ti: u64| {
+            format!(
+                r#"{{"timestamp":"2026-09-22T10:0{ord}:00.000Z","ordinal":{ord},"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{ti},"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":{ti}}}}},"rate_limits":null}}}}"#
+            )
+        };
+        // Compaction drops the counter; delta is the post-reset value.
+        let p = tmp.write(
+            "r.jsonl",
+            &([meta("s", "/u/p"), tc(5, 5000), tc(6, 800)].join("\n") + "\n"),
+        );
+        let ex = CodexExtractor
+            .extract(&p, &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert_eq!(ex.records[1].input, 800);
+    }
+
+    #[test]
+    fn last_usage_still_advances_the_cumulative_baseline() {
+        // A `last_token_usage` event followed by a totals-only event: the
+        // second must diff against the first's total, not zero — otherwise
+        // the whole session re-counts.
+        let tmp = TmpDir::new("codex-mixed");
+        let both = r#"{"timestamp":"2026-09-22T10:01:00.000Z","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":1000},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":1000}},"rate_limits":null}}"#;
+        let total_only = r#"{"timestamp":"2026-09-22T10:02:00.000Z","ordinal":3,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1500,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":1500}},"rate_limits":null}}"#;
+        let p = tmp.write(
+            "r.jsonl",
+            &([meta("s", "/u/p"), both.to_string(), total_only.to_string()].join("\n") + "\n"),
+        );
+        let ex = CodexExtractor
+            .extract(&p, &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert_eq!(
+            ex.records.iter().map(|r| r.input).collect::<Vec<_>>(),
+            vec![1000, 500],
+            "the totals-only event diffs against 1000, not 0"
+        );
+    }
+
+    #[test]
+    fn a_resumed_pass_keeps_the_persisted_session_context() {
+        // Two passes over one file through the same FileState: the second
+        // pass's bytes carry no session_meta, so attribution must come
+        // from aux — otherwise everything past the first scan lands under
+        // "unknown".
+        let tmp = TmpDir::new("codex-resume");
+        let p = tmp.write(
+            "rollout-x-sess1.jsonl",
+            &(meta("sess1", "/u/proj") + "\n" + &turn_ctx("gpt-5.2-codex") + "\n"),
+        );
+        let mut st = fresh();
+        let first = CodexExtractor
+            .extract(&p, &mut st, u64::MAX, later())
+            .unwrap();
+        assert!(first.records.is_empty());
+        st.cursor = first.cursor;
+        // The session's first token_count arrives in a later append.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&p)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all((token_count(7, 100, 40, 30) + "\n").as_bytes())
+            })
+            .unwrap();
+        let second = CodexExtractor
+            .extract(&p, &mut st, u64::MAX, later())
+            .unwrap();
+        assert_eq!(second.records.len(), 1);
+        assert_eq!(second.records[0].project, "proj");
+        assert_eq!(second.records[0].model, "gpt-5.2-codex");
+        assert_eq!(second.records[0].session_id, "sess1");
+    }
+
+    #[test]
+    fn null_info_is_skipped_not_counted() {
+        let tmp = TmpDir::new("codex-null");
+        let l = r#"{"timestamp":"2026-09-22T10:00:00.000Z","ordinal":9,"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":null}}"#;
+        let p = tmp.write(
+            "r.jsonl",
+            &([meta("s", "/u/p"), l.to_string()].join("\n") + "\n"),
+        );
+        let ex = CodexExtractor
+            .extract(&p, &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert!(ex.records.is_empty());
+        assert_eq!(ex.skipped_unparsed, 0);
+    }
+}
