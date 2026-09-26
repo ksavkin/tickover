@@ -373,3 +373,82 @@ fn a_state_loss_rebuild_does_not_double_count() {
         let _ = fs::remove_dir_all(d);
     }
 }
+
+/// `[history] glob` is swept into the placeholder-declaration check exactly
+/// like `[logfile] glob` (`manifest::validate`'s own `templates` list), so a
+/// manifest may declare `{option.<key>}` in it — and `scan_tick` must then
+/// actually substitute it before handing the glob to the scanner, the same
+/// way `engine_logfile::fetch` substitutes `lf.glob` before
+/// `collect_log_files` ever sees it. Left unsubstituted, the glob would
+/// search for a literal, unresolved placeholder and match nothing, ever,
+/// regardless of the option's value.
+#[test]
+fn scan_tick_substitutes_an_option_placeholder_in_the_glob() {
+    let root = tmpdir("option-glob");
+    fs::write(root.join("rollout-true-1.jsonl"), codex_fixture()).unwrap();
+
+    let text = format!(
+        r#"
+id         = "optglob"
+name       = "Sample"
+menu_label = "Sa"
+order      = 1
+engine     = "log-file"
+requires_reader = ["reading-history"]
+
+[[option]]
+key     = "enabled"
+label   = "Enabled"
+default = true
+
+[[windows]]
+label = "5H"
+role  = "primary"
+[windows.period]
+mode    = "assumed"
+assumed = 300
+[windows.source]
+used_percent_path = "used_percent"
+resets_at_path    = "resets_at"
+
+[logfile]
+root          = "{root}"
+glob          = "*.jsonl"
+container_key = "rate_limits"
+
+[history]
+format = "codex-rollouts"
+root   = "{root}"
+glob   = "rollout-{{option.enabled}}-*.jsonl"
+"#,
+        root = toml_escaped_path(&root),
+    );
+    let m = PluginManifest::from_str(&text).unwrap_or_else(|e| panic!("fixture manifest: {e}"));
+
+    let on_dir = tmpdir("option-glob-store-on");
+    let mut store_on = HistoryStore::open(&on_dir).unwrap();
+    let mut on = BTreeMap::new();
+    on.insert("enabled".to_string(), true);
+    let scans = scan_tick(&mut store_on, std::slice::from_ref(&m), &|_| on.clone());
+    assert!(!scans[0].root_missing);
+    assert_eq!(
+        scans[0].outcome.files_seen, 1,
+        "the substituted glob must match the fixture file"
+    );
+
+    // With the option off, the substituted glob (`rollout-false-*.jsonl`)
+    // no longer matches the fixture named `rollout-true-1.jsonl`.
+    let off_dir = tmpdir("option-glob-store-off");
+    let mut store_off = HistoryStore::open(&off_dir).unwrap();
+    let mut off = BTreeMap::new();
+    off.insert("enabled".to_string(), false);
+    let scans = scan_tick(&mut store_off, std::slice::from_ref(&m), &|_| off.clone());
+    assert_eq!(
+        scans[0].outcome.files_seen, 0,
+        "a mismatched substituted glob must find nothing"
+    );
+
+    for d in [&root, &on_dir, &off_dir] {
+        let _ = fs::remove_dir_all(d);
+    }
+}

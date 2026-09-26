@@ -127,8 +127,16 @@ pub fn scan_tick(
             continue;
         }
         let extractor = formats::extractor_for(h.format);
-        let outcome =
-            scanner::scan_root(store, &m.id, &root, &h.glob, extractor.as_ref(), deadline);
+        // `glob` gets the same `{option.<key>}` substitution `root` just
+        // got above (both go through `resolve_root_fields`/`substitute_options`
+        // for `root`, and this call for `glob`) — the manifest layer sweeps
+        // it for exactly that placeholder (`PluginManifest::validate`'s
+        // `templates` list treats the three the same), so leaving it raw
+        // here would mean a declared, validated placeholder that never
+        // actually resolves: the glob would search for its own literal
+        // `{option.…}` text and match nothing, ever.
+        let glob = crate::plugin::substitute_options(&h.glob, &options);
+        let outcome = scanner::scan_root(store, &m.id, &root, &glob, extractor.as_ref(), deadline);
         scans.push(ProviderScan {
             provider: m.id.clone(),
             root_missing: false,

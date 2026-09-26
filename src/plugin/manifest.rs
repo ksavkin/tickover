@@ -609,6 +609,22 @@ impl PluginManifest {
             if lf.root_env.as_deref().is_some_and(|e| e.trim().is_empty()) {
                 return Err("`[logfile] root_env` names no environment variable".to_string());
             }
+            // A name outside the POSIX/Windows environment-variable charset
+            // (an `=`, a null byte, whitespace) is not "unset" the way a
+            // blank one is — `std::env::var_os` can simply never return a
+            // value for it — but it reads as configured to a manifest
+            // author, the same silent-no-op the blank check above closes.
+            // Same rule `client.id_env`/`client.secret_env` already carry
+            // (`is_valid_env_var_name`'s own doc).
+            if let Some(name) = &lf.root_env {
+                if !is_valid_env_var_name(name) {
+                    return Err(format!(
+                        "`[logfile] root_env = \"{name}\"` is not a valid environment variable \
+                         name — a leading letter or underscore, then letters, digits or \
+                         underscores"
+                    ));
+                }
+            }
             // `root_env_join` is joined onto the env var's *value*
             // (`$CODEX_HOME` → `$CODEX_HOME/sessions`), never onto `root`
             // itself — it is a subdirectory name, not a path of its own, so
@@ -792,6 +808,17 @@ impl PluginManifest {
         }
         if h.root_env.as_deref().is_some_and(|e| e.trim().is_empty()) {
             return Err("`[history] root_env` names no environment variable".to_string());
+        }
+        // Same charset check `[logfile] root_env` gets, for the same reason:
+        // a name outside it can never be set, so a manifest naming one is a
+        // silent no-op the environment can never fill.
+        if let Some(name) = &h.root_env {
+            if !is_valid_env_var_name(name) {
+                return Err(format!(
+                    "`[history] root_env = \"{name}\"` is not a valid environment variable \
+                     name — a leading letter or underscore, then letters, digits or underscores"
+                ));
+            }
         }
         if h.root_env.is_none() && h.root_env_join.is_some() {
             return Err(
@@ -1592,6 +1619,25 @@ impl PluginManifest {
                         w.label
                     ));
                 }
+                // The floor above stops a much-too-small number; this stops
+                // the opposite mistake reaching the same arithmetic. A
+                // `from_field`/`from_bounds` length read off a response is
+                // already held to this ceiling
+                // (`crate::plugin::time::plausible_period_minutes`,
+                // `container_period_minutes`'s own two call sites) before it
+                // ever becomes a window's length — `assumed` is a length too,
+                // manifest-author-picked rather than provider-stated, and
+                // reaches the identical `* 60` `main.rs` does for both
+                // (`ping_due`, `seen_at_is_plausible`). Nothing measures an
+                // `assumed` value the way a response is measured, so it gets
+                // the same fail-safe rather than a looser one.
+                if !crate::plugin::time::plausible_period_minutes(assumed) {
+                    return Err(format!(
+                        "windows[label = \"{}\"]: period.assumed = {assumed} minutes is longer \
+                         than a `from_field`/`from_bounds` length would ever be trusted to be",
+                        w.label
+                    ));
+                }
             }
         }
 
@@ -1938,6 +1984,16 @@ impl PluginManifest {
                         "`[[http.value]] name = \"{}\"` `path_env` names no environment variable",
                         v.name
                     ));
+                }
+                if let Some(name) = &v.path_env {
+                    if !is_valid_env_var_name(name) {
+                        return Err(format!(
+                            "`[[http.value]] name = \"{}\"` `path_env = \"{name}\"` is not a \
+                             valid environment variable name — a leading letter or underscore, \
+                             then letters, digits or underscores",
+                            v.name
+                        ));
+                    }
                 }
                 // `path_env_join` is appended to `path_env`'s *value* — with
                 // no `path_env` there is nothing to join onto, so it would
@@ -2496,7 +2552,8 @@ impl PluginManifest {
                             if !is_valid_env_var_name(name) {
                                 return Err(format!(
                                     "surface \"{}\": a `{}` auth step's `{field}` = \"{name}\" is not \
-                                     a valid environment variable name",
+                                     a valid environment variable name — a leading letter or \
+                                     underscore, then letters, digits or underscores",
                                     surface.id,
                                     auth_type_name(step.kind)
                                 ));
@@ -2598,6 +2655,102 @@ impl PluginManifest {
                         auth_type_name(step.kind)
                     ));
                 }
+                // Every field below is read by exactly one step kind
+                // (`auth::credentials_map_step`/`keychain_step`/
+                // `electron_safe_storage_step`/`win_credential_step`/
+                // `reject_when_step`/`oauth_refresh_step`, each its own
+                // `require_str`/`require_vec` call), same silent-no-op
+                // reasoning as `expiry_json_path`/`macos_keychain_key`/
+                // `unless_json_path` above: present on any other kind, it
+                // loads clean and is never consulted.
+                if step.key_prefix.is_some() && step.kind != AuthType::CredentialsMap {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `key_prefix`, which only \
+                         `credentials-map` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.service.is_some() && step.kind != AuthType::Keychain {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `service`, which only \
+                         `keychain` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.config_path.is_some() && step.kind != AuthType::ElectronSafeStorage {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `config_path`, which only \
+                         `electron-safe-storage` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.blob_json_path.is_some() && step.kind != AuthType::ElectronSafeStorage {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `blob_json_path`, which only \
+                         `electron-safe-storage` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.targets.is_some() && step.kind != AuthType::WinCredential {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `targets`, which only \
+                         `win-credential` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.json_path.is_some() && step.kind != AuthType::RejectWhen {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `json_path`, which only \
+                         `reject-when` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.message.is_some() && step.kind != AuthType::RejectWhen {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `message`, which only \
+                         `reject-when` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.token_url.is_some() && step.kind != AuthType::OauthRefresh {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `token_url`, which only \
+                         `oauth-refresh` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.client_id.is_some() && step.kind != AuthType::OauthRefresh {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `client_id`, which only \
+                         `oauth-refresh` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.client_secret.is_some() && step.kind != AuthType::OauthRefresh {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `client_secret`, which only \
+                         `oauth-refresh` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.var.is_some() && step.kind != AuthType::Env {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `var`, which only `env` \
+                         steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
                 // `path_env`/`path_env_join` are honoured by
                 // `credentials-file` and `reject-when` steps (both resolve
                 // `path` through `auth::resolve_credentials_file_path` →
@@ -2629,6 +2782,17 @@ impl PluginManifest {
                         surface.id,
                         auth_type_name(step.kind)
                     ));
+                }
+                if let Some(name) = &step.path_env {
+                    if !is_valid_env_var_name(name) {
+                        return Err(format!(
+                            "surface \"{}\": auth step {i} (`{}`) `path_env = \"{name}\"` is not \
+                             a valid environment variable name — a leading letter or underscore, \
+                             then letters, digits or underscores",
+                            surface.id,
+                            auth_type_name(step.kind)
+                        ));
+                    }
                 }
                 // Same shape as `[logfile] root_env_join`, and the same
                 // reason: it is joined onto `path_env`'s *value*
@@ -2708,6 +2872,17 @@ impl PluginManifest {
                         auth_type_name(step.kind)
                     ));
                 }
+                if let Some(name) = &step.service_env {
+                    if !is_valid_env_var_name(name) {
+                        return Err(format!(
+                            "surface \"{}\": auth step {i} (`{}`) `service_env = \"{name}\"` is \
+                             not a valid environment variable name — a leading letter or \
+                             underscore, then letters, digits or underscores",
+                            surface.id,
+                            auth_type_name(step.kind)
+                        ));
+                    }
+                }
                 // `service_env_suffix` names the recipe for turning
                 // `service_env`'s value into a suffix; without a variable to
                 // hash, it loads clean and is never consulted — the same
@@ -2746,6 +2921,24 @@ impl PluginManifest {
                              — the only supported recipe is `\"sha256:8\"`",
                             surface.id,
                             auth_type_name(step.kind)
+                        ));
+                    }
+                }
+                // `var` is `env_step`'s own field — the variable
+                // `std::env::var` reads the token out of directly, not an
+                // override name like `path_env`/`service_env` above. By this
+                // point it is `Some` and non-blank on an `env` step (the
+                // `missing`/`blank` checks earlier in this fn already
+                // returned otherwise), so this only ever runs against text a
+                // manifest actually wrote.
+                if step.kind == AuthType::Env {
+                    let var = step.var.as_deref().unwrap_or_default();
+                    if !is_valid_env_var_name(var) {
+                        return Err(format!(
+                            "surface \"{}\": auth step {i} (`env`) `var = \"{var}\"` is not a \
+                             valid environment variable name — a leading letter or underscore, \
+                             then letters, digits or underscores",
+                            surface.id
                         ));
                     }
                 }
@@ -3199,6 +3392,15 @@ impl PluginManifest {
         if let Some(lf) = &self.logfile {
             dotdot_fields.push(("`[logfile] root`".to_string(), lf.root.as_str()));
         }
+        // `[history] root` reaches `scanner::scan_root`'s own recursive walk
+        // exactly the way `[logfile] root` reaches `collect_log_files`'s,
+        // with no depth bound of its own — the same escape, so the same
+        // sweep. `root_env_join` needs no entry here: `validate_history`
+        // already refuses a `..` in it on its own, the same as `[logfile]
+        // root_env_join` does above.
+        if let Some(h) = &self.history {
+            dotdot_fields.push(("`[history] root`".to_string(), h.root.as_str()));
+        }
         if let Some(http) = &self.http {
             for v in &http.value {
                 if let Some(path) = &v.path {
@@ -3322,7 +3524,8 @@ impl PluginManifest {
             // `[http.version] files` — read verbatim by `resolve_version`,
             // the same as `client.files` below: nothing substitutes a
             // version file's own path, so a stray `{token}` in one would be
-            // a directory name with braces in it, not a credential.
+            // a directory name with braces in it, not a credential — refused
+            // below, by name, the same as an undeclared `{option.<key>}` is.
             if let Some(version) = &http.version {
                 for (i, f) in version.files.iter().enumerate() {
                     templates.push((
@@ -3366,13 +3569,40 @@ impl PluginManifest {
                 ));
             }
         }
+        // `[history]` gets the same three, with the same classification —
+        // `history::scan_tick` substitutes `root`/`root_env_join` exactly
+        // where `engine_logfile::resolve_root` does (`resolve_root_fields`,
+        // shared by both), and `glob` exactly where `fetch`'s own
+        // `substitute_options` call does. An undeclared `{option.<key>}`
+        // here would otherwise load clean and search a directory that is a
+        // literal, unresolved placeholder.
+        if let Some(h) = &self.history {
+            templates.push((
+                "`[history] root`".to_string(),
+                h.root.as_str(),
+                Substituted::OptionsOnly,
+            ));
+            templates.push((
+                "`[history] glob`".to_string(),
+                h.glob.as_str(),
+                Substituted::OptionsOnly,
+            ));
+            if let Some(join) = &h.root_env_join {
+                templates.push((
+                    "`[history] root_env_join`".to_string(),
+                    join.as_str(),
+                    Substituted::OptionsOnly,
+                ));
+            }
+        }
         for surface in &self.surface {
             for step in &surface.auth {
                 // `token_url`/`client_id`/`client_secret` get no substitution of
                 // their own (this step's network call is not the engine's — see
                 // `auth::oauth_refresh_step`), so they belong beside
                 // `path`/`config_path` here: a stray `{token}` in `client_secret`
-                // would otherwise be sent as nine literal characters, silently.
+                // would otherwise be sent as nine literal characters, silently —
+                // refused below instead, by name.
                 for (field, text) in [
                     ("path", &step.path),
                     ("config_path", &step.config_path),
@@ -3395,7 +3625,8 @@ impl PluginManifest {
                 // `client`'s own fields, same treatment: nothing substitutes
                 // a pattern, an env var name or a file/bin candidate either,
                 // so a stray `{token}` in one of them would be read literally
-                // by `auth::discover_client` rather than rejected here.
+                // by `auth::discover_client` — refused below instead, the
+                // same as the fields just above.
                 if let Some(client) = &step.client {
                     for (field, text) in [
                         ("client.id_env", &client.id_env),
@@ -3433,11 +3664,33 @@ impl PluginManifest {
         }
         for (where_it_is, template, substituted) in templates {
             for placeholder in placeholders(template) {
+                // `{token}`/`{version}` are meaningful wherever headers/body
+                // substitute them — refusing them on a `ValuesAndOptions`
+                // field would break every shipped manifest's own
+                // `Authorization` header — but three comments above name
+                // them by hand for the `Nothing`-classified fields
+                // (`[http.version] files`, `token_url`/`client_id`/
+                // `client_secret`, `client`'s own fields) as a stray value
+                // that "would be read literally" there, never rejected —
+                // this is the rejection those comments describe. `Nothing`
+                // is the one classification substituting neither, so this
+                // is checked by exact name here rather than folded into
+                // `covers` below, which a `OptionsOnly` field (a URL, a
+                // log-file path) must not trip: those get their own,
+                // narrower sweep (`url_placeholder`) or, for `[logfile]`/
+                // `[history]`, never carry either placeholder at all.
+                if matches!(placeholder, "token" | "version") && substituted == Substituted::Nothing
+                {
+                    return Err(format!(
+                        "{where_it_is} names {{{placeholder}}}, which nothing substitutes there — \
+                         it would be used as literal text"
+                    ));
+                }
                 let kind = match () {
                     _ if placeholder.starts_with("value.") => Substituted::ValuesAndOptions,
                     _ if placeholder.starts_with("option.") => Substituted::OptionsOnly,
-                    // `{token}`, `{version}`, `{config_dir}` and anything a
-                    // future engine adds are not this rule's business.
+                    // `{config_dir}` and anything a future engine adds are
+                    // not this rule's business.
                     _ => continue,
                 };
                 if !substituted.covers(kind) {
@@ -6268,6 +6521,28 @@ mod tests {
         assert!(err.contains("http-api"), "{err}");
     }
 
+    /// `period.assumed` gets the same ceiling `container_period_minutes`
+    /// already holds a `from_field`/`from_bounds` length to
+    /// (`crate::plugin::time::plausible_period_minutes`, ten years) — an
+    /// `assumed` value reaches the identical `* 60` arithmetic
+    /// (`main.rs`'s `ping_due`/`seen_at_is_plausible`) with nothing ever
+    /// having measured it, so the boundary is exact: the ceiling itself
+    /// still loads, one minute past it is refused.
+    #[test]
+    fn period_assumed_at_the_plausible_ceiling_is_accepted() {
+        let toml = CODEX_LIKE.replace("assumed = 10080", "assumed = 5256000");
+        PluginManifest::from_str(&toml)
+            .expect("an assumed period exactly at the ten-year ceiling is still plausible");
+    }
+
+    #[test]
+    fn period_assumed_beyond_the_plausible_ceiling_is_refused() {
+        let toml = CODEX_LIKE.replace("assumed = 10080", "assumed = 5256001");
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("an assumed period a minute past the ten-year ceiling must be refused");
+        assert!(err.contains("5256001"), "{err}");
+    }
+
     // ── [[option]] ───────────────────────────────────────────────────────
 
     /// A minimal valid manifest body shared by the `[[option]]` tests, with
@@ -7132,6 +7407,41 @@ mod tests {
         assert!(err.contains("{value.account_id}"), "{err}");
     }
 
+    /// `client_secret` is `Substituted::Nothing` — this step's own network
+    /// call is not the engine's (`auth::oauth_refresh_step`), so nothing
+    /// substitutes into it. A `{token}` there is not a credential, it is
+    /// nine literal characters sent to the token endpoint verbatim. Same
+    /// rule the `token_url`/`client_id`/`client_secret`/`client.*` comment
+    /// above the sweep describes; this pins that the sweep now actually
+    /// enforces it.
+    #[test]
+    fn a_stray_token_placeholder_in_client_secret_is_refused() {
+        let toml = OAUTH_REFRESH_BASE.replace(
+            "client_secret   = \"some-client-secret\"",
+            "client_secret   = \"{token}\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a stray {token} in client_secret must be refused");
+        assert!(err.contains("{token}"), "{err}");
+        assert!(err.contains("client_secret"), "{err}");
+    }
+
+    /// `[http.version] files` is `Substituted::Nothing` too — read verbatim
+    /// by `resolve_version`, so a `{version}` in one of its own candidate
+    /// paths would be a directory name with braces in it, not the value this
+    /// section exists to read.
+    #[test]
+    fn a_stray_version_placeholder_in_an_http_version_file_is_refused() {
+        let toml = CLAUDE_LIKE.replace(
+            "\"/usr/local/lib/node_modules/@anthropic-ai/claude-code/package.json\",",
+            "\"/usr/local/lib/{version}/package.json\",",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a stray {version} in an [http.version] files entry must be refused");
+        assert!(err.contains("{version}"), "{err}");
+        assert!(err.contains("`[http.version] files[0]`"), "{err}");
+    }
+
     #[test]
     fn a_json_shaped_body_swallows_its_own_placeholder() {
         // The failure this rule exists for: the body's own leading `{`
@@ -7297,6 +7607,86 @@ mod tests {
         let err =
             PluginManifest::from_str(&toml).expect_err("an unknown history format must be refused");
         assert!(err.contains("yaml-pipe-dreams"), "{err}");
+    }
+
+    /// `[history] root` reaches `scanner::scan_root`'s own recursive walk
+    /// exactly the way `[logfile] root` reaches `collect_log_files`'s, with
+    /// no depth bound of its own — the same `..` escape the log-file sibling
+    /// is refused for.
+    #[test]
+    fn a_history_root_with_a_dotdot_component_is_refused() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format = \"codex-rollouts\"\n        \
+             root   = \"~/.codex/../../etc\"\n        \
+             glob   = \"**/*.jsonl\"\n";
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a `..` component in [history] root must be refused");
+        assert!(err.contains(".."), "{err}");
+        assert!(err.contains("`[history] root`"), "{err}");
+    }
+
+    /// `[history] root`/`glob`/`root_env_join` read `{option.<key>}` the
+    /// same way their `[logfile]` counterparts do (same `Substituted::
+    /// OptionsOnly` classification) — an undeclared key must be refused
+    /// exactly like it would be there, not loaded clean with the literal
+    /// placeholder still in the path.
+    #[test]
+    fn a_history_root_naming_an_undeclared_option_is_refused() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format = \"codex-rollouts\"\n        \
+             root   = \"~/.codex/{option.enabled}\"\n        \
+             glob   = \"**/*.jsonl\"\n";
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("an undeclared {option.enabled} in [history] root must be refused");
+        assert!(err.contains("{option.enabled}"), "{err}");
+        assert!(err.contains("`[history] root`"), "{err}");
+    }
+
+    #[test]
+    fn a_history_glob_naming_an_undeclared_option_is_refused() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format = \"codex-rollouts\"\n        \
+             root   = \"~/.codex/sessions\"\n        \
+             glob   = \"{option.enabled}/*.jsonl\"\n";
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("an undeclared {option.enabled} in [history] glob must be refused");
+        assert!(err.contains("{option.enabled}"), "{err}");
+        assert!(err.contains("`[history] glob`"), "{err}");
+    }
+
+    #[test]
+    fn a_history_root_env_join_naming_an_undeclared_option_is_refused() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format        = \"codex-rollouts\"\n        \
+             root          = \"~/.codex\"\n        \
+             glob          = \"**/*.jsonl\"\n        \
+             root_env      = \"CODEX_HOME\"\n        \
+             root_env_join = \"{option.enabled}\"\n";
+        let err = PluginManifest::from_str(&toml).expect_err(
+            "an undeclared {option.enabled} in [history] root_env_join must be refused",
+        );
+        assert!(err.contains("{option.enabled}"), "{err}");
+        assert!(err.contains("`[history] root_env_join`"), "{err}");
     }
 
     /// And `[account] url`, which `resolve_account_url` substitutes exactly
@@ -7709,6 +8099,181 @@ mod tests {
         );
     }
 
+    // ── Fields read by exactly one step kind, refused on the others ──────
+    // Same shape as `expiry_json_path`/`macos_keychain_key`/`unless_json_path`
+    // above: each field below is read by exactly one of
+    // `credentials_map_step`/`keychain_step`/`electron_safe_storage_step`/
+    // `win_credential_step`/`reject_when_step`/`oauth_refresh_step`/`env_step`
+    // (see the corresponding `require_str`/`require_vec` call in `auth.rs`),
+    // and every other kind used to accept it in silence.
+
+    #[test]
+    fn key_prefix_is_refused_on_a_step_kind_that_never_reads_it() {
+        // `credentials-map` declared too: without it, the backward-compat
+        // capability gate refuses `key_prefix`'s mere presence before
+        // `validate` ever runs its own kind check — a different refusal
+        // this test is not the one to pin.
+        let toml = KEYCHAIN_EXPIRY_BASE
+            .replace(
+                "expiry_json_path = \"token.expiry\"",
+                "key_prefix = \"acme::\"",
+            )
+            .replace(
+                "requires_reader = [\"keychain-expiry\"]",
+                "requires_reader = [\"keychain-expiry\", \"credentials-map\"]",
+            );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("key_prefix on a keychain step must be refused");
+        assert!(err.contains("key_prefix"), "{err}");
+        assert!(err.contains("credentials-map"), "{err}");
+    }
+
+    #[test]
+    fn service_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "type            = \"keychain\"\n        service         = \"gemini\"\n        token_json_path = \"token.access_token\"\n        expiry_json_path = \"token.expiry\"",
+            "type             = \"credentials-file\"\n        path             = \"~/.sample/auth.json\"\n        token_json_path  = \"token.access_token\"\n        service          = \"gemini\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("service on a credentials-file step must be refused");
+        assert!(err.contains("service"), "{err}");
+        assert!(err.contains("keychain"), "{err}");
+    }
+
+    #[test]
+    fn config_path_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "config_path = \"~/.sample/config.json\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("config_path on a keychain step must be refused");
+        assert!(err.contains("config_path"), "{err}");
+        assert!(err.contains("electron-safe-storage"), "{err}");
+    }
+
+    #[test]
+    fn blob_json_path_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "blob_json_path = \"blob\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("blob_json_path on a keychain step must be refused");
+        assert!(err.contains("blob_json_path"), "{err}");
+        assert!(err.contains("electron-safe-storage"), "{err}");
+    }
+
+    #[test]
+    fn targets_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "targets = [\"Sample\"]",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("targets on a keychain step must be refused");
+        assert!(err.contains("targets"), "{err}");
+        assert!(err.contains("win-credential"), "{err}");
+    }
+
+    #[test]
+    fn json_path_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "json_path = \"tokens.access_token\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("json_path on a keychain step must be refused");
+        assert!(err.contains("json_path"), "{err}");
+        assert!(err.contains("reject-when"), "{err}");
+    }
+
+    #[test]
+    fn message_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "message = \"no subscription\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("message on a keychain step must be refused");
+        assert!(err.contains("message"), "{err}");
+        assert!(err.contains("reject-when"), "{err}");
+    }
+
+    #[test]
+    fn token_url_is_refused_on_a_step_kind_that_never_reads_it() {
+        // `oauth-refresh` declared too, for the same reason `key_prefix`'s
+        // own test above declares `credentials-map`: without it the
+        // capability gate is what refuses `token_url`, not `validate`'s own
+        // kind check.
+        let toml = KEYCHAIN_EXPIRY_BASE
+            .replace(
+                "expiry_json_path = \"token.expiry\"",
+                "token_url = \"https://oauth2.example.com/token\"",
+            )
+            .replace(
+                "requires_reader = [\"keychain-expiry\"]",
+                "requires_reader = [\"keychain-expiry\", \"oauth-refresh\"]",
+            );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("token_url on a keychain step must be refused");
+        assert!(err.contains("token_url"), "{err}");
+        assert!(err.contains("oauth-refresh"), "{err}");
+    }
+
+    #[test]
+    fn client_id_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "client_id = \"sample-client-id\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("client_id on a keychain step must be refused");
+        assert!(err.contains("client_id"), "{err}");
+        assert!(err.contains("oauth-refresh"), "{err}");
+    }
+
+    #[test]
+    fn client_secret_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "client_secret = \"sample-client-secret\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("client_secret on a keychain step must be refused");
+        assert!(err.contains("client_secret"), "{err}");
+        assert!(err.contains("oauth-refresh"), "{err}");
+    }
+
+    #[test]
+    fn var_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "var = \"SAMPLE_TOKEN\"",
+        );
+        let err =
+            PluginManifest::from_str(&toml).expect_err("var on a keychain step must be refused");
+        assert!(err.contains("`var`"), "{err}");
+        assert!(err.contains("`env`"), "{err}");
+    }
+
+    /// The one field above with no existing positive coverage elsewhere —
+    /// `service`/`targets`/`key_prefix`/`token_url`/`client_id`/`client_secret`
+    /// all already parse on their own kind in tests above this one or in
+    /// `KEYCHAIN_EXPIRY_BASE`'s own base case, and `config_path`/
+    /// `blob_json_path`/`json_path`/`message` parse in `CLAUDE_LIKE`/
+    /// the shipped `codex.toml` respectively — no shipped or existing
+    /// fixture uses `type = "env"` at all.
+    #[test]
+    fn var_is_accepted_on_an_env_step() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "type            = \"keychain\"\n        service         = \"gemini\"\n        token_json_path = \"token.access_token\"\n        expiry_json_path = \"token.expiry\"",
+            "type = \"env\"\n        var  = \"SAMPLE_TOKEN\"",
+        );
+        let m = PluginManifest::from_str(&toml).expect("var on an env step is accepted");
+        assert_eq!(m.surface[0].auth[0].var.as_deref(), Some("SAMPLE_TOKEN"));
+    }
+
     #[test]
     fn declares_token_expiry_is_true_only_for_a_surface_whose_chain_names_one() {
         let with_expiry = PluginManifest::from_str(KEYCHAIN_EXPIRY_BASE).expect("valid manifest");
@@ -8081,6 +8646,118 @@ mod tests {
         let err = PluginManifest::from_str(&toml)
             .expect_err("a hyphen is not a valid environment variable name character");
         assert!(err.contains("client.id_env"), "{err}");
+    }
+
+    /// `[logfile] root_env` names a variable `std::env::var_os` reads
+    /// verbatim — a name outside the POSIX/Windows charset (an `=` here) can
+    /// never be set, the same silent-no-op `client.id_env` is already
+    /// refused for above. An empty name is refused too (already covered by
+    /// its own "names no environment variable" check), and a plausible one
+    /// — `CODEX_HOME`, the shipped-shape value — still loads.
+    #[test]
+    fn logfile_root_env_must_be_a_plausible_environment_variable_name() {
+        let with_equals = CODEX_LIKE.replace(
+            "root_env      = \"CODEX_HOME\"",
+            "root_env      = \"CODEX=HOME\"",
+        );
+        let err = PluginManifest::from_str(&with_equals)
+            .expect_err("an `=` cannot appear in a real environment variable name");
+        assert!(err.contains("`[logfile] root_env"), "{err}");
+
+        let empty = CODEX_LIKE.replace("root_env      = \"CODEX_HOME\"", "root_env      = \"\"");
+        let err = PluginManifest::from_str(&empty)
+            .expect_err("an empty name names no environment variable");
+        assert!(err.contains("`[logfile] root_env`"), "{err}");
+
+        PluginManifest::from_str(CODEX_LIKE).expect("CODEX_HOME is a plausible name");
+    }
+
+    /// Same rule, `[history] root_env` — the credential-adjacent charset
+    /// check applies to every field that names an environment variable, not
+    /// only the ones `[logfile]` and auth steps carry.
+    #[test]
+    fn a_history_root_env_with_an_equals_sign_is_refused() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format   = \"codex-rollouts\"\n        \
+             root     = \"~/.codex\"\n        \
+             glob     = \"**/*.jsonl\"\n        \
+             root_env = \"CODEX=HOME\"\n";
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("an `=` in [history] root_env must be refused");
+        assert!(err.contains("`[history] root_env"), "{err}");
+    }
+
+    /// Same rule, `[[http.value]] path_env`.
+    #[test]
+    fn an_http_value_path_env_with_an_equals_sign_is_refused() {
+        let toml = http_manifest_with(
+            "",
+            "[[http.value]]\nname = \"account_id\"\ntype = \"json-file\"\n\
+             path = \"~/.codex/auth.json\"\npath_env = \"CODEX=HOME\"\njson_path = \"tokens.account_id\"",
+            "",
+        )
+        .replacen(
+            "engine     = \"http-api\"",
+            "engine     = \"http-api\"\n            requires_reader = [\"http-value-path-env\"]",
+            1,
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("an `=` in [[http.value]] path_env must be refused");
+        assert!(err.contains("path_env"), "{err}");
+    }
+
+    /// Same rule, an auth step's `path_env` (`credentials-file`).
+    #[test]
+    fn an_auth_step_path_env_with_an_equals_sign_is_refused() {
+        let toml = KEYCHAIN_EXPIRY_BASE
+            .replace(
+                "type            = \"keychain\"\n        service         = \"gemini\"\n        token_json_path = \"token.access_token\"",
+                "type             = \"credentials-file\"\n        path             = \"~/.sample/.credentials.json\"\n        \
+                 path_env         = \"SAMPLE=CONFIG\"\n        token_json_path  = \"token.access_token\"",
+            )
+            .replace(
+                "requires_reader = [\"keychain-expiry\"]",
+                "requires_reader = [\"keychain-expiry\", \"credentials-file-path-env\"]",
+            );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("an `=` in an auth step's path_env must be refused");
+        assert!(err.contains("path_env"), "{err}");
+    }
+
+    /// Same rule, an auth step's `service_env` (`keychain` only).
+    #[test]
+    fn an_auth_step_service_env_with_an_equals_sign_is_refused() {
+        let toml = KEYCHAIN_EXPIRY_BASE
+            .replace(
+                "service         = \"gemini\"",
+                "service            = \"gemini\"\n        service_env        = \"CLAUDE=CONFIG\"\n        service_env_suffix = \"sha256:8\"",
+            )
+            .replace(
+                "requires_reader = [\"keychain-expiry\"]",
+                "requires_reader = [\"keychain-expiry\", \"keychain-service-env\"]",
+            );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("an `=` in an auth step's service_env must be refused");
+        assert!(err.contains("service_env"), "{err}");
+    }
+
+    /// Same rule, an `env` step's `var` — the field the token itself is
+    /// read out of, not an override name, but exactly as unable to name a
+    /// real variable with an `=` in it.
+    #[test]
+    fn an_env_step_var_with_an_equals_sign_is_refused() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "type            = \"keychain\"\n        service         = \"gemini\"\n        token_json_path = \"token.access_token\"\n        expiry_json_path = \"token.expiry\"",
+            "type = \"env\"\n        var  = \"SAMPLE=TOKEN\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("an `=` in an env step's var must be refused");
+        assert!(err.contains("var"), "{err}");
     }
 
     #[test]

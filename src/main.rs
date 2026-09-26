@@ -10654,6 +10654,12 @@ fn handle_install_outcome(
     let (raw_bytes, manifest, sha_hex, base_url) = match outcome {
         InstallOutcome::Failed(err) => {
             diag::line(format!("{kind:?} \"{}\": {err}", entry.id));
+            // `err` can be a validator refusal (`PluginManifest::validate`'s
+            // own messages embed the manifest's offending text verbatim —
+            // a `client.bins` entry, a service name, a path) — untrusted the
+            // same way `registry_entry_row`'s `name`/`description` are, and
+            // routed through the same sanitiser before it reaches a row.
+            let err = tickover::plugin::sanitize_provider_text(&err);
             match kind {
                 PendingKind::Install => {
                     set_registry_row_status(registry_model, &entry.id, InstallStatus::Failed, &err)
@@ -18175,6 +18181,48 @@ mod title_tests {
         );
         assert!(!row.name.contains('\n') && !row.name.contains('\u{202E}'));
         assert!(!row.description.contains('\n') && !row.description.contains('\u{200B}'));
+    }
+
+    /// A validator refusal embeds the manifest's own offending text (a
+    /// `client.bins` entry, a `path_env_join` value, a service name — see
+    /// `PluginManifest::validate`'s own messages) — untrusted the same way
+    /// a registry's `name`/`description` are, and the row above already
+    /// routes those through the sanitiser. This one must too, or a control
+    /// character/bidi override in a rejected manifest's own text reaches
+    /// the plugin-manager row raw.
+    #[test]
+    fn handle_install_outcome_sanitizes_a_validator_refusal_before_it_reaches_the_row() {
+        let entry = make_registry_entry("acme", "Acme", "1.0.0", "deadbeef");
+        let registry_model: RegistryRows = Rc::new(VecModel::from(vec![RegistryPluginRow {
+            id: ss("acme"),
+            name: ss("Acme"),
+            version: ss("1.0.0"),
+            description: ss(""),
+            status: InstallStatus::Installing,
+            error: ss(""),
+        }]));
+        let plugin_model: PluginRows = Rc::new(VecModel::from(Vec::<PluginRow>::new()));
+        let plugins: Plugins = Rc::new(RefCell::new(Vec::new()));
+
+        let raw = "surface \"default\": a `keychain` auth step's `client.bins` entry \
+                   \"\u{202E}evil\u{202E}\" must be a bare program name, not a path";
+        let wrote = handle_install_outcome(
+            PendingKind::Install,
+            entry,
+            InstallOutcome::Failed(raw.to_string()),
+            &plugins,
+            &plugin_model,
+            &registry_model,
+        );
+        assert!(!wrote, "a failed fetch/verify never writes a manifest");
+
+        let row = registry_model.row_data(0).expect("row still present");
+        assert_eq!(row.status, InstallStatus::Failed);
+        assert_eq!(
+            row.error.as_str(),
+            tickover::plugin::sanitize_provider_text(raw)
+        );
+        assert!(!row.error.contains('\u{202E}'));
     }
 
     #[test]

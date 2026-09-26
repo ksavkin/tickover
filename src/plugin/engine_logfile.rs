@@ -2967,7 +2967,11 @@ mod tests {
     /// a hostile value cannot inflate threefold in `%XX` escapes.
     #[test]
     fn a_secondary_reading_id_is_sanitised_and_encoded_before_becoming_a_config_key() {
-        let m = codex_like_manifest("/nonexistent", "/nonexistent", "/nonexistent");
+        let m = codex_like_manifest(
+            "TICKOVER_TEST_NONEXISTENT_ROOT_ENV",
+            "/nonexistent",
+            "/nonexistent",
+        );
         let lf = m.logfile.as_ref().unwrap();
         let raw = RawReading {
             primary: Some(slot(10.0, Some(300))),

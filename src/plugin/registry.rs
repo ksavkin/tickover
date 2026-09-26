@@ -2615,13 +2615,26 @@ mod tests {
         let path_line = matches!(auth_type, "credentials-file" | "credentials-map")
             .then(|| "path = \"~/.x/creds.json\"")
             .unwrap_or_default();
-        // `macos_keychain_key` is `electron-safe-storage`'s own field
-        // (`auth::electron_safe_storage_step`) — `validate` now refuses it on
-        // any other step kind, same as `expiry_json_path` already was, so
-        // this can no longer be wired in unconditionally like `service`/`var`/
-        // `config_path`/`blob_json_path`, none of which `validate` checks.
+        // `macos_keychain_key`/`service`/`var`/`config_path`/`blob_json_path`
+        // are each a single step kind's own field
+        // (`auth::electron_safe_storage_step`/`keychain_step`/`env_step`) —
+        // `validate` now refuses every one of them on any other step kind,
+        // the same as `expiry_json_path` already was, so none of these can
+        // be wired in unconditionally any more.
         let macos_keychain_key_line = matches!(auth_type, "electron-safe-storage")
             .then(|| "macos_keychain_key = \"key\"")
+            .unwrap_or_default();
+        let service_line = matches!(auth_type, "keychain")
+            .then(|| "service = \"svc\"")
+            .unwrap_or_default();
+        let var_line = matches!(auth_type, "env")
+            .then(|| "var = \"SOME_VAR\"")
+            .unwrap_or_default();
+        let config_path_line = matches!(auth_type, "electron-safe-storage")
+            .then(|| "config_path = \"~/.x/config.json\"")
+            .unwrap_or_default();
+        let blob_json_path_line = matches!(auth_type, "electron-safe-storage")
+            .then(|| "blob_json_path = \"blob\"")
             .unwrap_or_default();
         let toml = format!(
             r#"
@@ -2650,10 +2663,10 @@ mod tests {
             type = "{auth_type}"
             {path_line}
             token_json_path = "access_token"
-            service = "svc"
-            var = "SOME_VAR"
-            config_path = "~/.x/config.json"
-            blob_json_path = "blob"
+            {service_line}
+            {var_line}
+            {config_path_line}
+            {blob_json_path_line}
             {macos_keychain_key_line}
             "#
         );

@@ -818,6 +818,16 @@ fn rules() -> Vec<Rule> {
             names: "minute floor",
         },
         Rule {
+            // The same ten-year ceiling a `from_field`/`from_bounds` length
+            // is already held to (`crate::plugin::time::
+            // plausible_period_minutes`) before it reaches `main.rs`'s own
+            // `* 60` arithmetic — `assumed` reaches the identical arithmetic
+            // and gets the identical fail-safe.
+            says: "an assumed period beyond ten years is a number nobody stated, not a window",
+            broken_by: changed(LOGFILE, "assumed = 300", "assumed = 5256001"),
+            names: "5256001",
+        },
+        Rule {
             says: "a period read from a field has to say which field",
             broken_by: changed(
                 LOGFILE,
@@ -1223,6 +1233,15 @@ fn rules() -> Vec<Rule> {
             names: "names no environment variable",
         },
         Rule {
+            // An `=` (or a null, or anything else outside the POSIX/Windows
+            // charset) is a name `std::env::var_os` can never find a value
+            // for, so a manifest naming one reads as configured while it is
+            // the same silent no-op the blank check above catches.
+            says: "root_env has to be a plausible environment variable name",
+            broken_by: plus(LOGFILE, "root_env = \"SAMPLE=DIR\""),
+            names: "not a valid environment variable name",
+        },
+        Rule {
             says: "root_env_join is appended to root_env's value, not used in its place",
             broken_by: plus(
                 LOGFILE,
@@ -1273,6 +1292,15 @@ fn rules() -> Vec<Rule> {
                  root_env = \"  \"",
             ),
             names: "names no environment variable",
+        },
+        Rule {
+            says: "[history] root_env has to be a plausible environment variable name",
+            broken_by: plus(
+                &declaring("[\"reading-history\"]"),
+                "[history]\nformat = \"codex-rollouts\"\nroot = \"~/h\"\nglob = \"*.jsonl\"\n\
+                 root_env = \"SAMPLE=DIR\"",
+            ),
+            names: "not a valid environment variable name",
         },
         Rule {
             says: "[history] root_env_join with no root_env has nothing to join onto",
@@ -1476,6 +1504,141 @@ fn rules() -> Vec<Rule> {
             names: "unless_json_path",
         },
         Rule {
+            // `key_prefix` is `credentials_map_step`'s own field — a
+            // `credentials-file` step never reads it, same silent-no-op
+            // reasoning as `unless_json_path` above.
+            says: "key_prefix only means something on a credentials-map step",
+            broken_by: changed(
+                HTTP,
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\nkey_prefix      = \"acme::\"",
+            ),
+            names: "key_prefix",
+        },
+        Rule {
+            // `service` is `keychain_step`'s own field — a `credentials-file`
+            // step never reads it, same silent-no-op reasoning as above.
+            says: "service only means something on a keychain step",
+            broken_by: changed(
+                HTTP,
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\nservice         = \"svc\"",
+            ),
+            names: "service",
+        },
+        Rule {
+            // `config_path` is `electron_safe_storage_step`'s own field — a
+            // `credentials-file` step never reads it, same silent-no-op
+            // reasoning as above.
+            says: "config_path only means something on an electron-safe-storage step",
+            broken_by: changed(
+                HTTP,
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\nconfig_path     = \"~/.x/config.json\"",
+            ),
+            names: "config_path",
+        },
+        Rule {
+            says: "blob_json_path only means something on an electron-safe-storage step",
+            broken_by: changed(
+                HTTP,
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\nblob_json_path  = \"blob\"",
+            ),
+            names: "blob_json_path",
+        },
+        Rule {
+            // `targets` is `win_credential_step`'s own field — a
+            // `credentials-file` step never reads it, same silent-no-op
+            // reasoning as above.
+            says: "targets only means something on a win-credential step",
+            broken_by: changed(
+                HTTP,
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\ntargets         = [\"Sample\"]",
+            ),
+            names: "targets",
+        },
+        Rule {
+            // `json_path` is `reject_when_step`'s own field — a
+            // `credentials-file` step never reads it, same silent-no-op
+            // reasoning as above.
+            says: "json_path only means something on a reject-when step",
+            broken_by: changed(
+                HTTP,
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\njson_path       = \"tokens.access_token\"",
+            ),
+            names: "json_path",
+        },
+        Rule {
+            says: "message only means something on a reject-when step",
+            broken_by: changed(
+                HTTP,
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\nmessage         = \"no subscription\"",
+            ),
+            names: "message",
+        },
+        Rule {
+            // `token_url`/`client_id`/`client_secret` are `oauth_refresh_step`'s
+            // own fields — a `credentials-file` step never reads any of
+            // them, same silent-no-op reasoning as above.
+            says: "token_url only means something on an oauth-refresh step",
+            broken_by: changed(
+                HTTP,
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\ntoken_url       = \"https://oauth2.example.com/token\"",
+            ),
+            names: "token_url",
+        },
+        Rule {
+            says: "client_id only means something on an oauth-refresh step",
+            broken_by: changed(
+                HTTP,
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\nclient_id       = \"sample-client-id\"",
+            ),
+            names: "client_id",
+        },
+        Rule {
+            says: "client_secret only means something on an oauth-refresh step",
+            broken_by: changed(
+                HTTP,
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\nclient_secret   = \"sample-client-secret\"",
+            ),
+            names: "client_secret",
+        },
+        Rule {
+            // Nothing substitutes into `client_secret` (this step's own
+            // network call is not the engine's — `auth::oauth_refresh_step`),
+            // so a `{token}` there is nine literal characters sent to the
+            // token endpoint, not a credential — the same rule an undeclared
+            // `{option.<key>}` already gets, now covering `{token}`/
+            // `{version}` too wherever nothing substitutes them.
+            says: "a stray {token} placeholder in client_secret is refused",
+            broken_by: changed(
+                &http_declaring(r#"["oauth-refresh"]"#),
+                "type            = \"credentials-file\"\npath            = \"~/.sample/auth.json\"\ntoken_json_path = \"token\"",
+                "type            = \"oauth-refresh\"\npath            = \"~/.sample/oauth_creds.json\"\n\
+                 token_json_path = \"refresh_token\"\ntoken_url       = \"https://oauth2.example.com/token\"\n\
+                 client_id       = \"sample-client-id\"\nclient_secret   = \"{token}\"",
+            ),
+            names: "{token}",
+        },
+        Rule {
+            // `var` is `env_step`'s own field — a `credentials-file` step
+            // never reads it, same silent-no-op reasoning as above.
+            says: "var only means something on an env step",
+            broken_by: changed(
+                HTTP,
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\nvar             = \"SAMPLE_TOKEN\"",
+            ),
+            names: "`var`",
+        },
+        Rule {
             // `path_env`/`path_env_join` are `credentials_file_step`'s own
             // fields (`auth::resolve_credentials_file_path`) — every other
             // step kind never reads either, the same silent-no-op reasoning
@@ -1532,6 +1695,17 @@ fn rules() -> Vec<Rule> {
             names: "path_env_join` must not be empty",
         },
         Rule {
+            // Same charset check `[logfile] root_env` gets: an `=` is a name
+            // `std::env::var_os` can never find a value for.
+            says: "an auth step's path_env has to be a plausible environment variable name",
+            broken_by: changed(
+                &http_declaring(r#"["credentials-file-path-env"]"#),
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\npath_env         = \"SAMPLE=CONFIG\"",
+            ),
+            names: "not a valid environment variable name",
+        },
+        Rule {
             // `service_env`/`service_env_suffix` are `keychain_step`'s own
             // fields (`auth::resolve_keychain_service`) — every other step
             // kind never reads either, the same silent-no-op reasoning
@@ -1556,6 +1730,28 @@ fn rules() -> Vec<Rule> {
                  service_env        = \"  \"\nservice_env_suffix = \"sha256:8\"",
             ),
             names: "names no environment variable",
+        },
+        Rule {
+            says: "service_env has to be a plausible environment variable name",
+            broken_by: changed(
+                &http_declaring(r#"["keychain-service-env"]"#),
+                "type            = \"credentials-file\"\npath            = \"~/.sample/auth.json\"\ntoken_json_path = \"token\"",
+                "type               = \"keychain\"\nservice            = \"Sample\"\ntoken_json_path    = \"token\"\n\
+                 service_env        = \"SAMPLE=CONFIG\"\nservice_env_suffix = \"sha256:8\"",
+            ),
+            names: "not a valid environment variable name",
+        },
+        Rule {
+            // `var` is `env_step`'s own field — the variable the token is
+            // read out of directly, not an override name, but exactly as
+            // unable to name a real variable with an `=` in it.
+            says: "an env step's var has to be a plausible environment variable name",
+            broken_by: changed(
+                HTTP,
+                "type            = \"credentials-file\"\npath            = \"~/.sample/auth.json\"\ntoken_json_path = \"token\"",
+                "type = \"env\"\nvar  = \"SAMPLE=TOKEN\"",
+            ),
+            names: "not a valid environment variable name",
         },
         Rule {
             // `service_env_suffix` names the recipe for turning
@@ -1923,6 +2119,15 @@ fn rules() -> Vec<Rule> {
                  json_path = \"a\"\npath_env = \"  \"",
             ),
             names: "`path_env` names no environment variable",
+        },
+        Rule {
+            says: "http.value path_env has to be a plausible environment variable name",
+            broken_by: plus(
+                &http_declaring(r#"["http-value-path-env"]"#),
+                "[[http.value]]\nname = \"a\"\ntype = \"json-file\"\npath = \"~/x.json\"\n\
+                 json_path = \"a\"\npath_env = \"SAMPLE=DIR\"",
+            ),
+            names: "not a valid environment variable name",
         },
         Rule {
             // The capability is declared because it has to be: without it the
