@@ -189,15 +189,26 @@ pub fn scan_root(
         // the retry diffs against an already-advanced baseline and the
         // records between are lost silently.
         let aux_backup = store.file_state(&sig.path).map(|s| s.aux.clone());
-        let extraction = {
-            let Some(st) = store.file_state_mut(&sig.path) else {
-                continue;
-            };
-            match extractor.extract(&sig.path, st, PER_FILE_BYTE_CAP, deadline) {
-                Ok(e) => e,
-                Err(_) => continue, // read failure: retry next pass, cursor unmoved
-            }
+        // Cloned rather than handed out mutably straight from the store:
+        // `extract` can fail partway through, and a `file_state_mut` handout
+        // marks `state` dirty and invalidates the liveness cache the moment
+        // it is taken — a file that fails to read every pass (a permission
+        // error, a lock another process holds) would otherwise force a
+        // `state.json` rewrite on every single retry, forever, for a pass
+        // that changed nothing. The mutated copy replaces the stored one
+        // only once extraction actually succeeds; a failed extraction
+        // leaves the store's copy, and `state`, untouched — matching what
+        // "cursor unmoved" below already promised.
+        let Some(mut st) = store.file_state(&sig.path).cloned() else {
+            continue;
         };
+        let extraction = match extractor.extract(&sig.path, &mut st, PER_FILE_BYTE_CAP, deadline) {
+            Ok(e) => e,
+            Err(_) => continue, // read failure: retry next pass, cursor unmoved
+        };
+        if let Some(slot) = store.file_state_mut(&sig.path) {
+            *slot = st;
+        }
         outcome.files_scanned += 1;
         outcome.bytes_read += extraction.cursor.saturating_sub(resume_from);
         outcome.skipped_unparsed += extraction.skipped_unparsed;

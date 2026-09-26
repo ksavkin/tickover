@@ -827,15 +827,21 @@ impl HistoryStore {
     /// Drop every global-ring entry `path` owns — part of a rewrite reset:
     /// the file's contribution is about to be re-derived under a bumped
     /// generation, so its old ownership claims die with the old one.
-    /// `global_ids` is what `state.json` persists, so this dirties `state`
-    /// unconditionally — `global_map` is the `#[serde(skip)]` mirror and
-    /// would need nothing on its own.
+    /// `global_ids` is what `state.json` persists, so `state` is dirtied
+    /// only once that retain actually removes something — `global_map` is
+    /// the `#[serde(skip)]` mirror and never needs to dirty anything on its
+    /// own, and a path that owned nothing here (the ordinary case: most
+    /// rewrites touch a file that never emitted a ring-eligible id) must
+    /// not force a `state.json` rewrite for having been asked.
     pub fn release_owned(&mut self, path: &str) {
-        self.mark_state_dirty();
         self.state.global_map.retain(|_, p| p != path);
+        let before = self.state.global_ids.len();
         self.state
             .global_ids
             .retain(|g| !matches!(g, GlobalKey::V2 { p, .. } if p == path));
+        if self.state.global_ids.len() != before {
+            self.mark_state_dirty();
+        }
     }
 
     /// Refresh `id`'s recency in the global ring — a duplicate sighting
@@ -924,11 +930,6 @@ impl HistoryStore {
             return Ok(());
         }
         let batch = self.state.next_batch;
-        self.state.next_batch = self.state.next_batch.saturating_add(1);
-        // The counter moved even if every line below turns out to be a
-        // crash-rescan duplicate and `accepted` ends up empty — `state`
-        // already differs from what `commit` last wrote.
-        self.mark_state_dirty();
         let mut accepted: Vec<(String, DayLine)> = Vec::with_capacity(new.len());
         for d in new {
             let mut d = d.clone();
@@ -945,6 +946,11 @@ impl HistoryStore {
         if accepted.is_empty() {
             return Ok(());
         }
+        // Claimed only now that a line is actually going to carry it — a
+        // pass that re-offers nothing but duplicates advances neither the
+        // counter nor `state`, so `commit` below finds nothing to write.
+        self.state.next_batch = self.state.next_batch.saturating_add(1);
+        self.mark_state_dirty();
         let path = Self::days_path(&self.dir);
         let mut oo = fs::OpenOptions::new();
         oo.create(true).append(true);
@@ -1015,12 +1021,15 @@ impl HistoryStore {
     /// superseded generations, so the file's latest *live* gen stands in
     /// as its remembered watermark.
     ///
-    /// O(live lines) per call, not O(files + days): the answer is memoized
-    /// in [`Self::live_cache`] and only recomputed after a change any
-    /// `&mut self` path here might have made. A tick asks this same
-    /// question once per (provider, window) — 5-6 times a second against an
-    /// unchanged snapshot — so the walk over `state.files` and `days` that
-    /// answering it fresh needs must not repeat for every one of them.
+    /// Amortised O(live lines) per call: the answer is memoized in
+    /// [`Self::live_cache`], so only the first call after a change any
+    /// `&mut self` path here might have made pays to rebuild it — an
+    /// O(files + days) walk over `state.files` and `days` — and every call
+    /// after that, until the next such change, is just an iterator over the
+    /// indices that walk already found. A tick asks this same question once
+    /// per (provider, window) — 5-6 times a second against an unchanged
+    /// snapshot — so it is that rebuild, not the read, that must not repeat
+    /// for every one of them.
     pub fn live_days(&self) -> impl Iterator<Item = &DayLine> {
         let idx = {
             let mut cache = self.live_cache.borrow_mut();
@@ -1239,6 +1248,41 @@ mod tests {
         assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 0);
         store.append_days(&[day("/f", 1, 7)]).unwrap();
         assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 7);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pass_that_only_reoffers_duplicate_lines_leaves_state_untouched() {
+        // `next_batch` wound back to the value the first call used stands in
+        // for a crash-rescan retry: the re-derived line serializes to the
+        // exact bytes `seen_lines` already holds, so every line this second
+        // call offers is a duplicate and none of it should move `state` —
+        // not the counter, not the dirty flag `commit` below would
+        // otherwise pay to clear.
+        let dir = tmpdir("dup-noop");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        // `open` already claims a batch id one past the highest it finds on
+        // disk (nothing, here, so 1) before this call ever raises it further
+        // — captured so the rewind below lands on the exact id the accepted
+        // line was stamped with, not a guessed constant.
+        let batch = store.state.next_batch;
+        store.append_days(&[day("/f", 0, 10)]).unwrap();
+        store.state_mut().next_batch = batch;
+        store.commit().unwrap();
+        assert!(!store.state_dirty, "commit must have cleared it");
+        let before = fs::read(dir.join("state.json")).unwrap();
+
+        store.append_days(&[day("/f", 0, 10)]).unwrap();
+        assert!(
+            !store.state_dirty,
+            "an all-duplicate append must not dirty state"
+        );
+        store.commit().unwrap();
+        let after = fs::read(dir.join("state.json")).unwrap();
+        assert_eq!(
+            before, after,
+            "state.json must be byte-identical after an all-duplicate append"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

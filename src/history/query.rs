@@ -661,10 +661,11 @@ fn bucket_counts(hour: &str, since: DateTime<Utc>, since_hour: &str) -> bool {
 }
 
 /// Tokens a provider spent inside a quota window, from `since` (unix
-/// seconds) — the store-touching half of [`window_burn`]. Split out so a
-/// caller that asks the same `(provider, since)` again — every tick, for an
-/// open window — can cache this and only redo the elapsed-hours half below,
-/// which needs nothing from the store.
+/// seconds) — the store-touching half of a burn figure, split out from the
+/// elapsed-hours half a caller pairs it with. A caller that asks the same
+/// `(provider, since)` again — every tick, for an open window — can cache
+/// this and only redo the elapsed-hours half, which needs nothing from the
+/// store.
 pub fn window_tokens(store: &HistoryStore, provider: &str, since_unix: u64) -> Option<u64> {
     let since = Utc.timestamp_opt(since_unix as i64, 0).single()?;
     if since >= Utc::now() {
@@ -679,20 +680,6 @@ pub fn window_tokens(store: &HistoryStore, provider: &str, since_unix: u64) -> O
         .map(|d| d.active())
         .sum();
     (tokens > 0).then_some(tokens)
-}
-
-/// Tokens a provider spent inside a quota window, for the projection hatch:
-/// `since` is the window's start (unix seconds). Returns `(tokens, hours
-/// elapsed)` — `None` when nothing was counted, so the caller can omit the
-/// burn figure rather than draw a fabricated one.
-pub fn window_burn(store: &HistoryStore, provider: &str, since_unix: u64) -> Option<(u64, f64)> {
-    let tokens = window_tokens(store, provider, since_unix)?;
-    // `window_tokens` already proved `since_unix` parses and is in the
-    // past; redone rather than threaded through so the store-touching half
-    // stays the only part a caller ever needs to cache.
-    let since = Utc.timestamp_opt(since_unix as i64, 0).single()?;
-    let now = Utc::now();
-    Some((tokens, (now - since).num_seconds().max(1) as f64 / 3600.0))
 }
 
 #[cfg(test)]

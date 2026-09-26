@@ -232,8 +232,10 @@ export component QuotaBlock inherits VerticalLayout {
             vertical-alignment: center;
         }
         Rectangle { horizontal-stretch: 1; min-width: 4px; }
-        // Right side of the resets line: the burn projection the hatch
-        // above draws ("burn 41.2K/h → ~74%", or "caps ~20:12" in crit).
+        // Right side of the resets line: the pace the hatch above draws, as
+        // a clock reading — "→ ~74%" on its own, "burn 41.2K/h → ~74%" once
+        // local history names the rate, or "caps ~20:12" once it crosses
+        // 100%.
         if root.burn-line != "" : Text {
             text: root.burn-line;
             font-size: 10px;

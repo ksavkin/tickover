@@ -204,13 +204,12 @@ type HistoryShared = ();
 /// `quota_projection`'s per-tick memo: `(provider id, window start unix) →
 /// tokens spent since then`, so a tick that asks the same open window's
 /// burn for every plugin fetch it draws only touches the store once per
-/// window rather than once per ask. Keyed on tokens alone, not the whole
-/// `window_burn` pair — the hours-elapsed half is cheap and depends on
-/// `now`, which moves every tick, so it is always recomputed fresh rather
-/// than cached alongside a figure that wouldn't need to be. Cleared
-/// whenever the answer could change: a new store snapshot, or the enabled
-/// plugin set. `()` in a build without the feature, matching
-/// [`HistoryShared`].
+/// window rather than once per ask. Keyed on tokens alone, not on tokens
+/// paired with hours elapsed — the hours half is cheap and depends on `now`,
+/// which moves every tick, so it is always recomputed fresh rather than
+/// cached alongside a figure that wouldn't need to be. Cleared whenever the
+/// answer could change: a new store snapshot, or the enabled plugin set.
+/// `()` in a build without the feature, matching [`HistoryShared`].
 #[cfg(feature = "history")]
 type ProjectionCache = Rc<RefCell<HashMap<(String, u64), Option<u64>>>>;
 #[cfg(not(feature = "history"))]
@@ -5768,10 +5767,12 @@ fn window_hatch_start(w: &Window) -> Option<u64> {
 /// yet positive, or before `elapsed` clears the floor below — a pace read
 /// off the first few minutes of a five-hour window is noise wearing a
 /// percentage sign, not a projection. The floor is `max(10 minutes, period
-/// / 10)`: ten minutes alone would let a window shorter than that finish
-/// before ever drawing one, and a tenth of the period alone would hold a
-/// five-hour window's hatch back for a full thirty minutes, which the flat
-/// floor already covers.
+/// / 10)` because both have to hold before the pace means anything: the
+/// window must have run for a flat ten minutes *and* for a tenth of its own
+/// length, and the larger of the two is the threshold that actually decides
+/// when both are true. Plainly: a window whose whole period is ten minutes
+/// or less never clears the floor and never draws a hatch at all — nothing
+/// shipped declares one that short.
 ///
 /// Returns the percentage (clamped to 100), its tone (1 ok / 2 warn / 3
 /// crit), and — set only once the pace crosses 100 — when that happens, so
@@ -5840,7 +5841,13 @@ fn quota_projection(
     now: u64,
 ) -> Option<(f32, i32, String)> {
     let (pct, tone, caps_at) = quota_pace(w, used, now)?;
-    let burn = if caps_at.is_none() && w.role != Role::Extra {
+    // Looked up even once the pace has already capped out, where the
+    // caption below never uses it: an over-quota window still keeps
+    // `proj_cache` warm for whatever else asks about this exact (provider,
+    // start) later in the same tick — the HTML report's own burn figure,
+    // for one, which would otherwise have to scan the store a second time
+    // for a window this lookup already touched.
+    let burn = if w.role != Role::Extra {
         window_hatch_start(w).and_then(|start| {
             // The store-touching half, asked once per (provider, start) for
             // as long as `proj_cache` isn't cleared — every other window row
@@ -5874,6 +5881,33 @@ fn quota_projection(
 ) -> Option<(f32, i32, String)> {
     let (pct, tone, caps_at) = quota_pace(w, used, now)?;
     Some((pct, tone, quota_caption(pct, caps_at, None)))
+}
+
+#[cfg(all(test, not(feature = "history")))]
+mod quota_projection_without_history_tests {
+    use super::*;
+
+    /// The whole point of splitting `quota_pace` out on its own: with the
+    /// `history` feature compiled out, `HistoryShared` and `ProjectionCache`
+    /// are both `()` and there is no store to ask, yet the hatch still has
+    /// to draw — with the same plain arrow caption a live build shows before
+    /// local history has counted anything for the window.
+    #[test]
+    fn draws_the_hatch_with_the_plain_caption_and_no_store_at_all() {
+        let w = Window {
+            key: "5H:".into(),
+            label: "5H".into(),
+            role: Role::Primary,
+            used_percent: None,
+            resets_at: Some(1_018_000),
+            period_minutes: Some(300),
+        };
+        let (pct, tone, caption) = quota_projection(&(), &(), "codex", &w, 2.0, 1_001_800)
+            .expect("the hatch draws with the history feature compiled out entirely");
+        assert_eq!(pct, 20.0);
+        assert_eq!(tone, 1);
+        assert_eq!(caption, "→ ~20%");
+    }
 }
 
 #[cfg(test)]
@@ -5925,15 +5959,33 @@ mod quota_pace_tests {
     }
 
     #[test]
-    fn a_pace_past_the_cap_names_when_and_never_later_than_reset() {
+    fn a_pace_past_the_cap_names_when_it_happens() {
         let w = primary(RESET, PERIOD_MIN);
         let now = START + 1_800;
         // 15% used at the floor projects to 150%, well past the cap.
         let (pct, tone, caps_at) = quota_pace(&w, 15.0, now).expect("well past 100%");
         assert_eq!(pct, 100.0);
         assert_eq!(tone, 3);
-        let caps_at = caps_at.expect("the crit case always names when");
-        assert!(caps_at <= RESET, "never later than the window's own end");
+        // caps_at = start + elapsed * 100 / used = 1_000_000 + 1_800*100/15.
+        assert_eq!(caps_at, Some(1_012_000));
+    }
+
+    #[test]
+    fn a_pace_past_the_cap_clamps_to_reset_when_the_raw_estimate_overshoots_it() {
+        // At this magnitude a u64 no longer round-trips through f64 exactly
+        // (the mantissa holds 52 bits): the raw estimate, mathematically
+        // equal to the reset here, computes eight seconds past it. `.min
+        // (reset)` is what stands between that rounding error and a caption
+        // naming a time after the window it belongs to has already ended.
+        const PERIOD_MINUTES: u64 = 153_722_867_280_912_930;
+        const PERIOD: u64 = PERIOD_MINUTES * 60; // 9_223_372_036_854_775_800
+        let w = primary(PERIOD, PERIOD_MINUTES); // start = 0, reset = PERIOD
+        let (_, _, caps_at) = quota_pace(&w, 50.0, PERIOD / 2).expect("well past 100%");
+        assert_eq!(
+            caps_at,
+            Some(PERIOD),
+            "the raw estimate overshoots the reset by 8s at this scale; the clamp pins it back"
+        );
     }
 
     #[test]
