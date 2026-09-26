@@ -355,9 +355,12 @@ struct Ctx {
 
 /// The refresh triple nearly every settings-sheet callback below closes
 /// with: rebuild the plugin-manager rows, rebuild the provider rows, and
-/// let the tray icon catch up. All three only run once `ctx.weak` still
-/// resolves — one guard shared by every call site, rather than each one
-/// wrapping its own copy of this same triple in an identical check.
+/// let the tray icon catch up — plus the Activity card, which every one of
+/// these callbacks can change the provider set of (enable/disable, a surface
+/// opt-in, reset, an option that re-fetches). All four only run once
+/// `ctx.weak` still resolves — one guard shared by every call site, rather
+/// than each one wrapping its own copy of this same triple in an identical
+/// check.
 fn refresh_all(ctx: &Ctx) {
     if let Some(app) = ctx.weak.upgrade() {
         refresh_plugins_model(&ctx.plugin_model, &ctx.plugins.borrow());
@@ -380,6 +383,7 @@ fn refresh_all(ctx: &Ctx) {
             &ctx.cache,
             &ctx.tray_key,
         );
+        sync_activity(&app, ctx);
     }
 }
 
@@ -883,7 +887,20 @@ fn wire_ui_callbacks(app: &AppWindow, ctx: &Ctx) {
         let ctx2 = ctx.clone();
         app.on_open_report(move || open_history_report(&ctx2));
         let ctx2 = ctx.clone();
-        app.on_check_log_paths(move || spawn_history_scan(&ctx2));
+        let weak2 = app.as_weak();
+        app.on_check_log_paths(move || {
+            spawn_history_scan(&ctx2);
+            // `spawn_history_scan` raises `ctx.history_io.busy` before this
+            // returns — but nothing samples it until the next `sync_activity`
+            // call, which without this is whichever comes first: a range
+            // toggle, or the scan's own commit finishing. Sampling it here
+            // is what makes the button's only visible effect (the header
+            // switching to "scanning…") show up on the very click that
+            // asked for it, not on some later, unrelated event.
+            if let Some(app) = weak2.upgrade() {
+                sync_activity(&app, &ctx2);
+            }
+        });
     }
 }
 
@@ -1112,12 +1129,14 @@ fn setup_tray(
 /// still answered: nothing here was this plugin's to remove.
 ///
 /// Returns whether the conventional-name slot is free of such a remnant:
-/// `false` only when a removal was attempted and failed (a `NotFound` on the
-/// removal attempt itself is a scan→remove race, already free). Callers use
-/// that to decide whether the rest of the removal bookkeeping may run —
-/// wiping `plugin.<id>.*` config while a broken `<id>.toml` survives would
-/// resurrect the plugin with its settings reset if the file ever parses
-/// again.
+/// `false` when a removal was attempted and failed, or when the metadata
+/// read that decides whether to attempt one failed for any reason but
+/// absence (`NotFound` on either read is a scan→remove race, already free).
+/// Callers use that to decide whether the rest of the removal bookkeeping
+/// may run — wiping `plugin.<id>.*` config while a broken `<id>.toml`
+/// survives would resurrect the plugin with its settings reset if the file
+/// ever parses again, and a metadata error says nothing about whether it
+/// still does.
 ///
 /// `symlink_metadata`, not `exists()`: a dangling symlink at the name blocks
 /// `install_write` just as surely, and `remove_file` on it removes the link,
@@ -1133,8 +1152,16 @@ fn remove_unparsable_remnant(dir: &std::path::Path, id: &str) -> bool {
     if foreign {
         return true;
     }
-    let Ok(meta) = remnant.symlink_metadata() else {
-        return true;
+    let meta = match remnant.symlink_metadata() {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(e) => {
+            diag::line(format!(
+                "remove-plugin: could not check for a remnant at {}: {e}",
+                remnant.display()
+            ));
+            return false;
+        }
     };
     let gone = if meta.file_type().is_dir() {
         std::fs::remove_dir(&remnant)
@@ -1676,6 +1703,11 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                     &ctx.cache,
                     &ctx.tray_key,
                 );
+                // Not routed through `refresh_all`: `reload_and_fetch` above
+                // already did its plugin-manager half. Removing the last
+                // `[history]` provider must still hide the Activity card,
+                // same as every other path that changes the provider set.
+                sync_activity(&app, &ctx);
             }
         });
     }
@@ -2138,6 +2170,20 @@ fn run_slow_timer(
                     *ctx.history.borrow_mut() = Some(store);
                     ctx.projection_cache.borrow_mut().clear();
                     sync_activity(&app, &ctx);
+                } else if scan_ended_without_a_store(
+                    app.get_activity().scanning,
+                    ctx.history_io
+                        .busy
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                ) {
+                    // A scan that ended with nothing to install (no history
+                    // directory yet, a lock that could not be taken, a
+                    // commit failure, a panic mid-scan) still clears `busy`
+                    // — but sends nothing here to notice it. Without this,
+                    // the card is left showing "scanning…" until some
+                    // unrelated event (a range toggle, the next scan's own
+                    // successful commit) happens to call `sync_activity`.
+                    sync_activity(&app, &ctx);
                 }
                 if n % 120 == 17 {
                     spawn_history_scan(&ctx);
@@ -2147,8 +2193,15 @@ fn run_slow_timer(
             // Built once and threaded through the rest of this tick —
             // `refresh_model_from`, `sync_tray_indicator_from`, and the
             // ping loop below all read the same `current` rather than
-            // each rebuilding it from `cache` for itself.
+            // each rebuilding it from `cache` for itself. `current_reported`
+            // travels with it for the same reason — both read `ctx.cache`
+            // as it stood at this exact moment.
             let current = readings(&ctx.plugins.borrow(), &ctx.cache.borrow());
+            let current_reported = every_enabled_plugin_has_reported(
+                &ctx.plugins.borrow(),
+                &ctx.cache.borrow(),
+                plugin_enabled,
+            );
 
             // Rebuilding the Slint model is skipped while the popover is
             // not on screen — the common case for a menu-bar app — since
@@ -2166,7 +2219,10 @@ fn run_slow_timer(
                     &app,
                     &ctx.model,
                     &ctx.plugins.borrow(),
-                    &current,
+                    ReadingsPass {
+                        current: &current,
+                        reported: current_reported,
+                    },
                     &ctx.window_models,
                     &ctx.balance_models,
                     Projection {
@@ -2184,33 +2240,52 @@ fn run_slow_timer(
             // it has one — so it leaves a note instead, and this instance
             // answers the click that started it. Without this, launching the
             // app while it is already running does nothing whatsoever, which
-            // looks exactly like an app that failed to start.
-            if platform::take_show_request() && !app.window().is_visible() {
-                // The gate above skipped `refresh_model_from` for exactly
-                // this window (hidden when this tick started) — force it
-                // now, with the same `current`, so the popover this is
-                // about to show is not a tick behind.
-                if should_refresh_panel(app.window().is_visible(), true) {
-                    refresh_model_from(
+            // looks exactly like an app that failed to start. Consumed
+            // unconditionally — see `show_request_action`'s own doc for why
+            // a visible window still gets something done for it, not
+            // nothing, now that this branches on it instead of `!visible`.
+            let show_requested = platform::take_show_request();
+            match show_request_action(show_requested, app.window().is_visible()) {
+                ShowRequestAction::None => {}
+                ShowRequestAction::Raise => {
+                    // Already on screen, just possibly buried — dock mode,
+                    // another app in front — so bring it forward rather
+                    // than run the present-and-place sequence a hidden
+                    // window needs.
+                    use slint::winit_030::WinitWindowAccessor;
+                    app.window().with_winit_window(|w| w.focus_window());
+                    platform::activate_app();
+                }
+                ShowRequestAction::Present => {
+                    // The gate above skipped `refresh_model_from` for
+                    // exactly this window (hidden when this tick started) —
+                    // force it now, with the same `current`, so the popover
+                    // this is about to show is not a tick behind.
+                    if should_refresh_panel(app.window().is_visible(), true) {
+                        refresh_model_from(
+                            &app,
+                            &ctx.model,
+                            &ctx.plugins.borrow(),
+                            ReadingsPass {
+                                current: &current,
+                                reported: current_reported,
+                            },
+                            &ctx.window_models,
+                            &ctx.balance_models,
+                            Projection {
+                                hist: &ctx.history,
+                                cache: &ctx.projection_cache,
+                            },
+                        );
+                    }
+                    present_popover(
                         &app,
-                        &ctx.model,
-                        &ctx.plugins.borrow(),
-                        &current,
-                        &ctx.window_models,
-                        &ctx.balance_models,
-                        Projection {
-                            hist: &ctx.history,
-                            cache: &ctx.projection_cache,
-                        },
+                        &ctx.anchor,
+                        &ctx.shown_at,
+                        &ctx.pending_position,
+                        Shown::ByAnythingElse,
                     );
                 }
-                present_popover(
-                    &app,
-                    &ctx.anchor,
-                    &ctx.shown_at,
-                    &ctx.pending_position,
-                    Shown::ByAnythingElse,
-                );
             }
 
             // Keep "· checked <registry-checked-at>" live (Slint only ever
@@ -2752,6 +2827,16 @@ fn truly_fresh_install() -> bool {
 /// `upgrade_builtin_manifests` alone, which is exactly how the regression
 /// this function fixes went unnoticed by the tests already guarding
 /// `upgrade_builtin_manifests`.
+///
+/// A seed that fails to write skips [`upgrade_builtin_manifests`] entirely
+/// this launch, rather than letting it read the still-empty `dir` the
+/// failure left behind. `codex.toml`/`claude.toml` ship
+/// `deliver_if_absent = false` — an install without them is assumed to have
+/// removed them on purpose — so `Absent` off an empty `dir` settles their
+/// marker for good whether or not a write ever actually ran; a disk full or
+/// read-only for one launch would otherwise cost either headline provider
+/// every future one. Leaving the markers untouched keeps `truly_fresh_install`
+/// true, so the whole sequence — seed included — simply retries next launch.
 fn seed_and_upgrade_builtins(dir: &std::path::Path) {
     if truly_fresh_install() {
         if let Err(e) = seed::seed_if_empty(dir) {
@@ -2759,6 +2844,7 @@ fn seed_and_upgrade_builtins(dir: &std::path::Path) {
                 "could not seed plugin manifests in {}: {e}",
                 dir.display()
             ));
+            return;
         }
     }
     upgrade_builtin_manifests(dir);
@@ -3237,8 +3323,20 @@ fn plugin_manifest_target(dir: &std::path::Path, id: &str) -> Option<std::path::
 /// broken badly enough that it no longer parses can no longer be reopened via
 /// `edit-plugin` to fix it by its conventional filename; the plugins folder
 /// (`open-plugins-folder`) is still reachable for that case.
+///
+/// Two files can still parse to the same `id` — a stray copy dropped in by
+/// hand, say — and `plugin::manifest::load_dir` already has a rule for
+/// exactly that: lowest `order`, ties broken by path, the same key
+/// `dedup_plugin_ids` uses to call every other claimant a duplicate and drop
+/// it. Directory-listing order agrees with that by coincidence at best — it
+/// is whatever the filesystem hands back, not even alphabetical on every one
+/// this runs on — so every match is collected and sorted by that same key
+/// rather than returning the first one the scan happens to meet. Anything
+/// less would let Edit open, and Remove delete, a file the app never
+/// actually loaded.
 fn find_plugin_manifest_path(dir: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
+    let mut candidates: Vec<(i64, std::path::PathBuf)> = Vec::new();
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
@@ -3253,12 +3351,16 @@ fn find_plugin_manifest_path(dir: &std::path::Path, id: &str) -> Option<std::pat
         {
             if let Ok(m) = PluginManifest::from_str(&text) {
                 if m.id == id {
-                    return Some(path);
+                    candidates.push((m.order, path));
                 }
             }
         }
     }
-    None
+    // `(order, path)`: every candidate here already shares `id`, so the
+    // `id` term `load_dir`'s own key also sorts by can never break a tie —
+    // this is that same key with the constant term dropped.
+    candidates.sort();
+    candidates.into_iter().next().map(|(_, path)| path)
 }
 
 /// Drop a removed plugin's provenance record from the registry lockfile at
@@ -5161,6 +5263,41 @@ fn should_refresh_panel(visible: bool, forced: bool) -> bool {
     visible || forced
 }
 
+/// What a second launch's note calls for, once `platform::take_show_request`
+/// has actually consumed one this tick — `requested` is that call's own
+/// answer, so this never re-asks it, and never runs when it was `false`.
+/// `visible` is stale by the time either non-`None` case has run its own
+/// side effects, the same way every other reader of it earlier in this tick
+/// already is — nothing here relies on it staying accurate afterward.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShowRequestAction {
+    /// No note arrived this tick — `requested` was `false`.
+    None,
+    /// The window is already visible, just not necessarily on top of
+    /// everything (dock mode, another app in front) — bring it forward
+    /// rather than run the present-and-place sequence a hidden window needs.
+    Raise,
+    /// The window is hidden — show and place it fresh, the sequence every
+    /// other presentation in this file already runs.
+    Present,
+}
+
+/// `requested` came from `platform::take_show_request` itself consuming the
+/// note — a request the tick's own `if` used to gate on `!visible` as well,
+/// so one that arrived while the window was already up (buried, not
+/// necessarily gone) read as nothing to do and the note was still spent for
+/// nothing. [`ShowRequestAction::Raise`] is what a visible window gets
+/// instead: brought forward, not re-presented.
+fn show_request_action(requested: bool, visible: bool) -> ShowRequestAction {
+    if !requested {
+        ShowRequestAction::None
+    } else if visible {
+        ShowRequestAction::Raise
+    } else {
+        ShowRequestAction::Present
+    }
+}
+
 /// The store handle ([`HistoryShared`]) and its per-tick token memo
 /// ([`ProjectionCache`]) travel everywhere together — bundled into one
 /// parameter so `refresh_model`/`refresh_model_from` stay under clippy's
@@ -5170,6 +5307,20 @@ fn should_refresh_panel(visible: bool, forced: bool) -> bool {
 struct Projection<'a> {
     hist: &'a HistoryShared,
     cache: &'a ProjectionCache,
+}
+
+/// `readings()`'s own list for this tick, plus whether every currently
+/// enabled plugin already has an entry in the cache that list was built
+/// from — the two pieces [`header_status`] needs, bundled the same way
+/// [`Projection`] bundles the history handle and its cache, for the same
+/// reason: `refresh_model_from` is already at clippy's argument-count
+/// ceiling, so this replaces the bare slice it used to take rather than
+/// growing an eighth slot.
+#[derive(Clone, Copy)]
+struct ReadingsPass<'a> {
+    current: &'a [ProviderReading],
+    /// See [`every_enabled_plugin_has_reported`]'s own doc.
+    reported: bool,
 }
 
 /// Rebuild the provider list from the cache. Two nested reconciles keep the UI
@@ -5194,11 +5345,15 @@ fn refresh_model(
     proj: Projection<'_>,
 ) {
     let readings = readings(plugins, &cache.borrow());
+    let reported = every_enabled_plugin_has_reported(plugins, &cache.borrow(), plugin_enabled);
     refresh_model_from(
         app,
         model,
         plugins,
-        &readings,
+        ReadingsPass {
+            current: &readings,
+            reported,
+        },
         window_models,
         balance_models,
         proj,
@@ -5214,11 +5369,12 @@ fn refresh_model_from(
     app: &AppWindow,
     model: &Providers,
     plugins: &[PluginManifest],
-    readings: &[ProviderReading],
+    pass: ReadingsPass<'_>,
     window_models: &WindowModels,
     balance_models: &BalanceModels,
     proj: Projection<'_>,
 ) {
+    let readings = pass.current;
     let now = now_unix();
 
     let mut win_models = window_models.borrow_mut();
@@ -5281,7 +5437,7 @@ fn refresh_model_from(
     }
 
     let has_live = readings.iter().any(|r| r.error.is_none());
-    let (updated, updated_live) = header_status(has_live, !readings.is_empty());
+    let (updated, updated_live) = header_status(has_live, !readings.is_empty(), pass.reported);
     app.set_updated(ss(updated));
     app.set_updated_live(updated_live);
 }
@@ -5362,10 +5518,40 @@ fn reconcile_balance_model(
     ModelRc::from(fresh)
 }
 
-fn header_status(has_live_provider: bool, has_provider_reading: bool) -> (&'static str, bool) {
+/// Whether every currently enabled plugin already has an entry in `cache` —
+/// not whether it produced a *visible* reading, only whether a fetch for it
+/// has landed at all. `readings()` drops a "no credentials found" reading so
+/// completely that an empty `readings()` list means either "nothing fetched
+/// yet" or "every signed-in provider is actually signed out" identically;
+/// this is what [`header_status`] uses to tell the two apart. `enabled` is
+/// injected the same way [`readings_with`]'s own resolvers are, so a test
+/// can drive it without touching real config.
+fn every_enabled_plugin_has_reported(
+    plugins: &[PluginManifest],
+    cache: &HashMap<String, Vec<ProviderReading>>,
+    enabled: impl Fn(&PluginManifest) -> bool,
+) -> bool {
+    plugins
+        .iter()
+        .filter(|m| enabled(m))
+        .all(|m| cache.contains_key(&m.id))
+}
+
+/// The header's own words for what `readings()` came back with this tick.
+/// `all_enabled_have_reported` is the answer `has_provider_reading` alone
+/// cannot give: that one is `false` both when nothing has been fetched yet
+/// and when every provider fetched came back signed-out (`readings()` drops
+/// a "no credentials" reading before either ever reaches here), and those
+/// two states need different words — "reading…" is a promise something is
+/// still coming, which a settled, empty install never had coming at all.
+fn header_status(
+    has_live_provider: bool,
+    has_provider_reading: bool,
+    all_enabled_have_reported: bool,
+) -> (&'static str, bool) {
     if has_live_provider {
         ("LIVE", true)
-    } else if has_provider_reading {
+    } else if has_provider_reading || all_enabled_have_reported {
         ("no data", false)
     } else {
         ("reading…", false)
@@ -6271,22 +6457,35 @@ fn spawn_history_scan(ctx: &Ctx) {
 #[cfg(not(feature = "history"))]
 fn spawn_history_scan(_: &Ctx) {}
 
+/// Whether the tick must call `sync_activity` on its own even though the
+/// scan channel produced no store to install this pass — the shape a scan
+/// that ends without one leaves (no history directory yet, a lock that
+/// could not be taken, a commit failure, a panic mid-scan): `busy` clears
+/// either way, but only the channel side of a finished scan is what
+/// normally triggers a resync. Without this, `still_busy` going `false`
+/// with nothing sent leaves the card showing "scanning…" until some
+/// unrelated event — a range toggle, the next scan's own successful commit
+/// — happens to call `sync_activity` for an unrelated reason.
+#[cfg(feature = "history")]
+fn scan_ended_without_a_store(card_shows_scanning: bool, still_busy: bool) -> bool {
+    card_shows_scanning && !still_busy
+}
+
 /// Push the Activity card's data to the window for whichever range its
 /// toggle currently shows. Start-up, each scan commit, and
 /// `activity-range-changed` all come through here — one code path, so a
 /// toggle and fresh data can never disagree about what the card means.
+///
+/// Always calls [`activity_data`], even with no `[history]` manifest at
+/// all — that function's own `visible` decides whether the card shows,
+/// computed fresh from `plugins` every time. A call that returned early
+/// instead left whatever `ActivityData` a previous, non-empty set had
+/// produced on screen: the card, and the provider it last named, surviving
+/// the very set that named it going empty.
 #[cfg(feature = "history")]
 fn sync_activity(app: &AppWindow, ctx: &Ctx) {
     use tickover::history::query::{PanelRange, Totals};
     let plugins = ctx.plugins.borrow();
-    let history_providers: Vec<String> = plugins
-        .iter()
-        .filter(|m| m.history.is_some() && plugin_enabled(m))
-        .map(|m| m.id.clone())
-        .collect();
-    if history_providers.is_empty() {
-        return; // no [history] manifest — the card stays hidden
-    }
     // Design §6: "not counted" names providers that cannot publish local
     // history — the ones with no `[history]` section, like Copilot. A
     // provider that declares history but saw no usage in range is counted;
@@ -6454,8 +6653,16 @@ fn activity_data(
         PanelState::EmptyRange => format!("streak ended at {}d", sum.streak_ended),
         _ => format!("{}-day streak · {} sessions", sum.streak_days, sum.sessions),
     };
+    // The card's own reason to exist: at least one enabled provider that can
+    // actually publish local history. Read here, not assumed by a caller
+    // that stopped calling this at all once the set went empty — that left
+    // whatever `ActivityData` this call last produced on screen, headline
+    // and all, for a provider the set no longer contains.
+    let visible = plugins
+        .iter()
+        .any(|m| m.history.is_some() && plugin_enabled(m));
     ActivityData {
-        visible: true,
+        visible,
         first_run,
         scanning,
         empty_range,
@@ -6516,6 +6723,199 @@ fn activity_data(
         empty_line2: ss(empty_line2),
         last_when: ss(last_when),
         last_where: ss(last_where),
+    }
+}
+
+#[cfg(all(test, feature = "history"))]
+mod activity_data_tests {
+    use super::*;
+
+    /// A manifest with a `[history]` section and nothing else the card
+    /// needs — order and enabled state are what these tests vary. `id`
+    /// doubles as `menu_label`, capped at 16 characters, so callers pass a
+    /// short one.
+    fn history_manifest_toml(id: &str) -> String {
+        format!(
+            r#"
+            id         = "{id}"
+            name       = "{id}"
+            menu_label = "{id}"
+            order      = 1
+            engine     = "log-file"
+            requires_reader = ["reading-history"]
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [logfile]
+            root = "~/.x"
+            glob = "*.jsonl"
+            container_key = "rate_limits"
+            [history]
+            format = "codex-rollouts"
+            root   = "~/.x"
+            glob   = "*.jsonl"
+            "#
+        )
+    }
+
+    fn history_manifest(id: &str) -> PluginManifest {
+        PluginManifest::from_str(&history_manifest_toml(id))
+            .expect("valid manifest with a [history] section")
+    }
+
+    /// The same shape, minus `[history]` — a quota-only provider (Copilot,
+    /// in the shipped set).
+    fn quota_only_manifest(id: &str) -> PluginManifest {
+        let toml = format!(
+            r#"
+            id         = "{id}"
+            name       = "{id}"
+            menu_label = "{id}"
+            order      = 1
+            engine     = "log-file"
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [logfile]
+            root = "~/.x"
+            glob = "*.jsonl"
+            container_key = "rate_limits"
+            "#
+        );
+        PluginManifest::from_str(&toml).expect("valid manifest with no [history] section")
+    }
+
+    /// The empty `PanelSummary` [`activity_data`] falls back to when `sum`
+    /// is `None` — every test below asks about `visible` alone, never the
+    /// figures a real store would fill in.
+    fn no_summary() -> Option<&'static tickover::history::query::PanelSummary> {
+        None
+    }
+
+    /// No manifest publishes history at all: the card the comment at its own
+    /// head promises stays hidden must actually be hidden, not whatever the
+    /// caller last set it to.
+    #[test]
+    fn no_history_publishing_provider_is_not_visible() {
+        let plugins = Vec::new();
+        let data = activity_data(
+            no_summary(),
+            tickover::history::query::PanelRange::Day,
+            &plugins,
+            false,
+        );
+        assert!(
+            !data.visible,
+            "an empty provider set has nothing to publish — the card must be hidden"
+        );
+    }
+
+    /// A provider with no `[history]` section (Copilot, say) is the same as
+    /// none at all for this purpose: quota-only manifests never make the
+    /// card visible.
+    #[test]
+    fn a_quota_only_provider_does_not_make_the_card_visible() {
+        let plugins = vec![quota_only_manifest("quota-only")];
+        let data = activity_data(
+            no_summary(),
+            tickover::history::query::PanelRange::Day,
+            &plugins,
+            false,
+        );
+        assert!(
+            !data.visible,
+            "a manifest with no [history] must not show the card"
+        );
+    }
+
+    /// Disabling the plugin that owns the only `[history]` section hides the
+    /// card — the empty set is what `plugin_enabled` reads once the config
+    /// override lands, not merely the manifest going away.
+    #[test]
+    fn disabling_the_last_history_provider_hides_the_card() {
+        let id = "activity-hist";
+        let m = history_manifest(id);
+        let plugins = vec![m];
+
+        config::set_plugin_enabled(id, true);
+        let shown = activity_data(
+            no_summary(),
+            tickover::history::query::PanelRange::Day,
+            &plugins,
+            false,
+        );
+        assert!(
+            shown.visible,
+            "an enabled [history] provider must show the card"
+        );
+
+        config::set_plugin_enabled(id, false);
+        let hidden = activity_data(
+            no_summary(),
+            tickover::history::query::PanelRange::Day,
+            &plugins,
+            false,
+        );
+        assert!(
+            !hidden.visible,
+            "disabling the only [history] provider must hide the card"
+        );
+
+        config::set_plugin_enabled(id, true);
+        let shown_again = activity_data(
+            no_summary(),
+            tickover::history::query::PanelRange::Day,
+            &plugins,
+            false,
+        );
+        assert!(
+            shown_again.visible,
+            "re-enabling it must show the card again"
+        );
+
+        config::remove_plugin_keys(id);
+    }
+}
+
+#[cfg(all(test, feature = "history"))]
+mod scan_sync_tests {
+    use super::*;
+
+    /// The regression: a scan whose worker thread never sent a store — no
+    /// history directory yet, a lock that could not be taken, a commit
+    /// failure, a panic mid-scan — cleared `busy` but left the card's own
+    /// "scanning…" state stuck, because nothing besides the channel receive
+    /// used to call `sync_activity`.
+    #[test]
+    fn a_scan_that_never_sends_a_store_still_needs_a_resync() {
+        assert!(
+            scan_ended_without_a_store(true, false),
+            "card still says scanning, busy already cleared: must resync"
+        );
+        assert!(
+            !scan_ended_without_a_store(true, true),
+            "still actually busy: the scan hasn't ended yet"
+        );
+        assert!(
+            !scan_ended_without_a_store(false, false),
+            "the card already agrees: nothing to reconcile"
+        );
+        assert!(
+            !scan_ended_without_a_store(false, true),
+            "busy again (a fresh scan) while the card still said so: not this case"
+        );
     }
 }
 
@@ -11809,9 +12209,29 @@ mod title_tests {
 
     #[test]
     fn header_status_is_not_live_without_a_fresh_provider() {
-        assert_eq!(header_status(false, false), ("reading…", false));
-        assert_eq!(header_status(false, true), ("no data", false));
-        assert_eq!(header_status(true, true), ("LIVE", true));
+        assert_eq!(header_status(false, false, false), ("reading…", false));
+        assert_eq!(header_status(false, true, false), ("no data", false));
+        assert_eq!(header_status(true, true, false), ("LIVE", true));
+    }
+
+    /// The third answer: every provider signed out, or every plugin
+    /// disabled, still leaves `has_provider_reading` false — `readings()`
+    /// drops a "no credentials" row so completely that it reads exactly
+    /// like nothing having been fetched yet. Without `all_enabled_have_reported`
+    /// the header cannot tell the two apart, and says "reading…" forever for
+    /// a machine that will never have anything else to say.
+    #[test]
+    fn header_status_says_no_data_once_every_enabled_plugin_has_reported_with_nothing_to_show() {
+        assert_eq!(
+            header_status(false, false, true),
+            ("no data", false),
+            "a completed pass with nothing live must not read as still fetching"
+        );
+        assert_eq!(
+            header_status(false, false, false),
+            ("reading…", false),
+            "genuinely nothing fetched yet is unchanged"
+        );
     }
 
     // ── merge (`readings()`) ─────────────────────────────────────────────
@@ -12204,6 +12624,65 @@ mod title_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A seed that cannot write must not settle `codex`/`claude` as "the user
+    /// deleted it": both ship `deliver_if_absent = false` (an install without
+    /// them is assumed to have removed them on purpose — see
+    /// `seed::BUILTIN_UPGRADES`), so `upgrade_builtin_manifests` reads the
+    /// still-empty `dir` the seed step left behind as exactly that, settles
+    /// the marker, and neither headline provider ever gets a second launch to
+    /// try again. Unix-only: a read-only directory is the least contrived way
+    /// to make the seed step's own write fail without touching `seed.rs`.
+    #[test]
+    #[cfg(unix)]
+    fn a_seed_write_failure_does_not_settle_the_built_ins_that_never_redeliver() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-seed-write-failure-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert!(
+            truly_fresh_install(),
+            "a scratch config with no markers at all is what a fresh install looks like"
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+            .expect("deny writes into the plugins directory");
+
+        seed_and_upgrade_builtins(&dir);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions for the assertions and cleanup below");
+
+        for id in ["codex", "claude"] {
+            assert!(
+                config::builtin_migrated(id).is_none(),
+                "{id} must stay undecided after a launch that could not write it \
+                 — settling it here reads exactly like the user having deleted it"
+            );
+            assert!(
+                !dir.join(format!("{id}.toml")).exists(),
+                "{id}.toml must not exist — the write that would have created it failed"
+            );
+        }
+
+        // The next launch, disk trouble gone: both reach the machine as if
+        // this were still the fresh install it always was.
+        seed_and_upgrade_builtins(&dir);
+        for id in ["codex", "claude"] {
+            assert!(
+                dir.join(format!("{id}.toml")).exists(),
+                "{id}.toml must reach the machine once the disk is writable again"
+            );
+            assert!(
+                config::builtin_migrated(id).is_some(),
+                "{id} is settled once it actually reaches disk"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Every built-in whose file is missing from `dir` is named in `logged`,
     /// and **no** built-in whose file is there is.
     fn logged_exactly_for(dir: &std::path::Path, logged: &[String]) {
@@ -12447,6 +12926,52 @@ mod title_tests {
         );
         assert!(out.iter().find(|r| r.id == "alpha").unwrap().bare_when_sole);
         assert!(!out.iter().find(|r| r.id == "beta").unwrap().bare_when_sole);
+    }
+
+    /// A plugin with no cache entry at all — never fetched, not merely
+    /// filtered out of `readings()` — is what keeps this `false`; every
+    /// enabled plugin needs its own entry, whatever that entry contains.
+    #[test]
+    fn every_enabled_plugin_has_reported_needs_a_cache_entry_for_each_one() {
+        let plugins = vec![stub_manifest("alpha", 10), stub_manifest("beta", 20)];
+        let mut cache = HashMap::new();
+        cache.insert("alpha".to_string(), vec![stub_reading("alpha")]);
+
+        assert!(
+            !every_enabled_plugin_has_reported(&plugins, &cache, |_| true),
+            "beta has no cache entry yet"
+        );
+
+        cache.insert("beta".to_string(), Vec::new());
+        assert!(
+            every_enabled_plugin_has_reported(&plugins, &cache, |_| true),
+            "an empty Vec is still a reported fetch — the row was just filtered out of it"
+        );
+    }
+
+    /// A disabled plugin is never waited on — the cache slot it never fills
+    /// must not hold the answer back for the providers that are enabled.
+    #[test]
+    fn every_enabled_plugin_has_reported_skips_disabled_plugins() {
+        let plugins = vec![stub_manifest("alpha", 10), stub_manifest("beta", 20)];
+        let mut cache = HashMap::new();
+        cache.insert("alpha".to_string(), vec![stub_reading("alpha")]);
+
+        assert!(
+            every_enabled_plugin_has_reported(&plugins, &cache, |m| m.id == "alpha"),
+            "beta is disabled — its missing cache entry must not count against the answer"
+        );
+    }
+
+    /// No enabled plugin at all is vacuously "everyone has reported" —
+    /// exactly the state a fresh header must not read as still fetching.
+    #[test]
+    fn every_enabled_plugin_has_reported_is_true_with_no_enabled_plugin() {
+        let plugins = vec![stub_manifest("alpha", 10)];
+        let cache = HashMap::new();
+        assert!(every_enabled_plugin_has_reported(&plugins, &cache, |_| {
+            false
+        }));
     }
 
     // ── dynamic sub-account rows (log-file multi-account) ─────────────────
@@ -15870,6 +16395,27 @@ mod title_tests {
         );
     }
 
+    /// The regression: a second launch's note used to read as nothing to do
+    /// once the window was already visible, even though "visible" never
+    /// meant "on top" — dock mode, another app in front, the same
+    /// window the note was trying to reach. The note is consumed either
+    /// way; what changed is what happens with it.
+    #[test]
+    fn show_request_action_raises_a_visible_window_instead_of_dropping_the_request() {
+        assert_eq!(show_request_action(false, false), ShowRequestAction::None);
+        assert_eq!(show_request_action(false, true), ShowRequestAction::None);
+        assert_eq!(
+            show_request_action(true, false),
+            ShowRequestAction::Present,
+            "hidden: the ordinary present-and-place sequence"
+        );
+        assert_eq!(
+            show_request_action(true, true),
+            ShowRequestAction::Raise,
+            "visible but possibly buried: raise it, don't drop the request"
+        );
+    }
+
     /// [`renewal_ping_due`]'s floor and its clamp of a `pinged_at` from the
     /// future — the same two cases `ping_due`'s own tests pin for the
     /// window ping — with the defensive no-value case (`renewal = None`)
@@ -17379,6 +17925,60 @@ mod title_tests {
         std::fs::remove_dir_all(&dir).ok();
 
         assert_eq!(found, None);
+    }
+
+    /// Two files declaring the same id must resolve to the one
+    /// `plugin::manifest::load_dir` actually keeps — lowest `order`, ties
+    /// broken by path, the same rule `dedup_plugin_ids` relies on to call the
+    /// loser a duplicate. Directory-listing order is neither, and is not even
+    /// alphabetical on every filesystem this runs on: these two names are
+    /// picked because `read_dir` on this machine's temp filesystem hands
+    /// `zzz-winner.toml` back before `aaa-shadowed.toml`, so a scan that
+    /// simply returns whichever file it meets first resolves to the
+    /// higher-`order` loser under this exact arrangement, which is why it
+    /// is the one pinned here.
+    #[test]
+    fn find_plugin_manifest_path_resolves_a_duplicate_id_the_way_the_loader_would() {
+        let dir = temp_plugins_dir("duplicate-id");
+        let wins = dir.join("aaa-shadowed.toml");
+        let loses = dir.join("zzz-winner.toml");
+        std::fs::write(&wins, stub_manifest_toml("dup", 1)).expect("write fixture");
+        std::fs::write(&loses, stub_manifest_toml("dup", 9)).expect("write fixture");
+
+        let found = find_plugin_manifest_path(&dir, "dup");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            found,
+            Some(wins),
+            "the lowest-`order` file wins a duplicate id, not whichever the scan meets first"
+        );
+    }
+
+    /// A metadata read that fails for a reason other than absence — here, a
+    /// directory whose search permission was pulled out from under it — must
+    /// answer "not free", the same as a removal that failed outright a few
+    /// lines below it. Answering "free" is what let Remove wipe a plugin's
+    /// settings while its manifest was still sitting there, unreadable
+    /// rather than gone.
+    #[test]
+    #[cfg(unix)]
+    fn remove_unparsable_remnant_treats_an_unreadable_metadata_as_not_free() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_plugins_dir("remnant-metadata-error");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o600))
+            .expect("deny traversal into the directory");
+
+        let free = remove_unparsable_remnant(&dir, "acme");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions so cleanup can remove the directory");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            !free,
+            "a metadata error that is not NotFound must not read as an empty slot"
+        );
     }
 
     // ── Registry: check-updates / install / update ────────────────────────
