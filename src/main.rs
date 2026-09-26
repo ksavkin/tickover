@@ -5606,9 +5606,11 @@ fn window_rows(
     r: &ProviderReading,
     now: u64,
     seen: &dyn Fn(&str) -> Option<config::SeenWindow>,
-    // Burn projection per window, from the history store — `None` answers
-    // draw no hatch. Tests pass [`no_projection`]; production passes a
-    // closure over the shared snapshot.
+    // Per-window projection hatch — a straight-line pace of the window's own
+    // percentage (`quota_pace`), with a burn figure added to the caption only
+    // when local history has counted tokens for it. `None` answers draw no
+    // hatch at all. Tests pass `NO_PROJ`; production passes a closure over
+    // the shared snapshot.
     proj: &ProjectionFn<'_>,
 ) -> Vec<(String, WindowData)> {
     // A window the provider reported no percentage for is left out rather than
@@ -5744,10 +5746,90 @@ fn cached_window_tokens(
     tokens
 }
 
-/// The quota-projection hatch's one input (design §4): where the burn rate
-/// lands the window at reset, its tone, and the right-hand caption.
-/// `None` — nothing drawn — when there is no history to project from, no
-/// window bounds, or nothing spent yet; a projection never fabricates.
+/// A window's start from what it currently states — `resets_at - period` —
+/// not [`window_start`], which also projects one forward once the provider
+/// has stopped reporting the window at all: this is asked only of a window
+/// that is still stating both of its own bounds, and answers `None` rather
+/// than guess when either is missing or the subtraction would wrap.
+fn window_hatch_start(w: &Window) -> Option<u64> {
+    w.resets_at?.checked_sub(w.period_minutes?.checked_mul(60)?)
+}
+
+/// The quota-projection hatch's time-linear half: a straight-line pace of
+/// the percentage already used, needing nothing from local history at all.
+/// A reading's own numbers already say everything this draws — spending
+/// bought `used` percent for however many tokens it took, so the same rate
+/// run at `tokens / elapsed` per hour over the hours left buys `used +
+/// (tokens / elapsed) * left * (used / tokens)` more; the token count
+/// cancels out of its own derivation, and this function never asks a caller
+/// for one. What is left is `used * period / elapsed`.
+///
+/// `None` before the window opens, once it has reset, when `used` is not
+/// yet positive, or before `elapsed` clears the floor below — a pace read
+/// off the first few minutes of a five-hour window is noise wearing a
+/// percentage sign, not a projection. The floor is `max(10 minutes, period
+/// / 10)`: ten minutes alone would let a window shorter than that finish
+/// before ever drawing one, and a tenth of the period alone would hold a
+/// five-hour window's hatch back for a full thirty minutes, which the flat
+/// floor already covers.
+///
+/// Returns the percentage (clamped to 100), its tone (1 ok / 2 warn / 3
+/// crit), and — set only once the pace crosses 100 — when that happens, so
+/// the caller can name it without this function formatting a time zone of
+/// its own.
+fn quota_pace(w: &Window, used: f64, now: u64) -> Option<(f32, i32, Option<u64>)> {
+    let reset = w.resets_at?;
+    let start = window_hatch_start(w)?;
+    if now <= start || now >= reset || used <= 0.0 {
+        return None;
+    }
+    let period = reset - start;
+    let elapsed = now - start;
+    if elapsed < 600.max(period / 10) {
+        return None;
+    }
+    let projected = used * period as f64 / elapsed as f64;
+    if projected < 100.0 {
+        let tone = if projected >= 90.0 { 2 } else { 1 };
+        return Some((projected as f32, tone, None));
+    }
+    // Reaching the cap before reset is the crit state — it names when,
+    // clamped to the reset itself: the straight line can overshoot past it,
+    // but the window cannot cap any later than its own end.
+    let caps_at = start
+        .saturating_add((elapsed as f64 * 100.0 / used) as u64)
+        .min(reset);
+    Some((100.0, 3, Some(caps_at)))
+}
+
+/// The hatch's right-hand caption, composed the same way whichever cfg
+/// variant of [`quota_projection`] is asking: the crit case names when the
+/// pace caps out and nothing else — a rate that has already blown past 100%
+/// has nothing more useful to add — otherwise the arrow always appears, with
+/// `burn` (a token figure already formatted behind the `history` feature,
+/// since this function is not) in front of it whenever there is one.
+fn quota_caption(pct: f32, caps_at: Option<u64>, burn: Option<&str>) -> String {
+    match caps_at {
+        Some(caps_at) => {
+            let at = chrono::DateTime::from_timestamp(caps_at as i64, 0)
+                .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                .unwrap_or_default();
+            format!("caps ~{at}")
+        }
+        None => match burn {
+            Some(burn) => format!("burn {burn}/h → ~{pct:.0}%"),
+            None => format!("→ ~{pct:.0}%"),
+        },
+    }
+}
+
+/// The quota-projection hatch: [`quota_pace`]'s percentage and tone, plus a
+/// burn figure in the caption whenever local history has counted tokens for
+/// this window — never for an `Extra` window, whose tokens are the
+/// provider's account-wide spend rather than that one model's own. Drawing
+/// the hatch itself needs no history at all — the `not(feature = "history")`
+/// variant below draws the identical percentage and tone from the same
+/// [`quota_pace`] — only the caption's token half depends on the feature.
 #[cfg(feature = "history")]
 fn quota_projection(
     hist: &HistoryShared,
@@ -5757,60 +5839,28 @@ fn quota_projection(
     used: f64,
     now: u64,
 ) -> Option<(f32, i32, String)> {
-    let guard = hist.borrow();
-    let store = guard.as_ref()?;
-    let reset = w.resets_at?;
-    let period_secs = w.period_minutes?.checked_mul(60)?;
-    let start = reset.checked_sub(period_secs)?;
-    // Only an open window projects: before its start there is no burn to
-    // measure, past its reset the percentage belongs to the next window.
-    if now <= start || now >= reset {
-        return None;
-    }
-    // The store-touching half, asked once per (provider, start) for as long
-    // as `proj_cache` isn't cleared — every other window row this tick
-    // draws for the same provider and window shares this one lookup.
-    let tokens = cached_window_tokens(proj_cache, (provider.to_string(), start), || {
-        tickover::history::query::window_tokens(store, provider, start)
-    })?;
-    // Recomputed from this tick's own `now` every time, unlike `tokens`
-    // above — the store only needs asking once per snapshot, but the hours
-    // elapsed since `start` move every second regardless of it.
-    let elapsed_h = now.saturating_sub(start).max(1) as f64 / 3600.0;
-    if used <= 0.0 || elapsed_h <= 0.0 {
-        return None;
-    }
-    let hours_left = (reset - now) as f64 / 3600.0;
-    // The window's own reading implies % per token — no provider-stated cap
-    // needed: tokens so far bought `used` percent, so the same pace over the
-    // hours left buys burn·hours_left·pct_per_token more.
-    let pct_per_token = used / tokens as f64;
-    let burn_per_h = tokens as f64 / elapsed_h;
-    let projected = used + burn_per_h * hours_left * pct_per_token;
-    if projected >= 100.0 {
-        // Reaching the cap before reset is the crit state — it names when.
-        let pct_per_h = used / elapsed_h;
-        let caps_at = if pct_per_h > 0.0 {
-            now + (((100.0 - used) / pct_per_h) * 3600.0) as u64
-        } else {
-            reset
-        };
-        let at = chrono::DateTime::from_timestamp(caps_at as i64, 0)
-            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
-            .unwrap_or_default();
-        Some((100.0, 3, format!("caps ~{at}")))
+    let (pct, tone, caps_at) = quota_pace(w, used, now)?;
+    let burn = if caps_at.is_none() && w.role != Role::Extra {
+        window_hatch_start(w).and_then(|start| {
+            // The store-touching half, asked once per (provider, start) for
+            // as long as `proj_cache` isn't cleared — every other window row
+            // this tick draws for the same provider and window shares this
+            // one lookup. `fetch` runs with nothing borrowed going in, per
+            // `cached_window_tokens`'s own doc.
+            let tokens = cached_window_tokens(proj_cache, (provider.to_string(), start), || {
+                hist.borrow().as_ref().and_then(|store| {
+                    tickover::history::query::window_tokens(store, provider, start)
+                })
+            })?;
+            let elapsed_h = now.saturating_sub(start).max(1) as f64 / 3600.0;
+            Some(stats_cli::fmt_tokens(
+                (tokens as f64 / elapsed_h).round() as u64
+            ))
+        })
     } else {
-        let tone = if projected >= 90.0 { 2 } else { 1 };
-        Some((
-            projected as f32,
-            tone,
-            format!(
-                "burn {}/h → ~{:.0}%",
-                stats_cli::fmt_tokens(burn_per_h.round() as u64),
-                projected
-            ),
-        ))
-    }
+        None
+    };
+    Some((pct, tone, quota_caption(pct, caps_at, burn.as_deref())))
 }
 
 #[cfg(not(feature = "history"))]
@@ -5818,11 +5868,152 @@ fn quota_projection(
     _: &HistoryShared,
     _: &ProjectionCache,
     _: &str,
-    _: &Window,
-    _: f64,
-    _: u64,
+    w: &Window,
+    used: f64,
+    now: u64,
 ) -> Option<(f32, i32, String)> {
-    None
+    let (pct, tone, caps_at) = quota_pace(w, used, now)?;
+    Some((pct, tone, quota_caption(pct, caps_at, None)))
+}
+
+#[cfg(test)]
+mod quota_pace_tests {
+    use super::*;
+
+    fn primary(resets_at: u64, period_minutes: u64) -> Window {
+        Window {
+            key: "5H:".into(),
+            label: "5H".into(),
+            role: Role::Primary,
+            used_percent: None,
+            resets_at: Some(resets_at),
+            period_minutes: Some(period_minutes),
+        }
+    }
+
+    // A five-hour window: period_secs = 18_000, floor = max(600, 1_800).
+    const START: u64 = 1_000_000;
+    const PERIOD_MIN: u64 = 300;
+    const PERIOD_SECS: u64 = PERIOD_MIN * 60;
+    const RESET: u64 = START + PERIOD_SECS;
+
+    #[test]
+    fn a_closed_window_never_projects() {
+        let w = primary(RESET, PERIOD_MIN);
+        assert_eq!(quota_pace(&w, 50.0, START - 500), None, "well before start");
+        assert_eq!(quota_pace(&w, 50.0, START), None, "not open yet");
+        assert_eq!(quota_pace(&w, 50.0, RESET), None, "already reset");
+        assert_eq!(quota_pace(&w, 50.0, RESET + 10), None, "past reset");
+    }
+
+    #[test]
+    fn below_the_floor_draws_nothing() {
+        let w = primary(RESET, PERIOD_MIN);
+        // Five minutes into a five-hour window is well under the 1_800s floor.
+        assert_eq!(quota_pace(&w, 2.0, START + 300), None);
+    }
+
+    #[test]
+    fn exactly_at_the_floor_projects_the_straight_line() {
+        let w = primary(RESET, PERIOD_MIN);
+        let now = START + 1_800; // the floor itself, inclusive
+        let (pct, tone, caps_at) = quota_pace(&w, 2.0, now).expect("the floor itself draws");
+        // used * period / elapsed = 2.0 * 18_000 / 1_800 = 20.0 exactly.
+        assert_eq!(pct, 20.0);
+        assert_eq!(tone, 1);
+        assert_eq!(caps_at, None);
+    }
+
+    #[test]
+    fn a_pace_past_the_cap_names_when_and_never_later_than_reset() {
+        let w = primary(RESET, PERIOD_MIN);
+        let now = START + 1_800;
+        // 15% used at the floor projects to 150%, well past the cap.
+        let (pct, tone, caps_at) = quota_pace(&w, 15.0, now).expect("well past 100%");
+        assert_eq!(pct, 100.0);
+        assert_eq!(tone, 3);
+        let caps_at = caps_at.expect("the crit case always names when");
+        assert!(caps_at <= RESET, "never later than the window's own end");
+    }
+
+    #[test]
+    fn used_at_zero_never_projects() {
+        let w = primary(RESET, PERIOD_MIN);
+        assert_eq!(quota_pace(&w, 0.0, START + 1_800), None);
+    }
+}
+
+#[cfg(all(test, feature = "history"))]
+mod quota_projection_tests {
+    use super::*;
+
+    fn primary(resets_at: u64, period_minutes: u64) -> Window {
+        Window {
+            key: "5H:".into(),
+            label: "5H".into(),
+            role: Role::Primary,
+            used_percent: None,
+            resets_at: Some(resets_at),
+            period_minutes: Some(period_minutes),
+        }
+    }
+
+    const START: u64 = 1_000_000;
+    const PERIOD_MIN: u64 = 300;
+    const RESET: u64 = START + PERIOD_MIN * 60;
+    const NOW: u64 = START + 1_800; // exactly at the floor
+
+    #[test]
+    fn no_history_still_draws_the_hatch_with_a_plain_caption() {
+        let hist: HistoryShared = Rc::new(RefCell::new(None));
+        let cache: ProjectionCache = Rc::new(RefCell::new(HashMap::new()));
+        let w = primary(RESET, PERIOD_MIN);
+        let (pct, tone, caption) =
+            quota_projection(&hist, &cache, "codex", &w, 2.0, NOW).expect("no store still draws");
+        assert_eq!(pct, 20.0);
+        assert_eq!(tone, 1);
+        assert_eq!(caption, "→ ~20%");
+    }
+
+    #[test]
+    fn history_tokens_add_a_burn_figure_to_the_same_caption() {
+        let hist: HistoryShared = Rc::new(RefCell::new(None));
+        let cache: ProjectionCache = Rc::new(RefCell::new(HashMap::new()));
+        // Pre-seeded rather than fetched: `cached_window_tokens` never calls
+        // `fetch` on a hit, so this never touches `hist` (left empty above) —
+        // the same reason a real tick only ever asks the store once.
+        cache
+            .borrow_mut()
+            .insert(("codex".to_string(), START), Some(3_600));
+        let w = primary(RESET, PERIOD_MIN);
+        let (pct, tone, caption) = quota_projection(&hist, &cache, "codex", &w, 2.0, NOW)
+            .expect("open window, past the floor");
+        assert_eq!(pct, 20.0);
+        assert_eq!(tone, 1);
+        // 3_600 tokens over 0.5h (1_800s) is 7_200/h, formatted "7.2K".
+        assert_eq!(caption, "burn 7.2K/h → ~20%");
+    }
+
+    #[test]
+    fn an_extra_window_never_shows_a_burn_figure_even_with_history() {
+        let hist: HistoryShared = Rc::new(RefCell::new(None));
+        let cache: ProjectionCache = Rc::new(RefCell::new(HashMap::new()));
+        cache
+            .borrow_mut()
+            .insert(("codex".to_string(), START), Some(3_600));
+        let w = Window {
+            role: Role::Extra,
+            ..primary(RESET, PERIOD_MIN)
+        };
+        let (pct, tone, caption) = quota_projection(&hist, &cache, "codex", &w, 2.0, NOW)
+            .expect("an Extra window still draws its own hatch");
+        assert_eq!(pct, 20.0);
+        assert_eq!(tone, 1);
+        assert_eq!(
+            caption, "→ ~20%",
+            "an Extra window's tokens are the account's, not this window's own"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "history"))]
@@ -6225,6 +6416,18 @@ fn activity_data(
     }
 }
 
+/// The plugin id a report row's history lookups key on — the owning
+/// manifest's id, never the reading's own: a multi-surface provider's history
+/// is filed once, under its plugin id, and a reading id like `claude-cli` has
+/// never been a key into it. Split out from [`open_history_report`] so a
+/// two-surface fixture can pin the answer without a live store.
+#[cfg(feature = "history")]
+fn report_row_id(plugins: &[PluginManifest], r: &ProviderReading) -> String {
+    owning_manifest(plugins, &r.id)
+        .map(|m| m.id.clone())
+        .unwrap_or_else(|| r.id.clone())
+}
+
 /// "Full report ↗": render the HTML report from the in-memory snapshot and
 /// hand it to the browser. Runs on the callback — `compute` is a single
 /// pass over buckets the store already holds, so no worker is worth the
@@ -6233,9 +6436,8 @@ fn activity_data(
 fn open_history_report(ctx: &Ctx) {
     let store = ctx.history.borrow();
     let Some(store) = store.as_ref() else { return };
-    let enabled: std::collections::HashSet<String> = ctx
-        .plugins
-        .borrow()
+    let plugins = ctx.plugins.borrow();
+    let enabled: std::collections::HashSet<String> = plugins
         .iter()
         .filter(|m| plugin_enabled(m))
         .map(|m| m.id.clone())
@@ -6243,47 +6445,54 @@ fn open_history_report(ctx: &Ctx) {
     let stats = tickover::history::query::compute(store, 30, &enabled);
     let now = now_unix();
     // The panel's live readings become the report's RIGHT NOW cards — same
-    // primary window, same projection math the quota blocks already drew.
-    let quota: Vec<tickover::history::report::QuotaNow> =
-        readings(&ctx.plugins.borrow(), &ctx.cache.borrow())
-            .iter()
-            .filter_map(|r| {
-                let w = r.primary_window()?;
-                let used = w.used_percent?;
-                let proj =
-                    quota_projection(&ctx.history, &ctx.projection_cache, &r.id, w, used, now);
-                let weekly = w
-                    .period_minutes
-                    .map_or(w.role == Role::Secondary, |m| m > 720);
-                let name = window_title(w);
-                let (_, rel, at, ..) =
-                    window_view(now, used, w.resets_at, w.period_minutes, weekly, &name);
-                let reset_hint = if rel.is_empty() {
-                    at.clone()
-                } else if at.is_empty() {
-                    rel
-                } else {
-                    format!("{rel} · {at}")
-                };
-                let burn_per_hour = w
-                    .resets_at
-                    .zip(w.period_minutes)
-                    .and_then(|(reset, m)| reset.checked_sub(m * 60))
-                    .and_then(|start| tickover::history::query::window_burn(store, &r.id, start))
-                    .map(|(tokens, h)| (tokens as f64 / h).round() as u64);
-                Some(tickover::history::report::QuotaNow {
-                    provider: r.id.clone(),
-                    label: name,
-                    used_pct: used,
-                    projected_pct: proj.map(|p| p.0 as f64),
-                    reset_hint,
-                    burn_per_hour,
+    // primary window, same projection math the quota blocks already drew,
+    // keyed the same way: by the owning plugin's id ([`report_row_id`]), so a
+    // multi-surface provider's burn figure is found under the id its history
+    // was actually filed under, not one of its reading ids.
+    let quota: Vec<tickover::history::report::QuotaNow> = readings(&plugins, &ctx.cache.borrow())
+        .iter()
+        .filter_map(|r| {
+            let w = r.primary_window()?;
+            let used = w.used_percent?;
+            let id = report_row_id(&plugins, r);
+            let proj = quota_projection(&ctx.history, &ctx.projection_cache, &id, w, used, now);
+            let weekly = w
+                .period_minutes
+                .map_or(w.role == Role::Secondary, |m| m > 720);
+            let name = window_title(w);
+            let (_, rel, at, ..) =
+                window_view(now, used, w.resets_at, w.period_minutes, weekly, &name);
+            let reset_hint = if rel.is_empty() {
+                at.clone()
+            } else if at.is_empty() {
+                rel
+            } else {
+                format!("{rel} · {at}")
+            };
+            // Only once the hatch itself drew (so the report never states a
+            // burn rate for a window the panel's own floor already refused),
+            // and from the very lookup `quota_projection` just made:
+            // `cached_window_tokens` answers a hit straight from the cache,
+            // so this never asks the store a second time.
+            let burn_per_hour = proj.as_ref().and_then(|_| {
+                let start = window_hatch_start(w)?;
+                let elapsed_h = now.saturating_sub(start).max(1) as f64 / 3600.0;
+                cached_window_tokens(&ctx.projection_cache, (id.clone(), start), || {
+                    tickover::history::query::window_tokens(store, &id, start)
                 })
+                .map(|tokens| (tokens as f64 / elapsed_h).round() as u64)
+            });
+            Some(tickover::history::report::QuotaNow {
+                provider: id,
+                label: name,
+                used_pct: used,
+                projected_pct: proj.map(|p| p.0 as f64),
+                reset_hint,
+                burn_per_hour,
             })
-            .collect();
-    let sources: Vec<String> = ctx
-        .plugins
-        .borrow()
+        })
+        .collect();
+    let sources: Vec<String> = plugins
         .iter()
         .filter_map(|m| m.history.as_ref().map(|h| h.root.clone()))
         .collect();
@@ -6302,9 +6511,12 @@ fn open_history_report(ctx: &Ctx) {
 fn open_history_report(_: &Ctx) {}
 
 /// The projection closure `window_rows` consults per window — returns
-/// `(projected_pct, tone, burn_line)` or `None` when history offers no
-/// honest answer. The `+ 'a` bound keeps a borrowed closure legal — a bare
-/// `dyn Fn` alias defaults to `'static` and only `'static` closures pass.
+/// `(projected_pct, tone, burn_line)` or `None` when the window's own bounds
+/// and timing give the pace nothing honest to draw (closed, barely open, or
+/// nothing spent yet — see `quota_pace`); local history only ever changes
+/// what `burn_line` says, never whether one is drawn at all. The `+ 'a` bound
+/// keeps a borrowed closure legal — a bare `dyn Fn` alias defaults to
+/// `'static` and only `'static` closures pass.
 type ProjectionFn<'a> = dyn Fn(&Window, f64) -> Option<(f32, i32, String)> + 'a;
 
 /// Build one `WindowData` row from a reading window and the percentage it
@@ -12321,6 +12533,24 @@ mod title_tests {
             owning_manifest(&plugins, "claude-desktop").map(|m| m.id.as_str()),
             Some("claude"),
             "the plugin's other surface is unaffected"
+        );
+    }
+
+    // ── report_row_id ───────────────────────────────────────────────────────
+
+    /// The bug this function exists to close: a two-surface provider's
+    /// history is filed once, under its plugin id, and a report row built
+    /// from the `cli` surface's reading id must still land on that same key.
+    #[cfg(feature = "history")]
+    #[test]
+    fn report_row_id_resolves_a_two_surface_readings_plugin_id() {
+        let plugins = vec![claude_like_two_surface_manifest()];
+        let r = claude_surface_reading("cli");
+        assert_eq!(r.id, "claude-cli", "the collision this test is about");
+        assert_eq!(
+            report_row_id(&plugins, &r),
+            "claude",
+            "the report must key history lookups on the plugin id, never the reading id"
         );
     }
 

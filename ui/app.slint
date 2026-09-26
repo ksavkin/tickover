@@ -50,13 +50,16 @@ export struct WindowData {
     // of a bar at 0%. False — the default, so a row that forgets to say
     // anything is drawn as an ordinary one — means every other field is real.
     not-started: bool,
-    // Quota × history join (design §4): the burn projection, drawn as a
-    // hatched segment continuing the bar past the solid `pct` fill.
-    // `proj-pct` is where the projection lands (0 = no projection — either
-    // no history or no window bounds, and nothing is drawn rather than
-    // invented); `proj-tone` is 1 ok / 2 warn / 3 crit by the same severity
-    // ladder the fill uses; `burn-line` is the right-hand caption under the
-    // bar ("burn 41.2K/h → ~74%" / "caps ~20:12"), "" when there is none.
+    // The quota-projection hatch: a straight-line pace of the percentage
+    // already used, drawn as a hatched segment continuing the bar past the
+    // solid `pct` fill. `proj-pct` is where that pace lands by reset (0 = no
+    // projection — the window is closed, barely open, or nothing has been
+    // spent yet, and nothing is drawn rather than invented); `proj-tone` is
+    // 1 ok / 2 warn / 3 crit by the same severity ladder the fill uses;
+    // `burn-line` is the right-hand caption under the bar — "→ ~74%" on its
+    // own, "burn 41.2K/h → ~74%" once local history has a token figure to
+    // add, or "caps ~20:12" once the pace crosses 100% — "" when there is no
+    // projection at all.
     proj-pct: float,
     proj-tone: int,
     burn-line: string,

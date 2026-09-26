@@ -29,6 +29,9 @@ pub struct QuotaNow {
     pub used_pct: f64,
     pub projected_pct: Option<f64>,
     pub reset_hint: String,
+    /// `None` whenever `projected_pct` is — the caller only ever fills this
+    /// once the projection itself was drawn, so the card never states a pace
+    /// for a window its own bar has nothing to show for.
     pub burn_per_hour: Option<u64>,
 }
 
@@ -335,16 +338,19 @@ fn right_now(h: &mut String, quota: &[QuotaNow]) {
     h.push_str(
         r#"<div style="display: flex; flex-direction: column; gap: 14px;">
 <div class="row"><h2 class="sec">RIGHT NOW</h2>
-<span class="secnote">live quota, projected from the burn rate in the current window</span></div>
+<span class="secnote">live quota, projected forward at the window's current pace</span></div>
 <div class="grid3">
 "#,
     );
     for q in quota {
         let used = q.used_pct.clamp(0.0, 100.0);
         let proj = q.projected_pct.unwrap_or(used).clamp(0.0, 100.0);
+        // 90 here, not the round-number 85 this used to say: the panel's own
+        // hatch turns amber at 90, and a card and its own bar disagreeing on
+        // where amber starts would tell two stories about the same window.
         let color = if used >= 90.0 || proj >= 100.0 {
             c::CRIT
-        } else if used >= 70.0 || proj >= 85.0 {
+        } else if used >= 70.0 || proj >= 90.0 {
             c::WARN
         } else {
             c::OK

@@ -101,12 +101,13 @@ export component QuotaBlock inherits VerticalLayout {
 
     // Severity follows the *displayed* value, not the raw one: 89.6 shows as
     // "90%", and a 90 printed in amber contradicts the palette's own legend.
-    // Quota × history join (design §4): burn-rate projection drawn as a
-    // 135° hatch continuing the bar past the solid fill — measured is solid,
-    // projected is hatched, and the hatch never counts as quota.
+    // The quota-projection hatch: a straight-line pace of the used
+    // percentage, drawn as a 135° stripe continuing the bar past the solid
+    // fill — measured is solid, projected is hatched, and the hatch never
+    // counts as quota.
     in property <float> proj-pct: 0;   // where the projection lands; 0 = none
     in property <int> proj-tone: 1;    // 1 ok / 2 warn / 3 crit
-    in property <string> burn-line: "";// "burn 41.2K/h → ~74%" / "caps ~20:12"
+    in property <string> burn-line: "";// "→ ~74%" / "burn 41.2K/h → ~74%" / "caps ~20:12"
 
     // The 0.4pp this shifts the bar's colour boundary by is invisible.
     property <color> accent: Theme.sev(root.used-rounded);
