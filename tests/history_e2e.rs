@@ -33,7 +33,21 @@ fn tmpdir(tag: &str) -> PathBuf {
     dir
 }
 
+/// The root, escaped for the TOML basic string it lands in below: on
+/// Windows it arrives as `C:\Users\…`, and TOML reads a bare backslash there
+/// as the start of an escape sequence rather than as a path separator —
+/// `\U`, in particular, is not a recognized one, so the manifest would fail
+/// to parse before a single fixture file was ever read. Same escaping
+/// `tests/reader.rs`'s `codex_like_manifest` uses for the same reason.
+fn toml_escaped_path(root: &std::path::Path) -> String {
+    root.display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
 fn manifest(id: &str, format: &str, root: &std::path::Path, glob: &str) -> PluginManifest {
+    let root = toml_escaped_path(root);
     let text = format!(
         r#"
 id         = "{id}"
@@ -63,9 +77,26 @@ format = "{format}"
 root   = "{root}"
 glob   = "{glob}"
 "#,
-        root = root.display()
     );
     PluginManifest::from_str(&text).unwrap_or_else(|e| panic!("fixture manifest: {e}"))
+}
+
+/// Pins the escaping itself, independent of every other test in this file
+/// running on the host's own platform: a Windows-shaped root, backslashes
+/// and all, must still produce a manifest that parses, and the round-tripped
+/// `[logfile].root` must read back exactly the path that went in. Without
+/// this, the file's own suite could stay green on macOS or Linux — where
+/// every fixture root is already slash-separated — while every test here
+/// still panicked the moment it ran under a Windows CI runner.
+#[test]
+fn manifest_escapes_a_windows_shaped_root_so_it_still_parses() {
+    let root = std::path::Path::new(r"C:\Users\demo\AppData\Roaming\tickover");
+    let m = manifest("winlike", "codex-rollouts", root, "rollout-*.jsonl");
+    assert_eq!(
+        m.logfile.expect("a [logfile] section").root,
+        root.display().to_string(),
+        "the parsed root must match the unescaped path, not the escaped text"
+    );
 }
 
 /// Test manifests are all enabled — mirror the filter the app applies
@@ -178,18 +209,43 @@ fn scan_then_query_matches_the_fixture() {
 #[test]
 fn nothing_but_usage_metadata_leaves_the_extractor() {
     let store_dir = tmpdir("priv-store");
-    let root = tmpdir("priv-claude");
-    fs::create_dir_all(root.join("p")).unwrap();
-    fs::write(root.join("p/s.jsonl"), claude_fixture()).unwrap();
-    fs::write(root.join("rollout-r.jsonl"), codex_fixture()).unwrap();
+    // Separate roots per provider, not one shared directory: a manifest's
+    // glob is matched by basename alone (see `engine_logfile::glob_matches`'s
+    // own doc), so a shared root with `claude`'s broad "**/*.jsonl" would
+    // have it walk `codex`'s file too — harmless for the extraction itself,
+    // but it would leave that file's on-disk cursor stamped fully read
+    // before `codex`'s own scan ever reached it, which is not the thing this
+    // test exists to prove.
+    let claude_root = tmpdir("priv-claude");
+    let codex_root = tmpdir("priv-codex");
+    fs::create_dir_all(claude_root.join("p")).unwrap();
+    fs::write(claude_root.join("p/s.jsonl"), claude_fixture()).unwrap();
+    fs::write(codex_root.join("rollout-r.jsonl"), codex_fixture()).unwrap();
 
     let manifests = vec![
-        manifest("claude", "claude-transcripts", &root, "**/*.jsonl"),
-        manifest("codex", "codex-rollouts", &root, "rollout-*.jsonl"),
+        manifest("claude", "claude-transcripts", &claude_root, "**/*.jsonl"),
+        manifest("codex", "codex-rollouts", &codex_root, "rollout-*.jsonl"),
     ];
     let mut store = HistoryStore::open(&store_dir).unwrap();
-    let _ = scan_tick(&mut store, &manifests, &|_| BTreeMap::new());
+    let scans = scan_tick(&mut store, &manifests, &|_| BTreeMap::new());
     store.commit().unwrap();
+
+    // The positive control: prove the scan actually extracted usage before
+    // asserting the sentinel's absence below, so a scanner gone quiet (an
+    // extractor that stopped matching, a glob that stopped finding files)
+    // cannot pass this test by leaving both the store and the prompt equally
+    // empty. Same fixtures, same expected figures as
+    // `scan_then_query_matches_the_fixture`.
+    for s in &scans {
+        assert!(!s.root_missing, "{} fixture root missing", s.provider);
+    }
+    let st = query::compute(&store, 30, &all_enabled(&manifests));
+    let cl = &st.by_provider["claude"];
+    assert_eq!(cl.input, 1000, "claude usage must have been extracted");
+    assert_eq!(cl.messages, 1);
+    let cx = &st.by_provider["codex"];
+    assert_eq!(cx.input, 6000, "codex usage must have been extracted");
+    assert!(st.total.sum() > 0, "the scan produced no usage at all");
 
     // The sentinel prompt is in the fixture twice (a user line per format);
     // it must be in neither persistent file nor the report.
@@ -202,10 +258,17 @@ fn nothing_but_usage_metadata_leaves_the_extractor() {
         );
     }
 
-    let st = query::compute(&store, 30, &all_enabled(&manifests));
     let report_path = store_dir.join("report.html");
     let written = report::write(&st, Some(report_path.clone()), false, &[], &[]).unwrap();
     let html = fs::read_to_string(&written).unwrap();
+    // The report's own positive control: its "TOKENS" card always renders
+    // `st.total.sum()` abbreviated to one decimal place (6500 + 9800 here),
+    // so an empty or broken report cannot pass the leak check below by
+    // having nothing in it at all.
+    assert!(
+        html.contains("16.3K"),
+        "report must show the usage it computed, not just omit the sentinel"
+    );
     assert!(!html.contains(SENTINEL), "report leaked prompt content");
 
     // The report file is created owner-only.
@@ -216,7 +279,7 @@ fn nothing_but_usage_metadata_leaves_the_extractor() {
         assert_eq!(mode, 0o600, "report must be mode 0600, got {mode:o}");
     }
 
-    for d in [&store_dir, &root] {
+    for d in [&store_dir, &claude_root, &codex_root] {
         let _ = fs::remove_dir_all(d);
     }
 }

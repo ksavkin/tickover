@@ -16,6 +16,35 @@ fn fixtures_dir() -> PathBuf {
         .join("fixtures")
 }
 
+/// A private, one-off copy of the oracle fixture, nested one level under a
+/// fresh temp directory — for the "recursive walk from a parent directory"
+/// test below, which needs a `root` whose fixture is *not* directly inside
+/// it. `collect_log_files` walks every file under `root` and matches by
+/// basename alone (`engine_logfile::glob_matches` only looks at the part of
+/// `glob` after its last path separator), so pointing that test at the real,
+/// checked-in `tests/` directory — the fixture's own parent's parent — would
+/// let any other `rollout-*.jsonl` fixture ever placed anywhere else under
+/// `tests/` change what "exactly one reading" there actually proves. A
+/// private nested copy has nothing else under it to find.
+fn isolated_nested_fixture() -> PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "tickover-reader-nested-{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    let nested = root.join("nested");
+    std::fs::create_dir_all(&nested).expect("create a nested temp dir");
+    std::fs::copy(
+        fixtures_dir().join("rollout-sample.jsonl"),
+        nested.join("rollout-sample.jsonl"),
+    )
+    .expect("copy the oracle fixture into it");
+    root
+}
+
 /// A Codex-like manifest whose `[logfile].root` is the fixture directory
 /// itself (an absolute, literal path — `expand_home` leaves it unchanged).
 /// No `root_env` is set, so the test never touches a real environment
@@ -24,7 +53,7 @@ fn fixtures_dir() -> PathBuf {
 /// The root is escaped for the TOML basic string it lands in: on Windows it
 /// arrives as `D:\a\tickover\…`, and TOML reads a backslash there as the
 /// start of an escape sequence rather than as a path separator.
-fn codex_like_manifest(root: &std::path::Path) -> PluginManifest {
+fn codex_like_manifest(root: &std::path::Path, glob: &str) -> PluginManifest {
     let root = root
         .display()
         .to_string()
@@ -67,7 +96,7 @@ fn codex_like_manifest(root: &std::path::Path) -> PluginManifest {
 
         [logfile]
         root          = "{root}"
-        glob          = "**/rollout-*.jsonl"
+        glob          = "{glob}"
         container_key = "rate_limits"
         "#,
     );
@@ -76,7 +105,7 @@ fn codex_like_manifest(root: &std::path::Path) -> PluginManifest {
 
 #[test]
 fn parses_last_reading_matching_oracle() {
-    let m = codex_like_manifest(&fixtures_dir());
+    let m = codex_like_manifest(&fixtures_dir(), "**/rollout-*.jsonl");
     let readings = engine_logfile::fetch(&m, &[], &std::collections::BTreeMap::new());
     assert_eq!(
         readings.len(),
@@ -116,14 +145,13 @@ fn parses_last_reading_matching_oracle() {
 
 #[test]
 fn fetch_falls_back_across_files_when_pointed_at_a_parent_directory() {
-    // The fixture lives one level down (tests/fixtures/rollout-sample.jsonl);
-    // pointing the manifest's root at its parent proves the engine's glob
-    // walk is recursive, not a flat listing of `root` itself.
-    let dir = fixtures_dir()
-        .parent()
-        .expect("fixtures dir has a parent")
-        .to_path_buf();
-    let m = codex_like_manifest(&dir);
+    // The fixture lives one level down from `root` here too (a private copy,
+    // not `tests/fixtures/rollout-sample.jsonl` itself — see
+    // `isolated_nested_fixture`'s own doc for why): pointing the manifest's
+    // root at its parent proves the engine's glob walk is recursive, not a
+    // flat listing of `root` itself.
+    let root = isolated_nested_fixture();
+    let m = codex_like_manifest(&root, "rollout-*.jsonl");
     let readings = engine_logfile::fetch(&m, &[], &std::collections::BTreeMap::new());
 
     assert_eq!(readings.len(), 1);
@@ -135,4 +163,5 @@ fn fetch_falls_back_across_files_when_pointed_at_a_parent_directory() {
         readings[0].primary_window().unwrap().used_percent,
         Some(11.0)
     );
+    std::fs::remove_dir_all(&root).ok();
 }

@@ -2990,6 +2990,16 @@ fn the_corpus_has_a_line_for_every_rule_the_validator_enforces() {
     };
 
     let manifest_src = include_str!("../src/plugin/manifest.rs");
+    // Production code only, up to the one `#[cfg(test)]` this file carries —
+    // its own `mod tests` runs thousands of lines past that marker, and a
+    // plain substring count over the whole file would count a call this
+    // test module happened to make the same way it counts one that actually
+    // backs a refusal, drifting the very number this test exists to keep
+    // honest.
+    const TEST_MOD_MARKER: &str = "\n#[cfg(test)]\nmod tests {";
+    let manifest_src = &manifest_src[..manifest_src
+        .find(TEST_MOD_MARKER)
+        .unwrap_or_else(|| panic!("test module marker moved — update this scope"))];
     let validate_fns = [
         "pub fn validate(&self)",
         "fn validate_identity(&self)",

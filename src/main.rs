@@ -718,7 +718,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // render — every plugin is fetched on this thread, blocking.
         *cache.borrow_mut() = sync_fetch_all(&plugins.borrow());
     } else {
-        spawn_all_plugin_fetches(&plugins.borrow(), &plugin_tx, &fetching);
+        spawn_all_plugin_fetches(&plugins.borrow(), &plugin_tx, &fetching, Instant::now());
     }
     refresh_model(
         &app,
@@ -845,7 +845,12 @@ fn wire_ui_callbacks(app: &AppWindow, ctx: &Ctx) {
     {
         let ctx = ctx.clone();
         app.on_refresh(move || {
-            spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
+            spawn_all_plugin_fetches(
+                &ctx.plugins.borrow(),
+                &ctx.plugin_tx,
+                &ctx.fetching,
+                Instant::now(),
+            );
             if let Some(app) = ctx.weak.upgrade() {
                 refresh_model(
                     &app,
@@ -1185,6 +1190,7 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                         plugin_options(m),
                         &ctx.plugin_tx,
                         &ctx.fetching,
+                        Instant::now(),
                     );
                 }
             } else {
@@ -1225,6 +1231,7 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                         plugin_options(m),
                         &ctx.plugin_tx,
                         &ctx.fetching,
+                        Instant::now(),
                     );
                 }
             } else {
@@ -1267,7 +1274,12 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
             // pre-reset manifest — otherwise its stale result would be the one
             // that lands in the (now-cleared) cache.
             ctx.fetching.borrow_mut().clear();
-            spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
+            spawn_all_plugin_fetches(
+                &ctx.plugins.borrow(),
+                &ctx.plugin_tx,
+                &ctx.fetching,
+                Instant::now(),
+            );
             refresh_all(&ctx);
         });
     }
@@ -1292,6 +1304,7 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                         plugin_options(m),
                         &ctx.plugin_tx,
                         &ctx.fetching,
+                        Instant::now(),
                     );
                 }
             }
@@ -2007,7 +2020,12 @@ fn run_fast_timer(
 
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == tray_menu.refresh_id {
-                spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
+                spawn_all_plugin_fetches(
+                    &ctx.plugins.borrow(),
+                    &ctx.plugin_tx,
+                    &ctx.fetching,
+                    Instant::now(),
+                );
                 refresh_model(
                     &app,
                     &ctx.model,
@@ -2096,6 +2114,7 @@ fn run_slow_timer(
                         plugin_options(m),
                         &ctx.plugin_tx,
                         &ctx.fetching,
+                        Instant::now(),
                     );
                 }
             }
@@ -2552,7 +2571,12 @@ fn drain_tray_clicks(app: &AppWindow, ctx: &Ctx) -> usize {
                     position_popover(app, &ctx.anchor, &ctx.pending_position, Shown::ByTrayClick);
                 }
             } else if !dismissed {
-                spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
+                spawn_all_plugin_fetches(
+                    &ctx.plugins.borrow(),
+                    &ctx.plugin_tx,
+                    &ctx.fetching,
+                    Instant::now(),
+                );
                 if should_refresh_panel(app.window().is_visible(), true) {
                     refresh_model(
                         app,
@@ -3165,7 +3189,7 @@ fn reload_and_fetch(
     // manifest set can't dedupe away the fresh one spawned below — mirrors
     // `reset-plugins`'s own comment on the same race.
     fetching.borrow_mut().clear();
-    spawn_all_plugin_fetches(&plugins.borrow(), tx, fetching);
+    spawn_all_plugin_fetches(&plugins.borrow(), tx, fetching, Instant::now());
 }
 
 /// `add-plugin`'s intended write target for a newly-imported manifest's
@@ -3695,12 +3719,21 @@ fn drain_engine_diagnostics() {
 /// spawn time — the same instant a fetch is decided to happen — not inside
 /// the background thread, so a config change mid-flight can't retroactively
 /// alter an already-dispatched fetch.
+///
+/// `now` is a parameter rather than read here with `Instant::now()`, the
+/// same reason [`ping_probe_decision`] takes one: a test that wants to prove
+/// the stalled-fetch path needs an `InFlight` already older than
+/// [`FETCH_PATIENCE`], and the only way to build that without ever
+/// subtracting from `Instant::now()` — which panics if the result would
+/// precede the monotonic clock's own epoch — is to hand this function a
+/// `now` computed by *adding* to the `started` it recorded.
 fn spawn_plugin_fetch(
     m: &PluginManifest,
     active_surface_ids: Vec<String>,
     options: BTreeMap<String, bool>,
     tx: &mpsc::Sender<(String, u64, Vec<ProviderReading>)>,
     fetching: &Fetching,
+    now: Instant,
 ) {
     if !plugin_enabled(m) {
         return; // disabled plugins are never fetched
@@ -3713,7 +3746,7 @@ fn spawn_plugin_fetch(
     {
         let mut in_flight = fetching.borrow_mut();
         let existing = in_flight.get(&m.id).copied();
-        let elapsed = existing.map(|f| f.started.elapsed());
+        let elapsed = existing.map(|f| now.saturating_duration_since(f.started));
         match admit_fetch(elapsed, FETCH_PATIENCE) {
             Admission::Wait => return,
             // Never a second thread walking this plugin's own fetch
@@ -3747,7 +3780,7 @@ fn spawn_plugin_fetch(
             m.id.clone(),
             InFlight {
                 generation,
-                started: Instant::now(),
+                started: now,
                 stall_logged: false,
             },
         );
@@ -3838,9 +3871,17 @@ fn spawn_all_plugin_fetches(
     plugins: &[PluginManifest],
     tx: &mpsc::Sender<(String, u64, Vec<ProviderReading>)>,
     fetching: &Fetching,
+    now: Instant,
 ) {
     for m in plugins {
-        spawn_plugin_fetch(m, active_surface_ids(m), plugin_options(m), tx, fetching);
+        spawn_plugin_fetch(
+            m,
+            active_surface_ids(m),
+            plugin_options(m),
+            tx,
+            fetching,
+            now,
+        );
     }
 }
 
@@ -5349,8 +5390,18 @@ fn display_account(account: &str) -> String {
             .ok()
             .filter(|s| !s.is_empty())
     });
+    display_account_with(demo.as_deref(), account)
+}
+
+/// The rule itself, split out from the `OnceLock` that caches which
+/// environment answered it: once that lock has resolved for a process, no
+/// later `std::env::set_var`/`remove_var` can make [`display_account`]
+/// re-ask, which would make a test asserting "no override" order-dependent
+/// on every other test in this module that ever calls it — this half has no
+/// such memory, so it is what the rule is actually tested against.
+fn display_account_with(demo: Option<&str>, account: &str) -> String {
     match demo {
-        Some(demo) if !account.is_empty() => demo.clone(),
+        Some(demo) if !account.is_empty() => demo.to_string(),
         _ => account.to_string(),
     }
 }
@@ -8473,14 +8524,28 @@ fn create_ping_workdir(dir: &std::path::Path) -> std::io::Result<()> {
 /// runs is exactly the "an AGENTS.md left there is read" gap a fresh one per
 /// run closes.
 fn ping_cwd() -> Option<std::path::PathBuf> {
+    ping_cwd_from(
+        &std::env::temp_dir(),
+        &seed::plugins_dir().with_file_name("ping-workdir"),
+    )
+}
+
+/// The pure-parents half of [`ping_cwd`] — which two directories it tries
+/// under is a parameter rather than `std::env::temp_dir()`/`seed::plugins_dir()`
+/// read here directly, so a test can name a parent of its own and never risk
+/// the fallback branch reaching the real `seed::plugins_dir()` (under the
+/// real `$HOME`) the way calling [`ping_cwd`] itself would if its *first*
+/// attempt ever happened to fail on the machine running the test.
+fn ping_cwd_from(
+    primary_parent: &std::path::Path,
+    fallback_parent: &std::path::Path,
+) -> Option<std::path::PathBuf> {
     let name = unique_ping_workdir_name();
-    let primary = std::env::temp_dir().join(&name);
+    let primary = primary_parent.join(&name);
     if create_ping_workdir(&primary).is_ok() {
         return Some(primary);
     }
-    let fallback = seed::plugins_dir()
-        .with_file_name("ping-workdir")
-        .join(&name);
+    let fallback = fallback_parent.join(&name);
     match create_ping_workdir(&fallback) {
         Ok(()) => {
             diag::line(format!(
@@ -11210,8 +11275,10 @@ mod title_tests {
     /// Test-only uniform-gate resolver: every non-opt-in surface always, every
     /// opt-in one iff `opt_in_enabled`. Production's [`active_surface_ids`]
     /// reads each opt-in surface's state independently from `config`; this
-    /// pins them all to one bool so the `readings_with`/`active_surface_ids`
-    /// tests stay pure (no on-disk config).
+    /// pins them all to one bool so the `readings_with` fixtures below stay
+    /// pure (no on-disk config) — `active_surface_ids` itself is exercised
+    /// directly, against real `config`, by
+    /// `active_surface_ids_reads_the_opt_in_gate_from_config` further down.
     fn active_surface_ids_with(m: &PluginManifest, opt_in_enabled: bool) -> Vec<String> {
         m.surface
             .iter()
@@ -12470,6 +12537,35 @@ mod title_tests {
         assert_eq!(
             active_surface_ids_with(&m, true),
             vec!["cli".to_string(), "desktop".to_string()]
+        );
+    }
+
+    /// The rule the test above pins through a stand-in — here it is asked of
+    /// production [`active_surface_ids`] itself, reading the real
+    /// `config::plugin_surface_enabled` rather than a test-supplied bool.
+    /// `claude_like_two_surface_manifest`'s `("claude", "desktop")` pair
+    /// happens to be the one surface `config` bridges to a legacy key
+    /// (`monitor_desktop`) rather than the generic `plugin.<id>.surface.<id>`
+    /// one — deliberately kept rather than swapped for an unbridged
+    /// id/surface pair, since the bridge is exactly the kind of indirection
+    /// this test would otherwise never touch. `config`'s own per-thread test
+    /// fallback (see `config::path`) keeps this off the real config file;
+    /// both states are set explicitly below rather than relying on either
+    /// one being config's unset default.
+    #[test]
+    fn active_surface_ids_reads_the_opt_in_gate_from_config() {
+        let m = claude_like_two_surface_manifest();
+        config::set_plugin_surface_enabled(&m.id, "desktop", false);
+        assert_eq!(
+            active_surface_ids(&m),
+            vec!["cli".to_string()],
+            "the opt-in surface stays out until config turns it on"
+        );
+        config::set_plugin_surface_enabled(&m.id, "desktop", true);
+        assert_eq!(
+            active_surface_ids(&m),
+            vec!["cli".to_string(), "desktop".to_string()],
+            "config turning it on must be what changes the answer"
         );
     }
 
@@ -14946,18 +15042,25 @@ mod title_tests {
         let m = stub_manifest("stalled", 10);
         let fetching: Fetching = Rc::new(RefCell::new(HashMap::new()));
         let original_generation = 42;
+        let started = Instant::now();
         fetching.borrow_mut().insert(
             m.id.clone(),
             InFlight {
                 generation: original_generation,
-                started: Instant::now() - FETCH_PATIENCE - Duration::from_secs(1),
+                started,
                 stall_logged: false,
             },
         );
+        // Built by adding to `started`, never by subtracting from
+        // `Instant::now()` — see `spawn_plugin_fetch`'s own doc for why: a
+        // fresh process with well under `FETCH_PATIENCE` of uptime would
+        // panic on that subtraction, where adding to an instant already on
+        // the clock never can.
+        let now = started + FETCH_PATIENCE + Duration::from_secs(1);
         let (tx, _rx) = mpsc::channel();
         let _ = diag::take_recorded();
 
-        spawn_plugin_fetch(&m, vec![], BTreeMap::new(), &tx, &fetching);
+        spawn_plugin_fetch(&m, vec![], BTreeMap::new(), &tx, &fetching, now);
 
         let after_first = fetching
             .borrow()
@@ -14981,7 +15084,7 @@ mod title_tests {
         );
 
         // A second tick, still stalled: no second line, no new generation.
-        spawn_plugin_fetch(&m, vec![], BTreeMap::new(), &tx, &fetching);
+        spawn_plugin_fetch(&m, vec![], BTreeMap::new(), &tx, &fetching, now);
         let after_second = fetching
             .borrow()
             .get(&m.id)
@@ -15023,7 +15126,7 @@ mod title_tests {
     /// `cfg(unix)`, since a Windows shell would need a different script).
     /// `process_group(0)` mirrors what `spawn_hello` sets on the real ping
     /// command — without it,
-    /// `run_with_deadline_kills_a_command_that_outlives_it_and_its_child`
+    /// `run_with_deadline_kills_a_command_that_outlives_it_and_its_grandchild`
     /// below would prove nothing about `kill_process_tree` reaching a
     /// grandchild, since there would be no group for it to join.
     #[cfg(unix)]
@@ -15298,9 +15401,16 @@ mod title_tests {
     /// `if let Some`, on `home_dir()`: a test environment with no resolvable
     /// home is the one case this property can't even be asked about, and
     /// silently skipping the assertion is how the same mistake happens twice.
+    ///
+    /// Goes through [`ping_cwd_from`] with a temp-dir parent for both
+    /// attempts, not [`ping_cwd`] itself: that function's *fallback* parent
+    /// is `seed::plugins_dir()`, under the real `$HOME` on this machine, and
+    /// calling it directly would only avoid reaching that branch for as long
+    /// as the OS temp directory keeps accepting the primary attempt.
     #[test]
     fn ping_cwd_is_never_the_home_directory() {
-        let cwd = ping_cwd().expect("one of the two attempts succeeds in a test environment");
+        let parent = std::env::temp_dir();
+        let cwd = ping_cwd_from(&parent, &parent).expect("a writable parent always succeeds");
         assert!(cwd.exists(), "the returned directory must already exist");
         let home = dirs::home_dir().expect("a test environment has a resolvable home directory");
         assert!(
@@ -15318,8 +15428,9 @@ mod title_tests {
     /// entirely) could have left a file in.
     #[test]
     fn ping_cwd_creates_a_distinct_directory_on_every_call() {
-        let first = ping_cwd().expect("first call creates a directory");
-        let second = ping_cwd().expect("second call creates a directory");
+        let parent = std::env::temp_dir();
+        let first = ping_cwd_from(&parent, &parent).expect("first call creates a directory");
+        let second = ping_cwd_from(&parent, &parent).expect("second call creates a directory");
         assert_ne!(
             first, second,
             "reusing one directory across runs is the gap a fresh one per run closes"
@@ -15336,9 +15447,39 @@ mod title_tests {
     #[cfg(unix)]
     fn ping_cwd_creates_the_directory_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let cwd = ping_cwd().expect("a directory is created");
+        let parent = std::env::temp_dir();
+        let cwd = ping_cwd_from(&parent, &parent).expect("a directory is created");
         let mode = std::fs::metadata(&cwd).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "got mode {mode:o}");
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// The branch neither test above ever reaches: a primary parent that
+    /// cannot be created into (here, a *file* standing where a directory
+    /// would go — `create_ping_workdir`'s `DirBuilder::create` fails on
+    /// that the same way it would on a permission-denied real temp dir)
+    /// falls back to the second parent, itself still a temp directory, never
+    /// `seed::plugins_dir()`.
+    #[test]
+    fn ping_cwd_falls_back_when_the_primary_parent_cannot_be_created_into() {
+        let unwritable_parent = std::env::temp_dir().join(format!(
+            "tickover-ping-cwd-unwritable-parent-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::write(&unwritable_parent, b"a file, not a directory")
+            .expect("create the file standing in the primary parent's way");
+        let fallback_parent = std::env::temp_dir();
+
+        let cwd = ping_cwd_from(&unwritable_parent, &fallback_parent)
+            .expect("the fallback parent still succeeds");
+        assert!(
+            cwd.starts_with(&fallback_parent),
+            "must have fallen back, not somehow created under the unwritable parent: {}",
+            cwd.display()
+        );
+
+        std::fs::remove_file(&unwritable_parent).ok();
         std::fs::remove_dir_all(&cwd).ok();
     }
 
@@ -16712,15 +16853,16 @@ mod title_tests {
             "the flip starts clean: {state:?}"
         );
 
-        // Same-host respawn (a verdict aged past the TTL) keeps `last` —
-        // it is ignored anyway, and dropping it would only widen the window
-        // in which nothing is known.
-        let at = Instant::now();
+        // Same-host respawn keeps `last` whatever its age — `ping_probe_stamp`
+        // never reads the timestamp at all, only `ping_probe_decision` does,
+        // so any instant here proves the same thing; dropping `last` on a
+        // same-host respawn would only widen the window in which nothing is
+        // known.
         let mut same = PingProbe {
             host: "example.com".to_string(),
             in_flight: false,
             started: None,
-            last: Some((at - PING_PROBE_TTL - Duration::from_secs(1), true)),
+            last: Some((Instant::now(), true)),
         };
         ping_probe_stamp(&mut same, "example.com");
         assert!(
@@ -18165,24 +18307,59 @@ mod title_tests {
         );
     }
 
-    /// With no `TICKOVER_DEMO_ACCOUNT` set (the ordinary case, and the only
-    /// one safe to exercise here — the override is resolved once per process
-    /// into a `OnceLock`, so no test can flip it back and forth), the address
-    /// passed in comes back unchanged.
+    /// `display_account` itself is not exercised here: its `OnceLock` is
+    /// resolved once for the whole process from whatever the real
+    /// environment says, so a test built on it would pass or fail depending
+    /// on which other test happened to ask first — and on whether the
+    /// developer running the suite has `TICKOVER_DEMO_ACCOUNT` exported the
+    /// way `docs/DEVELOPMENT.md` tells them to for screenshots. The rule
+    /// itself lives in `display_account_with`, which takes the resolved
+    /// environment as a plain argument instead of caching it, so it is what
+    /// gets tested — with no demo account, the address passed in comes back
+    /// unchanged either way.
     #[test]
-    fn display_account_passes_the_real_address_through_with_no_demo_override() {
-        assert_eq!(display_account("person@example.com"), "person@example.com");
-        assert_eq!(display_account(""), "", "an empty account stays empty");
+    fn display_account_with_passes_the_real_address_through_with_no_demo_override() {
+        assert_eq!(
+            display_account_with(None, "person@example.com"),
+            "person@example.com"
+        );
+        assert_eq!(
+            display_account_with(None, ""),
+            "",
+            "an empty account stays empty"
+        );
     }
 
-    /// [`tray_indicator_key`] changes exactly when something it is a proxy
-    /// for changed — the widget's own [`menubar::cache_key`], the
-    /// disabled/empty/rendered shape, or the tooltip's own minute-by-minute
-    /// text — and stays put otherwise, so `sync_tray_indicator_from`'s "same
-    /// key, no work" shortcut neither redraws on nothing nor misses a real
-    /// change.
+    /// A demo account set in the environment replaces a real, non-empty
+    /// address, but never invents one where the underlying reading has
+    /// none — an empty account is "no reading yet", not something a
+    /// screenshot stand should paper over with a fake identity.
     #[test]
-    fn tray_indicator_key_changes_with_the_widget_or_the_tooltip_and_only_then() {
+    fn display_account_with_a_demo_override_replaces_a_real_address_but_not_an_empty_one() {
+        assert_eq!(
+            display_account_with(Some("demo@example.com"), "person@example.com"),
+            "demo@example.com"
+        );
+        assert_eq!(
+            display_account_with(Some("demo@example.com"), ""),
+            "",
+            "nothing to replace when there is no account reading yet"
+        );
+    }
+
+    /// [`tray_indicator_key`] changes when something it is a proxy for
+    /// changed — the widget's own [`menubar::cache_key`], the
+    /// disabled/empty/rendered shape, or the tooltip's own minute-by-minute
+    /// text — so `sync_tray_indicator_from`'s "same key, no work" shortcut
+    /// neither redraws on nothing nor misses a real change.
+    ///
+    /// Covers those three inputs only, not all of them: the key also folds
+    /// in `tray_badge_px()` on Windows, read live from `GetSystemMetrics`
+    /// with no parameter this test could vary deterministically, so that
+    /// axis is untested here — a DPI change on that platform is trusted to
+    /// move the key on the strength of the source, not a test double.
+    #[test]
+    fn tray_indicator_key_changes_with_the_widget_or_the_tooltip() {
         let row = |used_percent: f64| menubar::ProviderRow {
             label: "Cx".to_string(),
             five_hour: Some(menubar::WindowStat {

@@ -23,20 +23,27 @@
 # drops the bin target from the build (a filename-collision warning, nothing
 # louder) and never once documents `src/main.rs`. `cargo rustdoc --bin` is
 # the command that actually does.
+#
+# `--no-default-features` gets its own clippy and test steps rather than a
+# `features` dimension in the matrix: a matrix entry would double the
+# Windows job and the release build too, for a configuration this project
+# only ever verifies on macOS — same reasoning as the plain clippy and docs
+# steps above, and the same macOS runner that already carries them.
 
 name: CI
 
 # Runs on every push to `main` and `dev`, on every pull request, and on
-# demand (`gh workflow run CI --ref <branch>`). `paths-ignore` skips a push
-# that touches only documentation: a checkpoint in `docs/` is not a build,
-# and Windows in particular takes long enough that running it for prose
-# would just be noise between the pushes that changed code.
+# demand (`gh workflow run CI --ref <branch>`). No `paths-ignore`: a push
+# that touches only `docs/PLUGIN-ARCHITECTURE.md` is exactly the case
+# `tests/spec_examples.rs` exists to catch — that file asserts the doc's two
+# embedded manifest listings still match `plugins/codex.toml` and
+# `plugins/claude.toml` byte for byte — and a workflow that skips `docs/**`
+# would skip the one test whose subject is a documentation file, on every
+# push that could actually make it drift.
 on:
   push:
     branches: [main, dev]
-    paths-ignore: ["docs/**", "**/*.md"]
   pull_request:
-    paths-ignore: ["docs/**", "**/*.md"]
   workflow_dispatch:
 
 # One run per commit, whatever asked for it. A second push to the same branch
@@ -123,6 +130,15 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      # The quota-only configuration `Cargo.toml` advertises
+      # (`--no-default-features` drops `history`, and the roughly ten
+      # `#[cfg(not(feature = "history"))]` shims that stand in for it) gets
+      # its own clippy pass — see the note at the top for why a matrix
+      # dimension was declined instead.
+      - name: Clippy — no default features (macOS only — see the note at the top)
+        if: matrix.os == 'macos-latest'
+        run: cargo clippy --no-default-features --locked --all-targets -- -D warnings
+
       # Two invocations, not one: the lib and the bin both carry the crate
       # name `tickover`, so a plain `cargo doc` silently drops the bin target
       # (a filename-collision warning, no error) and never documents a single
@@ -144,3 +160,13 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets --locked
+
+      # The quota-only build's own test suite — whatever a plugin author or
+      # a reader of `#[cfg(not(feature = "history"))]` sees when they build
+      # it is what this step actually ran, not an assumption `Test` above
+      # never checks. `--all-targets` is left off: the suite this
+      # configuration compiles is smaller, and this step exists to run it,
+      # not to grow the matrix it already declined above.
+      - name: Test — no default features (macOS only — see the note at the top)
+        if: matrix.os == 'macos-latest'
+        run: cargo test --locked --no-default-features

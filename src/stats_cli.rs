@@ -12,13 +12,35 @@ use tickover::history::store::HistoryStore;
 use tickover::history::{pricing, query};
 use tickover::plugin::manifest::PluginManifest;
 
-/// If argv names the `stats` subcommand, run it and return the process
-/// exit code. `None` → argv is not ours, `main` continues to the tray app.
-pub fn maybe_run(load_manifests: impl FnOnce() -> Vec<PluginManifest>) -> Option<i32> {
-    let mut args = std::env::args().skip(1);
-    if args.next().as_deref() != Some("stats") {
-        return None;
-    }
+/// What a well-formed `stats` invocation asks for, `--report`/`--json`'s
+/// precedence already resolved: only one of these ever reaches `run`.
+/// `--report` (or its `--html` alias) wins over `--json` however the two are
+/// ordered on the command line — a report is a file written to disk and
+/// opened for a human, the fuller of the two answers, and `--json`'s stdout
+/// has nothing to add once that file exists. A caller that wants both would
+/// need two separate invocations; this CLI does not attempt to hand back
+/// machine-readable output alongside an artifact it already opened.
+#[derive(Debug, PartialEq, Eq)]
+enum Output {
+    Report(Option<PathBuf>),
+    Json,
+    Text,
+}
+
+/// `argv` after the `stats` word itself, parsed into what to do — or a
+/// refusal, carrying the same two early exits `maybe_run` returns a code
+/// for: `--help`/`-h` and a flag nothing above recognized.
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedArgs {
+    Run(Output),
+    Help,
+    Unknown(String),
+}
+
+/// The pure half of argument handling — never touches `std::env::args`
+/// itself, so it is testable against any list of words. [`maybe_run`] is the
+/// thin shell that supplies the real one.
+fn parse_args(args: impl IntoIterator<Item = String>) -> ParsedArgs {
     let mut json = false;
     let mut report: Option<Option<PathBuf>> = None;
     for arg in args {
@@ -28,17 +50,35 @@ pub fn maybe_run(load_manifests: impl FnOnce() -> Vec<PluginManifest>) -> Option
             _ if arg.starts_with("--report=") || arg.starts_with("--html=") => {
                 report = arg.split_once('=').map(|(_, p)| Some(PathBuf::from(p)));
             }
-            "--help" | "-h" => {
-                print!("{}", usage());
-                return Some(0);
-            }
-            other => {
-                eprintln!("tickover stats: unknown flag `{other}`\n\n{}", usage());
-                return Some(64);
-            }
+            "--help" | "-h" => return ParsedArgs::Help,
+            other => return ParsedArgs::Unknown(other.to_string()),
         }
     }
-    Some(run(json, report, load_manifests()))
+    ParsedArgs::Run(match report {
+        Some(path) => Output::Report(path),
+        None if json => Output::Json,
+        None => Output::Text,
+    })
+}
+
+/// If argv names the `stats` subcommand, run it and return the process
+/// exit code. `None` → argv is not ours, `main` continues to the tray app.
+pub fn maybe_run(load_manifests: impl FnOnce() -> Vec<PluginManifest>) -> Option<i32> {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() != Some("stats") {
+        return None;
+    }
+    Some(match parse_args(args) {
+        ParsedArgs::Help => {
+            print!("{}", usage());
+            0
+        }
+        ParsedArgs::Unknown(flag) => {
+            eprintln!("tickover stats: unknown flag `{flag}`\n\n{}", usage());
+            64
+        }
+        ParsedArgs::Run(output) => run(output, load_manifests()),
+    })
 }
 
 fn usage() -> &'static str {
@@ -51,7 +91,7 @@ fn usage() -> &'static str {
                       (default: <config>/tickover/reports/usage-<ts>.html)\n"
 }
 
-fn run(json: bool, report: Option<Option<PathBuf>>, manifests: Vec<PluginManifest>) -> i32 {
+fn run(output: Output, manifests: Vec<PluginManifest>) -> i32 {
     // A provider the user disabled keeps its history files untouched and
     // drops out of the report entirely — same filter the tray scan
     // applies in `spawn_history_scan`.
@@ -100,27 +140,30 @@ fn run(json: bool, report: Option<Option<PathBuf>>, manifests: Vec<PluginManifes
     let stats = query::compute(&store, 30, &enabled);
     let cost_on = crate::config::history_cost_estimate();
 
-    if let Some(path) = report {
-        let sources: Vec<String> = manifests
-            .iter()
-            .filter_map(|m| m.history.as_ref().map(|h| h.root.clone()))
-            .collect();
-        let path = match tickover::history::report::write(&stats, path, cost_on, &[], &sources) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("tickover stats: report failed: {e}");
-                return 1;
-            }
-        };
-        println!("report written: {}", path.display());
-        open_in_browser(&path);
-        return 0;
-    }
-    if json {
-        let out = json_out(&stats, &scans, &manifests, cost_on);
-        let _ = writeln!(std::io::stdout(), "{out}");
-    } else {
-        print!("{}", text_out(&stats, &scans, &manifests, cost_on));
+    match output {
+        Output::Report(path) => {
+            let sources: Vec<String> = manifests
+                .iter()
+                .filter_map(|m| m.history.as_ref().map(|h| h.root.clone()))
+                .collect();
+            let path = match tickover::history::report::write(&stats, path, cost_on, &[], &sources)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("tickover stats: report failed: {e}");
+                    return 1;
+                }
+            };
+            println!("report written: {}", path.display());
+            open_in_browser(&path);
+        }
+        Output::Json => {
+            let out = json_out(&stats, &scans, &manifests, cost_on);
+            let _ = writeln!(std::io::stdout(), "{out}");
+        }
+        Output::Text => {
+            print!("{}", text_out(&stats, &scans, &manifests, cost_on));
+        }
     }
     0
 }
@@ -286,4 +329,113 @@ fn json_out(
             .unwrap_or(serde_json::Value::Null);
     }
     serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds the `String` iterator [`parse_args`] takes from plain string
+    /// literals — argv words are owned, so a test's `&str` slice needs this
+    /// conversion whether the flags parse cleanly or not.
+    fn words(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_flags_at_all_means_plain_text() {
+        assert_eq!(parse_args(words(&[])), ParsedArgs::Run(Output::Text));
+    }
+
+    #[test]
+    fn json_alone_asks_for_json() {
+        assert_eq!(
+            parse_args(words(&["--json"])),
+            ParsedArgs::Run(Output::Json)
+        );
+    }
+
+    #[test]
+    fn report_alone_with_no_value_uses_the_default_path() {
+        assert_eq!(
+            parse_args(words(&["--report"])),
+            ParsedArgs::Run(Output::Report(None))
+        );
+    }
+
+    /// `--html` is a bare alias for `--report`, not a distinct output mode —
+    /// same variant, same default-path behavior.
+    #[test]
+    fn html_is_an_alias_for_report() {
+        assert_eq!(
+            parse_args(words(&["--html"])),
+            ParsedArgs::Run(Output::Report(None))
+        );
+    }
+
+    #[test]
+    fn report_with_a_value_names_the_path() {
+        assert_eq!(
+            parse_args(words(&["--report=out.html"])),
+            ParsedArgs::Run(Output::Report(Some(PathBuf::from("out.html"))))
+        );
+        assert_eq!(
+            parse_args(words(&["--html=out.html"])),
+            ParsedArgs::Run(Output::Report(Some(PathBuf::from("out.html"))))
+        );
+    }
+
+    /// `--report=` with nothing after the `=` is not the same thing as bare
+    /// `--report`: today it names an empty path rather than falling back to
+    /// the default one. Pinned as-is — nothing here asks the parser to
+    /// second-guess a value the user actually typed.
+    #[test]
+    fn report_with_an_empty_value_names_an_empty_path_rather_than_the_default() {
+        assert_eq!(
+            parse_args(words(&["--report="])),
+            ParsedArgs::Run(Output::Report(Some(PathBuf::from(""))))
+        );
+    }
+
+    #[test]
+    fn help_short_and_long_both_stop_parsing_at_once() {
+        assert_eq!(parse_args(words(&["--help"])), ParsedArgs::Help);
+        assert_eq!(parse_args(words(&["-h"])), ParsedArgs::Help);
+        // A flag already seen does not change the answer — `--help` wins
+        // outright, the same way `maybe_run` printed usage and returned
+        // before this was split out.
+        assert_eq!(parse_args(words(&["--json", "--help"])), ParsedArgs::Help);
+    }
+
+    #[test]
+    fn an_unrecognized_flag_is_refused_by_name() {
+        assert_eq!(
+            parse_args(words(&["--bogus"])),
+            ParsedArgs::Unknown("--bogus".to_string())
+        );
+        // Refused at the point it is found — a flag after it is never
+        // reached, matching the loop's own early return.
+        assert_eq!(
+            parse_args(words(&["--json", "--bogus", "--report"])),
+            ParsedArgs::Unknown("--bogus".to_string())
+        );
+    }
+
+    /// The rule named on [`Output`]'s own doc, pinned both ways round:
+    /// `--report` wins over `--json` whichever comes first on the line.
+    #[test]
+    fn report_wins_over_json_in_either_order() {
+        assert_eq!(
+            parse_args(words(&["--report", "--json"])),
+            ParsedArgs::Run(Output::Report(None))
+        );
+        assert_eq!(
+            parse_args(words(&["--json", "--report"])),
+            ParsedArgs::Run(Output::Report(None))
+        );
+        assert_eq!(
+            parse_args(words(&["--json", "--report=out.html"])),
+            ParsedArgs::Run(Output::Report(Some(PathBuf::from("out.html"))))
+        );
+    }
 }
