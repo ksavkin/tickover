@@ -3,7 +3,8 @@
 //! Separate machinery from the quota walk (`engine_logfile`) on purpose:
 //! quota reads the newest handful of matching files under a hard byte
 //! budget, while history needs *everything, eventually* — so this scanner
-//! is resumable instead of bounded. Each file's [`FileState`] remembers
+//! is resumable instead of bounded. Each file's
+//! [`FileState`](crate::history::store::FileState) remembers
 //! how far it was consumed (`cursor`), and a scan only ever reads forward
 //! of it. The wall-clock budget stops a pass partway (`partial`), and the
 //! next pass resumes where the last one stopped rather than starting over.
@@ -102,9 +103,21 @@ pub fn scan_root(
 
         // Stamp the owning provider before the unchanged check can skip —
         // the query layer attributes drift counts (and any future
-        // per-file figure) to a provider through it.
-        if let Some(st) = store.file_state_mut(&sig.path) {
-            st.provider = provider.to_string();
+        // per-file figure) to a provider through it. Read-checked first: a
+        // mutable handout dirties `state` unconditionally (see
+        // `file_state_mut`'s own doc), and this runs for every file on
+        // every pass — a file whose provider already matches (every
+        // unchanged file, every pass after the first) must not force a
+        // `state.json` rewrite just for having been looked at. A file not
+        // yet in `state.files` at all needs nothing here either —
+        // `begin_file` below stamps it correctly the moment it exists.
+        if store
+            .file_state(&sig.path)
+            .is_some_and(|st| st.provider != provider)
+        {
+            if let Some(st) = store.file_state_mut(&sig.path) {
+                st.provider = provider.to_string();
+            }
         }
 
         // Decide what this file needs. Three answers: nothing (unchanged),
@@ -520,6 +533,7 @@ mod tests {
     use crate::history::formats::Extraction;
     use crate::history::store::{FileState, HistoryStore};
     use crate::history::UsageRecord;
+    use crate::plugin::manifest::PluginManifest;
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -958,6 +972,109 @@ mod tests {
         let live: Vec<_> = store.live_days().cloned().collect();
         assert_eq!(live.iter().map(|d| d.input).sum::<u64>(), 300);
         assert!(live.iter().any(|d| d.full));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A minimal manifest declaring only what [`crate::history::scan_tick`]
+    /// reads: the `[history]` section's format/root/glob. `[[windows]]` and
+    /// `[logfile]` are here only because `PluginManifest::from_str` won't
+    /// validate without them, not because the scan path touches them.
+    fn history_manifest(id: &str, format: &str, root: &Path, glob: &str) -> PluginManifest {
+        let text = format!(
+            r#"
+id         = "{id}"
+name       = "Sample"
+menu_label = "Sa"
+order      = 1
+engine     = "log-file"
+requires_reader = ["reading-history"]
+
+[[windows]]
+label = "5H"
+role  = "primary"
+[windows.period]
+mode    = "assumed"
+assumed = 300
+[windows.source]
+used_percent_path = "used_percent"
+resets_at_path    = "resets_at"
+
+[logfile]
+root          = "{root_display}"
+glob          = "*.jsonl"
+container_key = "rate_limits"
+
+[history]
+format = "{format}"
+root   = "{root_display}"
+glob   = "{glob}"
+"#,
+            root_display = root.display()
+        );
+        PluginManifest::from_str(&text).unwrap_or_else(|e| panic!("fixture manifest: {e}"))
+    }
+
+    #[test]
+    fn a_second_scan_tick_over_an_unchanged_tree_leaves_state_json_untouched() {
+        // The store's dirty flag only pays off if the scanner stops
+        // reaching for a mutable `FileState` merely to look at one: a tick
+        // that changes nothing (every file's signature already matches,
+        // `prune_files_outside` removes nothing) must not rewrite
+        // `state.json` at all, while a tick that does change a file must.
+        let root = tmpdir("ticksave-root");
+        let dir = tmpdir("ticksave-store");
+        fs::write(root.join("t.jsonl"), claude_line("m1", 100, 10) + "\n").unwrap();
+        let manifests = vec![history_manifest(
+            "claude",
+            "claude-transcripts",
+            &root,
+            "*.jsonl",
+        )];
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let _ = crate::history::scan_tick(&mut store, &manifests, &|_| BTreeMap::new());
+        store.commit().unwrap();
+
+        let path = dir.join("state.json");
+        let before_meta = fs::metadata(&path).unwrap();
+        let before_bytes = fs::read(&path).unwrap();
+
+        // Nothing on disk changed since the first tick: every signature
+        // still matches, and the manifest's root is unchanged, so
+        // `prune_files_outside` finds nothing outside it either.
+        let scans = crate::history::scan_tick(&mut store, &manifests, &|_| BTreeMap::new());
+        assert_eq!(scans[0].outcome.files_scanned, 0, "nothing needed reading");
+        store.commit().unwrap();
+
+        let after_meta = fs::metadata(&path).unwrap();
+        let after_bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            before_bytes, after_bytes,
+            "an unchanged tick must not rewrite the bytes"
+        );
+        assert_eq!(
+            before_meta.modified().unwrap(),
+            after_meta.modified().unwrap(),
+            "an unchanged tick must not touch the file at all, not just leave it byte-identical"
+        );
+
+        // A real change must still reach disk on the very next commit.
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("t.jsonl"))
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{}", claude_line("m1", 100, 40)).unwrap();
+        drop(f);
+        let scans = crate::history::scan_tick(&mut store, &manifests, &|_| BTreeMap::new());
+        assert_eq!(scans[0].outcome.files_scanned, 1);
+        store.commit().unwrap();
+        let changed_bytes = fs::read(&path).unwrap();
+        assert_ne!(
+            before_bytes, changed_bytes,
+            "the changed cursor must reach disk"
+        );
+
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&dir);
     }

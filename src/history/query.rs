@@ -143,7 +143,7 @@ pub fn compute(
         streak_days: 0,
         active_days: 0,
         skipped_unparsed: store
-            .state
+            .state()
             .files
             .values()
             .filter(|f| enabled.contains(&f.provider))
@@ -605,28 +605,94 @@ fn last_seen(
         .map(|(h, project, _)| (h.with_timezone(&Local), project))
 }
 
+/// Whether `hour` has exactly the shape every bucket the scanner writes
+/// has — `"YYYY-MM-DDTHH"`, fixed-width, zero-padded, *and* a real calendar
+/// hour (scanner.rs stamps each one with `DateTime::format("%Y-%m-%dT%H")`,
+/// which can never emit `"2026-02-30"` or an hour past 23). Calendar
+/// validity is not optional here: `parse_bucket_hour` rejects an impossible
+/// date or `h >= 24`, and a shape check that only looked at digit
+/// placement would accept one of those and then compare it lexicographically
+/// instead of dropping it — counting a bucket the parser, and `compute`'s
+/// own load path, never would. Still O(1): four small digit folds and one
+/// calendar lookup (leap years included), never a full
+/// `NaiveDate::parse_from_str`. `parse_bucket_hour` stays looser on
+/// purpose — it also accepts an unpadded hour like `"...T7"` — so anything
+/// this check can't vouch for falls back to it rather than being treated
+/// as malformed outright.
+fn bucket_hour_well_formed(hour: &str) -> bool {
+    let b = hour.as_bytes();
+    if b.len() != 13 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
+        return false;
+    }
+    let is_digits = |s: &[u8]| s.iter().all(u8::is_ascii_digit);
+    if !is_digits(&b[..4])
+        || !is_digits(&b[5..7])
+        || !is_digits(&b[8..10])
+        || !is_digits(&b[11..13])
+    {
+        return false;
+    }
+    // Every byte here already passed the digit check above, so a plain
+    // base-10 fold is exact — no `Result` either field could still fail.
+    let field = |s: &[u8]| s.iter().fold(0u32, |acc, &d| acc * 10 + (d - b'0') as u32);
+    let (y, m, d, h) = (
+        field(&b[..4]),
+        field(&b[5..7]),
+        field(&b[8..10]),
+        field(&b[11..13]),
+    );
+    h < 24 && NaiveDate::from_ymd_opt(y as i32, m, d).is_some()
+}
+
+/// Whether an hour bucket falls inside a window that started at `since`:
+/// buckets are hour-granular, so the hour containing `since` counts whole —
+/// equivalent to `parse_bucket_hour(hour) + 1h > since` for every
+/// well-formed bucket, since both `since_hour` and a well-formed `hour` are
+/// zero-padded to the same width, so string order and chronological order
+/// of the truncated hour agree (see `window_tokens`'s test for the worked
+/// cases). `since_hour` is `since` floored to its hour and formatted the
+/// same way, computed once by the caller rather than per bucket.
+fn bucket_counts(hour: &str, since: DateTime<Utc>, since_hour: &str) -> bool {
+    if bucket_hour_well_formed(hour) {
+        hour >= since_hour
+    } else {
+        parse_bucket_hour(hour).is_some_and(|h| h + Duration::hours(1) > since)
+    }
+}
+
+/// Tokens a provider spent inside a quota window, from `since` (unix
+/// seconds) — the store-touching half of [`window_burn`]. Split out so a
+/// caller that asks the same `(provider, since)` again — every tick, for an
+/// open window — can cache this and only redo the elapsed-hours half below,
+/// which needs nothing from the store.
+pub fn window_tokens(store: &HistoryStore, provider: &str, since_unix: u64) -> Option<u64> {
+    let since = Utc.timestamp_opt(since_unix as i64, 0).single()?;
+    if since >= Utc::now() {
+        return None;
+    }
+    let since_hour = since.format("%Y-%m-%dT%H").to_string();
+    let tokens: u64 = store
+        .live_days()
+        .filter(|d| d.provider == provider)
+        .filter(|d| bucket_counts(&d.hour, since, &since_hour))
+        // Burn excludes cache reads — a resent context is not fresh spend.
+        .map(|d| d.active())
+        .sum();
+    (tokens > 0).then_some(tokens)
+}
+
 /// Tokens a provider spent inside a quota window, for the projection hatch:
 /// `since` is the window's start (unix seconds). Returns `(tokens, hours
 /// elapsed)` — `None` when nothing was counted, so the caller can omit the
 /// burn figure rather than draw a fabricated one.
 pub fn window_burn(store: &HistoryStore, provider: &str, since_unix: u64) -> Option<(u64, f64)> {
+    let tokens = window_tokens(store, provider, since_unix)?;
+    // `window_tokens` already proved `since_unix` parses and is in the
+    // past; redone rather than threaded through so the store-touching half
+    // stays the only part a caller ever needs to cache.
     let since = Utc.timestamp_opt(since_unix as i64, 0).single()?;
     let now = Utc::now();
-    if since >= now {
-        return None;
-    }
-    let tokens: u64 = store
-        .live_days()
-        .filter(|d| d.provider == provider)
-        // Burn excludes cache reads — a resent context is not fresh spend.
-        .filter_map(|d| parse_bucket_hour(&d.hour).map(|h| (h, d.active())))
-        // Buckets are hour-granular: the hour containing `since` counts
-        // whole — dropping it would zero out any window shorter than an
-        // hour or one that starts mid-hour.
-        .filter(|(h, _)| *h + Duration::hours(1) > since)
-        .map(|(_, s)| s)
-        .sum();
-    (tokens > 0).then(|| (tokens, (now - since).num_seconds().max(1) as f64 / 3600.0))
+    Some((tokens, (now - since).num_seconds().max(1) as f64 / 3600.0))
 }
 
 #[cfg(test)]
@@ -757,12 +823,85 @@ mod tests {
             let mut st = FileState::fresh("d".into(), 1, 1);
             st.provider = provider.to_string();
             st.skipped_unparsed = n;
-            store.state.files.insert(path.to_string(), st);
+            store.state_mut().files.insert(path.to_string(), st);
         }
         let enabled: std::collections::HashSet<String> =
             ["claude".to_string()].into_iter().collect();
         let st = compute(&store, 30, &enabled);
         assert_eq!(st.skipped_unparsed, 3);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bucket_counts_matches_the_old_parse_and_compare_at_every_edge() {
+        // The old rule was `parse_bucket_hour(hour) + 1h > since`; the new
+        // one is a lexicographic compare of `hour` against `since`'s own
+        // hour string. Prove they agree at the hour-of-`since`, the hour
+        // before, and the hour after — with `since` both on an hour
+        // boundary and mid-hour — and that a malformed hour still falls
+        // back to the exact old expression instead of being skipped
+        // outright or compared as if it were well-formed.
+        for since in [
+            Utc.with_ymd_and_hms(2026, 9, 22, 14, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 9, 22, 14, 30, 0).unwrap(),
+        ] {
+            let since_hour = since.format("%Y-%m-%dT%H").to_string();
+            for hour in ["2026-09-22T14", "2026-09-22T13", "2026-09-22T15"] {
+                let old = parse_bucket_hour(hour).is_some_and(|h| h + Duration::hours(1) > since);
+                let new = bucket_counts(hour, since, &since_hour);
+                assert_eq!(new, old, "hour={hour} since={since}");
+            }
+            for malformed in [
+                "2026-09-22T7",
+                "not-an-hour",
+                "2026-09-22",
+                // Digit-shaped but not a calendar hour at all — the shape
+                // check alone would have waved these through and compared
+                // them lexicographically; `parse_bucket_hour` drops every
+                // one, and so must the fast path.
+                "2026-13-01T00", // month 13
+                "2026-09-32T00", // day 32
+                "2026-09-22T24", // hour 24
+                "2026-02-30T00", // February has no 30th, leap year or not
+            ] {
+                let old =
+                    parse_bucket_hour(malformed).is_some_and(|h| h + Duration::hours(1) > since);
+                assert!(!old, "parse_bucket_hour must reject {malformed}");
+                let new = bucket_counts(malformed, since, &since_hour);
+                assert_eq!(new, old, "malformed hour={malformed} since={since}");
+            }
+        }
+    }
+
+    #[test]
+    fn window_tokens_matches_the_old_expression_over_a_real_store() {
+        // Same edges as above, but through `window_tokens` against buckets
+        // actually appended to a store — the fast path's provider filter
+        // and `live_days()` plumbing included, not just the hour compare.
+        for since in [
+            Utc.with_ymd_and_hms(2026, 9, 22, 14, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 9, 22, 14, 30, 0).unwrap(),
+        ] {
+            let dir = tmpdir("window-tokens");
+            let mut store = HistoryStore::open(&dir).unwrap();
+            let lines = [
+                line("2026-09-22T14", "claude", "p", 100), // hour of `since`
+                line("2026-09-22T13", "claude", "p", 200), // one hour before
+                line("2026-09-22T15", "claude", "p", 300), // one hour after
+                line("2026-09-22T7", "claude", "p", 400),  // malformed (unpadded)
+                line("2026-09-22T15", "codex", "p", 999),  // different provider
+            ];
+            let old: u64 = lines
+                .iter()
+                .filter(|d| d.provider == "claude")
+                .filter_map(|d| parse_bucket_hour(&d.hour).map(|h| (h, d.active())))
+                .filter(|(h, _)| *h + Duration::hours(1) > since)
+                .map(|(_, s)| s)
+                .sum();
+            store.append_days(&lines).unwrap();
+            let new = window_tokens(&store, "claude", since.timestamp() as u64).unwrap_or(0);
+            assert_eq!(new, old, "since={since}");
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 }

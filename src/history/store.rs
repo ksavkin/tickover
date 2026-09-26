@@ -19,10 +19,12 @@
 //!   older lines stop counting at query time instead of being deleted.
 //!   When stale lines outweigh live ones the log is compacted once.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -425,7 +427,13 @@ fn bucket_key(d: &DayLine) -> BucketKey {
 /// The pair of files plus the in-memory state between them.
 pub struct HistoryStore {
     dir: PathBuf,
-    pub state: ScannerState,
+    /// Private rather than `pub`: every write has to pass through
+    /// [`Self::state_mut`] (or one of the narrower methods below) so
+    /// [`Self::live_cache`] never outlives a change to `files` that would
+    /// make it wrong — a public field would let a caller edit `files`
+    /// straight past that and read a liveness answer for the store as it
+    /// was before the edit.
+    state: ScannerState,
     /// Lines read from `days.jsonl`, including superseded ones — they
     /// leave through `dead` until the next compacting rewrite.
     days: Vec<DayLine>,
@@ -441,6 +449,25 @@ pub struct HistoryStore {
     /// Exact serialized lines — the crash-rescan artifact is a byte-
     /// identical re-append, cheaper to catch as a string than by key.
     seen_lines: std::collections::HashSet<String>,
+    /// [`Self::live_days`]'s answer, memoized as indices into `days` — one
+    /// walk of `files` and `days` per change instead of one per call, since
+    /// a tick asks every window of every provider the same question against
+    /// the same snapshot. `Arc` rather than a plain `Vec` so the accessor
+    /// can clone the handle out and drop the `RefCell` borrow before
+    /// building the returned iterator — a borrow held for the iterator's
+    /// whole life would panic the moment any caller tried to compact or
+    /// append while still consuming it. `None` means "unknown", not "empty";
+    /// every `&mut self` path that can change what counts as live clears it
+    /// back to `None` rather than trying to patch it in place.
+    live_cache: RefCell<Option<Arc<Vec<usize>>>>,
+    /// Whether `state` has changed since the last successful [`Self::commit`]
+    /// (or, on the very first commit, since `open` loaded — or failed to
+    /// load — it). `commit` skips the `state.json` rewrite entirely when
+    /// this is `false`: the file can be several megabytes, and a scan pass
+    /// that touched no file at all still called it once per manifest.
+    /// `days.jsonl`'s own append path has no equivalent — it is already
+    /// only ever written when there is something new to append.
+    state_dirty: bool,
 }
 
 impl HistoryStore {
@@ -463,19 +490,24 @@ impl HistoryStore {
         // tighten them now rather than only at the next create.
         enforce_private(&Self::state_path(dir));
         enforce_private(&Self::days_path(dir));
-        let state = match fs::read_to_string(Self::state_path(dir)) {
+        // `state_dirty` starts `false` only when what's now in memory is
+        // byte-for-byte what a fresh `open` would read straight back — a
+        // quarantined-and-rebuilt or altogether missing `state.json` needs a
+        // real file in its place even if nothing mutates `state` before the
+        // next `commit`, the same as an unconditional write always gave it.
+        let (state, state_dirty) = match fs::read_to_string(Self::state_path(dir)) {
             Ok(text) => match serde_json::from_str::<ScannerState>(&text) {
-                Ok(s) if s.version == SCHEMA_VERSION => s,
+                Ok(s) if s.version == SCHEMA_VERSION => (s, false),
                 _ => {
                     let aside = dir.join(format!(
                         "state.corrupt-{}.json",
                         chrono::Utc::now().timestamp()
                     ));
                     let _ = fs::rename(Self::state_path(dir), aside);
-                    ScannerState::default()
+                    (ScannerState::default(), true)
                 }
             },
-            Err(e) if e.kind() == io::ErrorKind::NotFound => ScannerState::default(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (ScannerState::default(), true),
             Err(e) => return Err(e),
         };
         let mut store = HistoryStore {
@@ -486,6 +518,8 @@ impl HistoryStore {
             by_key: std::collections::HashMap::new(),
             by_file: std::collections::HashMap::new(),
             seen_lines: std::collections::HashSet::new(),
+            live_cache: RefCell::new(None),
+            state_dirty,
         };
         match fs::read_to_string(Self::days_path(dir)) {
             Ok(text) => {
@@ -521,7 +555,11 @@ impl HistoryStore {
         }
         // Batch ids must stay ahead of anything already on disk — a state
         // rebuild resets the counter, and a reused id would let a stale
-        // line pose as a seal's batch-mate.
+        // line pose as a seal's batch-mate. Not a `state_dirty` site: this
+        // is deterministic from `days.jsonl`, which is already on disk —
+        // the identical value falls back out of the same computation on
+        // every future `open`, so there is nothing to lose by leaving its
+        // persistence to whatever next legitimately dirties `state`.
         store.state.next_batch = store
             .days
             .iter()
@@ -552,8 +590,12 @@ impl HistoryStore {
     /// range overlaps an earlier same-bucket line re-parsed those bytes —
     /// the earlier aggregate is superseded, not summed. Batch-mates
     /// (`old.b == d.b`, one append — e.g. a multi-hour extraction emitting
-    /// several buckets) are fresh coverage, never stale.
+    /// several buckets) are fresh coverage, never stale. Invalidates the
+    /// liveness cache unconditionally: this runs once per line during
+    /// `open`'s load loop (the cache is already empty then) and once per
+    /// appended line from `append_days`, where it always changes `days`.
     fn fold_line(&mut self, d: DayLine) {
+        self.invalidate_live_cache();
         // A line with `hi <= lo` never carried a real range: pre-range
         // writes deserialize to `lo = hi = 0`, and a buggy extractor can
         // persist an empty span. The rule is asymmetric: such a line
@@ -682,8 +724,12 @@ impl HistoryStore {
     }
 
     /// Drop `dead` indices from `days` and reindex — called after a load
-    /// that superseded lines, and after a compacting rewrite.
+    /// that superseded lines, and after a compacting rewrite. Every cached
+    /// live index would point at the wrong line once positions shift, so
+    /// this invalidates even though its one call site (inside `open`) never
+    /// finds a cache to drop.
     fn physically_drop_dead(&mut self) {
+        self.invalidate_live_cache();
         let mut days = Vec::with_capacity(self.days.len() - self.dead.len());
         let mut by_key: std::collections::HashMap<BucketKey, Vec<usize>> =
             std::collections::HashMap::new();
@@ -706,14 +752,56 @@ impl HistoryStore {
         self.dead.clear();
     }
 
+    /// Read-only view of the scanner's persisted position — file cursors,
+    /// generations, dedup rings. A read never needs to invalidate anything.
+    pub fn state(&self) -> &ScannerState {
+        &self.state
+    }
+
+    /// Mutable access to the scanner's persisted position, for a caller that
+    /// needs to reach past the narrower methods below (test setup, mainly).
+    /// Invalidates [`Self::live_cache`] and marks `state` dirty
+    /// unconditionally on the handout, not on some later inspection of what
+    /// changed — there is no way to see after the fact whether a
+    /// `&mut ScannerState` touched `files`.
+    pub fn state_mut(&mut self) -> &mut ScannerState {
+        self.invalidate_live_cache();
+        self.mark_state_dirty();
+        &mut self.state
+    }
+
+    /// Drop the memoized [`Self::live_days`] answer — called from every
+    /// path that can change which lines count as live: a fold (append or
+    /// load), a compaction, a dead-line sweep, a new file entry, or any
+    /// mutable reach into `state` that might bump a generation.
+    fn invalidate_live_cache(&mut self) {
+        *self.live_cache.get_mut() = None;
+    }
+
+    /// Mark that `state` no longer matches what `commit` last wrote (or what
+    /// `open` read) — called from every path that changes anything
+    /// `state.json` serializes: `files`, `global_ids`, `next_batch`. Distinct
+    /// from [`Self::invalidate_live_cache`] because the two caches answer
+    /// different questions — the global dedup ring is persisted but never
+    /// read by `live_days`, so a path that only touches it dirties `state`
+    /// without needing to invalidate the liveness cache at all.
+    fn mark_state_dirty(&mut self) {
+        self.state_dirty = true;
+    }
+
     /// This file's remembered progress, if it was ever scanned.
     pub fn file_state(&self, path: &Path) -> Option<&FileState> {
         self.state.files.get(&path.to_string_lossy().into_owned())
     }
 
     /// This file's remembered progress, mutably — for cursor and ring
-    /// updates after a successful extract.
+    /// updates after a successful extract. Invalidates on the handout: a
+    /// generation bump ([`FileState::reset`]) is invisible to the store
+    /// otherwise, and every other mutation through this handle is cheap
+    /// enough to over-invalidate for.
     pub fn file_state_mut(&mut self, path: &Path) -> Option<&mut FileState> {
+        self.invalidate_live_cache();
+        self.mark_state_dirty();
         self.state
             .files
             .get_mut(&path.to_string_lossy().into_owned())
@@ -739,7 +827,11 @@ impl HistoryStore {
     /// Drop every global-ring entry `path` owns — part of a rewrite reset:
     /// the file's contribution is about to be re-derived under a bumped
     /// generation, so its old ownership claims die with the old one.
+    /// `global_ids` is what `state.json` persists, so this dirties `state`
+    /// unconditionally — `global_map` is the `#[serde(skip)]` mirror and
+    /// would need nothing on its own.
     pub fn release_owned(&mut self, path: &str) {
+        self.mark_state_dirty();
         self.state.global_map.retain(|_, p| p != path);
         self.state
             .global_ids
@@ -760,6 +852,11 @@ impl HistoryStore {
             .position(|g| matches!(g, GlobalKey::V2 { k, .. } if k == id))
         {
             if let Some(g) = self.state.global_ids.remove(pos) {
+                // Only reached once the reposition below is guaranteed —
+                // the `contains_key` guard above can pass while this
+                // `position` still comes up empty (a V1 leftover), which
+                // must not mark `state` dirty for a no-op.
+                self.mark_state_dirty();
                 self.state.global_ids.push_back(g);
             }
         }
@@ -771,6 +868,7 @@ impl HistoryStore {
         if self.state.global_map.contains_key(&id) {
             return;
         }
+        self.mark_state_dirty();
         self.state.global_map.insert(id.clone(), path.to_string());
         self.state.global_ids.push_back(GlobalKey::V2 {
             k: id,
@@ -791,7 +889,10 @@ impl HistoryStore {
         }
     }
 
-    /// Register `path` at generation 0 (or return the existing entry).
+    /// Register `path` at generation 0 (or return the existing entry). A
+    /// path new to `state.files` can flip day lines of the same file out of
+    /// the deleted-file fallback [`Self::live_days`] otherwise uses, so this
+    /// invalidates unconditionally rather than only on the fresh-entry case.
     pub fn begin_file(
         &mut self,
         path: &Path,
@@ -800,6 +901,8 @@ impl HistoryStore {
         size: u64,
         mtime: i64,
     ) {
+        self.invalidate_live_cache();
+        self.mark_state_dirty();
         self.state
             .files
             .entry(path.to_string_lossy().into_owned())
@@ -822,6 +925,10 @@ impl HistoryStore {
         }
         let batch = self.state.next_batch;
         self.state.next_batch = self.state.next_batch.saturating_add(1);
+        // The counter moved even if every line below turns out to be a
+        // crash-rescan duplicate and `accepted` ends up empty — `state`
+        // already differs from what `commit` last wrote.
+        self.mark_state_dirty();
         let mut accepted: Vec<(String, DayLine)> = Vec::with_capacity(new.len());
         for d in new {
             let mut d = d.clone();
@@ -868,19 +975,35 @@ impl HistoryStore {
         Ok(())
     }
 
-    /// Persist `state.json` atomically (tmp + rename), then compact
-    /// `days.jsonl` if it has grown past [`DAYS_COMPACT_BYTES`].
+    /// Persist `state.json` atomically (tmp + rename) — but only when
+    /// [`Self::state_dirty`] says `state` actually differs from what's on
+    /// disk — then compact `days.jsonl` if it has grown past
+    /// [`DAYS_COMPACT_BYTES`] (that trigger is unconditional; a
+    /// `days.jsonl`-only pass with an untouched `state` still needs to
+    /// compact). A scan pass that touched no file still called this once
+    /// per manifest, and `tickover stats` calls it dozens of times a run —
+    /// serializing every one of `state.files`'s entries into a multi-
+    /// megabyte file when nothing about them changed was the real cost;
+    /// routing the write through a `BufWriter` (flushed before `sync_data`,
+    /// same tmp+rename shape and private-file creation as before) is what
+    /// makes the writes that do still happen cheap too. `days.jsonl`'s own
+    /// append path needed neither change — it only ever writes new lines.
     pub fn commit(&mut self) -> io::Result<()> {
-        self.state.version = SCHEMA_VERSION;
-        let tmp = self.dir.join("state.json.tmp");
-        let target = Self::state_path(&self.dir);
-        {
-            let mut f = create_private(&tmp)?;
-            serde_json::to_writer(&mut f, &self.state).map_err(io::Error::other)?;
-            f.write_all(b"\n")?;
-            f.sync_data().ok();
+        if self.state_dirty {
+            self.state.version = SCHEMA_VERSION;
+            let tmp = self.dir.join("state.json.tmp");
+            let target = Self::state_path(&self.dir);
+            {
+                let f = create_private(&tmp)?;
+                let mut w = io::BufWriter::new(f);
+                serde_json::to_writer(&mut w, &self.state).map_err(io::Error::other)?;
+                w.write_all(b"\n")?;
+                w.flush()?;
+                w.get_ref().sync_data().ok();
+            }
+            fs::rename(&tmp, &target)?;
+            self.state_dirty = false;
         }
-        fs::rename(&tmp, &target)?;
         self.maybe_compact_days()
     }
 
@@ -891,7 +1014,36 @@ impl HistoryStore {
     /// newest generation's: without the state entry nothing suppresses
     /// superseded generations, so the file's latest *live* gen stands in
     /// as its remembered watermark.
+    ///
+    /// O(live lines) per call, not O(files + days): the answer is memoized
+    /// in [`Self::live_cache`] and only recomputed after a change any
+    /// `&mut self` path here might have made. A tick asks this same
+    /// question once per (provider, window) — 5-6 times a second against an
+    /// unchanged snapshot — so the walk over `state.files` and `days` that
+    /// answering it fresh needs must not repeat for every one of them.
     pub fn live_days(&self) -> impl Iterator<Item = &DayLine> {
+        let idx = {
+            let mut cache = self.live_cache.borrow_mut();
+            if cache.is_none() {
+                *cache = Some(Arc::new(self.compute_live_indices()));
+            }
+            // Cloning the `Arc` out and dropping `cache` here (its scope
+            // ends with this block) is what lets the returned iterator
+            // outlive this call without holding the `RefCell` borrowed —
+            // a live iterator across a later `&mut self` call would
+            // otherwise panic on the second borrow instead of just being
+            // stale, which nothing here promises to avoid on its own.
+            Arc::clone(cache.as_ref().unwrap())
+        };
+        (0..idx.len()).map(move |k| &self.days[idx[k]])
+    }
+
+    /// [`Self::live_days`]'s answer, computed fresh: every non-dead index
+    /// whose file is at the state's current generation, or — for a file no
+    /// longer in `state.files` — at that file's own newest surviving
+    /// generation. Split out so [`Self::live_days`] only ever calls it
+    /// through the cache.
+    fn compute_live_indices(&self) -> Vec<usize> {
         let current: HashMap<&str, u32> = self
             .state
             .files
@@ -911,14 +1063,15 @@ impl HistoryStore {
         self.days
             .iter()
             .enumerate()
-            .filter(move |(i, d)| {
+            .filter(|(i, d)| {
                 !self.dead.contains(i)
                     && match current.get(d.file.as_str()) {
                         Some(&gen) => gen == d.gen,
                         None => last_live.get(d.file.as_str()) == Some(&d.gen),
                     }
             })
-            .map(|(_, d)| d)
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Rewrite `days.jsonl` dropping stale-generation lines, when it is big
@@ -960,6 +1113,10 @@ impl HistoryStore {
                 .or_default()
                 .push(i);
         }
+        // The indices the pre-compaction `live_days()` call above cached
+        // point at positions in the old `days` — every one of them is
+        // wrong now that the array has been rewritten shorter.
+        self.invalidate_live_cache();
         Ok(())
     }
 
@@ -967,12 +1124,25 @@ impl HistoryStore {
     /// narrowed the search leaves entries the walk can never reach again.
     /// Their day lines keep counting (history once recorded stays); if a
     /// path re-enters a root, the rescan's ranges supersede them at load.
+    /// A file leaving `state.files` can flip its day lines onto the
+    /// deleted-file fallback [`Self::live_days`] uses, so the liveness
+    /// cache invalidates even when nothing actually matched `roots` — but
+    /// `state` itself is only dirtied when something was actually removed:
+    /// this runs on every scan tick regardless of whether the root set
+    /// narrowed, and a dirty mark on every no-op call would leave `commit`
+    /// rewriting `state.json` on every tick again, the very rewrite the
+    /// dirty flag exists to skip.
     pub fn prune_files_outside(&mut self, roots: &[PathBuf]) -> usize {
+        self.invalidate_live_cache();
         let before = self.state.files.len();
         self.state
             .files
             .retain(|p, _| roots.iter().any(|r| Path::new(p).starts_with(r)));
-        before - self.state.files.len()
+        let removed = before - self.state.files.len();
+        if removed > 0 {
+            self.mark_state_dirty();
+        }
+        removed
     }
 
     /// blake2b hex of a file's first [`PREFIX_BYTES`] — the rewrite signal
@@ -1696,6 +1866,138 @@ mod tests {
             200,
             "40 (chain) + 160 (seal)"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_store_stays_send_for_the_scan_worker_to_hand_across_threads() {
+        // The scan worker builds its own `HistoryStore` off the UI thread
+        // and sends the finished one back over a channel — a type that
+        // stopped being `Send` (an `Rc` slipped into the liveness cache,
+        // say) would only fail at that one call site, far from here.
+        fn assert_send<T: Send>() {}
+        assert_send::<HistoryStore>();
+    }
+
+    #[test]
+    fn live_days_cache_reflects_every_kind_of_mutation_on_the_next_call() {
+        // The liveness answer is memoized. Each of these mutations — a
+        // superseding generation, a tombstone, and a compaction — must be
+        // visible on the very next `live_days()` call, not eventually.
+        let dir = tmpdir("cache-reflects");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store.append_days(&[day("/f", 0, 10)]).unwrap();
+        store
+            .state_mut()
+            .files
+            .insert("/f".to_string(), FileState::fresh("d".into(), 1, 1));
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            10,
+            "cache populated at gen 0"
+        );
+
+        // A superseding generation: the cached gen-0 answer must not stick.
+        store
+            .file_state_mut(Path::new("/f"))
+            .unwrap()
+            .reset("d2".into(), 2, 2);
+        store.append_days(&[day("/f", 1, 7)]).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            7,
+            "the next call must see the bumped generation, not the cached one"
+        );
+
+        // A tombstone seals the generation on top of the same cached call.
+        let mut tomb = day("/f", 1, 0);
+        tomb.lo = 0;
+        tomb.hi = 0;
+        tomb.full = true;
+        store.append_days(&[tomb]).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            0,
+            "the tombstone's seal must be visible on the very next call"
+        );
+
+        // Compaction rewrites `days` and reindexes every position the
+        // cache's indices pointed at; pad the file past the threshold
+        // (unparseable junk the store never folds in) so `commit` runs it.
+        store.append_days(&[day("/g", 0, 3)]).unwrap();
+        assert_eq!(store.live_days().count(), 2, "cache populated once more");
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("days.jsonl"))
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{}", "x".repeat(17 * 1024 * 1024)).unwrap();
+        drop(f);
+        store.commit().unwrap(); // compacts, reindexing every live position
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            3,
+            "compaction must not leave the cache pointing at stale positions"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_commit_with_no_mutation_since_the_last_one_leaves_the_state_file_untouched() {
+        let dir = tmpdir("commit-clean");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store
+            .state_mut()
+            .files
+            .insert("/f".to_string(), FileState::fresh("d".into(), 1, 1));
+        store.commit().unwrap();
+        let path = dir.join("state.json");
+        let before_meta = fs::metadata(&path).unwrap();
+        let before_bytes = fs::read(&path).unwrap();
+
+        // Nothing touches `state` between these — both must be no-ops.
+        store.commit().unwrap();
+        store.commit().unwrap();
+
+        let after_meta = fs::metadata(&path).unwrap();
+        let after_bytes = fs::read(&path).unwrap();
+        assert_eq!(before_bytes, after_bytes, "the bytes must not change");
+        assert_eq!(
+            before_meta.modified().unwrap(),
+            after_meta.modified().unwrap(),
+            "an unmodified state must not be rewritten at all, not just rewritten identically"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_commit_after_file_state_mut_changes_rewrites_the_state_file() {
+        let dir = tmpdir("commit-dirty");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store
+            .state_mut()
+            .files
+            .insert("/f".to_string(), FileState::fresh("d".into(), 1, 1));
+        store.commit().unwrap();
+        let path = dir.join("state.json");
+        let before_bytes = fs::read(&path).unwrap();
+
+        store
+            .file_state_mut(Path::new("/f"))
+            .unwrap()
+            .reset("d2".into(), 2, 2);
+        store.commit().unwrap();
+
+        let after_bytes = fs::read(&path).unwrap();
+        assert_ne!(
+            before_bytes, after_bytes,
+            "the bumped generation must have reached disk"
+        );
+        // The rewrite through `BufWriter` must round-trip exactly like the
+        // unbuffered write it replaced — `open` reading the new bytes back
+        // and finding gen 1 is the proof.
+        let reopened = HistoryStore::open(&dir).unwrap();
+        assert_eq!(reopened.file_state(Path::new("/f")).unwrap().gen, 1);
         let _ = fs::remove_dir_all(&dir);
     }
 }

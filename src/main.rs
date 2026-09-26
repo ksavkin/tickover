@@ -201,15 +201,33 @@ type HistoryShared = Rc<RefCell<Option<tickover::history::store::HistoryStore>>>
 #[cfg(not(feature = "history"))]
 type HistoryShared = ();
 
+/// `quota_projection`'s per-tick memo: `(provider id, window start unix) →
+/// tokens spent since then`, so a tick that asks the same open window's
+/// burn for every plugin fetch it draws only touches the store once per
+/// window rather than once per ask. Keyed on tokens alone, not the whole
+/// `window_burn` pair — the hours-elapsed half is cheap and depends on
+/// `now`, which moves every tick, so it is always recomputed fresh rather
+/// than cached alongside a figure that wouldn't need to be. Cleared
+/// whenever the answer could change: a new store snapshot, or the enabled
+/// plugin set. `()` in a build without the feature, matching
+/// [`HistoryShared`].
+#[cfg(feature = "history")]
+type ProjectionCache = Rc<RefCell<HashMap<(String, u64), Option<u64>>>>;
+#[cfg(not(feature = "history"))]
+type ProjectionCache = ();
+
 /// The scan-worker's plumbing: a sender it reports each commit on, and a
 /// busy flag so a slow scan is never stacked with a second one (the same
 /// one-thread-at-a-time rule [`Fetching`] gives provider fetches — the
 /// scanner walks provider directories, and two concurrent walks double the
-/// IO for nothing).
+/// IO for nothing). The channel carries the freshly scanned store itself,
+/// not a bare notification — the worker already holds the exact snapshot a
+/// reopen would produce, so handing it over directly is what keeps the UI
+/// thread from ever parsing `days.jsonl` again after startup.
 #[cfg(feature = "history")]
 #[derive(Clone)]
 struct HistoryIo {
-    tx: mpsc::Sender<()>,
+    tx: mpsc::Sender<tickover::history::store::HistoryStore>,
     busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 #[cfg(not(feature = "history"))]
@@ -311,6 +329,9 @@ struct Ctx {
     /// See [`HistoryShared`]. `()` when the feature is compiled out — the
     /// field exists either way so refresh plumbing doesn't fork on the flag.
     history: HistoryShared,
+    /// See [`ProjectionCache`]. `()` when the feature is compiled out, for
+    /// the same reason as `history`.
+    projection_cache: ProjectionCache,
     /// See [`HistoryIo`]. Empty unit struct when the feature is compiled out.
     #[cfg_attr(not(feature = "history"), allow(dead_code))]
     history_io: HistoryIo,
@@ -348,7 +369,10 @@ fn refresh_all(ctx: &Ctx) {
             &ctx.cache,
             &ctx.window_models,
             &ctx.balance_models,
-            &ctx.history,
+            Projection {
+                hist: &ctx.history,
+                cache: &ctx.projection_cache,
+            },
         );
         sync_tray_indicator(
             &ctx.tray,
@@ -592,11 +616,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // trust dialog and the actual disk write both need the UI thread, so
     // only the network+sha256 half runs off it.
     let (install_tx, install_rx) = mpsc::channel::<(PendingKind, RegistryEntry, InstallOutcome)>();
-    // History scan worker → UI: "the store changed on disk, reopen your
-    // snapshot". The scan itself runs off the UI thread (IO under a
-    // wall-clock budget); the receiver lives in `run_slow_timer`.
+    // History scan worker → UI: the freshly scanned-and-committed store, so
+    // the UI thread only ever installs a snapshot, never opens one itself.
+    // The scan runs off the UI thread (IO under a wall-clock budget); the
+    // receiver lives in `run_slow_timer`.
     #[cfg(feature = "history")]
-    let (history_tx, history_rx) = mpsc::channel::<()>();
+    let (history_tx, history_rx) = mpsc::channel::<tickover::history::store::HistoryStore>();
 
     // Slint creates the native macOS application lazily. Deferring tray
     // construction by one event-loop turn (`setup_tray`, below) makes the
@@ -604,12 +629,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // declared here, ahead of that, so `Ctx` can carry it from the start.
     let tray: TraySlot = Rc::new(RefCell::new(None));
 
-    // The UI-side history snapshot (see [`HistoryShared`]): reopened after
+    // The UI-side history snapshot (see [`HistoryShared`]): installed from
     // each scan-worker commit; `()` when the feature is compiled out.
     #[cfg(feature = "history")]
     let history_cell: HistoryShared = Rc::new(RefCell::new(None));
     #[cfg(not(feature = "history"))]
     let history_cell: HistoryShared = ();
+
+    // See [`ProjectionCache`] — cleared alongside `history_cell` every time
+    // it changes, and wherever the enabled plugin set can.
+    #[cfg(feature = "history")]
+    let projection_cache: ProjectionCache = Rc::new(RefCell::new(HashMap::new()));
+    #[cfg(not(feature = "history"))]
+    let projection_cache: ProjectionCache = ();
 
     let ctx = Ctx {
         weak: app.as_weak(),
@@ -634,6 +666,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         anchor: anchor.clone(),
         shown_at: shown_at.clone(),
         history: history_cell,
+        projection_cache,
         #[cfg(feature = "history")]
         history_io: HistoryIo {
             tx: history_tx,
@@ -695,7 +728,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cache,
         &window_models,
         &balance_models,
-        &ctx.history,
+        Projection {
+            hist: &ctx.history,
+            cache: &ctx.projection_cache,
+        },
     );
     sync_tray_indicator(&tray, menubar_on, &plugins.borrow(), &cache, &tray_key);
 
@@ -819,7 +855,10 @@ fn wire_ui_callbacks(app: &AppWindow, ctx: &Ctx) {
                     &ctx.cache,
                     &ctx.window_models,
                     &ctx.balance_models,
-                    &ctx.history,
+                    Projection {
+                        hist: &ctx.history,
+                        cache: &ctx.projection_cache,
+                    },
                 );
             }
         });
@@ -1129,6 +1168,13 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
         app.on_plugin_enabled_changed(move |id, on| {
             let id = id.to_string();
             config::set_plugin_enabled(&id, on);
+            // The projection cache is keyed by provider id alone, not by
+            // whether that provider is currently enabled, so this toggle
+            // can't actually stale an entry — cleared anyway, since a
+            // future keying that did depend on the enabled set would
+            // otherwise have one silent exception to find again.
+            #[cfg(feature = "history")]
+            ctx.projection_cache.borrow_mut().clear();
             if on {
                 // Re-enabled: fetch it now so its row appears without waiting
                 // for the next refresh cadence.
@@ -1215,6 +1261,8 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
             // own invalidation, separate from `ctx.cache.clear()` below.
             forget_changed_manifests(&previous, &ctx.plugins.borrow());
             ctx.cache.borrow_mut().clear();
+            #[cfg(feature = "history")]
+            ctx.projection_cache.borrow_mut().clear();
             // Clear in-flight markers so the fresh fetches below aren't
             // deduped away by an old worker that is still running against the
             // pre-reset manifest — otherwise its stale result would be the one
@@ -1426,6 +1474,7 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                     &ctx.fetching,
                     &ctx.plugin_model,
                     &ctx.plugin_tx,
+                    &ctx.projection_cache,
                 );
                 if let Some(app) = ctx.weak.upgrade() {
                     refresh_model(
@@ -1435,7 +1484,10 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                         &ctx.cache,
                         &ctx.window_models,
                         &ctx.balance_models,
-                        &ctx.history,
+                        Projection {
+                            hist: &ctx.history,
+                            cache: &ctx.projection_cache,
+                        },
                     );
                     sync_tray_indicator(
                         &ctx.tray,
@@ -1590,6 +1642,7 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                 &ctx.fetching,
                 &ctx.plugin_model,
                 &ctx.plugin_tx,
+                &ctx.projection_cache,
             );
             if let Some(app) = ctx.weak.upgrade() {
                 refresh_model(
@@ -1599,7 +1652,10 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                     &ctx.cache,
                     &ctx.window_models,
                     &ctx.balance_models,
-                    &ctx.history,
+                    Projection {
+                        hist: &ctx.history,
+                        cache: &ctx.projection_cache,
+                    },
                 );
                 sync_tray_indicator(
                     &ctx.tray,
@@ -1822,7 +1878,7 @@ fn run_fast_timer(
         // `reload_manifests_only`'s docs.
         let settings_open_now = app.get_settings_open();
         if settings_open_now && !settings_open_prev.get() {
-            reload_manifests_only(&ctx.plugins, &ctx.plugin_model);
+            reload_manifests_only(&ctx.plugins, &ctx.plugin_model, &ctx.projection_cache);
         }
         settings_open_prev.set(settings_open_now);
 
@@ -1915,6 +1971,7 @@ fn run_fast_timer(
                     &ctx.fetching,
                     &ctx.plugin_model,
                     &ctx.plugin_tx,
+                    &ctx.projection_cache,
                 );
                 got = true;
             }
@@ -1933,7 +1990,10 @@ fn run_fast_timer(
                 &ctx.cache,
                 &ctx.window_models,
                 &ctx.balance_models,
-                &ctx.history,
+                Projection {
+                    hist: &ctx.history,
+                    cache: &ctx.projection_cache,
+                },
             );
             sync_tray_indicator(
                 &ctx.tray,
@@ -1956,7 +2016,10 @@ fn run_fast_timer(
                     &ctx.cache,
                     &ctx.window_models,
                     &ctx.balance_models,
-                    &ctx.history,
+                    Projection {
+                        hist: &ctx.history,
+                        cache: &ctx.projection_cache,
+                    },
                 );
                 sync_tray_indicator(
                     &ctx.tray,
@@ -1995,7 +2058,7 @@ fn run_fast_timer(
 fn run_slow_timer(
     app: &AppWindow,
     ctx: &Ctx,
-    #[cfg(feature = "history")] history_rx: mpsc::Receiver<()>,
+    #[cfg(feature = "history")] history_rx: mpsc::Receiver<tickover::history::store::HistoryStore>,
 ) -> Timer {
     let tick_timer = Timer::default();
     let weak = app.as_weak();
@@ -2003,10 +2066,16 @@ fn run_slow_timer(
     #[cfg(feature = "history")]
     let history_rx = history_rx;
     let ticks = Cell::new(0u32);
+    // Rate-limits the "slow tick" log below to one line per 10 minutes — a
+    // tick over budget tends to repeat (the same expensive path runs again
+    // next second), and logging every one of them would just be noise on
+    // top of the slowdown it's reporting.
+    let last_slow_tick_logged = Cell::new(None::<Instant>);
     tick_timer.start(
         TimerMode::Repeated,
         Duration::from_millis(1000),
         move || {
+            let tick_started = Instant::now();
             let Some(app) = weak.upgrade() else { return };
             let n = ticks.get().wrapping_add(1);
             ticks.set(n);
@@ -2032,20 +2101,24 @@ fn run_slow_timer(
                 }
             }
 
-            // Local usage history: a committed scan means the on-disk store
-            // moved — reopen the UI's snapshot and redraw, so Activity and
-            // the quota hatches pick the new buckets up within a second.
-            // Rescans run on a slow cadence of their own: the scanner is
-            // incremental, but every pass still stats the provider trees.
+            // Local usage history: the scan worker sends its own freshly
+            // committed store rather than a bare notification — installing
+            // it here is the only thing this thread does, so it never
+            // parses `days.jsonl` itself. Several commits can land in one
+            // tick (a cold corpus scans in several 8-pass rounds); only the
+            // last is worth installing, so the drain keeps that one and
+            // throws the rest away. Rescans run on a slow cadence of their
+            // own: the scanner is incremental, but every pass still stats
+            // the provider trees.
             #[cfg(feature = "history")]
             {
-                let mut committed = false;
-                while history_rx.try_recv().is_ok() {
-                    committed = true;
+                let mut latest = None;
+                while let Ok(store) = history_rx.try_recv() {
+                    latest = Some(store);
                 }
-                if committed {
-                    *ctx.history.borrow_mut() = tickover::history::default_dir()
-                        .and_then(|d| tickover::history::store::HistoryStore::open(&d).ok());
+                if let Some(store) = latest {
+                    *ctx.history.borrow_mut() = Some(store);
+                    ctx.projection_cache.borrow_mut().clear();
                     sync_activity(&app, &ctx);
                 }
                 if n % 120 == 17 {
@@ -2078,7 +2151,10 @@ fn run_slow_timer(
                     &current,
                     &ctx.window_models,
                     &ctx.balance_models,
-                    &ctx.history,
+                    Projection {
+                        hist: &ctx.history,
+                        cache: &ctx.projection_cache,
+                    },
                 );
             }
             // Cheap no-op unless data, theme, or the toggle actually changed.
@@ -2104,7 +2180,10 @@ fn run_slow_timer(
                         &current,
                         &ctx.window_models,
                         &ctx.balance_models,
-                        &ctx.history,
+                        Projection {
+                            hist: &ctx.history,
+                            cache: &ctx.projection_cache,
+                        },
                     );
                 }
                 present_popover(
@@ -2330,6 +2409,22 @@ fn run_slow_timer(
                     pinged_at_while(&m.id, now, || spawn_hello(bin, ping.args.clone(), None));
                 }
             }
+
+            // A tick that runs long starves repaint — nothing else here
+            // notices, so this is the only place that shows it. 200ms is a
+            // fifth of the tick's own 1-second period: past that point a
+            // once-a-second update starts reading as a stutter rather than
+            // a smooth countdown, well before the tick threatens to miss
+            // its next period outright.
+            let elapsed = tick_started.elapsed();
+            if elapsed > Duration::from_millis(200)
+                && last_slow_tick_logged
+                    .get()
+                    .is_none_or(|at| at.elapsed() >= Duration::from_secs(600))
+            {
+                diag::line(format!("slow tick: {} ms", elapsed.as_millis()));
+                last_slow_tick_logged.set(Some(Instant::now()));
+            }
         },
     );
     tick_timer
@@ -2467,7 +2562,10 @@ fn drain_tray_clicks(app: &AppWindow, ctx: &Ctx) -> usize {
                         &ctx.cache,
                         &ctx.window_models,
                         &ctx.balance_models,
-                        &ctx.history,
+                        Projection {
+                            hist: &ctx.history,
+                            cache: &ctx.projection_cache,
+                        },
                     );
                 }
                 present_popover(
@@ -2555,7 +2653,10 @@ fn run_dock_reopen_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                         &ctx.cache,
                         &ctx.window_models,
                         &ctx.balance_models,
-                        &ctx.history,
+                        Projection {
+                            hist: &ctx.history,
+                            cache: &ctx.projection_cache,
+                        },
                     );
                 }
                 present_popover(
@@ -3027,12 +3128,25 @@ fn forget_changed_manifests(old: &[PluginManifest], new: &[PluginManifest]) {
 /// settings-sheet open (see the `settings-open` rising-edge check in the fast
 /// timer) without adding a surprise network hit just for opening a sheet, and
 /// safe to call after the last plugin manifest was deleted without
-/// resurrecting the built-ins.
-fn reload_manifests_only(plugins: &Plugins, plugin_model: &PluginRows) {
+/// resurrecting the built-ins. Clearing `proj_cache` here, rather than at
+/// each call site, is what keeps every reload/install/remove path covered
+/// without depending on every future call site remembering to do it itself.
+fn reload_manifests_only(
+    plugins: &Plugins,
+    plugin_model: &PluginRows,
+    proj_cache: &ProjectionCache,
+) {
+    // `proj_cache` is `()` without the feature — there's nothing to clear,
+    // but the parameter still has to be named to keep this signature
+    // uniform for every call site.
+    #[cfg(not(feature = "history"))]
+    let _ = proj_cache;
     let previous = plugins.borrow().clone();
     *plugins.borrow_mut() = load_plugins();
     forget_changed_manifests(&previous, &plugins.borrow());
     refresh_plugins_model(plugin_model, &plugins.borrow());
+    #[cfg(feature = "history")]
+    proj_cache.borrow_mut().clear();
 }
 
 /// [`reload_manifests_only`] plus a fresh fetch of every (enabled) plugin —
@@ -3045,8 +3159,9 @@ fn reload_and_fetch(
     fetching: &Fetching,
     plugin_model: &PluginRows,
     tx: &mpsc::Sender<(String, u64, Vec<ProviderReading>)>,
+    proj_cache: &ProjectionCache,
 ) {
-    reload_manifests_only(plugins, plugin_model);
+    reload_manifests_only(plugins, plugin_model, proj_cache);
     // Clear in-flight markers so a fetch still running against the pre-reload
     // manifest set can't dedupe away the fresh one spawned below — mirrors
     // `reset-plugins`'s own comment on the same race.
@@ -5006,6 +5121,17 @@ fn should_refresh_panel(visible: bool, forced: bool) -> bool {
     visible || forced
 }
 
+/// The store handle ([`HistoryShared`]) and its per-tick token memo
+/// ([`ProjectionCache`]) travel everywhere together — bundled into one
+/// parameter so `refresh_model`/`refresh_model_from` stay under clippy's
+/// argument-count ceiling instead of growing an eighth unrelated-looking
+/// slot for a cache the store handle already implies.
+#[derive(Clone, Copy)]
+struct Projection<'a> {
+    hist: &'a HistoryShared,
+    cache: &'a ProjectionCache,
+}
+
 /// Rebuild the provider list from the cache. Two nested reconciles keep the UI
 /// stable across the one-second tick:
 ///   * the outer list reuses each `ProviderData` slot in place (`set_row_data`
@@ -5025,7 +5151,7 @@ fn refresh_model(
     cache: &PluginCache,
     window_models: &WindowModels,
     balance_models: &BalanceModels,
-    hist: &HistoryShared,
+    proj: Projection<'_>,
 ) {
     let readings = readings(plugins, &cache.borrow());
     refresh_model_from(
@@ -5035,7 +5161,7 @@ fn refresh_model(
         &readings,
         window_models,
         balance_models,
-        hist,
+        proj,
     );
 }
 
@@ -5051,7 +5177,7 @@ fn refresh_model_from(
     readings: &[ProviderReading],
     window_models: &WindowModels,
     balance_models: &BalanceModels,
-    hist: &HistoryShared,
+    proj: Projection<'_>,
 ) {
     let now = now_unix();
 
@@ -5075,8 +5201,9 @@ fn refresh_model_from(
                         now,
                         &|key| m.and_then(|m| seen_window_for(m, &r.id, key)),
                         &|w, used| {
-                            m.map(|mm| mm.id.as_str())
-                                .and_then(|p| quota_projection(hist, p, w, used, now))
+                            m.map(|mm| mm.id.as_str()).and_then(|p| {
+                                quota_projection(proj.hist, proj.cache, p, w, used, now)
+                            })
                         },
                     );
                     let windows = reconcile_window_model(&mut win_models, &r.id, rows);
@@ -5597,6 +5724,26 @@ fn not_started_row(label: &str, role: Role, period_minutes: u64) -> WindowData {
     }
 }
 
+/// `proj_cache`'s memoized token sum for `key` — a miss runs `fetch` and
+/// remembers the answer, a hit skips the store entirely. `fetch` is called
+/// with nothing borrowed: it reaches into the history store, and holding
+/// `proj_cache` borrowed across that would panic the moment anything asked
+/// this same cache again before `fetch` returned (nothing does today, but
+/// the point is to be safe by construction rather than by that accident).
+#[cfg(feature = "history")]
+fn cached_window_tokens(
+    proj_cache: &ProjectionCache,
+    key: (String, u64),
+    fetch: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
+    if let Some(&hit) = proj_cache.borrow().get(&key) {
+        return hit;
+    }
+    let tokens = fetch();
+    proj_cache.borrow_mut().insert(key, tokens);
+    tokens
+}
+
 /// The quota-projection hatch's one input (design §4): where the burn rate
 /// lands the window at reset, its tone, and the right-hand caption.
 /// `None` — nothing drawn — when there is no history to project from, no
@@ -5604,6 +5751,7 @@ fn not_started_row(label: &str, role: Role, period_minutes: u64) -> WindowData {
 #[cfg(feature = "history")]
 fn quota_projection(
     hist: &HistoryShared,
+    proj_cache: &ProjectionCache,
     provider: &str,
     w: &Window,
     used: f64,
@@ -5619,7 +5767,16 @@ fn quota_projection(
     if now <= start || now >= reset {
         return None;
     }
-    let (tokens, elapsed_h) = tickover::history::query::window_burn(store, provider, start)?;
+    // The store-touching half, asked once per (provider, start) for as long
+    // as `proj_cache` isn't cleared — every other window row this tick
+    // draws for the same provider and window shares this one lookup.
+    let tokens = cached_window_tokens(proj_cache, (provider.to_string(), start), || {
+        tickover::history::query::window_tokens(store, provider, start)
+    })?;
+    // Recomputed from this tick's own `now` every time, unlike `tokens`
+    // above — the store only needs asking once per snapshot, but the hours
+    // elapsed since `start` move every second regardless of it.
+    let elapsed_h = now.saturating_sub(start).max(1) as f64 / 3600.0;
     if used <= 0.0 || elapsed_h <= 0.0 {
         return None;
     }
@@ -5659,6 +5816,7 @@ fn quota_projection(
 #[cfg(not(feature = "history"))]
 fn quota_projection(
     _: &HistoryShared,
+    _: &ProjectionCache,
     _: &str,
     _: &Window,
     _: f64,
@@ -5667,13 +5825,82 @@ fn quota_projection(
     None
 }
 
+#[cfg(all(test, feature = "history"))]
+mod projection_cache_tests {
+    use super::*;
+
+    /// A hit must never run `fetch` — the whole point of the memo is that a
+    /// tick asking the same (provider, start) more than once only touches
+    /// the store on the first ask.
+    #[test]
+    fn a_cached_key_never_calls_fetch_again() {
+        let cache: ProjectionCache = Rc::new(RefCell::new(HashMap::new()));
+        let calls = Cell::new(0u32);
+        let key = ("claude".to_string(), 1_000u64);
+
+        let first = cached_window_tokens(&cache, key.clone(), || {
+            calls.set(calls.get() + 1);
+            Some(42)
+        });
+        assert_eq!(first, Some(42));
+        assert_eq!(calls.get(), 1);
+
+        let second = cached_window_tokens(&cache, key.clone(), || {
+            calls.set(calls.get() + 1);
+            Some(0) // would prove a re-fetch happened if this won
+        });
+        assert_eq!(
+            second,
+            Some(42),
+            "the cached figure must survive, not the miss path's"
+        );
+        assert_eq!(calls.get(), 1, "the second ask must not have called fetch");
+
+        // A different key is a genuine miss and does call `fetch`.
+        let other = cached_window_tokens(&cache, ("codex".to_string(), 1_000), || {
+            calls.set(calls.get() + 1);
+            Some(7)
+        });
+        assert_eq!(other, Some(7));
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// `None` — "nothing counted yet" — is itself a cacheable answer, not a
+    /// miss to retry every tick.
+    #[test]
+    fn a_cached_none_also_survives_without_a_refetch() {
+        let cache: ProjectionCache = Rc::new(RefCell::new(HashMap::new()));
+        let calls = Cell::new(0u32);
+        let key = ("claude".to_string(), 1_000u64);
+
+        let first = cached_window_tokens(&cache, key.clone(), || {
+            calls.set(calls.get() + 1);
+            None
+        });
+        assert_eq!(first, None);
+        let second = cached_window_tokens(&cache, key, || {
+            calls.set(calls.get() + 1);
+            Some(99)
+        });
+        assert_eq!(
+            second, None,
+            "the cached miss must not be overwritten by a later fetch"
+        );
+        assert_eq!(calls.get(), 1);
+    }
+}
+
 /// Spawn the one-at-a-time history scan: the worker opens its own store
 /// handle, ticks the incremental scanner over every `[history]` manifest —
 /// each manifest's declared `[[option]]`s resolving its own `root` — and
-/// commits, then signals the slow timer, which reopens the UI's snapshot.
-/// The `busy` cell is the one-thread-at-a-time rule [`Fetching`] gives
-/// provider fetches: a still-running scan is left to finish, never stacked
-/// with a second walker on the same directories.
+/// commits, then hands that same store to the slow timer over the channel.
+/// Sending the store the worker already has, rather than a notification the
+/// UI thread would answer by opening its own copy, is what keeps
+/// `days.jsonl` off the UI thread after startup — the object in hand is
+/// already exactly what a fresh `open` of the just-committed directory would
+/// produce. The `busy` cell is the one-thread-at-a-time rule [`Fetching`]
+/// gives provider fetches: a still-running scan is left to finish, never
+/// stacked with a second walker on the same directories.
 #[cfg(feature = "history")]
 fn spawn_history_scan(ctx: &Ctx) {
     if ctx
@@ -5702,26 +5929,20 @@ fn spawn_history_scan(ctx: &Ctx) {
     // not panic with `busy` already raised — see `spawn_plugin_fetch`.
     if std::thread::Builder::new()
         .spawn(move || {
-            let report_done = |store_moved: bool| {
+            let report_done = |store: Option<tickover::history::store::HistoryStore>| {
                 busy.store(false, std::sync::atomic::Ordering::SeqCst);
-                if store_moved {
-                    let _ = tx.send(());
+                if let Some(store) = store {
+                    let _ = tx.send(store);
                 }
             };
             // A panic in a scan must still release `busy` — otherwise the
             // card would sit on "scanning…" forever and never scan again.
             let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let Some(dir) = tickover::history::default_dir() else {
-                    return false;
-                };
+                let dir = tickover::history::default_dir()?;
                 // `tickover stats` can scan this same store concurrently —
                 // the lock serializes open+scan+commit across processes.
-                let Ok(_lock) = tickover::history::store::lock_store(&dir) else {
-                    return false;
-                };
-                let Ok(mut store) = tickover::history::store::HistoryStore::open(&dir) else {
-                    return false;
-                };
+                let _lock = tickover::history::store::lock_store(&dir).ok()?;
+                let mut store = tickover::history::store::HistoryStore::open(&dir).ok()?;
                 // Resumable ticks: a pass that stopped on its wall-clock
                 // budget reports `partial`; a cold corpus takes a few.
                 for _ in 0..8 {
@@ -5729,19 +5950,19 @@ fn spawn_history_scan(ctx: &Ctx) {
                         tickover::history::scan_tick(&mut store, &manifests, &plugin_options);
                     if let Err(e) = store.commit() {
                         diag::line(format!("history: store commit failed: {e}"));
-                        return false;
+                        return None;
                     }
                     if !scans.iter().any(|s| s.outcome.partial) {
                         break;
                     }
                 }
-                true
+                Some(store)
             }));
             match run {
-                Ok(moved) => report_done(moved),
+                Ok(store) => report_done(store),
                 Err(_) => {
                     diag::line("history: scan thread panicked".into());
-                    report_done(false);
+                    report_done(None);
                 }
             }
         })
@@ -5824,8 +6045,9 @@ fn sync_activity(app: &AppWindow, ctx: &Ctx) {
 #[cfg(not(feature = "history"))]
 fn sync_activity(_: &AppWindow, _: &Ctx) {}
 
-/// Render a [`PanelSummary`] into the card's Slint struct — every string
-/// and fraction the UI needs, so `ui/app.slint` draws and never computes.
+/// Render a [`PanelSummary`](tickover::history::query::PanelSummary) into
+/// the card's Slint struct — every string and fraction the UI needs, so
+/// `ui/app.slint` draws and never computes.
 #[cfg(feature = "history")]
 fn activity_data(
     sum: Option<&tickover::history::query::PanelSummary>,
@@ -6028,7 +6250,8 @@ fn open_history_report(ctx: &Ctx) {
             .filter_map(|r| {
                 let w = r.primary_window()?;
                 let used = w.used_percent?;
-                let proj = quota_projection(&ctx.history, &r.id, w, used, now);
+                let proj =
+                    quota_projection(&ctx.history, &ctx.projection_cache, &r.id, w, used, now);
                 let weekly = w
                     .period_minutes
                     .map_or(w.role == Role::Secondary, |m| m > 720);
