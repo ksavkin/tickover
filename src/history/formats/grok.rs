@@ -80,6 +80,7 @@ impl HistoryExtractor for GrokExtractor {
     fn extract(
         &self,
         path: &Path,
+        _root: &Path,
         st: &mut FileState,
         byte_cap: u64,
         _deadline: Instant,
@@ -229,7 +230,7 @@ mod tests {
         );
         let p = tmp.write("unified.jsonl", content);
         let ex = GrokExtractor
-            .extract(&p, &mut fresh(), u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
             .unwrap();
         assert_eq!(ex.records.len(), 1);
         let r = &ex.records[0];
@@ -261,7 +262,7 @@ mod tests {
         );
         let p = tmp.write("unified.jsonl", content);
         let ex = GrokExtractor
-            .extract(&p, &mut fresh(), u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
             .unwrap();
         assert_eq!(ex.records.len(), 2);
         assert_eq!(ex.records[0].model, "grok-4");
@@ -283,7 +284,7 @@ mod tests {
         let p = tmp.write("unified.jsonl", head);
         let mut st = fresh();
         let first = GrokExtractor
-            .extract(&p, &mut st, u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut st, u64::MAX, later())
             .unwrap();
         assert!(first.records.is_empty());
         st.cursor = first.cursor;
@@ -299,7 +300,7 @@ mod tests {
             })
             .unwrap();
         let second = GrokExtractor
-            .extract(&p, &mut st, u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut st, u64::MAX, later())
             .unwrap();
         assert_eq!(second.records.len(), 1);
         assert_eq!(second.records[0].project, "proj");

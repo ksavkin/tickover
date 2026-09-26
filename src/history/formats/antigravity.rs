@@ -45,6 +45,7 @@ impl HistoryExtractor for AntigravityExtractor {
     fn extract(
         &self,
         path: &Path,
+        _root: &Path,
         st: &mut FileState,
         _byte_cap: u64,
         deadline: Instant,
@@ -538,6 +539,7 @@ mod tests {
         let out = AntigravityExtractor
             .extract(
                 &db,
+                &dir,
                 &mut st,
                 u64::MAX,
                 Instant::now() + std::time::Duration::from_secs(30),
@@ -550,6 +552,7 @@ mod tests {
         let out = AntigravityExtractor
             .extract(
                 &db,
+                &dir,
                 &mut st,
                 u64::MAX,
                 Instant::now() + std::time::Duration::from_secs(30),
@@ -567,6 +570,7 @@ mod tests {
         let out = AntigravityExtractor
             .extract(
                 &db,
+                &dir,
                 &mut st,
                 u64::MAX,
                 Instant::now() + std::time::Duration::from_secs(30),
@@ -603,7 +607,7 @@ mod tests {
         let mut st = FileState::fresh("d".into(), size, 1);
         let far = Instant::now() + std::time::Duration::from_secs(30);
         let out = AntigravityExtractor
-            .extract(&db, &mut st, u64::MAX, far)
+            .extract(&db, &dir, &mut st, u64::MAX, far)
             .unwrap();
         assert!(out.records.is_empty());
         // The row arrives after the first pass — it must still be read.
@@ -617,7 +621,7 @@ mod tests {
         }
         let far = Instant::now() + std::time::Duration::from_secs(30);
         let out = AntigravityExtractor
-            .extract(&db, &mut st, u64::MAX, far)
+            .extract(&db, &dir, &mut st, u64::MAX, far)
             .unwrap();
         assert_eq!(
             out.records.len(),
@@ -655,7 +659,7 @@ mod tests {
         let far = Instant::now() + std::time::Duration::from_secs(30);
         let mut st = FileState::fresh("d".into(), size, 1);
         let out = AntigravityExtractor
-            .extract(&db, &mut st, u64::MAX, far)
+            .extract(&db, &dir, &mut st, u64::MAX, far)
             .unwrap();
         assert!(out.records.is_empty());
         // The state.json boundary: serialize + deserialize the FileState.
@@ -675,7 +679,7 @@ mod tests {
             .unwrap();
         }
         let out = AntigravityExtractor
-            .extract(&db, &mut st, u64::MAX, far)
+            .extract(&db, &dir, &mut st, u64::MAX, far)
             .unwrap();
         assert_eq!(out.records.len(), 1, "idx = 0 read after a restart");
         let _ = std::fs::remove_dir_all(&dir);
@@ -727,7 +731,7 @@ mod tests {
         let mut st = FileState::fresh("d".into(), size, 1);
         let far = Instant::now() + std::time::Duration::from_secs(30);
         let out = AntigravityExtractor
-            .extract(&db, &mut st, u64::MAX, far)
+            .extract(&db, &dir, &mut st, u64::MAX, far)
             .unwrap();
         // The bad row is skipped permanently: the pass completes, the
         // tail row is emitted, and the watermark steps over the wreck so
@@ -737,7 +741,7 @@ mod tests {
         assert_eq!(out.skipped_unparsed, 1);
         assert_eq!(st.aux["max_idx"].as_i64(), Some(2));
         let out = AntigravityExtractor
-            .extract(&db, &mut st, u64::MAX, far)
+            .extract(&db, &dir, &mut st, u64::MAX, far)
             .unwrap();
         assert!(out.records.is_empty() && out.complete);
         let _ = std::fs::remove_dir_all(&dir);

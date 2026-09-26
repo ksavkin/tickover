@@ -171,19 +171,35 @@ pub fn compute(
         let day = local.date_naive();
 
         st.total.add(d);
-        st.by_provider.entry(d.provider.clone()).or_default().add(d);
         if day == today {
             st.today.add(d);
-            st.today_by_provider
-                .entry(d.provider.clone())
-                .or_default()
-                .add(d);
         }
         if day >= week_start {
             st.week.add(d);
         }
         if day >= month_start {
             st.month.add(d);
+        }
+        st.active_hours[local.hour() as usize] += d.sum();
+
+        // A line that records no tokens and no messages did not happen on
+        // any day, isn't a session, and isn't a provider/project/model the
+        // user actually used — a coverage tombstone always looks like
+        // this, but so would any other bucket that genuinely summed to
+        // zero, and both must drop out the same way: what matters is what
+        // the line records, not why. `total`/`today`/`week`/`month` and
+        // `active_hours` above are the exception: they describe coverage
+        // (bytes the scanner has read), not activity, so a tombstone's
+        // zero folds into them exactly as it always did.
+        if !d.has_activity() {
+            continue;
+        }
+        st.by_provider.entry(d.provider.clone()).or_default().add(d);
+        if day == today {
+            st.today_by_provider
+                .entry(d.provider.clone())
+                .or_default()
+                .add(d);
         }
         projects.entry(d.project.clone()).or_default().add(d);
         models.entry(d.model.clone()).or_default().add(d);
@@ -193,16 +209,6 @@ pub fn compute(
             .entry(d.model.clone())
             .or_default()
             .add(d);
-        st.active_hours[local.hour() as usize] += d.sum();
-
-        // A line that records no tokens and no messages did not happen on
-        // any day and is not a session — a coverage tombstone always looks
-        // like this, but so would any other bucket that genuinely summed
-        // to zero, and both must drop out of the day/streak/session views
-        // the same way: what matters is what the line records, not why.
-        if !d.has_activity() {
-            continue;
-        }
         *day_totals.entry(day).or_default() += d.sum();
         if day >= daily_floor {
             st.daily.entry(day).or_default().add(d);
@@ -512,16 +518,18 @@ pub fn panel(
         slots[slot] += d.sum();
         range_total += d.sum();
         class_totals.add(d);
-        projects.entry(d.project.clone()).or_default().add(d);
-        // See `compute`'s identical guard: a line recording nothing is
-        // not a session the user had.
+        // See `compute`'s identical guard: a line recording nothing is not
+        // a project or a (provider, model) pair the user actually used,
+        // and not a session either — the totals above describe coverage,
+        // not activity, so they alone stay unconditional.
         if d.has_activity() {
+            projects.entry(d.project.clone()).or_default().add(d);
             sessions.insert(format!("{}:{}", d.provider, d.session));
+            price_units
+                .entry((d.provider.clone(), d.model.clone()))
+                .or_default()
+                .add(d);
         }
-        price_units
-            .entry((d.provider.clone(), d.model.clone()))
-            .or_default()
-            .add(d);
     }
 
     out.headline = range_total;
@@ -534,10 +542,15 @@ pub fn panel(
     };
 
     out.delta = match range {
-        // Mean daily total over the whole baseline window — both paths
-        // divide by the window's own length, never by how much of it
-        // happened to carry data.
+        // Mean daily total over the whole 7-day baseline window, never
+        // over just how much of it happened to carry data — the window's
+        // own length (`base_days_span`) is fixed, unlike the count of
+        // days with data.
         PanelRange::Day => Some(base_total as f64 / base_days_span as f64),
+        // Week/Month compare `range_total` against `base_total` directly:
+        // both are sums over windows of the same length (7 or 30 days),
+        // so no division is needed — a per-day average and a ratio of the
+        // two totals agree once the lengths already match.
         _ => (base_total > 0).then_some(base_total as f64),
     }
     .filter(|b| *b > 0.0)
@@ -803,11 +816,23 @@ mod tests {
             "the tombstone's empty session id must not appear"
         );
         assert!(!st.daily.contains_key(&today));
+        assert!(st.providers.is_empty(), "no provider was ever used");
+        assert!(st.by_provider.is_empty());
+        assert!(
+            st.projects.is_empty(),
+            "the tombstone's blank project must not appear"
+        );
+        assert!(
+            st.models.is_empty(),
+            "the tombstone's blank model must not appear"
+        );
+        assert!(st.by_provider_model.is_empty());
 
         let panel_sum = panel(&store, PanelRange::Day, &[], &enabled, None);
         assert_eq!(panel_sum.streak_days, 0);
         assert_eq!(panel_sum.sessions, 0);
         assert!(panel_sum.last_seen.is_none(), "nothing was ever seen");
+        assert!(panel_sum.projects.is_empty(), "no project row to show");
         assert_eq!(
             panel_sum.state,
             PanelState::EmptyRange,
@@ -835,9 +860,21 @@ mod tests {
         store.commit().unwrap();
         let store = HistoryStore::open(&dir).unwrap();
 
-        let st = compute(&store, 30, &enabled_all());
+        let enabled = enabled_all();
+        let st = compute(&store, 30, &enabled);
         assert_eq!(st.active_days, 1);
         assert_eq!(st.sessions.len(), 1);
+        assert_eq!(
+            st.providers,
+            vec!["claude".to_string()],
+            "codex never had real usage"
+        );
+        assert_eq!(st.projects.len(), 1);
+        assert_eq!(st.models.len(), 1);
+        assert_eq!(st.by_provider_model.len(), 1);
+
+        let panel_sum = panel(&store, PanelRange::Week, &[], &enabled, None);
+        assert_eq!(panel_sum.projects.len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 

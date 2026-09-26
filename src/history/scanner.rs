@@ -170,6 +170,26 @@ pub fn scan_root(
                 }
             }
             None => {
+                // No tracked state — either the file is genuinely new, or
+                // its state was dropped without its day lines dying (a
+                // manifest edit narrowing a root, `prune_files_outside`)
+                // and it is only now being rediscovered. Either way a new
+                // life begins for it at generation 0, cursor 0: exactly
+                // when any ownership it held in a previous life goes
+                // stale. Releasing it here, rather than at the prune, is
+                // what keeps a merely-pruned-but-not-yet-rescanned file
+                // still blocking the same id in a second file (its day
+                // lines are still live) while still letting *this* file's
+                // own from-origin rescan recount everything it once owned
+                // — a rescan spanning several passes resumes mid-file on
+                // its later ones, and stale self-ownership there would
+                // read the file's own not-yet-re-seen ids as evicted
+                // repeats and skip them, right as the rescan's completing
+                // pass seals over the old lines that held them. A file
+                // that never owned anything here (the ordinary case: most
+                // discoveries are of files that never emitted a
+                // ring-eligible id) costs nothing extra to ask.
+                store.release_owned(&key);
                 let span = (sig.size).min(crate::history::store::PREFIX_BYTES as u64);
                 let digest = HistoryStore::prefix_digest(&sig.path, span).unwrap_or_default();
                 store.begin_file(&sig.path, provider, digest, sig.size, sig.mtime);
@@ -202,10 +222,11 @@ pub fn scan_root(
         let Some(mut st) = store.file_state(&sig.path).cloned() else {
             continue;
         };
-        let extraction = match extractor.extract(&sig.path, &mut st, PER_FILE_BYTE_CAP, deadline) {
-            Ok(e) => e,
-            Err(_) => continue, // read failure: retry next pass, cursor unmoved
-        };
+        let extraction =
+            match extractor.extract(&sig.path, root, &mut st, PER_FILE_BYTE_CAP, deadline) {
+                Ok(e) => e,
+                Err(_) => continue, // read failure: retry next pass, cursor unmoved
+            };
         if let Some(slot) = store.file_state_mut(&sig.path) {
             *slot = st;
         }
@@ -557,6 +578,7 @@ mod tests {
         fn extract(
             &self,
             _path: &Path,
+            _root: &Path,
             st: &mut FileState,
             _byte_cap: u64,
             _deadline: Instant,
@@ -826,6 +848,7 @@ mod tests {
         fn extract(
             &self,
             _path: &Path,
+            _root: &Path,
             st: &mut FileState,
             _byte_cap: u64,
             _deadline: Instant,
@@ -913,6 +936,7 @@ mod tests {
         fn extract(
             &self,
             _path: &Path,
+            _root: &Path,
             st: &mut FileState,
             _byte_cap: u64,
             _deadline: Instant,
@@ -1104,6 +1128,7 @@ glob   = "{glob}"
         fn extract(
             &self,
             _path: &Path,
+            _root: &Path,
             st: &mut FileState,
             _byte_cap: u64,
             _deadline: Instant,
@@ -1164,9 +1189,10 @@ glob   = "{glob}"
         // over from byte zero, but its *second* pass still resumes
         // mid-file (`resume_from > 0`) — exactly the shape the ordinary
         // rewrite path's `ring_evicted_self` exception was built for, so
-        // without releasing the pruned file's global-ring ownership first,
-        // that pass reads its own already-owned ids as duplicates, seals
-        // over the line that held them, and the tokens vanish for good.
+        // unless the file's stale ownership is released the moment
+        // `begin_file` gives it a fresh life, that pass reads its own
+        // already-owned ids as duplicates, seals over the line that held
+        // them, and the tokens vanish for good.
         let root = tmpdir("prune-rescan-root");
         let dir = tmpdir("prune-rescan-store");
         fs::write(root.join("t.jsonl"), "0123456789abcdef").unwrap();
@@ -1202,9 +1228,9 @@ glob   = "{glob}"
 
     #[test]
     fn pruning_one_file_leaves_another_files_ownership_alone() {
-        // The ordinary cross-file duplicate stays suppressed: releasing a
-        // pruned file's own ring ownership must not reach into a different
-        // file's claim on an unrelated id.
+        // `prune_files_outside` touches no ring entry at all — a and b's
+        // ownership of an unrelated id must survive dropping c's state
+        // exactly as if c had never existed for the ring's purposes.
         let root = tmpdir("prune-xfile-root");
         let dir = tmpdir("prune-xfile-store");
         fs::write(root.join("a.jsonl"), claude_line("shared", 100, 10) + "\n").unwrap();
@@ -1238,6 +1264,116 @@ glob   = "{glob}"
         };
         assert!(store.owns_globally(owner, "shared"));
         assert!(store.seen_globally(dup, "shared"));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pruned_owners_id_still_suppresses_a_kept_second_file() {
+        // The owner's day lines survive its prune (only its *state* was
+        // dropped), so "shared"'s tokens are still live under them. A
+        // second, still-tracked file re-emitting the same id later — a
+        // genuine mid-stream growth it had never seen before — must keep
+        // reading it as somebody else's, or the same usage counts twice.
+        let owner_root = tmpdir("pruned-owner-root");
+        let kept_root = tmpdir("pruned-kept-root");
+        let dir = tmpdir("pruned-owner-store");
+        fs::write(
+            owner_root.join("owner.jsonl"),
+            claude_line("shared", 100, 10) + "\n",
+        )
+        .unwrap();
+        fs::write(
+            kept_root.join("kept.jsonl"),
+            claude_line("shared", 100, 10) + "\n",
+        )
+        .unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let ex = crate::history::formats::claude::ClaudeExtractor;
+        let far = Instant::now() + Duration::from_secs(30);
+        scan_root(&mut store, "claude", &owner_root, "*.jsonl", &ex, far);
+        scan_root(&mut store, "claude", &kept_root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            100,
+            "one event, one count"
+        );
+
+        // Whichever of the two files scanned first owns "shared"; prune it
+        // and keep the other by name.
+        let owner_key = owner_root
+            .join("owner.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let kept_key = kept_root.join("kept.jsonl").to_string_lossy().into_owned();
+        let (owner_key, kept_key) = if store.owns_globally(&owner_key, "shared") {
+            (owner_key, kept_key)
+        } else {
+            (kept_key, owner_key)
+        };
+        let kept_dir = Path::new(&kept_key).parent().unwrap().to_path_buf();
+        store.prune_files_outside(std::slice::from_ref(&kept_dir));
+        store.commit().unwrap();
+        assert!(store.file_state(Path::new(&owner_key)).is_none());
+        assert!(store.file_state(Path::new(&kept_key)).is_some());
+
+        // The kept file grows, re-emitting "shared" at a new byte range it
+        // had never read before.
+        use std::io::Write as _;
+        let mut f = fs::OpenOptions::new().append(true).open(&kept_key).unwrap();
+        writeln!(f, "{}", claude_line("shared", 100, 40)).unwrap();
+        drop(f);
+        scan_root(&mut store, "claude", &kept_dir, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            100,
+            "the pruned owner's line still holds the only count; the \
+             kept file's late re-emission of the same id must not add \
+             a second"
+        );
+        let _ = fs::remove_dir_all(&owner_root);
+        let _ = fs::remove_dir_all(&kept_root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rewrite_still_releases_so_a_different_file_can_claim_the_id() {
+        // Contrast with the prune case above: a rewrite's old generation
+        // really does die (its lines are superseded, not merely
+        // orphaned), so the ids it owned must go back to the pool
+        // outright — a second file carrying the same id afterwards is not
+        // a duplicate of anything still live and may count.
+        let root = tmpdir("rewrite-release-root");
+        let dir = tmpdir("rewrite-release-store");
+        fs::write(root.join("a.jsonl"), claude_line("shared", 100, 10) + "\n").unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let ex = crate::history::formats::claude::ClaudeExtractor;
+        let far = Instant::now() + Duration::from_secs(30);
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 100);
+
+        // Rewrite: different bytes, no more "shared" in this file at all.
+        fs::write(root.join("a.jsonl"), claude_line("solo", 1, 1) + "\n").unwrap();
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            1,
+            "the old shared(100) is superseded by the rewrite; solo(1) is the new content"
+        );
+
+        // A second, unrelated file reuses the same id afterwards.
+        fs::write(root.join("b.jsonl"), claude_line("shared", 100, 10) + "\n").unwrap();
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            101,
+            "b's shared must count now that the rewrite released it"
+        );
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&dir);
     }

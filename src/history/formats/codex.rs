@@ -188,6 +188,7 @@ impl HistoryExtractor for CodexExtractor {
     fn extract(
         &self,
         path: &Path,
+        _root: &Path,
         st: &mut FileState,
         byte_cap: u64,
         _deadline: Instant,
@@ -408,7 +409,7 @@ mod tests {
                 + "\n"),
         );
         let ex = CodexExtractor
-            .extract(&p, &mut fresh(), u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
             .unwrap();
         assert_eq!(ex.records.len(), 1);
         let r = &ex.records[0];
@@ -433,7 +434,7 @@ mod tests {
             &(token_count(2, 100, 40, 30) + "\n"),
         );
         let ex = CodexExtractor
-            .extract(&p, &mut fresh(), u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
             .unwrap();
         assert_eq!(ex.records.len(), 1);
         let r = &ex.records[0];
@@ -462,7 +463,7 @@ mod tests {
         );
         st.cursor = 0;
         let ex = CodexExtractor
-            .extract(&p, &mut st, u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut st, u64::MAX, later())
             .unwrap();
         assert_eq!(ex.records.len(), 1);
         assert_eq!(
@@ -479,7 +480,7 @@ mod tests {
             serde_json::json!({"id": "sess-abc", "cwd": "/u/proj"}),
         );
         let ex2 = CodexExtractor
-            .extract(&p, &mut st2, u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut st2, u64::MAX, later())
             .unwrap();
         assert_eq!(ex2.records[0].dedup_key, "sess-abc:2");
 
@@ -497,7 +498,7 @@ mod tests {
             serde_json::json!({"id": uuid, "cwd": "/u/proj"}),
         );
         let ex3 = CodexExtractor
-            .extract(&p3, &mut st3, u64::MAX, later())
+            .extract(&p3, tmp.as_ref(), &mut st3, u64::MAX, later())
             .unwrap();
         assert_eq!(ex3.records[0].dedup_key, format!("{uuid}:2"));
     }
@@ -513,7 +514,7 @@ mod tests {
             &(meta.to_string() + "\n" + &token_count(2, 100, 40, 30) + "\n"),
         );
         let ex = CodexExtractor
-            .extract(&p, &mut fresh(), u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
             .unwrap();
         assert_eq!(ex.records.len(), 1);
         assert_eq!(ex.records[0].session_id, "sess9");
@@ -536,7 +537,7 @@ mod tests {
                 + "\n"),
         );
         let ex = CodexExtractor
-            .extract(&p, &mut fresh(), u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
             .unwrap();
         let r = &ex.records[0];
         assert_eq!(
@@ -558,7 +559,7 @@ mod tests {
             &([meta("s", "/u/p"), tc(5, 1000), tc(6, 2500)].join("\n") + "\n"),
         );
         let ex = CodexExtractor
-            .extract(&p, &mut fresh(), u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
             .unwrap();
         assert_eq!(
             ex.records.iter().map(|r| r.input).collect::<Vec<_>>(),
@@ -581,7 +582,7 @@ mod tests {
             &([meta("s", "/u/p"), tc(5, 5000), tc(6, 800)].join("\n") + "\n"),
         );
         let ex = CodexExtractor
-            .extract(&p, &mut fresh(), u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
             .unwrap();
         assert_eq!(ex.records[1].input, 800);
     }
@@ -599,7 +600,7 @@ mod tests {
             &([meta("s", "/u/p"), both.to_string(), total_only.to_string()].join("\n") + "\n"),
         );
         let ex = CodexExtractor
-            .extract(&p, &mut fresh(), u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
             .unwrap();
         assert_eq!(
             ex.records.iter().map(|r| r.input).collect::<Vec<_>>(),
@@ -621,7 +622,7 @@ mod tests {
         );
         let mut st = fresh();
         let first = CodexExtractor
-            .extract(&p, &mut st, u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut st, u64::MAX, later())
             .unwrap();
         assert!(first.records.is_empty());
         st.cursor = first.cursor;
@@ -635,7 +636,7 @@ mod tests {
             })
             .unwrap();
         let second = CodexExtractor
-            .extract(&p, &mut st, u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut st, u64::MAX, later())
             .unwrap();
         assert_eq!(second.records.len(), 1);
         assert_eq!(second.records[0].project, "proj");
@@ -652,7 +653,7 @@ mod tests {
             &([meta("s", "/u/p"), l.to_string()].join("\n") + "\n"),
         );
         let ex = CodexExtractor
-            .extract(&p, &mut fresh(), u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
             .unwrap();
         assert!(ex.records.is_empty());
         assert_eq!(ex.skipped_unparsed, 0);

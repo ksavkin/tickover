@@ -1152,30 +1152,26 @@ impl HistoryStore {
     /// rewriting `state.json` on every tick again, the very rewrite the
     /// dirty flag exists to skip.
     ///
-    /// A dropped path's global-ring ownership goes with it. The invariant:
-    /// an id may be held by the ring only while some live state still
-    /// accounts for the file that produced it — leave it standing and a
-    /// path that re-enters a root and rescans from the beginning finds its
-    /// own ids "already seen" by a state that no longer exists to back
-    /// that claim, and a from-origin pass that resumes mid-file across
-    /// several passes then loses the records the ring wrongly ate.
+    /// The global ring is deliberately left untouched here. A dropped
+    /// path's day lines are still live (just above), so the ids they
+    /// represent are still live too, and must keep blocking a *different*
+    /// path from claiming them — releasing them the way a rewrite does
+    /// would open exactly that double count. The ownership only goes stale
+    /// once the path's *own* state is gone, and staleness only matters the
+    /// moment a fresh scan resurrects it: that is `scan_root`'s job (the
+    /// `None` arm of its match, where `begin_file` registers a path with no
+    /// prior state), not this one's — see the release call planted there.
     pub fn prune_files_outside(&mut self, roots: &[PathBuf]) -> usize {
         self.invalidate_live_cache();
-        let mut dropped: Vec<String> = Vec::new();
-        self.state.files.retain(|p, _| {
-            let keep = roots.iter().any(|r| Path::new(p).starts_with(r));
-            if !keep {
-                dropped.push(p.clone());
-            }
-            keep
-        });
-        for path in &dropped {
-            self.release_owned(path);
-        }
-        if !dropped.is_empty() {
+        let before = self.state.files.len();
+        self.state
+            .files
+            .retain(|p, _| roots.iter().any(|r| Path::new(p).starts_with(r)));
+        let removed = before - self.state.files.len();
+        if removed > 0 {
             self.mark_state_dirty();
         }
-        dropped.len()
+        removed
     }
 
     /// blake2b hex of a file's first [`PREFIX_BYTES`] — the rewrite signal

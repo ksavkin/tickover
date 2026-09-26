@@ -50,11 +50,18 @@ pub trait HistoryExtractor: Send + Sync {
     /// reading at most `byte_cap` new bytes and stopping at `deadline`.
     /// `st.aux` is the format's own persisted scratch space (cumulative
     /// baselines and the like); `st.recent_ids`/`st.gen` are the scanner's.
+    /// `root` is the manifest's own configured root `path` was found
+    /// under — a format whose layout rule looks at directory structure
+    /// (Claude's `subagents/` check) must confine that search to the part
+    /// of `path` below `root`, or a directory happening to have that name
+    /// somewhere above the manifest's own root would misclassify every
+    /// file under it.
     ///
     /// Must never write to `path` — provider files are read-only.
     fn extract(
         &self,
         path: &Path,
+        root: &Path,
         st: &mut crate::history::store::FileState,
         byte_cap: u64,
         deadline: Instant,

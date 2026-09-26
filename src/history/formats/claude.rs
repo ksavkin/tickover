@@ -105,6 +105,7 @@ impl HistoryExtractor for ClaudeExtractor {
     fn extract(
         &self,
         path: &Path,
+        root: &Path,
         st: &mut crate::history::store::FileState,
         byte_cap: u64,
         _deadline: Instant,
@@ -116,10 +117,24 @@ impl HistoryExtractor for ClaudeExtractor {
             complete: eof,
             ..Default::default()
         };
-        // Whether this whole file lives under a `subagents/` directory —
-        // decided once per file, not per line, since a transcript never
-        // changes which kind of file it is mid-stream.
-        let in_subagent_file = path.components().any(|c| c.as_os_str() == "subagents");
+        // Whether this file sits somewhere under a `subagents/` directory
+        // — decided once per file, not per line, since a transcript never
+        // changes which kind of file it is mid-stream. The documented
+        // layout puts the file directly in that directory, but a further
+        // subdirectory below it is allowed too, so every directory
+        // component counts, not just the immediate parent — restricted to
+        // the part of the path *below* the manifest's own scanned root,
+        // and to `path`'s directory components rather than its own file
+        // name, or a directory named that way above the root (a project
+        // can be called anything, including "subagents") or a file whose
+        // own name happens to match would misclassify an ordinary parent
+        // transcript. `Path::components` compares path segments, not raw
+        // bytes, so `/` vs `\` is not a concern here.
+        let in_subagent_file = path
+            .strip_prefix(root)
+            .ok()
+            .and_then(|rel| rel.parent())
+            .is_some_and(|dirs| dirs.components().any(|c| c.as_os_str() == "subagents"));
         let mut offset_in_buf = 0u64;
         for raw in buf.split(|&b| b == b'\n') {
             let line_start = resume_from + offset_in_buf;
@@ -213,7 +228,7 @@ mod tests {
                 + "\n"),
         );
         let ex = ClaudeExtractor
-            .extract(&p, &mut fresh(), u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
             .unwrap();
         assert_eq!(ex.records.len(), 1);
         let r = &ex.records[0];
@@ -232,7 +247,7 @@ mod tests {
             &(good.clone() + r#"{"type":"assistant","isSidechain":false,"time"#),
         );
         let ex = ClaudeExtractor
-            .extract(&p, &mut fresh(), u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
             .unwrap();
         assert_eq!(ex.records.len(), 1);
         assert_eq!(
@@ -248,7 +263,7 @@ mod tests {
         let l1 = line("m1", 1, 1, false) + "\n";
         let p = tmp.write("t.jsonl", &l1);
         let first = ClaudeExtractor
-            .extract(&p, &mut fresh(), u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
             .unwrap();
         assert_eq!(first.records.len(), 1);
         let l2 = line("m2", 2, 2, false) + "\n";
@@ -256,7 +271,7 @@ mod tests {
         let mut resumed = fresh();
         resumed.cursor = first.cursor;
         let second = ClaudeExtractor
-            .extract(&p, &mut resumed, u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut resumed, u64::MAX, later())
             .unwrap();
         assert_eq!(second.records.len(), 1);
         assert_eq!(second.records[0].dedup_key, "m2");
@@ -274,7 +289,7 @@ mod tests {
             &(line("sub1", 40, 20, true) + "\n"),
         );
         let ex = ClaudeExtractor
-            .extract(&p, &mut fresh(), u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
             .unwrap();
         assert_eq!(ex.records.len(), 1, "the sub-agent's own turn counts");
         assert_eq!((ex.records[0].input, ex.records[0].output), (40, 20));
@@ -291,7 +306,7 @@ mod tests {
             &(line("m1", 40, 20, true) + "\n"),
         );
         let ex = ClaudeExtractor
-            .extract(&p, &mut fresh(), u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
             .unwrap();
         assert_eq!(
             ex.records.len(),
@@ -301,12 +316,57 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_subdirectory_under_subagents_still_counts() {
+        // The provider allows a further subdirectory below `subagents/`
+        // (a per-agent transcript subdir); every directory component below
+        // the scanned root must be searched, not just the immediate
+        // parent, or this layout would wrongly read as a parent file.
+        let tmp = TmpDir::new("claude-subagent-nested");
+        let p = tmp.write(
+            "proj/sess/subagents/subdir/agent-x.jsonl",
+            &(line("sub1", 40, 20, true) + "\n"),
+        );
+        let ex = ClaudeExtractor
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert_eq!(
+            ex.records.len(),
+            1,
+            "a subdirectory below subagents/ is still the sub-agent's own file"
+        );
+    }
+
+    #[test]
+    fn an_ancestor_named_subagents_above_the_scanned_root_does_not_count() {
+        // A project directory can itself be named "subagents" — the search
+        // must be confined to the part of the path below the manifest's
+        // own scanned root, or a directory happening to have that name
+        // above it would turn every ordinary parent transcript under it
+        // into a sub-agent file.
+        let tmp = TmpDir::new("claude-ancestor-subagents");
+        let root = tmp.write("subagents/actual-root/.keep", "");
+        let root = root.parent().unwrap();
+        let p = tmp.write(
+            "subagents/actual-root/sess/session.jsonl",
+            &(line("m1", 40, 20, true) + "\n"),
+        );
+        let ex = ClaudeExtractor
+            .extract(&p, root, &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert_eq!(
+            ex.records.len(),
+            0,
+            "\"subagents\" above the scanned root is not this file's own directory"
+        );
+    }
+
+    #[test]
     fn cache_creation_breakdown_is_cache_write() {
         let tmp = TmpDir::new("claude-cache");
         let l = r#"{"type":"assistant","isSidechain":false,"sessionId":"s","cwd":"/u/p","timestamp":"2026-09-22T14:30:00.000Z","message":{"id":"mx","model":"m","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":7,"cache_creation":{"ephemeral_5m_input_tokens":30,"ephemeral_1h_input_tokens":40}}}}"#;
         let p = tmp.write("t.jsonl", &(l.to_string() + "\n"));
         let ex = ClaudeExtractor
-            .extract(&p, &mut fresh(), u64::MAX, later())
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
             .unwrap();
         assert_eq!(ex.records[0].cache_write, 70);
         assert_eq!(ex.records[0].cache_read, 7);
