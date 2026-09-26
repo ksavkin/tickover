@@ -3,10 +3,15 @@
 //! One JSON object per line; only `type = "assistant"` lines carry
 //! `message.usage`. Two rules keep the count honest:
 //!
-//! * **`isSidechain` lines are skipped.** A sub-agent's turn is written
-//!   into the same transcript with its own `message.usage`; the parent
-//!   session's usage already accounts for it, so counting both doubles
-//!   the real spend.
+//! * **`isSidechain` lines count only from a `subagents/` transcript.** A
+//!   sub-agent's turn is written to its own file,
+//!   `<project>/<session>/subagents/agent-<id>.jsonl`, and every line
+//!   there is flagged `isSidechain` — it is that file's only record of
+//!   the spend, so it counts. The same flag turning up inside a *parent*
+//!   session's own transcript is a different thing: that turn is already
+//!   counted through the parent's ordinary lines, so a sidechain line
+//!   there really would double it, and stays skipped. The rule is which
+//!   file the line came from, not the flag alone.
 //! * **`message.id` dedups.** The same assistant message can be written
 //!   more than once (streamed progress, a session re-opened after a
 //!   crash); the scanner's pass set and per-file ring drop the copies.
@@ -41,7 +46,7 @@ struct Line {
     cwd: Option<String>,
     #[serde(default, rename = "sessionId")]
     session_id: Option<String>,
-    /// Sub-agent turn marker — skipped, see the module doc.
+    /// Sub-agent turn marker — see the module doc for when it is skipped.
     #[serde(default, rename = "isSidechain")]
     is_sidechain: bool,
     #[serde(default)]
@@ -111,6 +116,10 @@ impl HistoryExtractor for ClaudeExtractor {
             complete: eof,
             ..Default::default()
         };
+        // Whether this whole file lives under a `subagents/` directory —
+        // decided once per file, not per line, since a transcript never
+        // changes which kind of file it is mid-stream.
+        let in_subagent_file = path.components().any(|c| c.as_os_str() == "subagents");
         let mut offset_in_buf = 0u64;
         for raw in buf.split(|&b| b == b'\n') {
             let line_start = resume_from + offset_in_buf;
@@ -128,7 +137,7 @@ impl HistoryExtractor for ClaudeExtractor {
                     continue;
                 }
             };
-            if line.kind != "assistant" || line.is_sidechain {
+            if line.kind != "assistant" || (line.is_sidechain && !in_subagent_file) {
                 continue;
             }
             let Some(msg) = line.message.as_ref() else {
@@ -251,6 +260,44 @@ mod tests {
             .unwrap();
         assert_eq!(second.records.len(), 1);
         assert_eq!(second.records[0].dedup_key, "m2");
+    }
+
+    #[test]
+    fn a_subagent_transcript_counts_its_sidechain_lines() {
+        // Sub-agent turns are written to their own file under a
+        // `subagents/` directory, every line flagged `isSidechain` — the
+        // parent transcript never carries them at all, so skipping them
+        // here would drop the sub-agent's entire spend.
+        let tmp = TmpDir::new("claude-subagent");
+        let p = tmp.write(
+            "proj/sess/subagents/agent-x.jsonl",
+            &(line("sub1", 40, 20, true) + "\n"),
+        );
+        let ex = ClaudeExtractor
+            .extract(&p, &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert_eq!(ex.records.len(), 1, "the sub-agent's own turn counts");
+        assert_eq!((ex.records[0].input, ex.records[0].output), (40, 20));
+    }
+
+    #[test]
+    fn a_sidechain_line_inside_a_parent_transcript_still_skips() {
+        // The same flag inside the *parent's* own transcript is still the
+        // duplicate it always was — only the file's location changes what
+        // the flag means.
+        let tmp = TmpDir::new("claude-parent-sidechain");
+        let p = tmp.write(
+            "proj/sess/session.jsonl",
+            &(line("m1", 40, 20, true) + "\n"),
+        );
+        let ex = ClaudeExtractor
+            .extract(&p, &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert_eq!(
+            ex.records.len(),
+            0,
+            "a parent-file sidechain stays a duplicate"
+        );
     }
 
     #[test]

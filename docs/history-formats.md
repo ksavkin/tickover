@@ -31,9 +31,13 @@ cache-write.
 
 Two rules keep the count honest:
 
-- **`isSidechain` lines are skipped.** A sub-agent's turn lands in the same
-  transcript with its own `message.usage`, and the parent session's usage
-  already accounts for it — counting both doubles the spend.
+- **`isSidechain` lines count only from a `subagents/` transcript.** A
+  sub-agent's turn is written to its own file,
+  `<project>/<session>/subagents/agent-<id>.jsonl`, every line flagged
+  `isSidechain` — that file is the turn's only record, so it counts. The
+  same flag inside a *parent* session's own transcript marks a turn
+  already counted through the parent's ordinary lines; there it stays
+  skipped, or counting both would double the spend.
 - **`message.id` dedups.** The same assistant message can be written more
   than once (streamed progress, a session re-opened after a crash); copies
   are dropped.

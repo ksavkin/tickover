@@ -1089,4 +1089,202 @@ glob   = "{glob}"
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// A scripted two-slice extractor: call 0/2 emit the file's first half
+    /// (stopping mid-file, `complete: false`), call 1/3 emit the second
+    /// half (`complete: true`). Ingest and a later from-scratch rescan
+    /// both take this shape, so the same stub drives both — the rescan's
+    /// second slice adds `"third"`, a key never seen before, so a pass
+    /// that wrongly drops `"second"` still has something of its own to
+    /// seal with.
+    struct PruneRescanStub {
+        calls: AtomicUsize,
+    }
+    impl HistoryExtractor for PruneRescanStub {
+        fn extract(
+            &self,
+            _path: &Path,
+            st: &mut FileState,
+            _byte_cap: u64,
+            _deadline: Instant,
+        ) -> io::Result<Extraction> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let mid = st.size / 2;
+            let rec = |key: &str, input: u64| UsageRecord {
+                ts: chrono::Utc::now(),
+                provider: String::new(),
+                project: "p".into(),
+                session_id: "s".into(),
+                model: "m".into(),
+                input,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+                thinking: 0,
+                dedup_key: key.into(),
+            };
+            Ok(match n {
+                0 => Extraction {
+                    records: vec![rec("first", 10)],
+                    cursor: mid,
+                    range: Some((0, mid)),
+                    complete: false,
+                    ..Default::default()
+                },
+                1 => Extraction {
+                    records: vec![rec("second", 20)],
+                    cursor: st.size,
+                    range: Some((mid, st.size)),
+                    complete: true,
+                    ..Default::default()
+                },
+                2 => Extraction {
+                    records: vec![rec("first", 10)],
+                    cursor: mid,
+                    range: Some((0, mid)),
+                    complete: false,
+                    ..Default::default()
+                },
+                _ => Extraction {
+                    records: vec![rec("second", 20), rec("third", 5)],
+                    cursor: st.size,
+                    range: Some((mid, st.size)),
+                    complete: true,
+                    ..Default::default()
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn a_pruned_files_from_scratch_rescan_recovers_its_own_ids() {
+        // Ingest a file across two passes, then drop its state the way a
+        // manifest edit that narrows a root does (`prune_files_outside`
+        // without any change to the file itself). A rescan starts the file
+        // over from byte zero, but its *second* pass still resumes
+        // mid-file (`resume_from > 0`) — exactly the shape the ordinary
+        // rewrite path's `ring_evicted_self` exception was built for, so
+        // without releasing the pruned file's global-ring ownership first,
+        // that pass reads its own already-owned ids as duplicates, seals
+        // over the line that held them, and the tokens vanish for good.
+        let root = tmpdir("prune-rescan-root");
+        let dir = tmpdir("prune-rescan-store");
+        fs::write(root.join("t.jsonl"), "0123456789abcdef").unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let ex = PruneRescanStub {
+            calls: AtomicUsize::new(0),
+        };
+        let far = Instant::now() + Duration::from_secs(30);
+
+        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far);
+        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            30,
+            "first(10) + second(20)"
+        );
+
+        store.prune_files_outside(&[]);
+        store.commit().unwrap();
+
+        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far);
+        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            35,
+            "first(10) + second(20) + third(5) — none of the rescan's own ids are lost"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pruning_one_file_leaves_another_files_ownership_alone() {
+        // The ordinary cross-file duplicate stays suppressed: releasing a
+        // pruned file's own ring ownership must not reach into a different
+        // file's claim on an unrelated id.
+        let root = tmpdir("prune-xfile-root");
+        let dir = tmpdir("prune-xfile-store");
+        fs::write(root.join("a.jsonl"), claude_line("shared", 100, 10) + "\n").unwrap();
+        fs::write(root.join("b.jsonl"), claude_line("shared", 100, 10) + "\n").unwrap();
+        fs::write(root.join("c.jsonl"), claude_line("solo", 7, 1) + "\n").unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let ex = crate::history::formats::claude::ClaudeExtractor;
+        let far = Instant::now() + Duration::from_secs(30);
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            107,
+            "whichever of a/b scanned first (100) + c.jsonl's 7; the other's 100 is the duplicate"
+        );
+
+        // Drop only c.jsonl's state — a and b are untouched.
+        let c_key = root.join("c.jsonl").to_string_lossy().into_owned();
+        store.prune_files_outside(&[root.join("a.jsonl"), root.join("b.jsonl")]);
+        store.commit().unwrap();
+        assert!(store.file_state(Path::new(&c_key)).is_none());
+
+        // Whichever of a/b scanned first owns "shared"; the other must
+        // still read as its duplicate, not as newly unowned.
+        let a_key = root.join("a.jsonl").to_string_lossy().into_owned();
+        let b_key = root.join("b.jsonl").to_string_lossy().into_owned();
+        let (owner, dup) = if store.owns_globally(&a_key, "shared") {
+            (&a_key, &b_key)
+        } else {
+            (&b_key, &a_key)
+        };
+        assert!(store.owns_globally(owner, "shared"));
+        assert!(store.seen_globally(dup, "shared"));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A Claude transcript line flagged as a sub-agent turn — used both for
+    /// a `subagents/` file's own lines and for a parent transcript's echo
+    /// of the same event.
+    fn claude_sidechain_line(id: &str, input: u64, output: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","isSidechain":true,"sessionId":"s1","cwd":"/u/proj","timestamp":"2026-09-22T14:30:00.000Z","message":{{"id":"{id}","model":"m","usage":{{"input_tokens":{input},"output_tokens":{output}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_subagent_file_and_its_parents_echo_count_the_turn_once() {
+        // The parent transcript carries its own ordinary turn plus an
+        // `isSidechain` echo of a turn the sub-agent's own file also
+        // holds under the same message id. The echo must not count (it
+        // is the duplicate the parent-file skip exists for) and the
+        // sub-agent's file must not be dropped either — the turn counts
+        // exactly once, from the file that is its only real record.
+        let root = tmpdir("subagent-root");
+        let dir = tmpdir("subagent-store");
+        fs::write(
+            root.join("session.jsonl"),
+            claude_line("parent-turn", 100, 10) + "\n" + &claude_sidechain_line("shared", 40, 20),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("subagents")).unwrap();
+        fs::write(
+            root.join("subagents").join("agent-x.jsonl"),
+            claude_sidechain_line("shared", 40, 20) + "\n",
+        )
+        .unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let ex = crate::history::formats::claude::ClaudeExtractor;
+        let far = Instant::now() + Duration::from_secs(30);
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        let live: Vec<_> = store.live_days().cloned().collect();
+        assert_eq!(
+            live.iter().map(|d| d.input).sum::<u64>(),
+            140,
+            "parent-turn(100) + the sub-agent's own turn(40), once"
+        );
+        assert_eq!(live.iter().map(|d| d.messages).sum::<u32>(), 2);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

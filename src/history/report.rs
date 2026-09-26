@@ -1093,7 +1093,7 @@ fn footer(h: &mut String, sources: &[String]) {
         h,
         r#"<div style="padding: 8px 0 44px; display: flex; gap: 40px; border-top: 1px solid var(--track);">
 <div style="max-width: 560px; font-size: 12px; color: var(--meta); line-height: 1.7; padding-top: 14px;">
-Generated {now} by tickover {ver}. Read from {srcs}. Duplicate message ids removed; Codex cumulative counters differenced. Claude sub-agent turns count once, through their parent session.
+Generated {now} by tickover {ver}. Read from {srcs}. Duplicate message ids removed; Codex cumulative counters differenced. Claude sub-agent turns count once, from their own transcript file.
 </div>
 <span class="spacer"></span>
 <div class="mono" style="font-size: 11px; color: var(--meta); text-align: right; line-height: 1.8; padding-top: 14px;">file mode 0600<br>no network calls<br>no external assets</div>

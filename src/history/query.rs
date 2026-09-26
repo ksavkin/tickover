@@ -193,11 +193,20 @@ pub fn compute(
             .entry(d.model.clone())
             .or_default()
             .add(d);
+        st.active_hours[local.hour() as usize] += d.sum();
+
+        // A line that records no tokens and no messages did not happen on
+        // any day and is not a session — a coverage tombstone always looks
+        // like this, but so would any other bucket that genuinely summed
+        // to zero, and both must drop out of the day/streak/session views
+        // the same way: what matters is what the line records, not why.
+        if !d.has_activity() {
+            continue;
+        }
         *day_totals.entry(day).or_default() += d.sum();
         if day >= daily_floor {
             st.daily.entry(day).or_default().add(d);
         }
-        st.active_hours[local.hour() as usize] += d.sum();
 
         let sess = sessions
             .entry(format!("{}:{}", d.provider, d.session))
@@ -471,11 +480,12 @@ pub fn panel(
             day_floor - Duration::days(1),
         ),
     };
+    // The window's own length, in days — fixed by `base_lo`/`base_hi`
+    // regardless of which of those days actually saw usage. A day with no
+    // data is still a day: it still occupies a slot in the average, or the
+    // same total spread over fewer days would look bigger than it is.
+    let base_days_span = (base_hi - base_lo).num_days() + 1;
     let mut base_total = 0u64;
-    // The 24h baseline is a mean *daily* total over the window — bucket
-    // rows are per (hour × provider × project × model × session), so the
-    // denominator must be the window's day count, not the row count.
-    let mut base_days: std::collections::HashSet<NaiveDate> = std::collections::HashSet::new();
 
     let mut class_totals = Totals::default();
     let mut projects: HashMap<String, Totals> = HashMap::new();
@@ -497,14 +507,17 @@ pub fn panel(
         let day = local.date_naive();
         if day >= base_lo && day <= base_hi {
             base_total += d.sum();
-            base_days.insert(day);
         }
         let Some(slot) = slot_of(d) else { continue };
         slots[slot] += d.sum();
         range_total += d.sum();
         class_totals.add(d);
         projects.entry(d.project.clone()).or_default().add(d);
-        sessions.insert(format!("{}:{}", d.provider, d.session));
+        // See `compute`'s identical guard: a line recording nothing is
+        // not a session the user had.
+        if d.has_activity() {
+            sessions.insert(format!("{}:{}", d.provider, d.session));
+        }
         price_units
             .entry((d.provider.clone(), d.model.clone()))
             .or_default()
@@ -521,10 +534,10 @@ pub fn panel(
     };
 
     out.delta = match range {
-        PanelRange::Day => {
-            // Mean daily total over the baseline days that had any data.
-            (!base_days.is_empty()).then(|| base_total as f64 / base_days.len() as f64)
-        }
+        // Mean daily total over the whole baseline window — both paths
+        // divide by the window's own length, never by how much of it
+        // happened to carry data.
+        PanelRange::Day => Some(base_total as f64 / base_days_span as f64),
         _ => (base_total > 0).then_some(base_total as f64),
     }
     .filter(|b| *b > 0.0)
@@ -562,7 +575,7 @@ pub fn panel(
     out.sessions = sessions.len() as u64;
     let day_totals = store
         .live_days()
-        .filter(|d| enabled.contains(&d.provider))
+        .filter(|d| enabled.contains(&d.provider) && d.has_activity())
         .filter_map(|d| {
             let h = parse_bucket_hour(&d.hour)?;
             let local: DateTime<Local> = h.with_timezone(&Local);
@@ -597,7 +610,7 @@ fn last_seen(
 ) -> Option<(DateTime<Local>, String)> {
     store
         .live_days()
-        .filter(|d| enabled.contains(&d.provider))
+        .filter(|d| enabled.contains(&d.provider) && d.has_activity())
         .filter_map(|d| {
             parse_bucket_hour(&d.hour).map(|h| (h, d.project.clone(), d.session.clone()))
         })
@@ -733,6 +746,134 @@ mod tests {
             thinking: 0,
             messages: 1,
         }
+    }
+
+    /// The shape `scan_root` writes for a source with no usage at all —
+    /// coverage-only, no project/model/session, all counts zero.
+    fn tombstone(hour: &str, provider: &str) -> DayLine {
+        DayLine {
+            v: SCHEMA_VERSION,
+            hour: hour.into(),
+            provider: provider.into(),
+            project: String::new(),
+            model: String::new(),
+            session: String::new(),
+            file: "/tomb".into(),
+            gen: 0,
+            lo: 0,
+            hi: 0,
+            full: true,
+            b: 0,
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            thinking: 0,
+            messages: 0,
+        }
+    }
+
+    #[test]
+    fn a_store_of_only_tombstones_reports_no_activity() {
+        // A source that has never carried usage still gets a coverage
+        // line so the seal chain tiles — but it must not read as a day
+        // the user was active, a streak, a session, or a "last seen".
+        let dir = tmpdir("tombstones-only");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let today = Local::now().date_naive();
+        let yesterday_hour = (Utc::now() - Duration::days(1))
+            .format("%Y-%m-%dT%H")
+            .to_string();
+        let today_hour = Utc::now().format("%Y-%m-%dT%H").to_string();
+        store
+            .append_days(&[
+                tombstone(&yesterday_hour, "claude"),
+                tombstone(&today_hour, "claude"),
+            ])
+            .unwrap();
+        store.commit().unwrap();
+        let store = HistoryStore::open(&dir).unwrap();
+
+        let enabled = enabled_all();
+        let st = compute(&store, 30, &enabled);
+        assert_eq!(st.active_days, 0, "no day actually saw usage");
+        assert_eq!(st.streak_days, 0);
+        assert!(
+            st.sessions.is_empty(),
+            "the tombstone's empty session id must not appear"
+        );
+        assert!(!st.daily.contains_key(&today));
+
+        let panel_sum = panel(&store, PanelRange::Day, &[], &enabled, None);
+        assert_eq!(panel_sum.streak_days, 0);
+        assert_eq!(panel_sum.sessions, 0);
+        assert!(panel_sum.last_seen.is_none(), "nothing was ever seen");
+        assert_eq!(
+            panel_sum.state,
+            PanelState::EmptyRange,
+            "coverage lines still mean the source has been scanned"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_real_bucket_among_tombstones_counts_exactly_one_day() {
+        let dir = tmpdir("tombstones-mixed");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let real_hour = Utc::now().format("%Y-%m-%dT%H").to_string();
+        let other_hour = (Utc::now() - Duration::days(3))
+            .format("%Y-%m-%dT%H")
+            .to_string();
+        store
+            .append_days(&[
+                line(&real_hour, "claude", "proj", 50),
+                tombstone(&real_hour, "codex"),
+                tombstone(&other_hour, "claude"),
+                tombstone(&other_hour, "codex"),
+            ])
+            .unwrap();
+        store.commit().unwrap();
+        let store = HistoryStore::open(&dir).unwrap();
+
+        let st = compute(&store, 30, &enabled_all());
+        assert_eq!(st.active_days, 1);
+        assert_eq!(st.sessions.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn day_range_delta_divides_by_the_whole_baseline_window() {
+        // One real day's usage sits inside the 7-day baseline window; the
+        // other six days are empty. The baseline average must still be
+        // spread over all seven days, not just the one that has data —
+        // dividing by the days-with-data instead inflates a sparse week
+        // into a much heavier trend, sign included.
+        let dir = tmpdir("day-delta-sparse-baseline");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let baseline_hour = (Utc::now() - Duration::days(4))
+            .format("%Y-%m-%dT%H")
+            .to_string();
+        let today_hour = Utc::now().format("%Y-%m-%dT%H").to_string();
+        let baseline_line = line(&baseline_hour, "claude", "p", 100);
+        let today_line = line(&today_hour, "claude", "p", 50);
+        let expected_baseline_avg = baseline_line.sum() as f64 / 7.0;
+        let expected_range_total = today_line.sum() as f64;
+        let expected_delta = (expected_range_total - expected_baseline_avg) / expected_baseline_avg;
+        store.append_days(&[baseline_line, today_line]).unwrap();
+        store.commit().unwrap();
+        let store = HistoryStore::open(&dir).unwrap();
+
+        let sum = panel(&store, PanelRange::Day, &[], &enabled_all(), None);
+        let got = sum.delta.expect("a nonzero baseline must produce a delta");
+        assert!(
+            (got - expected_delta).abs() < 1e-9,
+            "got={got} expected={expected_delta}"
+        );
+        assert!(
+            got > 0.0,
+            "spreading the lone baseline day over the full week must not flip the sign"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
