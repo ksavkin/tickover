@@ -1506,10 +1506,15 @@ fn rules() -> Vec<Rule> {
         Rule {
             // `key_prefix` is `credentials_map_step`'s own field — a
             // `credentials-file` step never reads it, same silent-no-op
-            // reasoning as `unless_json_path` above.
+            // reasoning as `unless_json_path` above. `credentials-map`
+            // declared, the same way the unit test for this rule does —
+            // without it the backward-compat capability gate refuses
+            // `key_prefix`'s mere presence before this row's own kind check
+            // ever runs, which is a different refusal than the one `names`
+            // below pins.
             says: "key_prefix only means something on a credentials-map step",
             broken_by: changed(
-                HTTP,
+                &http_declaring(r#"["credentials-map"]"#),
                 "token_json_path = \"token\"",
                 "token_json_path = \"token\"\nkey_prefix      = \"acme::\"",
             ),
@@ -1583,10 +1588,13 @@ fn rules() -> Vec<Rule> {
         Rule {
             // `token_url`/`client_id`/`client_secret` are `oauth_refresh_step`'s
             // own fields — a `credentials-file` step never reads any of
-            // them, same silent-no-op reasoning as above.
+            // them, same silent-no-op reasoning as above. `oauth-refresh`
+            // declared, the same way the unit test for this rule does —
+            // without it the capability gate is what refuses `token_url`,
+            // not this row's own kind check.
             says: "token_url only means something on an oauth-refresh step",
             broken_by: changed(
-                HTTP,
+                &http_declaring(r#"["oauth-refresh"]"#),
                 "token_json_path = \"token\"",
                 "token_json_path = \"token\"\ntoken_url       = \"https://oauth2.example.com/token\"",
             ),
@@ -1959,7 +1967,7 @@ fn rules() -> Vec<Rule> {
             broken_by: changed(
                 &oauth_refresh_client_declaring(r#"["oauth-refresh", "oauth-client-discovery"]"#),
                 r#"id_env         = "SAMPLE_CLIENT_ID""#,
-                r#"id_env         = "SAMPLE-CLIENT-ID""#,
+                r#"id_env         = "SAMPLE=CLIENT=ID""#,
             ),
             names: "client.id_env",
         },

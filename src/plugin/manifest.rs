@@ -609,9 +609,8 @@ impl PluginManifest {
             if lf.root_env.as_deref().is_some_and(|e| e.trim().is_empty()) {
                 return Err("`[logfile] root_env` names no environment variable".to_string());
             }
-            // A name outside the POSIX/Windows environment-variable charset
-            // (an `=`, a null byte, whitespace) is not "unset" the way a
-            // blank one is — `std::env::var_os` can simply never return a
+            // A name containing an `=` or a null byte is not "unset" the way
+            // a blank one is — `std::env::var_os` can simply never return a
             // value for it — but it reads as configured to a manifest
             // author, the same silent-no-op the blank check above closes.
             // Same rule `client.id_env`/`client.secret_env` already carry
@@ -620,8 +619,7 @@ impl PluginManifest {
                 if !is_valid_env_var_name(name) {
                     return Err(format!(
                         "`[logfile] root_env = \"{name}\"` is not a valid environment variable \
-                         name — a leading letter or underscore, then letters, digits or \
-                         underscores"
+                         name — it must not be empty, contain `=`, or contain a null byte"
                     ));
                 }
             }
@@ -815,8 +813,8 @@ impl PluginManifest {
         if let Some(name) = &h.root_env {
             if !is_valid_env_var_name(name) {
                 return Err(format!(
-                    "`[history] root_env = \"{name}\"` is not a valid environment variable \
-                     name — a leading letter or underscore, then letters, digits or underscores"
+                    "`[history] root_env = \"{name}\"` is not a valid environment variable name \
+                     — it must not be empty, contain `=`, or contain a null byte"
                 ));
             }
         }
@@ -1989,8 +1987,8 @@ impl PluginManifest {
                     if !is_valid_env_var_name(name) {
                         return Err(format!(
                             "`[[http.value]] name = \"{}\"` `path_env = \"{name}\"` is not a \
-                             valid environment variable name — a leading letter or underscore, \
-                             then letters, digits or underscores",
+                             valid environment variable name — it must not be empty, contain \
+                             `=`, or contain a null byte",
                             v.name
                         ));
                     }
@@ -2552,8 +2550,8 @@ impl PluginManifest {
                             if !is_valid_env_var_name(name) {
                                 return Err(format!(
                                     "surface \"{}\": a `{}` auth step's `{field}` = \"{name}\" is not \
-                                     a valid environment variable name — a leading letter or \
-                                     underscore, then letters, digits or underscores",
+                                     a valid environment variable name — it must not be empty, \
+                                     contain `=`, or contain a null byte",
                                     surface.id,
                                     auth_type_name(step.kind)
                                 ));
@@ -2787,8 +2785,8 @@ impl PluginManifest {
                     if !is_valid_env_var_name(name) {
                         return Err(format!(
                             "surface \"{}\": auth step {i} (`{}`) `path_env = \"{name}\"` is not \
-                             a valid environment variable name — a leading letter or underscore, \
-                             then letters, digits or underscores",
+                             a valid environment variable name — it must not be empty, contain \
+                             `=`, or contain a null byte",
                             surface.id,
                             auth_type_name(step.kind)
                         ));
@@ -2876,8 +2874,8 @@ impl PluginManifest {
                     if !is_valid_env_var_name(name) {
                         return Err(format!(
                             "surface \"{}\": auth step {i} (`{}`) `service_env = \"{name}\"` is \
-                             not a valid environment variable name — a leading letter or \
-                             underscore, then letters, digits or underscores",
+                             not a valid environment variable name — it must not be empty, \
+                             contain `=`, or contain a null byte",
                             surface.id,
                             auth_type_name(step.kind)
                         ));
@@ -2936,8 +2934,8 @@ impl PluginManifest {
                     if !is_valid_env_var_name(var) {
                         return Err(format!(
                             "surface \"{}\": auth step {i} (`env`) `var = \"{var}\"` is not a \
-                             valid environment variable name — a leading letter or underscore, \
-                             then letters, digits or underscores",
+                             valid environment variable name — it must not be empty, contain \
+                             `=`, or contain a null byte",
                             surface.id
                         ));
                     }
@@ -5284,15 +5282,23 @@ fn is_absolute_on_any_platform(p: &Path) -> bool {
     p.is_absolute() || s.starts_with('/') || has_drive_prefix || s.starts_with("\\\\")
 }
 
-/// [`AuthClientDiscovery::id_env`]/`secret_env`: the POSIX/Windows
-/// environment-variable charset — a leading letter or underscore, then
-/// letters, digits or underscores. `std::env::var` would simply never find
-/// anything for a name outside it, so refusing it here is a clearer answer
-/// than a silent miss at every fetch.
+/// [`AuthClientDiscovery::id_env`]/`secret_env` and the other fields that
+/// name a variable rather than hold one: what an environment variable name
+/// actually cannot be, not the conservative identifier shape
+/// (`[A-Za-z_][A-Za-z0-9_]*`) most manifests happen to write. `ProgramFiles(x86)`
+/// is a real Windows variable, parentheses and all, and this app ships a
+/// Windows build — an identifier-shaped rule would refuse a manifest for
+/// naming it, which is not a rule the format needs. `setenv`/`getenv` and
+/// `GetEnvironmentVariable` cannot resolve a name that is empty, one
+/// containing `=` (the delimiter every setter and `environ` itself splits
+/// the name from the value on), or one containing a null byte (which ends a
+/// C string, so nothing after it is reachable through either API) — so the
+/// shape here is defined by what breaks the lookup, not by what a typical
+/// name looks like. `std::env::var_os` would simply never return anything
+/// for a name outside it, so refusing it here is a clearer answer than a
+/// silent miss at every fetch.
 fn is_valid_env_var_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    !name.is_empty() && !name.contains('=') && !name.contains('\0')
 }
 
 /// Whether `text` carries a control character (`char::is_control` — ASCII
@@ -8638,14 +8644,31 @@ mod tests {
     }
 
     #[test]
-    fn a_client_env_name_outside_the_variable_charset_is_refused() {
+    fn a_client_env_name_containing_an_equals_sign_is_refused() {
         let toml = OAUTH_REFRESH_CLIENT_BASE.replace(
             r#"id_env         = "SAMPLE_CLIENT_ID""#,
-            r#"id_env         = "SAMPLE-CLIENT-ID""#,
+            r#"id_env         = "SAMPLE=CLIENT=ID""#,
         );
         let err = PluginManifest::from_str(&toml)
-            .expect_err("a hyphen is not a valid environment variable name character");
+            .expect_err("an `=` is not a valid environment variable name character");
         assert!(err.contains("client.id_env"), "{err}");
+    }
+
+    /// The charset is defined by exclusion, not by an identifier shape:
+    /// `ProgramFiles(x86)` is a real Windows variable an identifier-shaped
+    /// rule (`[A-Za-z_][A-Za-z0-9_]*`) has no room for. `=` and a null byte
+    /// are the two shapes neither `std::env::set_var` nor
+    /// `GetEnvironmentVariable` can resolve, on any platform; an empty name
+    /// is refused as its own case rather than falling through to either of
+    /// those.
+    #[test]
+    fn is_valid_env_var_name_is_defined_by_exclusion_not_by_an_identifier_shape() {
+        assert!(is_valid_env_var_name("ProgramFiles(x86)"));
+        assert!(is_valid_env_var_name("CommonProgramFiles(x86)"));
+        assert!(is_valid_env_var_name("CODEX_HOME"));
+        assert!(!is_valid_env_var_name(""));
+        assert!(!is_valid_env_var_name("CODEX=HOME"));
+        assert!(!is_valid_env_var_name("CODEX\0HOME"));
     }
 
     /// `[logfile] root_env` names a variable `std::env::var_os` reads
@@ -8670,6 +8693,20 @@ mod tests {
         assert!(err.contains("`[logfile] root_env`"), "{err}");
 
         PluginManifest::from_str(CODEX_LIKE).expect("CODEX_HOME is a plausible name");
+    }
+
+    /// This app ships a Windows build, and `ProgramFiles(x86)` is a real
+    /// Windows environment variable a `root_env` override could plausibly
+    /// name — see `is_valid_env_var_name`'s own doc for why the charset
+    /// admits it.
+    #[test]
+    fn logfile_root_env_naming_a_windows_variable_with_parentheses_is_accepted() {
+        let toml = CODEX_LIKE.replace(
+            "root_env      = \"CODEX_HOME\"",
+            "root_env      = \"ProgramFiles(x86)\"",
+        );
+        PluginManifest::from_str(&toml)
+            .expect("a real Windows environment variable name must be accepted");
     }
 
     /// Same rule, `[history] root_env` — the credential-adjacent charset

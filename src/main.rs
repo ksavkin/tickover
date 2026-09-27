@@ -10696,9 +10696,13 @@ fn handle_install_outcome(
             // `err` can be a validator refusal (`PluginManifest::validate`'s
             // own messages embed the manifest's offending text verbatim —
             // a `client.bins` entry, a service name, a path) — untrusted the
-            // same way `registry_entry_row`'s `name`/`description` are, and
-            // routed through the same sanitiser before it reaches a row.
-            let err = tickover::plugin::sanitize_provider_text(&err);
+            // same way `registry_entry_row`'s `name`/`description` are, but a
+            // sentence rather than a label: `sanitize_provider_text`'s cap is
+            // sized for a caption, and a validator refusal cut there loses
+            // whatever it was naming with nothing to say so. `sanitize_trust_item`
+            // strips the same control characters and bidirectional overrides,
+            // at the longer cap a sentence needs, with a `…` marking the cut.
+            let err = sanitize_trust_item(&err);
             match kind {
                 PendingKind::Install => {
                     set_registry_row_status(registry_model, &entry.id, InstallStatus::Failed, &err)
@@ -10873,18 +10877,18 @@ fn join_with_and(parts: &[String]) -> String {
 }
 
 /// The most characters one manifest-supplied item may contribute to a trust
-/// dialog line before [`sanitize_trust_item`] cuts it short with `…` — a
-/// dialog line is meant to be read, not grown to whatever length a hostile
-/// manifest cares to spell out. Counted in `char`s, not bytes, so the cut
-/// point never lands inside a multi-byte character.
+/// dialog line or a plugin-manager row before [`sanitize_trust_item`] cuts it
+/// short with `…` — a dialog line or a row is meant to be read, not grown to
+/// whatever length a hostile manifest cares to spell out. Counted in `char`s,
+/// not bytes, so the cut point never lands inside a multi-byte character.
 const TRUST_ITEM_MAX_CHARS: usize = 120;
 
-/// Sanitise one manifest-supplied string before it reaches a trust dialog on
-/// either platform. [`applescript_escape`] only keeps a string from breaking
-/// out of the AppleScript literal it's interpolated into — it runs on macOS
-/// alone, and it has no opinion on a character that quotes fine but still
-/// rewrites how the line *looks*. This is that opinion, shared by both
-/// platforms:
+/// Sanitise one manifest-supplied string before it reaches a trust dialog or
+/// a plugin-manager row on either platform. [`applescript_escape`] only keeps
+/// a string from breaking out of the AppleScript literal it's interpolated
+/// into — it runs on macOS alone, and it has no opinion on a character that
+/// quotes fine but still rewrites how the line *looks*. This is that
+/// opinion, shared by both platforms:
 /// * C0 controls and DEL (`applescript_escape` already turns these into a
 ///   space for its own reason; the Windows `MessageBoxW` arm never calls
 ///   that function at all, so without this they'd reach it raw);
@@ -10912,7 +10916,13 @@ const TRUST_ITEM_MAX_CHARS: usize = 120;
 /// each host, and the plugin id itself — never to the assembled `short`/
 /// `detailed` strings afterwards: those are deliberately `\n`-separated
 /// labelled lines, and collapsing whitespace across the whole message would
-/// destroy that layout along with whatever it was sanitising.
+/// destroy that layout along with whatever it was sanitising. `handle_install_outcome`
+/// applies it a second way: a validator refusal quotes the manifest's own
+/// offending text, at whatever length that text happens to be, before the
+/// row that shows it caps its own width — a sentence, where every other call
+/// site sanitises a single short item, which is why this reaches for the
+/// longer cap rather than [`tickover::plugin::sanitize_provider_text`]'s
+/// label-sized one.
 fn sanitize_trust_item(s: &str) -> String {
     let mut collapsed = String::with_capacity(s.len());
     // Starts `true` so a leading run of whitespace never gets a space of its
@@ -18393,9 +18403,12 @@ mod title_tests {
     /// `client.bins` entry, a `path_env_join` value, a service name — see
     /// `PluginManifest::validate`'s own messages) — untrusted the same way
     /// a registry's `name`/`description` are, and the row above already
-    /// routes those through the sanitiser. This one must too, or a control
+    /// routes those through a sanitiser. This one must too, or a control
     /// character/bidi override in a rejected manifest's own text reaches
-    /// the plugin-manager row raw.
+    /// the plugin-manager row raw. `sanitize_trust_item`, not
+    /// `sanitize_provider_text`: a refusal is a sentence, not a label, and
+    /// the label-sized cap would cut one mid-word with nothing to say so —
+    /// see the two tests below.
     #[test]
     fn handle_install_outcome_sanitizes_a_validator_refusal_before_it_reaches_the_row() {
         let entry = make_registry_entry("acme", "Acme", "1.0.0", "deadbeef");
@@ -18424,11 +18437,91 @@ mod title_tests {
 
         let row = registry_model.row_data(0).expect("row still present");
         assert_eq!(row.status, InstallStatus::Failed);
-        assert_eq!(
-            row.error.as_str(),
-            tickover::plugin::sanitize_provider_text(raw)
-        );
+        assert_eq!(row.error.as_str(), sanitize_trust_item(raw));
         assert!(!row.error.contains('\u{202E}'));
+    }
+
+    /// The case the cap raise is for: `registry::verify_and_prepare`'s own
+    /// sha256-mismatch message is composed by this app, never quoted from a
+    /// manifest, and `expected_sha_hex` is shortened here so the whole
+    /// message sits under [`TRUST_ITEM_MAX_CHARS`] — nothing this short
+    /// should ever be touched at all.
+    #[test]
+    fn handle_install_outcome_leaves_an_app_authored_refusal_under_the_cap_intact() {
+        let entry = make_registry_entry("acme", "Acme", "1.0.0", "deadbeef");
+        let registry_model: RegistryRows = Rc::new(VecModel::from(vec![RegistryPluginRow {
+            id: ss("acme"),
+            name: ss("Acme"),
+            version: ss("1.0.0"),
+            description: ss(""),
+            status: InstallStatus::Installing,
+            error: ss(""),
+        }]));
+        let plugin_model: PluginRows = Rc::new(VecModel::from(Vec::<PluginRow>::new()));
+        let plugins: Plugins = Rc::new(RefCell::new(Vec::new()));
+
+        let refusal = registry::verify_and_prepare(b"downloaded bytes", "x").unwrap_err();
+        assert!(refusal.chars().count() <= TRUST_ITEM_MAX_CHARS, "{refusal}");
+        handle_install_outcome(
+            PendingKind::Install,
+            entry,
+            InstallOutcome::Failed(refusal.clone()),
+            &plugins,
+            &plugin_model,
+            &registry_model,
+        );
+        let row = registry_model.row_data(0).expect("row still present");
+        assert_eq!(row.error.as_str(), refusal);
+    }
+
+    /// The defect the cap raise closes, at the length two full sha256
+    /// hashes actually run to: at the 64-character label cap this message
+    /// used to end inside the *first* hash, silently. At
+    /// [`TRUST_ITEM_MAX_CHARS`] that hash, and the field name around it,
+    /// survive whole, and the cut that still has to happen is marked rather
+    /// than silent.
+    #[test]
+    fn handle_install_outcome_marks_a_refusal_past_the_cap_with_an_ellipsis() {
+        let entry = make_registry_entry("acme", "Acme", "1.0.0", "deadbeef");
+        let registry_model: RegistryRows = Rc::new(VecModel::from(vec![RegistryPluginRow {
+            id: ss("acme"),
+            name: ss("Acme"),
+            version: ss("1.0.0"),
+            description: ss(""),
+            status: InstallStatus::Installing,
+            error: ss(""),
+        }]));
+        let plugin_model: PluginRows = Rc::new(VecModel::from(Vec::<PluginRow>::new()));
+        let plugins: Plugins = Rc::new(RefCell::new(Vec::new()));
+
+        let expected_sha_hex = registry::sha256_hex(b"correct-content");
+        let refusal =
+            registry::verify_and_prepare(b"totally-wrong-content", &expected_sha_hex).unwrap_err();
+        assert!(refusal.chars().count() > TRUST_ITEM_MAX_CHARS, "{refusal}");
+        handle_install_outcome(
+            PendingKind::Install,
+            entry,
+            InstallOutcome::Failed(refusal.clone()),
+            &plugins,
+            &plugin_model,
+            &registry_model,
+        );
+        let row = registry_model.row_data(0).expect("row still present");
+        assert!(row.error.ends_with('…'), "{}", row.error);
+        let leading: String = refusal.chars().take(TRUST_ITEM_MAX_CHARS).collect();
+        assert!(
+            leading.contains(&expected_sha_hex),
+            "the wider cap must keep the expected hash whole: {leading}"
+        );
+        assert_eq!(
+            row.error
+                .chars()
+                .take(TRUST_ITEM_MAX_CHARS)
+                .collect::<String>(),
+            leading,
+            "leading content must survive the cut"
+        );
+        assert_eq!(row.error.chars().count(), TRUST_ITEM_MAX_CHARS + 1);
     }
 
     #[test]
