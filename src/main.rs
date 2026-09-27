@@ -10183,16 +10183,18 @@ fn fold_registry_diff(
 /// `InstallStatus::Available` with no error — [`set_registry_row_status`] is
 /// what moves it to installing/failed once the user actually clicks Install.
 ///
-/// `name`/`description` come from `index.toml` on whatever host serves this
-/// registry, not from the manifest being installed — the same untrusted class
+/// `name`/`description`/`version` come from `index.toml` on whatever host
+/// serves this registry, not from the manifest being installed — a registry
+/// entry is remote input, the same untrusted class
 /// [`tickover::plugin::sanitize_provider_text`] exists for. Any length cap
 /// belongs to `RegistryIndex::validate` at load time, not here; this is only
-/// the control/bidi stripping every other sink of response-fed text gets.
+/// the control/bidi stripping every other sink of response-fed text gets —
+/// on every field, not only the two `validate` happened to check first.
 fn registry_entry_row(entry: &RegistryEntry) -> RegistryPluginRow {
     RegistryPluginRow {
         id: ss(&entry.id),
         name: ss(tickover::plugin::sanitize_provider_text(&entry.name)),
-        version: ss(&entry.version),
+        version: ss(tickover::plugin::sanitize_provider_text(&entry.version)),
         description: ss(tickover::plugin::sanitize_provider_text(
             entry.description.as_deref().unwrap_or_default(),
         )),
@@ -10322,8 +10324,7 @@ fn apply_registry_check(
                 let Some(mut row) = plugin_model.row_data(i) else {
                     continue;
                 };
-                row.available_version = ss(available);
-                row.has_local_edits = *has_local_edits;
+                apply_update_badge(&mut row, available, *has_local_edits);
                 plugin_model.set_row_data(i, row);
             }
 
@@ -10341,6 +10342,20 @@ fn apply_registry_check(
             }
         }
     }
+}
+
+/// Write one `fold_registry_diff` update entry's badge onto an already-built
+/// `PluginRow` — pulled out of `apply_registry_check`'s loop so it can be
+/// pinned by a test without an `AppWindow`, the way `registry_entry_row`
+/// pins the not-yet-installed row's own sinks.
+///
+/// `available` is `entry.version` off the registry index — remote input the
+/// same way the not-yet-installed row's `name`/`description`/`version` are —
+/// and this row's Chip draws it beside `current_version` with no width bound
+/// of its own.
+fn apply_update_badge(row: &mut PluginRow, available: &str, has_local_edits: bool) {
+    row.available_version = ss(tickover::plugin::sanitize_provider_text(available));
+    row.has_local_edits = has_local_edits;
 }
 
 /// The `registry-summary` text for `RegistryStatus::Results` — the fixed
@@ -18277,6 +18292,25 @@ mod title_tests {
         assert_eq!(plugin_row(&m).current_version.as_str(), "2.3.4");
     }
 
+    /// `available` reaches this row the same way a not-yet-installed entry's
+    /// `name`/`description`/`version` reach `registry_entry_row`'s — off
+    /// whatever host serves `index.toml` — so a bidi override in it must
+    /// never land on an already-installed plugin's update badge raw either.
+    #[test]
+    fn apply_update_badge_sanitizes_the_registry_declared_available_version() {
+        let m = stub_manifest("acme", 1);
+        let mut row = plugin_row(&m);
+
+        apply_update_badge(&mut row, "1.1.0\u{202E}", true);
+
+        assert_eq!(
+            row.available_version.as_str(),
+            tickover::plugin::sanitize_provider_text("1.1.0\u{202E}")
+        );
+        assert!(!row.available_version.contains('\u{202E}'));
+        assert!(row.has_local_edits);
+    }
+
     /// An argument containing whitespace, joined onto the others by a
     /// bare space, would read as more than one argument — `["say", "hello
     /// world"]` displayed no differently than `["say", "hello", "world"]`.
@@ -18377,13 +18411,22 @@ mod title_tests {
         assert_eq!(diff.new_rows[0].error.as_str(), "");
     }
 
-    /// `name`/`description` come off whatever host serves the registry's
-    /// `index.toml` — this build's own, or a third-party one the user pointed
-    /// it at — so a control character or a bidi override in either must never
-    /// reach the plugin-manager row raw.
+    /// `name`/`description`/`version` come off whatever host serves the
+    /// registry's `index.toml` — this build's own, or a third-party one the
+    /// user pointed it at — so a control character or a bidi override in any
+    /// of the three must never reach the plugin-manager row raw. Built
+    /// straight from a `RegistryEntry`, bypassing `RegistryIndex::validate`
+    /// the way a caller only ever reaches this function after it: pinning
+    /// that the row itself still refuses to trust it, should validation ever
+    /// have a gap.
     #[test]
-    fn registry_entry_row_sanitizes_name_and_description() {
-        let mut entry = make_registry_entry("acme", "Acme\nProvider\u{202E}", "1.0.0", "deadbeef");
+    fn registry_entry_row_sanitizes_name_description_and_version() {
+        let mut entry = make_registry_entry(
+            "acme",
+            "Acme\nProvider\u{202E}",
+            "1.0.0\u{202E}",
+            "deadbeef",
+        );
         entry.description = Some("reads\u{200B}your\ncredentials".to_string());
 
         let row = registry_entry_row(&entry);
@@ -18395,8 +18438,13 @@ mod title_tests {
             row.description.as_str(),
             tickover::plugin::sanitize_provider_text("reads\u{200B}your\ncredentials")
         );
+        assert_eq!(
+            row.version.as_str(),
+            tickover::plugin::sanitize_provider_text("1.0.0\u{202E}")
+        );
         assert!(!row.name.contains('\n') && !row.name.contains('\u{202E}'));
         assert!(!row.description.contains('\n') && !row.description.contains('\u{200B}'));
+        assert!(!row.version.contains('\u{202E}'));
     }
 
     /// A validator refusal embeds the manifest's own offending text (a

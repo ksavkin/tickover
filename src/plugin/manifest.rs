@@ -232,10 +232,11 @@ const NAME_MAX_CHARS: usize = 64;
 const MENU_LABEL_MAX_CHARS: usize = 16;
 
 /// Cap on `windows[].label`, `balances[].label`, `surface[].label` and
-/// `option[].label` — a row caption drawn on a card with `wrap: word-wrap`
-/// (`ui/app.slint`), not a paragraph. Between [`MENU_LABEL_MAX_CHARS`] (a
-/// pill, sized to a couple of characters) and [`NAME_MAX_CHARS`] (a section
-/// header, 64): a row caption sits beside a figure rather than above a whole
+/// `option[].label` — a row caption elided rather than wrapped where it's
+/// drawn (`ui/widgets.slint`'s `QuotaBlock` and `ToggleRow`, `ui/app.slint`'s
+/// `BalanceRow`), not a paragraph. Between [`MENU_LABEL_MAX_CHARS`] (a pill,
+/// sized to a couple of characters) and [`NAME_MAX_CHARS`] (a section header,
+/// 64): a row caption sits beside a figure rather than above a whole
 /// section, so it gets more room than the pill and less than the header —
 /// wide enough for a legitimate label in any of the four places while
 /// bounding how far a hostile one can grow the card it lands in.

@@ -60,10 +60,18 @@ export component HatchFill inherits Rectangle {
     // 1 = "/" rising stripes (the 45° token-class hatch), -1 = "\" falling
     // (the 135° quota-projection hatch).
     in property <float> dir: 1;
+    // Widest this element will ever need to draw. Defaults to its own
+    // current width, which is exactly right for every call site whose box
+    // never animates; the one that does (the quota-projection slice, whose
+    // width tracks a 700ms tween) passes its track's fixed width instead, so
+    // the repeater below is sized once per layout rather than once per
+    // frame — `clip: true` trims whatever of it falls outside the box's
+    // current, narrower width, the same as it always trimmed a static one.
+    in property <length> pattern-width: self.width;
     clip: true;
     property <float> vbw: self.width / 1px;
     property <float> vbh: self.height / 1px;
-    for i in max(0, round(root.vbw / 4 + root.vbh / 4)) + 1 : Path {
+    for i in max(0, round(pattern-width / 1px / 4 + root.vbh / 4)) + 1 : Path {
         width: root.width;
         height: root.height;
         viewbox-width: root.vbw;
@@ -127,10 +135,15 @@ export component QuotaBlock inherits VerticalLayout {
     HorizontalLayout {
         spacing: 8px;
         Text {
+            // Unbounded, a manifest's full `LABEL_MAX_CHARS` allowance claims
+            // this layout's whole minimum width and leaves the "% used"
+            // figure past the fold — elided instead, the same way the
+            // provider header and registry row names are.
             text: root.win-label;
             font-size: 13px;
             color: root.not-started ? Theme.text-dim : Theme.text;
             vertical-alignment: center;
+            overflow: elide;
         }
         Rectangle { horizontal-stretch: 1; min-width: 8px; }
         // One figure, and it says what it is. The pair that used to stand here
@@ -168,6 +181,11 @@ export component QuotaBlock inherits VerticalLayout {
                 HatchFill {
                     width: parent.width;
                     height: parent.height;
+                    // `parent.width` (this slice) is the animated one; the
+                    // widest it can ever grow to is the whole track's own
+                    // fixed width, which is what the repeater count is sized
+                    // against — see `HatchFill.pattern-width`'s own doc.
+                    pattern-width: track.width;
                     dir: -1;
                     tint: root.proj-color;
                     opacity: 0.55;

@@ -83,7 +83,11 @@ pub struct RegistryEntry {
     /// parse time: no control, invisible or directional characters, and at
     /// most [`REGISTRY_NAME_MAX_CHARS`].
     pub name: String,
-    /// Publisher-declared version (compared with [`version_cmp`]).
+    /// Publisher-declared version (compared with [`version_cmp`]) — same two
+    /// checks as [`Self::name`] and bounded the same way, since it reaches
+    /// the install/update row exactly like them. An index entry is remote
+    /// input the moment its host is compromised; nothing about `version`
+    /// made it any less so than the fields either side of it.
     pub version: String,
     /// Optional one-line description shown before install — same two
     /// checks as [`Self::name`], bounded instead by
@@ -135,6 +139,8 @@ impl RegistryIndex {
             if p.version.trim().is_empty() {
                 return Err(format!("plugin \"{}\": `version` must not be empty", p.id));
             }
+            refuse_control_chars(&p.id, "version", &p.version)?;
+            refuse_too_long(&p.id, "version", &p.version, REGISTRY_VERSION_MAX_CHARS)?;
             if let Some(description) = &p.description {
                 refuse_control_chars(&p.id, "description", description)?;
                 refuse_too_long(
@@ -172,6 +178,11 @@ const REGISTRY_NAME_MAX_CHARS: usize = 64;
 /// [`RegistryEntry::description`]'s cap — a one-line summary shown before
 /// install, not a changelog.
 const REGISTRY_DESCRIPTION_MAX_CHARS: usize = 256;
+
+/// [`RegistryEntry::version`]'s cap — no real semver string (with a
+/// prerelease and build metadata included) comes close, and a hostile index
+/// gets no more mileage out of this field than it does out of `name`.
+const REGISTRY_VERSION_MAX_CHARS: usize = 64;
 
 /// The most `[[plugin]]` entries an index may list. No real registry
 /// approaches this (this repo ships a handful) — it exists purely so a 10
@@ -1980,6 +1991,31 @@ mod tests {
             err.contains("control, invisible or directional characters"),
             "unexpected error: {err}"
         );
+    }
+
+    /// `version` reaches the install/update row the same way `name` and
+    /// `description` do, so it needs the same class of refusal — a
+    /// hostile index cannot smuggle a bidi override through the one field
+    /// the other two checks left alone.
+    #[test]
+    fn rejects_a_bidi_override_in_a_version() {
+        let idx = entry_with("version", "1.0.0\u{202E}");
+        let err = RegistryIndex::from_str(&idx)
+            .expect_err("a bidi override in a version must be rejected");
+        assert!(
+            err.contains("control, invisible or directional characters"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Same reasoning as the charset check above, for length: `version` is
+    /// bounded the same way `name` is, so a hostile index cannot use it to
+    /// overflow the row either.
+    #[test]
+    fn rejects_a_version_over_the_length_cap() {
+        let idx = entry_with("version", &"1".repeat(REGISTRY_VERSION_MAX_CHARS + 1));
+        let err = RegistryIndex::from_str(&idx).expect_err("an overlong version must be rejected");
+        assert!(err.contains("version"), "unexpected error: {err}");
     }
 
     // ── resolve_manifest_url ─────────────────────────────────────────────
