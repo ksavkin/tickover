@@ -6048,10 +6048,10 @@ fn window_hatch_start(w: &Window) -> Option<u64> {
 /// or less never clears the floor and never draws a hatch at all — nothing
 /// shipped declares one that short.
 ///
-/// Returns the percentage (clamped to 100), its tone (1 ok / 2 warn / 3
-/// crit), and — set only once the pace crosses 100 — when that happens, so
-/// the caller can name it without this function formatting a time zone of
-/// its own.
+/// Returns the percentage (clamped to 100, rounded to the whole point a
+/// caption ever shows), its tone (1 ok / 2 warn / 3 crit), and — set only
+/// once the pace crosses 100 — when that happens, so the caller can name it
+/// without this function formatting a time zone of its own.
 fn quota_pace(w: &Window, used: f64, now: u64) -> Option<(f32, i32, Option<u64>)> {
     let reset = w.resets_at?;
     let start = window_hatch_start(w)?;
@@ -6065,8 +6065,20 @@ fn quota_pace(w: &Window, used: f64, now: u64) -> Option<(f32, i32, Option<u64>)
     }
     let projected = used * period as f64 / elapsed as f64;
     if projected < 100.0 {
-        let tone = if projected >= 90.0 { 2 } else { 1 };
-        return Some((projected as f32, tone, None));
+        // Rounded before the tone check and the return, not after: `elapsed`
+        // grows every second this is asked again, so the raw value drifts by
+        // a fraction of a point on every tick even when nothing about the
+        // reading itself has changed — invisible in a whole-percent caption,
+        // but the caller feeds this straight into an animated bar width
+        // (`QuotaBlock`'s `proj-pct`, `ui/widgets.slint`), where a value that
+        // never repeats retriggers that bar's own 700ms tween every second
+        // instead of ever letting it settle. Rounding first is the same
+        // choice `used-rounded` already makes for the measured half of the
+        // same bar — see `QuotaBlock`'s own doc: severity follows the
+        // *displayed* value, not the raw one.
+        let rounded = projected.round();
+        let tone = if rounded >= 90.0 { 2 } else { 1 };
+        return Some((rounded as f32, tone, None));
     }
     // Reaching the cap before reset is the crit state — it names when,
     // clamped to the reset itself: the straight line can overshoot past it,
