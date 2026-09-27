@@ -102,11 +102,28 @@ say the same thing (mint below 70 %, amber from 70 %, red from 90 %). The
 white tick is how much of the window has elapsed; hovering the bar shows the
 gap between the two in percent points in its tooltip — `pace +22 pp` is
 burning 22 points ahead of the clock. The countdown is recomputed every
-second from the absolute reset time, so it survives sleep. Extra rows carry
-limits a provider reports beside its main windows (Claude's per-model weekly
-caps, Codex's model-specific windows); balances carry calendar-period
-figures (Grok's credit and spend, Codex's credits, Copilot's premium
-requests); a notice above the rows says when a provider reports the account
+second from the absolute reset time, so it survives sleep.
+
+A window that reports its own period also carries a **projection**: a
+hatched band reaching from the used fill to where the present pace lands by
+the reset. It is drawn from the clock alone — the used percentage times the
+period over the time elapsed — so a build without local history draws the
+same band. It stays away until the window has run for ten minutes or a tenth
+of its period, whichever is longer: a pace read off the first few minutes of
+a five-hour window is noise wearing a percentage sign. The caption at the
+right of the reset line names it — `→ ~63%` on its own, `burn 41.2K/h →
+~63%` once local history has counted tokens for that window, and
+`caps ~18:40`, the clock time the pace crosses 100 % and never later than
+the reset itself, in place of both once it projects a full window. The band
+takes the bar's three colours on its own thresholds: mint, amber from 90 %
+projected, red once it projects a cap.
+
+Extra rows carry limits a provider reports beside its main windows
+(Claude's per-model weekly caps, Codex's model-specific windows) and never
+a burn figure — the tokens counted locally are the account's, not that one
+model's; balances carry calendar-period figures (Grok's credit and spend,
+Codex's credits, Copilot's premium requests); a notice above the rows says
+when a provider reports the account
 blocked. Optionally the reading is drawn in the tray itself — a pill in the
 macOS menu bar, bars inside the icon on Windows. That widget has room for two
 providers; with more configured, it shows the first two by order and the
