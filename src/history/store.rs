@@ -506,12 +506,28 @@ pub struct HistoryStore {
     /// downgrade, not corruption. The file was left exactly where it was
     /// rather than quarantined, so nothing here may ever write over it:
     /// `commit` checks this before every `state.json` rewrite, for the
-    /// life of this store, however many scans run in between. The cost is
-    /// that a downgraded run remembers nothing across restarts — every
-    /// process start rebuilds `state` from scratch and re-derives whatever
-    /// it touches — until the machine is upgraded back to the version that
-    /// owns the file, at which point it is exactly as that version left it.
+    /// life of this store, however many scans run in between — and skips
+    /// compacting `days.jsonl` too, since a compacting rewrite would write
+    /// it from this run's in-memory `days`, which `open` already built
+    /// with every newer-schema line dropped. The cost is that a downgraded
+    /// run remembers nothing across restarts — every process start
+    /// rebuilds `state` from scratch and re-derives whatever it touches —
+    /// and `days.jsonl` cannot shrink no matter how large it grows, until
+    /// the machine is upgraded back to the version that owns the file, at
+    /// which point both are exactly as that version left them.
     foreign_newer_state: bool,
+    /// Whether [`Self::prune_missing_files`] has already run once for this
+    /// store instance. A `stat` per tracked entry adds up on a machine
+    /// with ten thousand of them, and the caller that matters
+    /// (`spawn_history_scan`) opens the store once and runs up to eight
+    /// scan ticks inside the same lock — paying the whole sweep again on
+    /// every one of them would buy no new information, since a file
+    /// confirmed gone on tick one is still gone on tick eight. Limiting
+    /// the sweep to one call per store instance reduces the syscall count
+    /// for one run; it does not remove the risk, since no `stat` here
+    /// carries a timeout, so one unresponsive network volume still blocks
+    /// whichever tick's turn it is to run the (now singular) sweep.
+    missing_files_pruned: bool,
 }
 
 impl HistoryStore {
@@ -584,6 +600,7 @@ impl HistoryStore {
             live_cache: RefCell::new(None),
             state_dirty,
             foreign_newer_state,
+            missing_files_pruned: false,
         };
         match fs::read_to_string(Self::days_path(dir)) {
             Ok(text) => {
@@ -1050,7 +1067,16 @@ impl HistoryStore {
     /// disk, and never when [`Self::foreign_newer_state`] is set — then
     /// compact `days.jsonl` if it has grown past [`DAYS_COMPACT_BYTES`]
     /// (that trigger is unconditional; a `days.jsonl`-only pass with an
-    /// untouched `state` still needs to compact). The dirty guard earns its
+    /// untouched `state` still needs to compact) — *unless*
+    /// `foreign_newer_state` is set, in which case compaction is skipped
+    /// too: `open` already dropped every line a newer schema wrote from
+    /// this run's in-memory `days` (any `v` greater than
+    /// [`SCHEMA_VERSION`]), and a compacting rewrite writes `days.jsonl`
+    /// from that same memory — running it here would erase the newer
+    /// build's own lines from disk, exactly what leaving `state.json`
+    /// alone is meant to prevent. The cost is the same as leaving
+    /// `state.json` unwritten: no reclamation while downgraded, however
+    /// large `days.jsonl` grows in the meantime. The dirty guard earns its
     /// keep at this call's frequency: a scan pass that touched no file
     /// still calls it once per manifest, `tickover stats` calls it dozens
     /// of times a run, and `state.files` serialises to several megabytes on
@@ -1075,24 +1101,20 @@ impl HistoryStore {
             fs::rename(&tmp, &target)?;
             self.state_dirty = false;
         }
+        if self.foreign_newer_state {
+            return Ok(());
+        }
         self.maybe_compact_days()
     }
 
     /// Day lines that still count: a line is stale only when its file is
-    /// still tracked at a *newer, sealed* generation. Lines from a file
-    /// that has since been deleted keep counting — the usage happened; the
-    /// provider removing its log does not un-spend the tokens — but only
-    /// the newest generation's: without the state entry nothing suppresses
-    /// superseded generations, so the file's latest *live* gen stands in
-    /// as its remembered watermark. A generation counts as sealed once one
-    /// of its own lines is `full` — a rewrite bumps the tracked generation
-    /// the instant it is detected, before the rescan it triggers has
-    /// re-derived anything, so a not-yet-sealed current generation defers
-    /// to the newest generation this file *has* sealed, holding that
-    /// figure across however many wall-clock-budget passes the rescan
-    /// takes. A file with no sealed generation at all — still on its
-    /// first-ever, still-partial scan — has nothing to fall back to, so
-    /// its partial lines count as they arrive rather than waiting.
+    /// still tracked at a *newer, sealed* generation — see
+    /// [`Self::target_gen`] for exactly which generation that is. Lines
+    /// from a file that has since been deleted keep counting — the usage
+    /// happened; the provider removing its log does not un-spend the
+    /// tokens — but only the newest generation's: without the state entry
+    /// nothing suppresses superseded generations, so the file's latest
+    /// *live* gen stands in as its remembered watermark.
     ///
     /// Amortised O(live lines) per call: the answer is memoized in
     /// [`Self::live_cache`], so only the first call after a change any
@@ -1121,34 +1143,21 @@ impl HistoryStore {
     }
 
     /// [`Self::live_days`]'s answer, computed fresh: every non-dead index
-    /// whose file is at the state's current generation *if that generation
-    /// is sealed*, or otherwise at the newest generation this file has
-    /// sealed — or, for a file no longer in `state.files`, at that file's
-    /// own newest surviving generation. Split out so [`Self::live_days`]
-    /// only ever calls it through the cache.
+    /// whose generation matches [`Self::target_gen`] for its file — or,
+    /// for a file [`Self::target_gen`] returns `None` for (no longer in
+    /// `state.files`), one at that file's own newest surviving
+    /// generation. Split out so [`Self::live_days`] only ever calls it
+    /// through the cache.
     fn compute_live_indices(&self) -> Vec<usize> {
-        let (current, last_live, sealed_gen) = self.generation_maps();
+        let maps = self.generation_maps();
+        let (_, last_live, _) = &maps;
         self.days
             .iter()
             .enumerate()
             .filter(|(i, d)| {
                 !self.dead.contains(i)
-                    && match current.get(d.file.as_str()) {
-                        Some(&gen) => {
-                            // A rewrite bumps `gen` before the rescan it
-                            // triggers has sealed anything: until it does,
-                            // the file's last sealed generation is the
-                            // honest figure, not the unsealed slice the
-                            // rescan has produced so far. A file with no
-                            // sealed generation yet has no held figure to
-                            // defer to, so its partial lines count as they
-                            // land instead.
-                            let target = match sealed_gen.get(d.file.as_str()) {
-                                Some(&sealed) if sealed < gen => sealed,
-                                _ => gen,
-                            };
-                            d.gen == target
-                        }
+                    && match Self::target_gen(&maps, d.file.as_str()) {
+                        Some(target) => d.gen == target,
                         None => last_live.get(d.file.as_str()) == Some(&d.gen),
                     }
             })
@@ -1156,12 +1165,11 @@ impl HistoryStore {
             .collect()
     }
 
-    /// The three per-file generation facts [`Self::compute_live_indices`]
-    /// and [`Self::compute_droppable_indices`] both need: the state's
-    /// current generation, the newest generation any non-dead line has
-    /// reached, and the newest generation a `full` line has actually
-    /// sealed (absent for a file still on its first, still-partial scan —
-    /// there is nothing yet to fall back to for one).
+    /// The three per-file generation facts [`Self::target_gen`] needs: the
+    /// state's current generation, the newest generation any non-dead
+    /// line has reached, and the newest generation a `full` line has
+    /// actually sealed (absent for a file still on its first, still-
+    /// partial scan — there is nothing yet to fall back to for one).
     fn generation_maps(&self) -> GenerationMaps<'_> {
         let current: HashMap<&str, u32> = self
             .state
@@ -1189,29 +1197,75 @@ impl HistoryStore {
         (current, last_live, sealed_gen)
     }
 
+    /// The one generation a file's lines must carry to count as live —
+    /// the single source [`Self::compute_live_indices`] and
+    /// [`Self::compute_droppable_indices`] both read, so the two can never
+    /// disagree about which generation currently speaks for a file.
+    ///
+    /// `None` for a file no longer in `state.files`: there is no current
+    /// generation to target at all, and both callers fall back to the
+    /// file's newest surviving (non-dead) generation instead. For a
+    /// tracked file, the target is its current generation *if that
+    /// generation is sealed*, or otherwise the newest generation this
+    /// file *has* sealed — a rewrite bumps the tracked generation the
+    /// instant it is detected, before the rescan it triggers has
+    /// re-derived anything, so a not-yet-sealed current generation defers
+    /// to the last complete figure rather than the unsealed slice
+    /// produced so far. A file with no sealed generation *lower than its
+    /// current one* has nothing to defer to, so the target is simply the
+    /// current generation itself — whatever that generation's own lines
+    /// say, live or not yet begun. Two shapes reach this: a file still on
+    /// its first-ever, still-partial scan (no sealed generation exists at
+    /// all), and a file whose state was dropped and recreated (deletion,
+    /// a `prune_missing_files` sweep, a `SCHEMA_VERSION` reset, a
+    /// downgrade) while a sealed generation from its previous life is
+    /// still sitting in `days.jsonl` at a number *higher* than the fresh
+    /// one — that old sealed line is not a fallback candidate (it is
+    /// higher, not lower, than the current generation) and never lends
+    /// its figure to the file's new life.
+    fn target_gen(maps: &GenerationMaps<'_>, file: &str) -> Option<u32> {
+        let (current, _, sealed_gen) = maps;
+        let gen = *current.get(file)?;
+        Some(match sealed_gen.get(file) {
+            Some(&sealed) if sealed < gen => sealed,
+            _ => gen,
+        })
+    }
+
     /// Indices compaction may physically drop: [`Self::dead`] lines —
     /// already superseded within their own generation — plus lines whose
-    /// file has since sealed a *later* generation, which is what actually
-    /// makes an earlier one obsolete. A line excluded from
-    /// [`Self::live_days`] only because its generation is mid-rescan and
-    /// not yet sealed is not among these: dropping it here would be
-    /// permanent, and the seal that finishes the rescan still needs it to
-    /// complete its prefix chain — compacting in that window would turn a
-    /// figure that is merely hidden for now into one that never comes
-    /// back. A file no longer in `state.files` drops everything but its
-    /// own newest surviving generation, same as [`Self::live_days`]'s
-    /// deleted-file fallback.
+    /// generation misses [`Self::target_gen`] *and* whose file has since
+    /// sealed a strictly *later* generation than the line's own — the
+    /// only thing that actually makes an earlier generation obsolete. The
+    /// second test is load-bearing on its own, not merely a mirror of
+    /// "not live": a mid-rescan file with an unsealed current generation
+    /// misses the target too (the target is the last sealed generation,
+    /// not the in-progress one), but nothing has sealed *past* it yet, so
+    /// its lines are not droppable — dropping them here would be
+    /// permanent, and the seal that finishes the rescan still needs them
+    /// to complete its prefix chain. The same test is what keeps a file
+    /// back at a lower generation than one it had already sealed (see
+    /// [`Self::target_gen`]'s last case) from losing that older sealed
+    /// line to compaction: nothing has sealed past *that* generation
+    /// either, so it is retained — permanently, until this file's fresh
+    /// life reaches and seals past it in turn. A file no longer in
+    /// `state.files` drops everything but its own newest surviving
+    /// generation, same as [`Self::live_days`]'s deleted-file fallback.
     fn compute_droppable_indices(&self) -> std::collections::HashSet<usize> {
-        let (current, last_live, sealed_gen) = self.generation_maps();
+        let maps = self.generation_maps();
+        let (_, last_live, sealed_gen) = &maps;
         self.days
             .iter()
             .enumerate()
             .filter(|(i, d)| {
                 self.dead.contains(i)
-                    || match current.get(d.file.as_str()) {
-                        Some(_) => sealed_gen
-                            .get(d.file.as_str())
-                            .is_some_and(|&sealed| sealed > d.gen),
+                    || match Self::target_gen(&maps, d.file.as_str()) {
+                        Some(target) => {
+                            d.gen != target
+                                && sealed_gen
+                                    .get(d.file.as_str())
+                                    .is_some_and(|&sealed| sealed > d.gen)
+                        }
                         None => last_live.get(d.file.as_str()) != Some(&d.gen),
                     }
             })
@@ -1277,22 +1331,30 @@ impl HistoryStore {
         Ok(())
     }
 
-    /// Drop state for a path only once its file is confirmed gone: a bare
-    /// `NotFound` from `stat`ing the exact path, never "the last walk
-    /// didn't happen to reach it." The root a manifest resolves can differ
-    /// between the tray process and `tickover stats` (a different
-    /// `CODEX_HOME` or `CLAUDE_CONFIG_DIR` in one of the two
-    /// environments), and pruning by "no active root reaches this path
-    /// any more" let each process's tick prune the *other's* still-live
-    /// files out from under it — confirming against the filesystem itself
-    /// needs no notion of roots at all, and both processes agree on what
-    /// it says. An unreadable root, an unmounted volume, or a permission
-    /// failure surface as some other `io::Error`, never `NotFound` — so
-    /// they keep the entry rather than costing a cursor, same as a
-    /// successful stat does. `symlink_metadata` rather than `metadata`:
-    /// a tracked path is only ever a regular file the scanner opened
-    /// itself, never a symlink, and this must not treat one differently
-    /// than any other unreadable path would be.
+    /// Drop state for a path once its file is confirmed gone or replaced
+    /// by something the scanner's walk will never offer again: a bare
+    /// `NotFound` from `stat`ing the exact path, or a successful `stat`
+    /// reporting something other than a regular file. The root a
+    /// manifest resolves can differ between the
+    /// tray process and `tickover stats` (a different `CODEX_HOME` or
+    /// `CLAUDE_CONFIG_DIR` in one of the two environments), and pruning by
+    /// "no active root reaches this path any more" let each process's
+    /// tick prune the *other's* still-live files out from under it —
+    /// confirming against the filesystem itself needs no notion of roots
+    /// at all, and both processes agree on what it says. An unreadable
+    /// root, an unmounted volume, or a permission failure surface as some
+    /// other `io::Error`, never `NotFound` — so they keep the entry
+    /// rather than costing a cursor, same as a successful stat of a
+    /// regular file does. `symlink_metadata` rather than `metadata`: a
+    /// dangling symlink standing in a tracked file's place resolves to
+    /// nothing through `metadata` (misread as some other I/O error, not
+    /// `NotFound`), while `symlink_metadata` sees the link itself and
+    /// reports it as the non-regular-file case — `collect`'s walk never
+    /// follows symlinks and its own `is_file()` check excludes them, so
+    /// without this a path that has been replaced by a symlink, dangling
+    /// or not, would never be re-offered *and* never be pruned, stuck
+    /// exactly like an entry for a file that was deleted with nothing
+    /// left in its place.
     ///
     /// Their day lines keep counting regardless (history once recorded
     /// stays); if a path is recreated later, a fresh scan's overlapping
@@ -1319,17 +1381,23 @@ impl HistoryStore {
     /// moment a fresh scan resurrects it: that is `scan_root`'s job (the
     /// `None` arm of its match, where `begin_file` registers a path with no
     /// prior state), not this one's — see the release call planted there.
+    /// Runs at most once per store instance — see
+    /// [`Self::missing_files_pruned`]. A caller that wants a fresh sweep
+    /// (a long-lived process holding one store across many hours) has to
+    /// open a new [`HistoryStore`] for it; nothing here re-arms the guard.
     pub fn prune_missing_files(&mut self) -> usize {
+        if self.missing_files_pruned {
+            return 0;
+        }
+        self.missing_files_pruned = true;
         self.invalidate_live_cache();
         let gone: Vec<String> = self
             .state
             .files
             .keys()
-            .filter(|p| {
-                matches!(
-                    fs::symlink_metadata(Path::new(p.as_str())),
-                    Err(e) if e.kind() == io::ErrorKind::NotFound
-                )
+            .filter(|p| match fs::symlink_metadata(Path::new(p.as_str())) {
+                Err(e) => e.kind() == io::ErrorKind::NotFound,
+                Ok(meta) => !meta.file_type().is_file(),
             })
             .cloned()
             .collect();
@@ -1362,27 +1430,51 @@ fn hex_prefix(digest: &[u8]) -> String {
 }
 
 /// Delete every `state.corrupt-*.json` in `dir` beyond the
-/// [`MAX_CORRUPT_BACKUPS`] most recent. The epoch embedded in the name
-/// sorts the same lexically as chronologically at this digit width, so a
-/// plain string sort picks out the oldest without parsing anything back
-/// out. Best-effort: a listing or delete failure here must not fail `open`
-/// over files that are not the store's live data.
+/// [`MAX_CORRUPT_BACKUPS`] most recent, oldest epoch first. The epoch is
+/// parsed back out of the name and compared as the integer it is, not as
+/// a string: lexical order lets a stray file whose suffix happens to sort
+/// last (`state.corrupt-zzz.json`, or simply a wider number of digits)
+/// outrank every real backup and evict the one `open` just made. A name
+/// whose suffix doesn't parse as one is left alone entirely — neither
+/// counted against the cap nor deleted — rather than guessed at.
+///
+/// The epoch is whole seconds (`chrono::Utc::now().timestamp()` at the
+/// write site in [`HistoryStore::open`]), so two quarantines within the
+/// same second produce the same name; the `rename` that creates the
+/// second one then silently overwrites the first rather than erroring —
+/// accepted here as the cost of a scheme that names files after nothing
+/// but a wall-clock reading, since two corruption events one second apart
+/// are not a case this store expects to need forensics for.
+///
+/// Runs from every [`HistoryStore::open`], with no distinction for a
+/// caller that only ever reads the result — the read-only store handle
+/// the panel keeps for itself, and `tickover stats`, both prune here too.
+/// The alternative would be threading a "will this open write?" flag
+/// through every call site for the sake of a handful of quarantine files
+/// that are not the store's live data in the first place.
+///
+/// Best-effort throughout: a listing, parse, or delete failure here must
+/// not fail `open` over files that are not the store's live data.
 fn prune_corrupt_backups(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
-    let mut backups: Vec<(String, PathBuf)> = entries
+    let mut backups: Vec<(u64, PathBuf)> = entries
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            (name.starts_with("state.corrupt-") && name.ends_with(".json"))
-                .then(|| (name, e.path()))
+            let epoch: u64 = name
+                .strip_prefix("state.corrupt-")?
+                .strip_suffix(".json")?
+                .parse()
+                .ok()?;
+            Some((epoch, e.path()))
         })
         .collect();
     if backups.len() <= MAX_CORRUPT_BACKUPS {
         return;
     }
-    backups.sort_by(|a, b| a.0.cmp(&b.0));
+    backups.sort_by_key(|&(epoch, _)| epoch);
     for (_, path) in &backups[..backups.len() - MAX_CORRUPT_BACKUPS] {
         let _ = fs::remove_file(path);
     }
@@ -1488,12 +1580,26 @@ mod tests {
     }
 
     #[test]
-    fn stale_corrupt_backups_are_pruned_to_a_handful() {
-        let dir = tmpdir("corrupt-backups");
+    fn stale_corrupt_backups_are_pruned_by_parsed_epoch_not_lexical_order() {
+        // Real epochs are ten digits today; a lexical string sort gets a
+        // shorter or differently-led number wrong — `"1000000000"` sorts
+        // *before* `"999999999"` as strings (the first byte '1' loses to
+        // '9'), even though it is the larger, newer value. Parsed as the
+        // integer it names, order comes out right. An unparseable suffix
+        // is left alone entirely: neither evicted nor counted toward the
+        // cap.
+        let dir = tmpdir("corrupt-backups-numeric");
         fs::create_dir_all(&dir).unwrap();
-        for epoch in [100, 200, 300, 400, 500] {
+        for epoch in [
+            999_999_999u64,
+            1_000_000_000,
+            1_000_000_001,
+            1_000_000_002,
+            1_000_000_003,
+        ] {
             fs::write(dir.join(format!("state.corrupt-{epoch}.json")), "{}").unwrap();
         }
+        fs::write(dir.join("state.corrupt-not-a-number.json"), "{}").unwrap();
         let _store = HistoryStore::open(&dir).unwrap();
         let mut kept: Vec<String> = fs::read_dir(&dir)
             .unwrap()
@@ -1505,11 +1611,12 @@ mod tests {
         assert_eq!(
             kept,
             vec![
-                "state.corrupt-300.json".to_string(),
-                "state.corrupt-400.json".to_string(),
-                "state.corrupt-500.json".to_string(),
+                "state.corrupt-1000000001.json".to_string(),
+                "state.corrupt-1000000002.json".to_string(),
+                "state.corrupt-1000000003.json".to_string(),
+                "state.corrupt-not-a-number.json".to_string(),
             ],
-            "only the most recent backups survive"
+            "the three newest by parsed epoch survive; the unparseable name is untouched"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1587,6 +1694,127 @@ mod tests {
             store.live_days().map(|d| d.input).sum::<u64>(),
             12,
             "sealed — the new generation's own figures now stand on their own"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compaction_never_deletes_the_only_live_generation_of_a_file() {
+        // A file can land back at a generation *lower* than one it has
+        // already sealed: delete-and-recreate (its state entry drops
+        // while `days.jsonl` keeps the old sealed lines, then
+        // `begin_file` restarts it at gen 0), the next `SCHEMA_VERSION`
+        // bump (every older schema is quarantined, so a rewritten log's
+        // owner is rediscovered from gen 0 with its sealed history still
+        // sitting at a higher gen), or a downgrade. `state.files` says
+        // gen 0; `days.jsonl` still has a `full` line at gen 1 from the
+        // file's previous life. Liveness then targets gen 0 — the file's
+        // only live generation — and compaction must never read the
+        // stale sealed gen-1 line as "cover" for it and delete it.
+        let dir = tmpdir("recreate-lower-gen");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let mut sealed1 = day("/f", 1, 999);
+        sealed1.full = true;
+        store.append_days(&[sealed1]).unwrap();
+        // The file's fresh life: `state.files` says gen 0, same as
+        // `FileState::fresh` always starts — whatever dropped the old
+        // entry (deletion, a schema rebuild, a downgrade) is already
+        // behind this point.
+        store
+            .state
+            .files
+            .insert("/f".to_string(), FileState::fresh("d".into(), 1, 1));
+        store.append_days(&[day("/f", 0, 7)]).unwrap();
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 7);
+
+        // Pad past the compaction threshold with raw junk so a real
+        // compaction fires.
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("days.jsonl"))
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{}", "x".repeat(17 * 1024 * 1024)).unwrap();
+        drop(f);
+        store.commit().unwrap(); // compacts
+
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            7,
+            "gen 0 is the file's only live generation — compaction must not eat it"
+        );
+        drop(store);
+        let store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            7,
+            "the figure must survive a reopen too"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_and_droppable_never_overlap_across_every_generation_shape() {
+        // The shapes a file's (current, sealed) generations can take:
+        // steady state, a rescan in progress, a rescan just sealed, and a
+        // file back at a generation lower than one it already sealed
+        // (delete-and-recreate, a schema rebuild, a downgrade). No line
+        // may ever be both live and droppable in any of them — the two
+        // sets are read from the same `target_gen` so they cannot
+        // disagree, but a shared shortcut computing the same wrong answer
+        // twice would still pass this test only by accident, so every
+        // shape is checked by hand.
+        let dir = tmpdir("live-droppable-invariant");
+        let mut store = HistoryStore::open(&dir).unwrap();
+
+        // Steady: current 0, sealed 0.
+        let mut steady = day("/steady", 0, 1);
+        steady.full = true;
+        store.append_days(&[steady]).unwrap();
+        store
+            .state
+            .files
+            .insert("/steady".to_string(), FileState::fresh("d".into(), 1, 1));
+
+        // Mid-rescan: current 1, sealed 0.
+        let mut mid_sealed = day("/mid", 0, 1);
+        mid_sealed.full = true;
+        let mut mid_partial = day("/mid", 1, 1);
+        mid_partial.lo = 0;
+        mid_partial.hi = 10;
+        store.append_days(&[mid_sealed, mid_partial]).unwrap();
+        let mut mid_state = FileState::fresh("d".into(), 1, 1);
+        mid_state.gen = 1;
+        store.state.files.insert("/mid".to_string(), mid_state);
+
+        // Rescan just sealed: current 1, sealed 1.
+        let mut done_old = day("/done", 0, 1);
+        done_old.full = true;
+        let mut done_new = day("/done", 1, 1);
+        done_new.full = true;
+        store.append_days(&[done_old, done_new]).unwrap();
+        let mut done_state = FileState::fresh("d".into(), 1, 1);
+        done_state.gen = 1;
+        store.state.files.insert("/done".to_string(), done_state);
+
+        // Recreate: current 0, sealed 1 — a file back at a lower generation
+        // than one it already sealed.
+        let mut recreate_sealed = day("/recreate", 1, 1);
+        recreate_sealed.full = true;
+        let recreate_new = day("/recreate", 0, 1);
+        store.append_days(&[recreate_sealed, recreate_new]).unwrap();
+        store
+            .state
+            .files
+            .insert("/recreate".to_string(), FileState::fresh("d".into(), 1, 1));
+
+        let live: std::collections::HashSet<usize> =
+            store.compute_live_indices().into_iter().collect();
+        let droppable = store.compute_droppable_indices();
+        let overlap: Vec<usize> = live.intersection(&droppable).copied().collect();
+        assert!(
+            overlap.is_empty(),
+            "live and droppable overlap at indices {overlap:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1730,6 +1958,72 @@ mod tests {
 
         assert_eq!(removed, 0, "a path stat can't confirm must not be pruned");
         assert!(store.file_state(Path::new(&key)).is_some());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_missing_files_runs_at_most_once_per_store_instance() {
+        // A `stat` per tracked entry adds up across the up-to-eight scan
+        // ticks one process runs inside a single store's lifetime; the
+        // sweep sees everything it will ever see on the first call, so a
+        // file that becomes confirmably gone only *after* that call stays
+        // tracked until the next store is opened rather than costing a
+        // second full sweep to notice it.
+        let root = tmpdir("prune-once-root");
+        let dir = tmpdir("prune-once-store");
+        fs::write(root.join("a.jsonl"), b"x").unwrap();
+        let a_key = root.join("a.jsonl").to_string_lossy().into_owned();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store
+            .state
+            .files
+            .insert(a_key.clone(), FileState::fresh("d".into(), 1, 1));
+        assert_eq!(
+            store.prune_missing_files(),
+            0,
+            "the file exists on the store's one sweep"
+        );
+
+        fs::remove_file(root.join("a.jsonl")).unwrap();
+        assert_eq!(
+            store.prune_missing_files(),
+            0,
+            "a second call on the same store must not look again"
+        );
+        assert!(
+            store.file_state(Path::new(&a_key)).is_some(),
+            "the now-deleted file's entry is left for the next store's sweep"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_missing_files_treats_a_dangling_symlink_as_gone() {
+        // `symlink_metadata` succeeds on a symlink even once its target
+        // is missing — a bare `NotFound` check never catches this, and
+        // the scanner's walk (`follow_links(false)`, `is_file()`) never
+        // offers a symlink either way, so without the non-regular-file
+        // test the entry would be stuck forever: never rescanned, never
+        // pruned.
+        let root = tmpdir("prune-dangling-root");
+        let dir = tmpdir("prune-dangling-store");
+        let target = root.join("gone-target.jsonl");
+        fs::write(&target, b"x").unwrap();
+        let link = root.join("a.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        fs::remove_file(&target).unwrap(); // the symlink now dangles
+        let key = link.to_string_lossy().into_owned();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store
+            .state
+            .files
+            .insert(key.clone(), FileState::fresh("d".into(), 1, 1));
+
+        assert_eq!(store.prune_missing_files(), 1);
+        assert!(store.file_state(Path::new(&key)).is_none());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2193,16 +2487,22 @@ mod tests {
     }
 
     #[test]
-    fn compaction_keeps_an_unsealed_line_so_a_later_seal_still_completes_its_chain() {
-        // A rescan's first pass lands a partial, unsealed bucket; before
-        // the completing pass ever runs, `days.jsonl` crosses the
+    fn compaction_keeps_an_unsealed_line_but_drops_a_truly_superseded_one() {
+        // A rescan's first pass on `/f` lands a partial, unsealed bucket;
+        // before the completing pass ever runs, `days.jsonl` crosses the
         // compaction threshold. The partial line is invisible to
         // `live_days` right now — its generation isn't sealed yet — but
         // it is not dead: the completing pass still needs it in its
-        // prefix chain. Compaction dropping it because `live_days` hides
-        // it for the moment would be permanent.
+        // prefix chain. A *different* file, `/other`, has already
+        // completed its own rewrite — its old generation is sealed over
+        // and genuinely dead. Without `/other` in the fixture this test
+        // would pass even with compaction's rewrite skipped entirely
+        // (nothing droppable, `maybe_compact_days` returns before
+        // touching the file), proving nothing about the chain it claims
+        // to protect.
         let dir = tmpdir("compact-hold");
         let mut store = HistoryStore::open(&dir).unwrap();
+
         let mut sealed0 = day("/f", 0, 10);
         sealed0.full = true;
         store.append_days(&[sealed0]).unwrap();
@@ -2219,6 +2519,22 @@ mod tests {
         partial.hi = 50;
         store.append_days(&[partial]).unwrap();
 
+        // `/other`: already rewritten once — gen 0 is sealed and now
+        // genuinely superseded by the sealed gen 1 that replaced it.
+        let mut other_old = day("/other", 0, 999);
+        other_old.full = true;
+        let mut other_new = day("/other", 1, 3);
+        other_new.full = true;
+        store.append_days(&[other_old, other_new]).unwrap();
+        store
+            .state
+            .files
+            .insert("/other".to_string(), FileState::fresh("d".into(), 1, 1));
+        store
+            .file_state_mut(Path::new("/other"))
+            .unwrap()
+            .reset("d2".into(), 2, 2); // bumps to gen 1, matching other_new
+
         // Pad past the compaction threshold with raw junk — never loaded
         // into memory, so it is dropped on rewrite regardless; only its
         // size matters here.
@@ -2229,9 +2545,20 @@ mod tests {
         use std::io::Write as _;
         writeln!(f, "{}", "x".repeat(17 * 1024 * 1024)).unwrap();
         drop(f);
+        let before_size = fs::metadata(dir.join("days.jsonl")).unwrap().len();
         store.commit().unwrap(); // compacts
+        let after_size = fs::metadata(dir.join("days.jsonl")).unwrap().len();
+        assert!(
+            after_size < before_size,
+            "a genuinely dead line was in the fixture — compaction must have rewritten the file smaller"
+        );
+        assert_eq!(
+            store.days.len(),
+            3,
+            "/f's sealed(0) and partial(1), plus /other's sealed gen 1 — /other's dead gen 0 is gone"
+        );
 
-        // The completing pass seals the new generation, chaining onto the
+        // The completing pass seals /f's new generation, chaining onto the
         // prefix compaction must have preserved.
         let mut tail = day("/f", 1, 7);
         tail.lo = 50;
@@ -2240,8 +2567,8 @@ mod tests {
         store.append_days(&[tail]).unwrap();
         assert_eq!(
             store.live_days().map(|d| d.input).sum::<u64>(),
-            12,
-            "5 (preserved partial) + 7 (tail) — compaction must not have eaten the chain"
+            15,
+            "5 (preserved partial) + 7 (tail) + 3 (/other) — compaction must not have eaten the chain"
         );
         let _ = fs::remove_dir_all(&dir);
     }

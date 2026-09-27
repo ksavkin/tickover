@@ -52,6 +52,13 @@ pub struct ScanOutcome {
     pub records: usize,
     /// Lines that looked like usage but failed to parse.
     pub skipped_unparsed: u64,
+    /// Files matched by `glob` under `root` but claimed by a *live*
+    /// competitor — a different, still-enabled manifest whose walk
+    /// reached this same path first (an overlapping root, not a shipped
+    /// configuration). Without this, such a file reads as a permanent
+    /// zero with no visible cause: it never contributes to `records`,
+    /// never counts against `skipped_unparsed`, and never sets `partial`.
+    pub claimed_by_another: usize,
     /// `true` when the wall-clock budget stopped the pass early — the
     /// caller should schedule another pass soon, not treat this as done.
     pub partial: bool,
@@ -68,7 +75,10 @@ struct FileSig {
 /// same matcher `engine_logfile` uses) and extract new usage into `store`.
 ///
 /// `provider` is the manifest id stamped onto every record's bucket.
-/// Returns early with `partial` once `deadline` passes.
+/// `enabled` is every manifest id this tick considers enabled — used only
+/// to tell a live competitor for a claimed path from an owner that is no
+/// longer one of them (a removed or renamed manifest id, or one the user
+/// disabled). Returns early with `partial` once `deadline` passes.
 pub fn scan_root(
     store: &mut HistoryStore,
     provider: &str,
@@ -76,6 +86,7 @@ pub fn scan_root(
     glob: &str,
     extractor: &dyn HistoryExtractor,
     deadline: Instant,
+    enabled: &std::collections::HashSet<&str>,
 ) -> ScanOutcome {
     let mut outcome = ScanOutcome::default();
     let files = collect(root, glob);
@@ -106,27 +117,35 @@ pub fn scan_root(
         // overlaps, but a user's own manifest, or an unset
         // `CLAUDE_CONFIG_DIR` resolving to the current directory, can hand
         // the same path to a second provider's walk. Once claimed, a path
-        // stays claimed: flipping `provider` to whoever scanned it last
-        // would attribute the file's already-counted usage and drift to
-        // the newcomer, and the cursor the two would share already sits
-        // wherever the owner left it, so the newcomer could only ever
-        // read the tail the owner already read. An empty stored provider
-        // predates the field and is simply claimed on first sight.
-        // Read-checked first: a mutable handout dirties `state`
-        // unconditionally (see `file_state_mut`'s own doc), and this runs
-        // for every file on every pass — a file whose provider already
-        // matches (every unchanged file, every pass after the first) must
-        // not force a `state.json` rewrite just for having been looked
-        // at. A file not yet in `state.files` at all needs nothing here
-        // either — `begin_file` below stamps it correctly the moment it
-        // exists.
+        // stays claimed against a *live* competitor: flipping `provider`
+        // to whoever scanned it last would attribute the file's already-
+        // counted usage and drift to the newcomer, and the cursor the two
+        // would share already sits wherever the owner left it, so the
+        // newcomer could only ever read the tail the owner already read.
+        // A stored owner that is no longer in `enabled` is not a
+        // competitor at all — its manifest was removed, renamed, or
+        // disabled — so the claim is stale and this walk may take it over
+        // rather than leaving the path orphaned forever (nothing else
+        // ever revisits an old owner's stamp). An empty stored provider
+        // predates the field and is simply claimed on first sight, the
+        // same as a stale one. Read-checked first: a mutable handout
+        // dirties `state` unconditionally (see `file_state_mut`'s own
+        // doc), and this runs for every file on every pass — a file whose
+        // provider already matches (every unchanged file, every pass
+        // after the first) must not force a `state.json` rewrite just for
+        // having been looked at. A file not yet in `state.files` at all
+        // needs nothing here either — `begin_file` below stamps it
+        // correctly the moment it exists.
         match store.file_state(&sig.path).map(|st| st.provider.clone()) {
-            Some(owner) if owner.is_empty() => {
+            Some(owner) if owner.is_empty() || !enabled.contains(owner.as_str()) => {
                 if let Some(st) = store.file_state_mut(&sig.path) {
                     st.provider = provider.to_string();
                 }
             }
-            Some(owner) if owner != provider => continue, // claimed by another provider
+            Some(owner) if owner != provider => {
+                outcome.claimed_by_another += 1;
+                continue; // claimed by a live competitor
+            }
             _ => {}
         }
 
@@ -620,6 +639,14 @@ mod tests {
         dir
     }
 
+    /// The enabled-manifest set for a test that only ever scans as one
+    /// provider — the common case. A test exercising a live competitor
+    /// (two enabled manifests reaching the same path) builds its own set
+    /// instead.
+    fn only(id: &str) -> std::collections::HashSet<&str> {
+        std::iter::once(id).collect()
+    }
+
     #[test]
     fn a_growing_wal_reopens_an_unchanged_db() {
         let root = tmpdir("wal-root");
@@ -631,19 +658,19 @@ mod tests {
         };
         let far = Instant::now() + Duration::from_secs(30);
 
-        scan_root(&mut store, "agy", &root, "*.db", &ex, far);
+        scan_root(&mut store, "agy", &root, "*.db", &ex, far, &only("agy"));
         assert_eq!(ex.calls.load(Ordering::SeqCst), 1);
         // Same signatures, no WAL yet: the second pass is a stat-only skip.
-        scan_root(&mut store, "agy", &root, "*.db", &ex, far);
+        scan_root(&mut store, "agy", &root, "*.db", &ex, far, &only("agy"));
         assert_eq!(ex.calls.load(Ordering::SeqCst), 1);
         // Writes landing in the WAL alone must still reopen the db.
         fs::write(root.join("conv.db-wal"), b"new rows").unwrap();
-        scan_root(&mut store, "agy", &root, "*.db", &ex, far);
+        scan_root(&mut store, "agy", &root, "*.db", &ex, far, &only("agy"));
         assert_eq!(ex.calls.load(Ordering::SeqCst), 2);
         // Checkpointed away: WAL gone — one reopen to record (0,0), then skip.
         fs::remove_file(root.join("conv.db-wal")).unwrap();
-        scan_root(&mut store, "agy", &root, "*.db", &ex, far);
-        scan_root(&mut store, "agy", &root, "*.db", &ex, far);
+        scan_root(&mut store, "agy", &root, "*.db", &ex, far, &only("agy"));
+        scan_root(&mut store, "agy", &root, "*.db", &ex, far, &only("agy"));
         assert_eq!(ex.calls.load(Ordering::SeqCst), 3);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&dir);
@@ -669,7 +696,15 @@ mod tests {
         let ex = crate::history::formats::claude::ClaudeExtractor;
         let far = Instant::now() + Duration::from_secs(30);
 
-        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         store.commit().unwrap();
         // The stream continues: same id, output grew 10 -> 25.
         let mut f = fs::OpenOptions::new()
@@ -679,7 +714,15 @@ mod tests {
         use std::io::Write as _;
         writeln!(f, "{}", claude_line("m1", 100, 25)).unwrap();
         drop(f);
-        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         store.commit().unwrap();
 
         let live: Vec<_> = store.live_days().cloned().collect();
@@ -707,13 +750,13 @@ mod tests {
         };
         let far = Instant::now() + Duration::from_secs(30);
 
-        scan_root(&mut store, "agy", &root, "*.db", &ex, far);
+        scan_root(&mut store, "agy", &root, "*.db", &ex, far, &only("agy"));
         fs::write(
             root.join("conv.db-wal"),
             b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         )
         .unwrap();
-        scan_root(&mut store, "agy", &root, "*.db", &ex, far);
+        scan_root(&mut store, "agy", &root, "*.db", &ex, far, &only("agy"));
         assert_eq!(ex.calls.load(Ordering::SeqCst), 2);
         // Same length, different bytes — the sig must still move.
         fs::write(
@@ -721,7 +764,7 @@ mod tests {
             b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         )
         .unwrap();
-        scan_root(&mut store, "agy", &root, "*.db", &ex, far);
+        scan_root(&mut store, "agy", &root, "*.db", &ex, far, &only("agy"));
         assert_eq!(ex.calls.load(Ordering::SeqCst), 3);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&dir);
@@ -739,7 +782,15 @@ mod tests {
         let mut store = HistoryStore::open(&dir).unwrap();
         let ex = crate::history::formats::claude::ClaudeExtractor;
         let far = Instant::now() + Duration::from_secs(30);
-        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         store.commit().unwrap();
 
         // The stream regresses to (100,20) then partially recovers to
@@ -753,7 +804,15 @@ mod tests {
         writeln!(f, "{}", claude_line("m1", 100, 20)).unwrap();
         writeln!(f, "{}", claude_line("m1", 100, 25)).unwrap();
         drop(f);
-        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         store.commit().unwrap();
         let total_out: u64 = store.live_days().map(|d| d.output).sum();
         assert_eq!(total_out, 30, "regressed snapshots emit no growth");
@@ -765,7 +824,15 @@ mod tests {
             .unwrap();
         writeln!(f, "{}", claude_line("m1", 100, 40)).unwrap();
         drop(f);
-        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         store.commit().unwrap();
         let total_out: u64 = store.live_days().map(|d| d.output).sum();
         assert_eq!(total_out, 40, "growth past the high-water mark counts");
@@ -787,7 +854,15 @@ mod tests {
         let mut store = HistoryStore::open(&dir).unwrap();
         let ex = crate::history::formats::claude::ClaudeExtractor;
         let far = Instant::now() + Duration::from_secs(30);
-        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         store.commit().unwrap();
         assert_eq!(
             store.live_days().map(|d| d.input).sum::<u64>(),
@@ -805,7 +880,15 @@ mod tests {
             use std::io::Write as _;
             writeln!(f, "{}", claude_line("m1", 100, 40)).unwrap();
         }
-        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         store.commit().unwrap();
         let live: Vec<_> = store.live_days().cloned().collect();
         assert_eq!(
@@ -833,14 +916,22 @@ mod tests {
         let mut store = HistoryStore::open(&dir).unwrap();
         let ex = crate::history::formats::claude::ClaudeExtractor;
         let far = Instant::now() + Duration::from_secs(30);
+        // Both manifests are enabled for the whole tick this simulates —
+        // it is the overlapping root, not a disabled competitor, that is
+        // under test here.
+        let both: std::collections::HashSet<&str> = ["claude", "codex"].into_iter().collect();
 
-        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far, &both);
         store.commit().unwrap();
         assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 100);
 
         // A second, differently-provider'd walk reaches the same file.
-        scan_root(&mut store, "codex", &root, "*.jsonl", &ex, far);
+        let outcome = scan_root(&mut store, "codex", &root, "*.jsonl", &ex, far, &both);
         store.commit().unwrap();
+        assert_eq!(
+            outcome.claimed_by_another, 1,
+            "a permanent zero must carry a visible cause, not just silence"
+        );
 
         let key = root.join("t.jsonl").to_string_lossy().into_owned();
         let st = store.file_state(Path::new(&key)).unwrap();
@@ -876,14 +967,30 @@ mod tests {
 
         // Poison the sink: a directory where the file must be.
         fs::create_dir(dir.join("days.jsonl")).unwrap();
-        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         let key = root.join("t.jsonl").to_string_lossy().into_owned();
         let st = store.file_state(Path::new(&key)).unwrap();
         assert_eq!(st.cursor, 0, "a failed append must not move the cursor");
         assert!(!st.seen("m1"), "the ring must not mark a lost record");
 
         fs::remove_dir(dir.join("days.jsonl")).unwrap();
-        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         store.commit().unwrap();
         let live: Vec<_> = store.live_days().cloned().collect();
         assert_eq!(live.iter().map(|d| d.input).sum::<u64>(), 100);
@@ -965,14 +1072,14 @@ mod tests {
         };
         let far = Instant::now() + Duration::from_secs(30);
 
-        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far);
+        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far, &only("p"));
         store.commit().unwrap();
         assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 10);
 
         // Rewrite: new bytes, new generation.
         fs::write(root.join("t.jsonl"), "second generation bytes, different").unwrap();
-        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far); // truncated pass 1
-        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far); // completing pass 2
+        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far, &only("p")); // truncated pass 1
+        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far, &only("p")); // completing pass 2
         store.commit().unwrap();
         let live: Vec<_> = store.live_days().cloned().collect();
         assert_eq!(
@@ -1014,7 +1121,15 @@ mod tests {
         let mut store = HistoryStore::open(&dir).unwrap();
         let far = Instant::now() + Duration::from_secs(30);
 
-        scan_root(&mut store, "p", &root, "*.jsonl", &CorruptStub, far);
+        scan_root(
+            &mut store,
+            "p",
+            &root,
+            "*.jsonl",
+            &CorruptStub,
+            far,
+            &only("p"),
+        );
         store.commit().unwrap();
         assert_eq!(
             store.live_days().count(),
@@ -1041,7 +1156,15 @@ mod tests {
         let ex = crate::history::formats::claude::ClaudeExtractor;
         let far = Instant::now() + Duration::from_secs(30);
 
-        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         store.commit().unwrap();
         let live: Vec<_> = store.live_days().cloned().collect();
         assert_eq!(live.iter().map(|d| d.input).sum::<u64>(), 100);
@@ -1058,7 +1181,15 @@ mod tests {
         use std::io::Write as _;
         writeln!(f).unwrap();
         drop(f);
-        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         store.commit().unwrap();
         let live: Vec<_> = store.live_days().cloned().collect();
         assert_eq!(live.iter().map(|d| d.input).sum::<u64>(), 300);
@@ -1166,6 +1297,71 @@ glob   = "{glob}"
             "the changed cursor must reach disk"
         );
 
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_claim_from_a_no_longer_enabled_provider_is_released() {
+        // A manifest id can change (a rename) or the manifest can simply
+        // be disabled: either way its old claim on a path is stale, not a
+        // live competitor, and a differently-provider'd walk over the
+        // same path may take it over — otherwise nothing ever recovers
+        // it, and the file reads as permanently claimed by a provider
+        // that no longer exists.
+        let root = tmpdir("stale-claim-root");
+        let dir = tmpdir("stale-claim-store");
+        fs::write(root.join("t.jsonl"), claude_line("m1", 100, 10) + "\n").unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let ex = crate::history::formats::claude::ClaudeExtractor;
+        let far = Instant::now() + Duration::from_secs(30);
+
+        scan_root(
+            &mut store,
+            "codex-old",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("codex-old"),
+        );
+        store.commit().unwrap();
+        let key = root.join("t.jsonl").to_string_lossy().into_owned();
+        assert_eq!(
+            store.file_state(Path::new(&key)).unwrap().provider,
+            "codex-old"
+        );
+
+        // "codex-old" is no longer among the enabled manifests this
+        // tick — renamed to "codex-new", or disabled outright.
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("t.jsonl"))
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{}", claude_line("m2", 50, 5)).unwrap();
+        drop(f);
+        scan_root(
+            &mut store,
+            "codex-new",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("codex-new"),
+        );
+        store.commit().unwrap();
+
+        assert_eq!(
+            store.file_state(Path::new(&key)).unwrap().provider,
+            "codex-new",
+            "a stale owner's claim must be released to a live provider"
+        );
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            150,
+            "the new owner must actually read the file, not skip it as still claimed"
+        );
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1298,8 +1494,8 @@ glob   = "{glob}"
         };
         let far = Instant::now() + Duration::from_secs(30);
 
-        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far);
-        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far);
+        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far, &only("p"));
+        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far, &only("p"));
         store.commit().unwrap();
         assert_eq!(
             store.live_days().map(|d| d.input).sum::<u64>(),
@@ -1311,8 +1507,8 @@ glob   = "{glob}"
         store.state_mut().files.remove(&key);
         store.commit().unwrap();
 
-        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far);
-        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far);
+        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far, &only("p"));
+        scan_root(&mut store, "p", &root, "*.jsonl", &ex, far, &only("p"));
         store.commit().unwrap();
         assert_eq!(
             store.live_days().map(|d| d.input).sum::<u64>(),
@@ -1336,7 +1532,15 @@ glob   = "{glob}"
         let mut store = HistoryStore::open(&dir).unwrap();
         let ex = crate::history::formats::claude::ClaudeExtractor;
         let far = Instant::now() + Duration::from_secs(30);
-        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         store.commit().unwrap();
         assert_eq!(
             store.live_days().map(|d| d.input).sum::<u64>(),
@@ -1388,8 +1592,24 @@ glob   = "{glob}"
         let mut store = HistoryStore::open(&dir).unwrap();
         let ex = crate::history::formats::claude::ClaudeExtractor;
         let far = Instant::now() + Duration::from_secs(30);
-        scan_root(&mut store, "claude", &owner_root, "*.jsonl", &ex, far);
-        scan_root(&mut store, "claude", &kept_root, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &owner_root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
+        scan_root(
+            &mut store,
+            "claude",
+            &kept_root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         store.commit().unwrap();
         assert_eq!(
             store.live_days().map(|d| d.input).sum::<u64>(),
@@ -1421,7 +1641,15 @@ glob   = "{glob}"
         let mut f = fs::OpenOptions::new().append(true).open(&kept_key).unwrap();
         writeln!(f, "{}", claude_line("shared", 100, 40)).unwrap();
         drop(f);
-        scan_root(&mut store, "claude", &kept_dir, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &kept_dir,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         store.commit().unwrap();
         assert_eq!(
             store.live_days().map(|d| d.input).sum::<u64>(),
@@ -1448,13 +1676,29 @@ glob   = "{glob}"
         let mut store = HistoryStore::open(&dir).unwrap();
         let ex = crate::history::formats::claude::ClaudeExtractor;
         let far = Instant::now() + Duration::from_secs(30);
-        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         store.commit().unwrap();
         assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 100);
 
         // Rewrite: different bytes, no more "shared" in this file at all.
         fs::write(root.join("a.jsonl"), claude_line("solo", 1, 1) + "\n").unwrap();
-        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         store.commit().unwrap();
         assert_eq!(
             store.live_days().map(|d| d.input).sum::<u64>(),
@@ -1464,7 +1708,15 @@ glob   = "{glob}"
 
         // A second, unrelated file reuses the same id afterwards.
         fs::write(root.join("b.jsonl"), claude_line("shared", 100, 10) + "\n").unwrap();
-        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         store.commit().unwrap();
         assert_eq!(
             store.live_days().map(|d| d.input).sum::<u64>(),
@@ -1508,7 +1760,15 @@ glob   = "{glob}"
         let mut store = HistoryStore::open(&dir).unwrap();
         let ex = crate::history::formats::claude::ClaudeExtractor;
         let far = Instant::now() + Duration::from_secs(30);
-        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        scan_root(
+            &mut store,
+            "claude",
+            &root,
+            "*.jsonl",
+            &ex,
+            far,
+            &only("claude"),
+        );
         store.commit().unwrap();
         let live: Vec<_> = store.live_days().cloned().collect();
         assert_eq!(

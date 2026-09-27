@@ -101,6 +101,12 @@ pub fn scan_tick(
         scanner::SCAN_WALL_BUDGET / with_history as u32
     };
     let mut scans = Vec::new();
+    // Every manifest id this tick is willing to run — the set `scan_root`
+    // checks a claimed path's stored owner against, so a manifest that
+    // was removed, renamed, or disabled since the claim was made is not
+    // read as a live competitor for it.
+    let enabled: std::collections::HashSet<&str> =
+        manifests.iter().map(|m| m.id.as_str()).collect();
     for m in manifests {
         let Some(h) = &m.history else { continue };
         // A fresh deadline per provider: one that finishes early simply
@@ -131,7 +137,15 @@ pub fn scan_tick(
         // actually resolves: the glob would search for its own literal
         // `{option.…}` text and match nothing, ever.
         let glob = crate::plugin::substitute_options(&h.glob, &options);
-        let outcome = scanner::scan_root(store, &m.id, &root, &glob, extractor.as_ref(), deadline);
+        let outcome = scanner::scan_root(
+            store,
+            &m.id,
+            &root,
+            &glob,
+            extractor.as_ref(),
+            deadline,
+            &enabled,
+        );
         scans.push(ProviderScan {
             provider: m.id.clone(),
             root_missing: false,

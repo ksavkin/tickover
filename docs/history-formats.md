@@ -206,16 +206,23 @@ its own and exists only for the flock below:
   mark of the id *within its owning file* (a regressed snapshot never
   lowers the baseline, and a duplicate sighted by a second file is
   skipped outright rather than delta'd). A path's owning provider is a
-  permanent, first-come claim: if a second manifest's root also reaches
-  the same path (no shipped pair overlaps, but a user's own manifest
-  can), the walk that finds the path already owned skips it outright
-  rather than taking over its cursor — the two providers would
-  otherwise share one cursor, and whichever scanned last would silently
-  attribute the file's whole history to itself. A `state.json` written
-  by a *newer* build is a downgrade, not corruption: it is left exactly
+  claim against every *currently enabled* manifest: if a second
+  manifest's root also reaches the same path (no shipped pair overlaps,
+  but a user's own manifest can), the walk that finds the path already
+  owned by a live competitor skips it outright rather than taking over
+  its cursor — the two providers would otherwise share one cursor, and
+  whichever scanned last would silently attribute the file's whole
+  history to itself. An owner that is no longer among the enabled
+  manifest ids (renamed, removed, or disabled) is not a live competitor,
+  so the claim is stale and the walk that reaches the path takes it
+  over instead of leaving it orphaned forever. A `state.json` written by
+  a *newer* build is a downgrade, not corruption: it is left exactly
   where it is and this run starts empty instead, so the newer build
   finds its own file intact next time — this run remembers nothing
-  across restarts until then. An older or unreadable file is
+  across restarts, and skips compacting `days.jsonl` too (a compacting
+  rewrite would write it from this run's memory, which never holds the
+  newer build's own lines), until the machine is upgraded back to the
+  version that owns both files. An older or unreadable file is
   quarantined to `state.corrupt-<epoch>.json`, keeping only the most
   recent handful so repeated incidents don't accumulate one file per
   run forever.
@@ -230,11 +237,17 @@ and `tickover stats` can resolve the same provider's root differently
 and pruning by "no active root reaches this path" let one process's
 tick drop state the other still needed; confirming against the
 filesystem itself needs no notion of roots, and both processes agree on
-what it says. Any other outcome — the path exists, or `stat` fails some
-other way (an unreadable root, an unmounted volume, a permission
-failure) — keeps the entry. Their day lines stay counted regardless,
-and a path that is recreated later rescans into place via range
-supersession.
+what it says. A path a symlink has replaced (dangling or not) counts as
+gone too — the scan never follows symlinks and never re-offers one, so
+leaving its entry in place would strand it exactly like a deletion would.
+Any other outcome — the path exists as a regular file, or `stat` fails
+some other way (an unreadable root, an unmounted volume, a permission
+failure) — keeps the entry. Their day lines stay counted regardless, and
+a path that is recreated later rescans into place via range
+supersession. The sweep itself runs at most once per store instance, not
+once per scan tick — the same eight-tick loop that resumes a cold scan
+would otherwise pay a `stat` per tracked entry up to eight times over for
+no new answer.
 
 Several edges are accepted rather than chased:
 
@@ -255,10 +268,20 @@ Several edges are accepted rather than chased:
   one stale cursor per abandoned path, not a miscount.
 - **A provider whose log only ever grows is not size-bounded.**
   Compaction rewrites `days.jsonl` past a size threshold, but only
-  lines a rewrite has made genuinely dead ever leave. A provider that
-  never rewrites its own log — new hours, sessions or models, never a
-  stale generation — has nothing to drop, and the file keeps growing
-  past the threshold on every future check.
+  lines a *later, sealed* generation has actually superseded ever
+  leave. A provider that never rewrites its own log — new hours,
+  sessions or models, never a stale generation — has nothing to drop,
+  and the file keeps growing past the threshold on every future check.
+- **A recreated file's stale sealed generation is retained forever,
+  until re-sealed past.** Delete-and-recreate, a `SCHEMA_VERSION`
+  rebuild, or a downgrade can hand a file a fresh life at a generation
+  *lower* than one it had already sealed. The old sealed line is
+  neither live (the current, lower generation is what counts) nor
+  droppable (nothing has sealed a generation *past* it — the lower
+  current one doesn't count): compaction keeps it, doing nothing,
+  until the file's fresh life reaches and reseals past it in turn.
+  Bounded to one retained generation per such incident, and it never
+  contributes to any total in the meantime.
 - **Owner-rewrite loses a shared id.** If a dedup id lives in two
   files, the first file to see it owns it; if that file is later
   rewritten without it, the second file has already moved past the
