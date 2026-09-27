@@ -249,9 +249,10 @@ component Chip inherits Rectangle {
             // that neither wraps nor scrolls sideways. 120px is well past
             // the longest real content any caller shows — a version
             // transition badge like "1.10.20 → 1.11.0" — so ordinary text
-            // never elides; a caller passing the raw 64-char field this app
-            // caps names/versions/tags at cannot claim more of the row than
-            // a badge should.
+            // never elides; eliding sets the minimum to the ellipsis's own
+            // width no matter how long the string behind it actually is, so
+            // even a caller with no length cap of its own on what it passes
+            // in cannot claim more of the row than a badge should.
             overflow: elide;
             max-width: 120px;
         }

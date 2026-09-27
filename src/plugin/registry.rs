@@ -168,25 +168,48 @@ impl RegistryIndex {
 
 /// [`RegistryEntry::name`]'s cap — plenty for any real provider's display
 /// name, and short enough that a hostile index can't hand the install/update
-/// UI a caption built to overflow it. A constant of its own rather than
-/// reusing `crate::plugin::PROVIDER_TEXT_MAX_CHARS`: that one bounds a
-/// provider *response* string this app sanitises at every render because it
-/// changes without notice, where registry text is validated once, here, at
-/// index-parse time.
-const REGISTRY_NAME_MAX_CHARS: usize = 64;
+/// UI a caption built to overflow it. A definition of its own, not a reuse
+/// of `crate::plugin::PROVIDER_TEXT_MAX_CHARS`: that one bounds a provider
+/// *response* string this app sanitises at every render because it changes
+/// without notice, where registry text is validated once, here, at
+/// index-parse time — a different reason to land on the same number, not
+/// the same reason written twice. `pub`, and checked against
+/// `PROVIDER_TEXT_MAX_CHARS` immediately below the three of these: `src/
+/// main.rs`'s `registry_entry_row` sanitises a validated `name` with
+/// `crate::plugin::sanitize_provider_text` rather than a registry-sized
+/// sanitiser of its own, on the strength of the two numbers staying equal.
+pub const REGISTRY_NAME_MAX_CHARS: usize = 64;
 
 /// [`RegistryEntry::description`]'s cap — a one-line summary shown before
-/// install, not a changelog. `pub`, unlike [`REGISTRY_NAME_MAX_CHARS`] and
-/// [`REGISTRY_VERSION_MAX_CHARS`]: [`sanitize_description`] and the row it
-/// feeds need this exact number too, and a caller reaching for it from
-/// outside this module gets the one `validate` enforces rather than a
-/// second definition that could drift from it.
+/// install, not a changelog. `pub` for a second reason beyond the one
+/// [`REGISTRY_NAME_MAX_CHARS`] and [`REGISTRY_VERSION_MAX_CHARS`] are:
+/// [`sanitize_description`] and the row it feeds need this exact number
+/// too, and a caller reaching for it from outside this module gets the one
+/// `validate` enforces rather than a second definition that could drift
+/// from it.
 pub const REGISTRY_DESCRIPTION_MAX_CHARS: usize = 256;
 
 /// [`RegistryEntry::version`]'s cap — no real semver string (with a
 /// prerelease and build metadata included) comes close, and a hostile index
-/// gets no more mileage out of this field than it does out of `name`.
-const REGISTRY_VERSION_MAX_CHARS: usize = 64;
+/// gets no more mileage out of this field than it does out of `name`. `pub`
+/// for the same reason `name`'s own cap is.
+pub const REGISTRY_VERSION_MAX_CHARS: usize = 64;
+
+/// `src/main.rs`'s `registry_entry_row` and `apply_update_badge` sanitise a
+/// validated `name`/`version` with [`crate::plugin::sanitize_provider_text`]
+/// rather than a registry-sized sanitiser of their own — sound only because
+/// [`RegistryIndex::validate`] never lets either field run longer than
+/// [`REGISTRY_NAME_MAX_CHARS`]/[`REGISTRY_VERSION_MAX_CHARS`], and
+/// `sanitize_provider_text`'s own cap is never tighter than that. Checked
+/// here at compile time rather than left for a comment to keep true: a
+/// widened registry cap left unmatched here fails the build instead of
+/// quietly handing that sink text longer than the cap it was sized for —
+/// the exact defect [`sanitize_description`] exists to close for
+/// `description`, which this keeps from reopening for the other two.
+const _: () = assert!(
+    REGISTRY_NAME_MAX_CHARS == crate::plugin::PROVIDER_TEXT_MAX_CHARS
+        && REGISTRY_VERSION_MAX_CHARS == crate::plugin::PROVIDER_TEXT_MAX_CHARS
+);
 
 /// The most `[[plugin]]` entries an index may list. No real registry
 /// approaches this (this repo ships a handful) — it exists purely so a 10
@@ -258,9 +281,13 @@ pub fn sanitize_description(text: &str) -> String {
         .filter(|c| !c.is_control() && !super::is_invisible_or_directional(*c))
         .collect();
     // Trimmed again for whatever the strip above exposed, before the cap
-    // below decides whether there is still something to mark as cut — the
-    // same order [`crate::plugin::sanitize_provider_text`] applies its own
-    // two trims in.
+    // below decides whether there is still something to mark as cut. The
+    // two trims land in the same relative order
+    // [`crate::plugin::sanitize_provider_text`] uses for its own — trailing,
+    // then leading — but not on the same side of the cap: that function
+    // caps inside its iterator chain before either trim runs; this one
+    // trims twice first and only then caps, trimming a third time on
+    // whatever the cut itself exposes.
     out.truncate(out.trim_end().len());
     let leading = out.len() - out.trim_start().len();
     out.drain(..leading);
@@ -270,10 +297,10 @@ pub fn sanitize_description(text: &str) -> String {
     }
     // One fewer than the cap, so the `…` appended after it leaves the whole
     // result at no more than the cap rather than one over it — not always
-    // exactly the cap: if the character right at this cut is trailing
-    // whitespace, the second trim below removes it before `…` goes on, the
-    // same as the first trim can shorten what `sanitize_provider_text`
-    // takes.
+    // exactly the cap: the cut can expose a whole run of trailing
+    // whitespace, not just the one character sitting right at the
+    // boundary, and the trim below removes all of it before `…` goes on,
+    // landing however many characters that run was under the cap.
     let mut cut: String = out
         .chars()
         .take(REGISTRY_DESCRIPTION_MAX_CHARS - 1)
@@ -2115,21 +2142,28 @@ mod tests {
         );
     }
 
-    /// The cap this ends up landing on is "no more than", not "exactly": a
-    /// space sitting right at the cut is trailing whitespace once the cut
-    /// makes it the last character, and the trim before `…` goes on removes
-    /// it — one character short of the cap rather than on it.
+    /// The cap this ends up landing on is "no more than", not "exactly":
+    /// the cut can expose a whole run of trailing whitespace, not just the
+    /// one character sitting right at the boundary, and
+    /// `cut.truncate(cut.trim_end().len())` removes the entire run before
+    /// `…` goes on — five spaces land the result five characters under the
+    /// cap, not one.
     #[test]
-    fn sanitize_description_can_land_one_character_under_the_cap_when_the_cut_exposes_whitespace() {
+    fn sanitize_description_can_land_several_characters_under_the_cap_when_the_cut_exposes_a_run_of_whitespace(
+    ) {
+        let run_of_spaces = 5;
+        let kept = REGISTRY_DESCRIPTION_MAX_CHARS - 1 - run_of_spaces;
         let padded = format!(
-            "{} {}",
-            "x".repeat(REGISTRY_DESCRIPTION_MAX_CHARS - 2),
+            "{}{}{}",
+            "x".repeat(kept),
+            " ".repeat(run_of_spaces),
             "y".repeat(10)
         );
         let sanitized = sanitize_description(&padded);
+        assert_eq!(sanitized, format!("{}…", "x".repeat(kept)));
         assert_eq!(
-            sanitized,
-            format!("{}…", "x".repeat(REGISTRY_DESCRIPTION_MAX_CHARS - 2))
+            sanitized.chars().count(),
+            REGISTRY_DESCRIPTION_MAX_CHARS - run_of_spaces
         );
     }
 

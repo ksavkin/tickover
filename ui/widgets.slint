@@ -71,9 +71,9 @@ export component HatchFill inherits Rectangle {
     // width the whole time the box is narrower than it, not only while it
     // tweens, so a projecting window's fill keeps roughly
     // `pattern-width / 4 + root.vbh / 4 + 1` `Path` elements resident at
-    // rest — not the three or so its current, pre-tween width alone would
-    // call for. `clip: true` hides what falls outside the box's edge; it
-    // does not uninstantiate them.
+    // rest — not the handful its own current width would call for. `clip:
+    // true` hides what falls outside the box's edge; it does not
+    // uninstantiate them.
     in property <length> pattern-width: self.width;
     clip: true;
     property <float> vbw: self.width / 1px;

@@ -2504,9 +2504,9 @@ Per `[[plugin]]` entry:
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `id` | string | yes | same charset rule as a manifest's own `id` (`^[A-Za-z0-9_-]+$`, see [Top-level fields](#top-level-fields)) — it becomes the installed manifest's `<id>.toml` filename stem |
-| `name` | string | yes | display name; must not be blank |
-| `version` | string | yes | must not be blank; compared with `version_cmp` (see [Installed-vs-registry state machine](#installed-vs-registry-state-machine)) |
-| `description` | string | no | one-line description shown before install |
+| `name` | string | yes | display name; must not be blank, at most 64 characters |
+| `version` | string | yes | must not be blank, at most 64 characters; compared with `version_cmp` (see [Installed-vs-registry state machine](#installed-vs-registry-state-machine)) |
+| `description` | string | no | one-line description shown before install, at most 256 characters |
 | `manifest` | string | yes | path to the manifest file, **relative to the index's own directory** — never a full URL (resolved by `resolve_manifest_url`, see [Install / update process](#install--update-process)) |
 | `sha256` | string | yes | expected sha256 of the manifest file's raw bytes — exactly 64 **lowercase** hex characters |
 
@@ -2525,6 +2525,10 @@ trusted:
 - `name` and `version` are capped at 64 characters, `description` at 256 —
   a field over its own cap refuses the whole index, the same as a
   malformed one.
+- `name`, `version`, `description` and `manifest` must not contain a
+  control character or an invisible/directional one (a bidi override, a
+  zero-width character) — a single occurrence in any of the four refuses
+  the whole index too.
 - `sha256`: exactly 64 characters, every one a lowercase hex digit;
   uppercase is **rejected outright, not normalized**, keeping every
   stored/compared hash in one canonical form.

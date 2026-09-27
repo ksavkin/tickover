@@ -10192,18 +10192,20 @@ fn fold_registry_diff(
 ///
 /// `name` and `version` go through `sanitize_provider_text` itself, capped
 /// at [`tickover::plugin::PROVIDER_TEXT_MAX_CHARS`] (64) — the same 64
-/// `validate` already enforced on both at load. On validated input that cap
-/// never actually fires, so the sanitiser only ever repeats a check
-/// `validate`'s own `refuse_control_chars` already made: nothing control,
-/// invisible or directional is left to strip, and with the string already
-/// under the cap, nothing is left to cut either — in particular, it cannot
-/// turn a non-empty `version` into `""`. That matters past this row too:
-/// [`apply_update_badge`] sanitises `available_version` the same way, and
-/// `""` there would hide the whole update sub-row behind
-/// `if p.available-version != ""` in `ui/app.slint`. Keep
-/// `PROVIDER_TEXT_MAX_CHARS` and the registry's own name/version caps equal,
-/// or a widened validator cap starts handing this sink text longer than the
-/// cap it was sized for.
+/// `validate` already enforces via
+/// [`registry::REGISTRY_NAME_MAX_CHARS`]/[`registry::REGISTRY_VERSION_MAX_CHARS`].
+/// On validated input that cap never actually fires, so the sanitiser only
+/// ever repeats a check `validate`'s own `refuse_control_chars` already
+/// made: nothing control, invisible or directional is left to strip, and
+/// with the string already under the cap, nothing is left to cut either —
+/// in particular, it cannot turn a non-empty `version` into `""`. That
+/// matters past this row too: [`apply_update_badge`] sanitises
+/// `available_version` the same way, and `""` there would hide the whole
+/// update sub-row behind `if p.available-version != ""` in `ui/app.slint`.
+/// That agreement is not left to this comment alone: `registry` asserts
+/// both caps against `PROVIDER_TEXT_MAX_CHARS` at compile time, so a
+/// widened validator cap left unmatched here fails the build instead of
+/// quietly handing this sink text longer than the cap it was sized for.
 ///
 /// `description` does not share that identity: `validate` lets it run to
 /// `registry::REGISTRY_DESCRIPTION_MAX_CHARS` (256), four times
@@ -10712,6 +10714,43 @@ fn update_target_unchanged(recorded_sha256: Option<&str>, current_sha256: &str) 
     recorded_sha256.is_none_or(|recorded| recorded.eq_ignore_ascii_case(current_sha256))
 }
 
+/// Sanitise `message` with `sanitize_trust_item` — not `sanitize_provider_text`,
+/// since a failure this reaches is a sentence, not a caption, and the
+/// label-sized cap would cut one mid-word with nothing to say so — then mark
+/// `entry_id`'s row `Failed` with it on whichever model `kind` names.
+/// [`handle_install_outcome`] reaches this from two unrelated places that
+/// both fold in text this app didn't author itself: a validator refusal
+/// quoting a manifest's own offending text, and an `install_write`/
+/// `update_write` error folding an `io::Error` in with `.to_string()`.
+/// Neither is any more this app's own text than the other, so both get the
+/// same cap and the same control/bidi strip before either row shows them.
+/// Always returns `false`, matching [`handle_install_outcome`]'s own "no
+/// manifest was written" contract for every path through it that isn't a
+/// landed write.
+fn fail_pending_row(
+    kind: PendingKind,
+    entry_id: &str,
+    plugins: &Plugins,
+    plugin_model: &PluginRows,
+    registry_model: &RegistryRows,
+    message: &str,
+) -> bool {
+    let message = sanitize_trust_item(message);
+    match kind {
+        PendingKind::Install => {
+            set_registry_row_status(registry_model, entry_id, InstallStatus::Failed, &message)
+        }
+        PendingKind::Update => set_plugin_update_status(
+            plugin_model,
+            plugins,
+            entry_id,
+            UpdateStatus::Failed,
+            &message,
+        ),
+    }
+    false
+}
+
 /// Apply one install/update's fetch+verify result: run the trust dialog when
 /// `analyze_trust` requires it, write the verified bytes to disk, record
 /// provenance in the lockfile, and (for an install) drop the plugin off
@@ -10735,26 +10774,10 @@ fn handle_install_outcome(
             // `err` can be a validator refusal (`PluginManifest::validate`'s
             // own messages embed the manifest's offending text verbatim —
             // a `client.bins` entry, a service name, a path) — untrusted the
-            // same way `registry_entry_row`'s `name`/`description` are, but a
-            // sentence rather than a label: `sanitize_provider_text`'s cap is
-            // sized for a caption, and a validator refusal cut there loses
-            // whatever it was naming with nothing to say so. `sanitize_trust_item`
-            // strips the same control characters and bidirectional overrides,
-            // at the longer cap a sentence needs, with a `…` marking the cut.
-            let err = sanitize_trust_item(&err);
-            match kind {
-                PendingKind::Install => {
-                    set_registry_row_status(registry_model, &entry.id, InstallStatus::Failed, &err)
-                }
-                PendingKind::Update => set_plugin_update_status(
-                    plugin_model,
-                    plugins,
-                    &entry.id,
-                    UpdateStatus::Failed,
-                    &err,
-                ),
-            }
-            return false;
+            // same way `registry_entry_row`'s `name`/`description` are.
+            // `fail_pending_row` is the sanitiser for this and one other
+            // path below that folds in text this app didn't author either.
+            return fail_pending_row(kind, &entry.id, plugins, plugin_model, registry_model, &err);
         }
         InstallOutcome::Ready {
             raw_bytes,
@@ -10825,15 +10848,10 @@ fn handle_install_outcome(
             "{kind:?} \"{}\": could not write manifest: {e}",
             entry.id
         ));
-        match kind {
-            PendingKind::Install => {
-                set_registry_row_status(registry_model, &entry.id, InstallStatus::Failed, &e)
-            }
-            PendingKind::Update => {
-                set_plugin_update_status(plugin_model, plugins, &entry.id, UpdateStatus::Failed, &e)
-            }
-        }
-        return false;
+        // `install_write`/`update_write` fold an `io::Error` in with
+        // `.to_string()` — no more this app's own text than a validator's
+        // refusal is, and `fail_pending_row` is the same sanitiser for both.
+        return fail_pending_row(kind, &entry.id, plugins, plugin_model, registry_model, &e);
     }
 
     lock.set(
@@ -18460,7 +18478,7 @@ mod title_tests {
         );
         assert_eq!(
             row.description.as_str(),
-            registry::sanitize_description("reads\u{200B}your\ncredentials")
+            tickover::plugin::sanitize_provider_text("reads\u{200B}your\ncredentials")
         );
         assert_eq!(
             row.version.as_str(),
@@ -18544,6 +18562,38 @@ mod title_tests {
         assert_eq!(row.status, InstallStatus::Failed);
         assert_eq!(row.error.as_str(), sanitize_trust_item(raw));
         assert!(!row.error.contains('\u{202E}'));
+    }
+
+    /// `install_write`/`update_write` fold an `io::Error` in with
+    /// `.to_string()` — a path or id spelled out in the message, no more
+    /// this app's own text than a validator's refusal is —
+    /// `fail_pending_row` is the same sanitiser [`handle_install_outcome`]
+    /// routes both through. Pinned directly against `fail_pending_row`
+    /// rather than through `handle_install_outcome` itself: reaching this
+    /// branch that way means going through `seed::plugins_dir()`, the real
+    /// config directory this app writes to, which this test never touches.
+    #[test]
+    fn fail_pending_row_sanitizes_a_write_failure_before_it_reaches_the_row() {
+        let m = stub_manifest("acme", 1);
+        let plugin_model: PluginRows = Rc::new(VecModel::from(vec![plugin_row(&m)]));
+        let plugins: Plugins = Rc::new(RefCell::new(vec![m]));
+        let registry_model: RegistryRows = Rc::new(VecModel::from(Vec::<RegistryPluginRow>::new()));
+
+        let raw = "no installed manifest file found for id \"acme\u{202E}\"";
+        let wrote = fail_pending_row(
+            PendingKind::Update,
+            "acme",
+            &plugins,
+            &plugin_model,
+            &registry_model,
+            raw,
+        );
+        assert!(!wrote, "a write failure never counts as a landed write");
+
+        let row = plugin_model.row_data(0).expect("row still present");
+        assert_eq!(row.update_status, UpdateStatus::Failed);
+        assert_eq!(row.update_error.as_str(), sanitize_trust_item(raw));
+        assert!(!row.update_error.contains('\u{202E}'));
     }
 
     /// The case the cap raise is for: `registry::verify_and_prepare`'s own
