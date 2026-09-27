@@ -40,8 +40,13 @@ use crate::history::store::FileState;
 use crate::history::UsageRecord;
 
 /// A `gen_metadata.data` blob refused past this size — the other
-/// extractors cap a line at the same width; a generation whose usage
-/// message needs more than this is not one this parser trusts.
+/// extractors cap a line at the same width. `rusqlite` has already
+/// materialised the row's `data` column into memory by the time this
+/// runs (the query fetches it as a plain column, not behind a
+/// length-gated second pass), so the cap does not bound that read; what
+/// it bounds is everything downstream of it — `parse_generation`'s wire
+/// walk over the bytes, and the record it might otherwise build from a
+/// generation whose usage message is not one this parser trusts.
 const MAX_BLOB_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct AntigravityExtractor;
@@ -371,21 +376,17 @@ fn read_varint(blob: &[u8], mut pos: usize) -> Option<(u64, usize)> {
 }
 
 fn varint_field(blob: &[u8], target: u64) -> Option<u64> {
-    fields(blob)
-        .into_iter()
-        .find_map(|(f, w, v)| match (f == target, w, v) {
-            (true, 0, Field::Varint(v)) => Some(v),
-            _ => None,
-        })
+    fields(blob).find_map(|(f, w, v)| match (f == target, w, v) {
+        (true, 0, Field::Varint(v)) => Some(v),
+        _ => None,
+    })
 }
 
 fn message_field(blob: &[u8], target: u64) -> Option<&[u8]> {
-    fields(blob)
-        .into_iter()
-        .find_map(|(f, w, v)| match (f == target, w, v) {
-            (true, 2, Field::Bytes(b)) => Some(b),
-            _ => None,
-        })
+    fields(blob).find_map(|(f, w, v)| match (f == target, w, v) {
+        (true, 2, Field::Bytes(b)) => Some(b),
+        _ => None,
+    })
 }
 
 fn string_field(blob: &[u8], target: u64) -> Option<String> {

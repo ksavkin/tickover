@@ -6760,9 +6760,18 @@ fn activity_data(
             .unwrap_or_default()),
         legend_in: ss(format!("in {}", stats_cli::fmt_tokens(sum.in_tokens))),
         legend_out: ss(format!("out {}", stats_cli::fmt_tokens(sum.out_tokens))),
+        // A trailing `*` is the only room this row has: no caption line
+        // of its own, and no tooltip is wired to it. The same shorthand
+        // the CLI and the report use for the same condition.
         legend_cost: ss(sum
             .est_cost
-            .map(|c| format!("est. ${c:.2}"))
+            .map(|c| {
+                if sum.est_cost_partial {
+                    format!("est. ${c:.2}*")
+                } else {
+                    format!("est. ${c:.2}")
+                }
+            })
             .unwrap_or_default()),
         // The bright figure — the Slint row adds the dim "counted" word.
         legend_counted: ss(if partial {
@@ -6950,6 +6959,41 @@ mod activity_data_tests {
         );
 
         config::remove_plugin_keys(id);
+    }
+
+    /// The legend's cost figure has no caption line of its own and no
+    /// tooltip wired to it — a trailing `*` is the only way this row can
+    /// say the estimate left a model out, and nothing else guards it.
+    #[test]
+    fn legend_cost_carries_a_marker_when_the_estimate_is_partial() {
+        let sum = tickover::history::query::PanelSummary {
+            est_cost: Some(4.5),
+            est_cost_partial: true,
+            ..Default::default()
+        };
+        let data = activity_data(
+            Some(&sum),
+            tickover::history::query::PanelRange::Day,
+            &[],
+            false,
+        );
+        assert_eq!(data.legend_cost.as_str(), "est. $4.50*");
+    }
+
+    #[test]
+    fn legend_cost_carries_no_marker_when_the_estimate_is_complete() {
+        let sum = tickover::history::query::PanelSummary {
+            est_cost: Some(4.5),
+            est_cost_partial: false,
+            ..Default::default()
+        };
+        let data = activity_data(
+            Some(&sum),
+            tickover::history::query::PanelRange::Day,
+            &[],
+            false,
+        );
+        assert_eq!(data.legend_cost.as_str(), "est. $4.50");
     }
 }
 

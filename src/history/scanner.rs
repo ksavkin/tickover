@@ -49,10 +49,14 @@ pub struct ScanOutcome {
     pub files_seen: usize,
     /// Files actually read this pass.
     pub files_scanned: usize,
-    /// New bytes consumed across all files — for a completing SQLite pass
-    /// this is the source's whole size, not just its newly read rows,
-    /// since that format's real progress is a row watermark, not a byte
-    /// offset (see [`crate::history::formats::HistoryExtractor::extract`]).
+    /// New bytes consumed across all files — the growth of the file's
+    /// cursor since the pass began (`extraction.cursor - resume_from`).
+    /// For SQLite that cursor is 0-or-size, not a byte count (see
+    /// [`crate::history::formats::HistoryExtractor::extract`]), so this
+    /// figure tracks the file's own byte growth, not how many rows were
+    /// actually new: a first scan reports the whole size, a later pass
+    /// that only reopened for a WAL-only write can report zero even
+    /// though it read genuinely new rows.
     pub bytes_read: u64,
     /// Records accepted after dedup.
     pub records: usize,

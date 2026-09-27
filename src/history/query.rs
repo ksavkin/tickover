@@ -362,9 +362,13 @@ pub enum PanelRange {
 /// Which face the Activity card shows — the design's three panel states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PanelState {
-    /// No enabled provider has ever produced a record — either a genuine
-    /// first run, or every provider that could show one is currently
-    /// disabled: ghosted sparkline, explainer copy.
+    /// No enabled provider has even a single live day line — not a
+    /// coverage tombstone, not a real record — set by `any_history`
+    /// before the activity filter `compute` applies elsewhere runs, so a
+    /// zero-activity tombstone is already enough to leave this state
+    /// (falling to `EmptyRange` instead). Either a genuine first run, or
+    /// every provider that could show one is currently disabled: ghosted
+    /// sparkline, explainer copy.
     #[default]
     FirstRun,
     /// History exists, but the selected range is empty: `0`, quiet copy,
@@ -399,6 +403,10 @@ pub struct PanelSummary {
     pub in_tokens: u64,
     pub out_tokens: u64,
     pub est_cost: Option<f64>,
+    /// Whether `est_cost` leaves out at least one priced-in-range model's
+    /// whole share — `false` whenever `est_cost` is `None` too, since
+    /// there is nothing partial about a figure that isn't shown at all.
+    pub est_cost_partial: bool,
     /// Top 2 projects in range: `(name, share 0..=1, tokens)`.
     pub projects: Vec<(String, f32, u64)>,
     /// All-time streak and the range's session count — the footer pair.
@@ -576,17 +584,26 @@ pub fn panel(
     out.cache_hit_pct = class_totals.cache_hit_pct();
     out.in_tokens = class_totals.input;
     out.out_tokens = class_totals.output + class_totals.thinking;
+    // Whether every priced-in-range pair actually has a price — set from
+    // inside the closure below, then folded into `est_cost_partial` once
+    // we also know whether `est_cost` itself is `Some` at all.
+    let mut cost_all_priced = true;
     out.est_cost = cost_fn.and_then(|f| {
         let mut sum = 0.0;
         let mut any = false;
         for ((p, m), t) in &price_units {
-            if let Some(c) = f(p, m, t) {
-                sum += c;
-                any = true;
+            match f(p, m, t) {
+                Some(c) => {
+                    sum += c;
+                    any = true;
+                }
+                None if t.sum() > 0 => cost_all_priced = false,
+                None => {}
             }
         }
         any.then_some(sum)
     });
+    out.est_cost_partial = out.est_cost.is_some() && !cost_all_priced;
     out.projects = sorted_desc(projects)
         .into_iter()
         .take(2)
@@ -711,7 +728,11 @@ pub fn window_tokens(store: &HistoryStore, provider: &str, since_unix: u64) -> O
         // A bucket's hour can never be later than now: with no upper
         // bound, one garbled future timestamp would inflate the burn
         // figure for as long as it stays inside the window (the panel's
-        // `slot_of` bounds `PanelRange::Day` the same way).
+        // `slot_of` bounds `PanelRange::Day` the same way). This also
+        // drops the current hour's own bucket under modest clock skew
+        // between the machine that wrote it and the one reading it here
+        // — narrower than the alternative of trusting an unbounded hour,
+        // but not free.
         .filter(|d| parse_bucket_hour(&d.hour).is_some_and(|h| h <= now))
         // Burn excludes cache reads — a resent context is not fresh spend.
         .map(|d| d.active())
@@ -994,6 +1015,59 @@ mod tests {
             "blended={blended} single-model={priced_at_first_model_only}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn panel_flags_est_cost_when_a_priced_model_is_missing() {
+        // A range mixing a priced and an unpriced model must not print a
+        // confident sum that silently dropped the unpriced model's share.
+        let dir = tmpdir("panel-partial-cost");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let hour = Utc::now().format("%Y-%m-%dT%H").to_string();
+        let mut priced = line(&hour, "claude", "p", 100);
+        priced.model = "known-model".into();
+        let mut unpriced = line(&hour, "claude", "p", 100);
+        unpriced.model = "mystery-model".into();
+        store.append_days(&[priced, unpriced]).unwrap();
+        store.commit().unwrap();
+        let store = HistoryStore::open(&dir).unwrap();
+
+        let cost_fn = |_p: &str, m: &str, t: &Totals| -> Option<f64> {
+            (m == "known-model").then_some(t.input as f64)
+        };
+        let sum = panel(&store, PanelRange::Day, &[], &enabled_all(), Some(&cost_fn));
+        assert!(
+            sum.est_cost.is_some(),
+            "the known model still prices something"
+        );
+        assert!(
+            sum.est_cost_partial,
+            "an unpriced model in the mix must flag the sum as partial"
+        );
+
+        // A range with only the priced model must not be flagged.
+        let dir2 = tmpdir("panel-full-cost");
+        let mut store2 = HistoryStore::open(&dir2).unwrap();
+        let mut only_priced = line(&hour, "claude", "p", 100);
+        only_priced.model = "known-model".into();
+        store2.append_days(&[only_priced]).unwrap();
+        store2.commit().unwrap();
+        let store2 = HistoryStore::open(&dir2).unwrap();
+        let sum2 = panel(
+            &store2,
+            PanelRange::Day,
+            &[],
+            &enabled_all(),
+            Some(&cost_fn),
+        );
+        assert!(sum2.est_cost.is_some());
+        assert!(
+            !sum2.est_cost_partial,
+            "every priced-in-range model has a price"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
     }
 
     #[test]

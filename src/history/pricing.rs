@@ -42,6 +42,15 @@ const TABLE: &[(&str, Price)] = &[
     // 5.1) — left out on purpose: nothing here can confirm the API
     // model-id slug a real transcript would carry for it, and a guessed
     // prefix risks silently mispricing whatever model actually owns it.
+    // Opus 5.5 is listed under both minor-version spellings: this
+    // table's own convention hyphenates minor versions in a real model
+    // id (`price_for`'s doc example is `claude-sonnet-4-6-20250922`,
+    // not `4.6`), so the dotted form alone would never match and the id
+    // would silently price as plain Opus 5 instead — whichever spelling
+    // a real id turns out to use, the longer prefix still wins. Opus
+    // 5.5's cache-read is 0.05× input, not this section's usual 0.10× —
+    // checked against the cited page, not a transcription slip.
+    ("claude-opus-5-5", p(4.0, 20.0, 0.20, 5.0)),
     ("claude-opus-5.5", p(4.0, 20.0, 0.20, 5.0)),
     ("claude-opus-5", p(5.0, 25.0, 0.50, 6.25)),
     ("claude-sonnet-5", p(2.0, 10.0, 0.20, 2.50)),
@@ -130,6 +139,18 @@ pub fn fully_priced(models: &[(String, Totals)]) -> bool {
         .all(|(m, _)| price_for(m).is_some())
 }
 
+/// [`cost_for_models`] and [`fully_priced`] together — every caller that
+/// shows a cost figure needs both (the number, and whether it left
+/// anything out), so this is the one call site for that pair rather than
+/// each caller re-deriving "is it partial" its own way. The second
+/// element is only meaningful when the first is `Some`: a figure that
+/// isn't shown at all has nothing to be partial about.
+pub fn cost_summary(models: &[(String, Totals)]) -> (Option<f64>, bool) {
+    let cost = cost_for_models(models);
+    let partial = cost.is_some() && !fully_priced(models);
+    (cost, partial)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,18 +209,37 @@ mod tests {
         let t = Totals {
             input: 1_000_000,
             output: 1_000_000,
-            cache_read: 0,
+            cache_read: 1_000_000,
             cache_write: 0,
             thinking: 0,
             messages: 0,
         };
         assert!(cost_usd("claude-sonnet-5-20260915", &t).is_some());
         assert!(cost_usd("claude-opus-5-20260915", &t).is_some());
-        assert!(cost_usd("claude-opus-5.5-20260915", &t).is_some());
-        // The longer prefix must win: Opus 5.5 is not priced as Opus 5.
+        // A real transcript hyphenates minor versions (`price_for`'s own
+        // doc example is `claude-sonnet-4-6-20250922`, not `4.6`) — this
+        // is the spelling that must price correctly, not just the dotted
+        // form a table comment happens to also carry.
         let opus5 = cost_usd("claude-opus-5-20260915", &t).unwrap();
-        let opus55 = cost_usd("claude-opus-5.5-20260915", &t).unwrap();
-        assert_ne!(opus5, opus55);
+        let opus55_hyphenated = cost_usd("claude-opus-5-5-20260915", &t).unwrap();
+        let opus55_dotted = cost_usd("claude-opus-5.5-20260915", &t).unwrap();
+        assert_eq!(
+            opus55_hyphenated, opus55_dotted,
+            "both spellings must price identically"
+        );
+        // A collapse to plain Opus 5's rate (5.0 input + 25.0 output +
+        // 0.50 cache read) would total 30.50; the real Opus 5.5 rate
+        // (4.0 + 20.0 + 0.20) totals 24.20 — cache reads alone are 2.5x
+        // apart (0.50 vs 0.20), the dominant class in a cache-heavy
+        // session.
+        assert!(
+            (opus55_hyphenated - 24.20).abs() < 1e-9,
+            "opus55={opus55_hyphenated} (must not collapse to opus5's 30.50)"
+        );
+        assert_ne!(
+            opus5, opus55_hyphenated,
+            "the longer prefix must win over plain Opus 5"
+        );
     }
 
     #[test]

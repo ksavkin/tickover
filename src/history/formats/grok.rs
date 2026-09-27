@@ -8,12 +8,23 @@
 //! `model changed` carries `ctx.model` — both keyed by the same `sid`,
 //! applied to the turns that follow them.
 //!
-//! Mapping to the shared record: like Codex's OpenAI Responses shape,
-//! `prompt_tokens` is a superset that already includes the cached share —
-//! so `input` is the uncached remainder (`prompt_tokens` minus
-//! `cached_prompt_tokens`); `cached_prompt_tokens` → `cache_read`,
-//! `completion_tokens` → `output`, `reasoning_tokens` → `thinking`. Grok
-//! reports no cache-write class.
+//! Mapping to the shared record: `prompt_tokens`/`completion_tokens` are
+//! *assumed* to be Chat-Completions-style supersets that already include
+//! their `cached_prompt_tokens`/`reasoning_tokens` shares — the same
+//! convention Codex's `input_tokens`/`output_tokens` follow, which Codex
+//! could verify against real rollouts (`total_tokens` equals
+//! `input + output` exactly there). Grok's own payload carries no such
+//! total to check itself against, and no captured Grok log exists in
+//! this repository to verify the assumption against either, so it stays
+//! an assumption rather than a checked fact. What would falsify it: a
+//! line where `cached_prompt_tokens > prompt_tokens` or
+//! `reasoning_tokens > completion_tokens` — the "subset" reading larger
+//! than its own parent. That line is counted as drift rather than
+//! silently clamped to zero, so the day the assumption breaks is visible
+//! instead of hidden. `input` is `prompt_tokens` minus
+//! `cached_prompt_tokens`; `output` is `completion_tokens` minus
+//! `reasoning_tokens`; `cached_prompt_tokens` → `cache_read`,
+//! `reasoning_tokens` → `thinking`. Grok reports no cache-write class.
 
 use std::collections::HashMap;
 use std::io;
@@ -143,6 +154,17 @@ impl HistoryExtractor for GrokExtractor {
                         out.skipped_unparsed += 1;
                         continue;
                     };
+                    // A subset reading larger than its own parent is the
+                    // exact shape that would disprove the superset
+                    // assumption (see the module doc) — `saturating_sub`
+                    // would clamp it to zero and hide it. Counted as
+                    // drift instead of emitted as a wrong record.
+                    if ctx.cached_prompt_tokens > ctx.prompt_tokens
+                        || ctx.reasoning_tokens > ctx.completion_tokens
+                    {
+                        out.skipped_unparsed += 1;
+                        continue;
+                    }
                     let info = sessions.get(&sid);
                     out.records.push(UsageRecord {
                         ts,
@@ -158,8 +180,8 @@ impl HistoryExtractor for GrokExtractor {
                             .clone()
                             .or_else(|| info.and_then(|i| i.model.clone()))
                             .unwrap_or_else(|| "unknown".into()),
-                        input: ctx.prompt_tokens.saturating_sub(ctx.cached_prompt_tokens),
-                        output: ctx.completion_tokens,
+                        input: ctx.prompt_tokens - ctx.cached_prompt_tokens,
+                        output: ctx.completion_tokens - ctx.reasoning_tokens,
                         cache_read: ctx.cached_prompt_tokens,
                         cache_write: 0,
                         thinking: ctx.reasoning_tokens,
@@ -237,15 +259,69 @@ mod tests {
             .unwrap();
         assert_eq!(ex.records.len(), 1);
         let r = &ex.records[0];
-        // `prompt_tokens` is a superset that already includes the cached
-        // share, so `input` is the uncached remainder: 1000 - 600 = 400.
+        // Both parents are assumed supersets: input = 1000 - 600 = 400,
+        // output = 200 - 50 = 150.
         assert_eq!(
             (r.input, r.cache_read, r.output, r.thinking),
-            (400, 600, 200, 50)
+            (400, 600, 150, 50)
         );
         assert_eq!(r.project, "proj");
         assert_eq!(r.model, "grok-4.5");
         assert_eq!(r.session_id, "s1");
+    }
+
+    #[test]
+    fn reasoning_tokens_are_not_double_counted_in_output() {
+        // `completion_tokens` is assumed to already include the reasoning
+        // share — a wholly-reasoning turn must show zero fresh output,
+        // not the full completion size again on top of `thinking`.
+        let tmp = TmpDir::new("grok-reasoning-superset");
+        let content = concat!(
+            r#"{"ts":"2026-09-22T10:00:00.000Z","sid":"s1","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":100,"completion_tokens":50,"reasoning_tokens":50}}"#,
+            "\n"
+        );
+        let p = tmp.write("unified.jsonl", content);
+        let ex = GrokExtractor
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert_eq!(ex.records.len(), 1);
+        let r = &ex.records[0];
+        assert_eq!((r.output, r.thinking), (0, 50));
+    }
+
+    #[test]
+    fn a_subset_larger_than_its_parent_counts_as_drift_not_a_clamp() {
+        // `saturating_sub` would silently clamp a broken assumption to
+        // zero; the line must be dropped and counted instead, so the day
+        // the superset assumption breaks is visible, not hidden.
+        let tmp = TmpDir::new("grok-broken-assumption");
+        let bad_cache = concat!(
+            r#"{"ts":"2026-09-22T10:00:00.000Z","sid":"s1","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":100,"cached_prompt_tokens":200,"completion_tokens":10}}"#,
+            "\n"
+        );
+        let p = tmp.write("unified.jsonl", bad_cache);
+        let ex = GrokExtractor
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert!(
+            ex.records.is_empty(),
+            "cached_prompt_tokens > prompt_tokens must not emit"
+        );
+        assert_eq!(ex.skipped_unparsed, 1);
+
+        let bad_reasoning = concat!(
+            r#"{"ts":"2026-09-22T10:00:00.000Z","sid":"s1","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":100,"completion_tokens":10,"reasoning_tokens":20}}"#,
+            "\n"
+        );
+        let p2 = tmp.write("unified2.jsonl", bad_reasoning);
+        let ex2 = GrokExtractor
+            .extract(&p2, tmp.as_ref(), &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert!(
+            ex2.records.is_empty(),
+            "reasoning_tokens > completion_tokens must not emit"
+        );
+        assert_eq!(ex2.skipped_unparsed, 1);
     }
 
     #[test]

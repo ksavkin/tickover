@@ -85,13 +85,27 @@ usage event itself lacks them: `session created` carries `ctx.cwd`, and
 `model changed` carries `ctx.model`. The extractor collects both into a
 per-pass map and joins them onto the records.
 
-Mapping: like Codex's OpenAI Responses shape, `prompt_tokens` is a
-superset that already includes the cached share, so the stored `input` is
-the uncached remainder (`prompt_tokens` minus `cached_prompt_tokens`);
-`cached_prompt_tokens` → `cache_read`, `completion_tokens` → `output`,
-`reasoning_tokens` → `thinking`. Grok reports no cache-write class;
-`sessions/*/updates.jsonl` is a session protocol log and carries no token
-counts.
+Mapping: `prompt_tokens` and `completion_tokens` are *assumed* to be
+Chat-Completions-style supersets that already include their
+`cached_prompt_tokens`/`reasoning_tokens` shares, the same convention
+Codex's `input_tokens`/`output_tokens` follow — but where Codex verified
+that convention against real rollouts (`total_tokens` equals
+`input + output` exactly), Grok's payload carries no such total to check
+itself against, and no captured Grok log exists to verify the assumption
+against either. It stays an assumption. A line where the "subset" reads
+larger than its own parent (`cached_prompt_tokens > prompt_tokens` or
+`reasoning_tokens > completion_tokens`) would falsify it; that line is
+dropped and counted as drift rather than silently clamped to zero. Under
+the assumption, `input` is `prompt_tokens` minus `cached_prompt_tokens`
+and `output` is `completion_tokens` minus `reasoning_tokens`;
+`cached_prompt_tokens` → `cache_read`, `reasoning_tokens` → `thinking`.
+Grok reports no cache-write class; `sessions/*/updates.jsonl` is a
+session protocol log and carries no token counts.
+
+This mapping is not retroactive: day lines already on disk were computed
+under the old (unreduced) definition, so a Grok total spanning the
+change blends two different notions of `input`/`output` for the same
+provider. Nothing here rewrites history to reconcile them.
 
 ## `antigravity-sqlite`
 

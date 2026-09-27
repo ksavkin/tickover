@@ -116,6 +116,20 @@ fn fmt_usd(v: Option<f64>) -> String {
     }
 }
 
+/// [`pricing::cost_for_models`] rendered through [`fmt_usd`], with a
+/// trailing `*` when `models` includes one this table has no price for —
+/// a sum missing a whole model's share must not print as confidently as
+/// one that knows every model it summed.
+fn fmt_usd_for_models(models: &[(String, Totals)]) -> String {
+    let (v, partial) = pricing::cost_summary(models);
+    let s = fmt_usd(v);
+    if partial {
+        format!("{s}*")
+    } else {
+        s
+    }
+}
+
 /// Write the report. `path: None` → `<config>/tickover/reports/
 /// usage-<yyyymmdd-hhmmss>.html`; the file is created `0600`. Returns the
 /// path actually written.
@@ -407,11 +421,10 @@ fn headline(h: &mut String, st: &Stats, cost_on: bool) {
         .unwrap_or_else(|| "—".into());
     let cost_card = if cost_on {
         let models: Vec<(String, Totals)> = st.models.clone();
-        let v = pricing::cost_for_models(&models);
         // A model this table doesn't know still contributed tokens the sum
         // leaves out entirely — the headline must say so rather than let a
         // partial total pass for the whole picture.
-        let partial = v.is_some() && !pricing::fully_priced(&models);
+        let (v, partial) = pricing::cost_summary(&models);
         (
             "EST. COST".to_string(),
             v.map(|x| {
@@ -583,11 +596,10 @@ fn tools(h: &mut String, st: &Stats, cost_on: bool) {
         );
         if cost_on {
             // Priced at the provider×model split — never at a guessed blend.
-            let usd = pricing::cost_for_models(&st.provider_models(p));
             let _ = write!(
                 h,
                 r#"<span class="mono" style="font-size: 12px; text-align: right; color: var(--text);">{}</span>"#,
-                fmt_usd(usd)
+                fmt_usd_for_models(&st.provider_models(p))
             );
         } else {
             let _ = write!(
@@ -955,7 +967,7 @@ fn habits_and_sessions(h: &mut String, st: &Stats, cost_on: bool) {
             // blend at whichever model its first bucket happened to log.
             let models: Vec<(String, Totals)> =
                 s.models.iter().map(|(m, t)| (m.clone(), *t)).collect();
-            fmt_usd(pricing::cost_for_models(&models))
+            fmt_usd_for_models(&models)
         } else {
             "—".into()
         };
@@ -1027,7 +1039,10 @@ fn wrapped(h: &mut String, st: &Stats, cost_on: bool) {
         let models: Vec<(String, Totals)> = st.models.clone();
         // What the cache saved: those tokens at full input price minus
         // their actual cache-read price. ≈-labelled — it is an estimate
-        // of an estimate.
+        // of an estimate. A model this table can't price contributes
+        // nothing to the sum below, silently, unless it actually read
+        // from cache — tracked separately so the figure can say so.
+        let mut any_unpriced_with_reads = false;
         let approx: f64 = models
             .iter()
             .filter_map(|(m, t)| {
@@ -1037,21 +1052,29 @@ fn wrapped(h: &mut String, st: &Stats, cost_on: bool) {
                         input: t.cache_read,
                         ..Totals::default()
                     },
-                )?;
+                );
                 let as_cache = pricing::cost_usd(
                     m,
                     &Totals {
                         cache_read: t.cache_read,
                         ..Totals::default()
                     },
-                )?;
-                Some(as_input - as_cache)
+                );
+                match (as_input, as_cache) {
+                    (Some(ai), Some(ac)) => Some(ai - ac),
+                    _ if t.cache_read > 0 => {
+                        any_unpriced_with_reads = true;
+                        None
+                    }
+                    _ => None,
+                }
             })
             .sum();
+        let marker = if any_unpriced_with_reads { "*" } else { "" };
         format!(
             r#"<div style="display: flex; justify-content: space-between; align-items: baseline; padding: 11px 0; border-bottom: 1px solid var(--track);">
 <span class="mono" style="font-size: 10px; letter-spacing: 0.13em; color: var(--meta);">SAVED BY CACHE</span>
-<span class="mono" style="font-size: 14px;">≈ {}</span>
+<span class="mono" style="font-size: 14px;">≈ {}{marker}</span>
 </div>"#,
             fmt_usd(Some(approx))
         )
@@ -1139,4 +1162,124 @@ Generated {now} by tickover {ver}. Read from {srcs}. Duplicate message ids remov
         now = Local::now().format("%d %b %Y %H:%M"),
         ver = env!("CARGO_PKG_VERSION"),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::query;
+    use crate::history::store::{DayLine, HistoryStore, SCHEMA_VERSION};
+    use std::fs;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-report-test-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// One session's bucket for a given model — round numbers throughout
+    /// so the rendered dollar figures land on exact cent/dollar strings,
+    /// not ones a test would have to fight floating rounding to match.
+    fn day(hour: &str, model: &str, cache_read: u64) -> DayLine {
+        DayLine {
+            v: SCHEMA_VERSION,
+            hour: hour.to_string(),
+            provider: "claude".into(),
+            project: "proj".into(),
+            model: model.into(),
+            session: "s1".into(),
+            file: "/f".into(),
+            gen: 0,
+            lo: 0,
+            hi: 0,
+            full: false,
+            b: 0,
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read,
+            cache_write: 0,
+            thinking: 0,
+            messages: 1,
+        }
+    }
+
+    #[test]
+    fn a_report_with_cost_on_marks_every_partial_sum() {
+        // One session, one provider, two models: one this table prices
+        // ("claude-sonnet-4"), one it does not ("mystery-model-x", which
+        // also reads from cache so the cache-savings row mixes too).
+        let dir = tmpdir("report-partial-cost");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let hour = chrono::Utc::now().format("%Y-%m-%dT%H").to_string();
+        store
+            .append_days(&[
+                day(&hour, "claude-sonnet-4", 0),
+                day(&hour, "mystery-model-x", 500_000),
+            ])
+            .unwrap();
+        store.commit().unwrap();
+        let store = HistoryStore::open(&dir).unwrap();
+        let enabled: std::collections::HashSet<String> =
+            ["claude".to_string()].into_iter().collect();
+        let st = query::compute(&store, 30, &enabled);
+
+        let html = render(&st, true, &[], &[]);
+
+        // Headline EST. COST: only "claude-sonnet-4" prices (3.0 + 15.0
+        // per 1M at its own rate = $18), and the caption says so.
+        assert!(html.contains("$18*"), "headline must mark the partial sum");
+        assert!(
+            html.contains("at list price, partial — unpriced models excluded"),
+            "headline caption must name the exclusion"
+        );
+        // Per-provider row and session row sum the same two models —
+        // both must carry the same marker.
+        assert!(
+            html.contains("$18.00*"),
+            "the per-provider and per-session cost cells must be marked"
+        );
+        // SAVED BY CACHE: only the unpriced model has cache reads, so the
+        // estimate is $0 with nothing to add — still marked, since that
+        // $0 is not "no savings", it is "unknown savings".
+        assert!(
+            html.contains("≈ $0*"),
+            "the cache-savings row must be marked when only an unpriced model read from cache"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_report_with_cost_on_and_one_priced_model_carries_no_marker() {
+        let dir = tmpdir("report-full-cost");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let hour = chrono::Utc::now().format("%Y-%m-%dT%H").to_string();
+        store
+            .append_days(&[day(&hour, "claude-sonnet-4", 0)])
+            .unwrap();
+        store.commit().unwrap();
+        let store = HistoryStore::open(&dir).unwrap();
+        let enabled: std::collections::HashSet<String> =
+            ["claude".to_string()].into_iter().collect();
+        let st = query::compute(&store, 30, &enabled);
+
+        let html = render(&st, true, &[], &[]);
+        assert!(html.contains("$18"), "the priced total still shows");
+        assert!(
+            !html.contains("$18*"),
+            "a fully priced sum must not be marked"
+        );
+        assert!(
+            !html.contains("partial"),
+            "no caption should mention partial coverage"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

@@ -260,11 +260,17 @@ fn text_out(
         }
         if cost_on {
             let per_model: Vec<(String, query::Totals)> = st.models.clone();
-            if let Some(usd) = pricing::cost_for_models(&per_model) {
-                s.push_str(&format!(
-                    "est. cost {:>8.2} USD (list price, opt-in)\n",
-                    usd
-                ));
+            let (usd, partial) = pricing::cost_summary(&per_model);
+            if let Some(usd) = usd {
+                // Same wording the report's headline uses for the same
+                // condition, so the two never disagree about what a
+                // partial estimate means.
+                let note = if partial {
+                    "list price, opt-in, partial — unpriced models excluded"
+                } else {
+                    "list price, opt-in"
+                };
+                s.push_str(&format!("est. cost {:>8.2} USD ({note})\n", usd));
             }
         }
         s.push_str(&format!("streak   {:>8} days\n\n", st.streak_days));
@@ -351,8 +357,17 @@ fn json_out(
     });
     if cost_on {
         let per_model: Vec<(String, query::Totals)> = st.models.clone();
-        v["est_cost_usd"] = pricing::cost_for_models(&per_model)
+        let (usd, partial) = pricing::cost_summary(&per_model);
+        v["est_cost_usd"] = usd
             .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null);
+        // `true` means at least one model that contributed usage has no
+        // listed price and its whole share is missing from `est_cost_usd`
+        // above, not merely underrepresented; `null` alongside a `null`
+        // `est_cost_usd` — there is nothing partial about a figure that
+        // isn't shown at all.
+        v["est_cost_usd_missing_models"] = usd
+            .map(|_| serde_json::Value::from(partial))
             .unwrap_or(serde_json::Value::Null);
     }
     serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into())
@@ -464,5 +479,119 @@ mod tests {
             parse_args(words(&["--json", "--report=out.html"])),
             ParsedArgs::Run(Output::Report(Some(PathBuf::from("out.html"))))
         );
+    }
+
+    use tickover::history::store::{DayLine, SCHEMA_VERSION};
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-statscli-test-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A round-numbered bucket for a given model — the CLI's `{:.2}`
+    /// formatting stays exact for whole-dollar totals, so a test doesn't
+    /// have to fight floating rounding to match a string.
+    fn day(model: &str) -> DayLine {
+        DayLine {
+            v: SCHEMA_VERSION,
+            hour: chrono::Utc::now().format("%Y-%m-%dT%H").to_string(),
+            provider: "claude".into(),
+            project: "proj".into(),
+            model: model.into(),
+            session: "s1".into(),
+            file: "/f".into(),
+            gen: 0,
+            lo: 0,
+            hi: 0,
+            full: false,
+            b: 0,
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 0,
+            cache_write: 0,
+            thinking: 0,
+            messages: 1,
+        }
+    }
+
+    /// One priced model and one this table doesn't know, both real
+    /// providers in `st.models` — the shape every "partial cost" test
+    /// below needs.
+    fn stats_with_a_partial_cost_mix(tag: &str) -> query::Stats {
+        let dir = tmpdir(tag);
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store
+            .append_days(&[day("claude-sonnet-4"), day("mystery-model-x")])
+            .unwrap();
+        store.commit().unwrap();
+        let store = HistoryStore::open(&dir).unwrap();
+        let enabled: std::collections::HashSet<String> =
+            ["claude".to_string()].into_iter().collect();
+        let st = query::compute(&store, 30, &enabled);
+        let _ = std::fs::remove_dir_all(&dir);
+        st
+    }
+
+    #[test]
+    fn text_out_marks_the_est_cost_line_when_a_model_is_unpriced() {
+        let st = stats_with_a_partial_cost_mix("text-partial");
+        let out = text_out(&st, &[], &[], true);
+        assert!(
+            out.contains(
+                "est. cost    18.00 USD (list price, opt-in, partial — unpriced models excluded)"
+            ),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn text_out_carries_no_partial_note_when_every_model_is_priced() {
+        let dir = tmpdir("text-full");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store.append_days(&[day("claude-sonnet-4")]).unwrap();
+        store.commit().unwrap();
+        let store = HistoryStore::open(&dir).unwrap();
+        let enabled: std::collections::HashSet<String> =
+            ["claude".to_string()].into_iter().collect();
+        let st = query::compute(&store, 30, &enabled);
+        let out = text_out(&st, &[], &[], true);
+        assert!(out.contains("est. cost    18.00 USD (list price, opt-in)\n"));
+        assert!(!out.contains("partial"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn json_out_names_the_missing_models_field_alongside_the_estimate() {
+        let st = stats_with_a_partial_cost_mix("json-partial");
+        let out = json_out(&st, &[], &[], true);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["est_cost_usd"], serde_json::json!(18.0));
+        assert_eq!(v["est_cost_usd_missing_models"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn json_out_leaves_the_missing_models_field_null_with_no_estimate() {
+        let dir = tmpdir("json-none");
+        let store = HistoryStore::open(&dir).unwrap();
+        let enabled: std::collections::HashSet<String> =
+            ["claude".to_string()].into_iter().collect();
+        let st = query::compute(&store, 30, &enabled);
+        let out = json_out(&st, &[], &[], true);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["est_cost_usd"].is_null());
+        assert!(
+            v["est_cost_usd_missing_models"].is_null(),
+            "nothing partial about an estimate that isn't shown at all"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
