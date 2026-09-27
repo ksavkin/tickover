@@ -92,6 +92,14 @@ fn usage() -> &'static str {
 }
 
 fn run(output: Output, manifests: Vec<PluginManifest>) -> i32 {
+    // Every manifest id the registry has, enabled or not, taken before
+    // the filter below (as owned `String`s — the filter drops disabled
+    // manifests outright, which would leave a borrowed `&str` dangling) —
+    // a provider merely disabled for this run must keep whatever claim it
+    // holds on a shared path, not have it quietly taken over by whichever
+    // other provider this run does scan.
+    let known_ids: Vec<String> = manifests.iter().map(|m| m.id.clone()).collect();
+    let known: std::collections::HashSet<&str> = known_ids.iter().map(String::as_str).collect();
     // A provider the user disabled keeps its history files untouched and
     // drops out of the report entirely — same filter the tray scan
     // applies in `spawn_history_scan`.
@@ -125,7 +133,8 @@ fn run(output: Output, manifests: Vec<PluginManifest>) -> i32 {
     let mut scans;
     let mut guard = 0;
     loop {
-        scans = tickover::history::scan_tick(&mut store, &manifests, &crate::plugin_options);
+        scans =
+            tickover::history::scan_tick(&mut store, &manifests, &known, &crate::plugin_options);
         let _ = store.commit();
         guard += 1;
         if !scans.iter().any(|s| s.outcome.partial) || guard >= 60 {

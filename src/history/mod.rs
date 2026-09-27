@@ -88,10 +88,16 @@ pub struct ProviderScan {
 ///
 /// `options_for` resolves a manifest's declared `[[option]]`s — per plugin,
 /// not global, since two manifests can reuse a key name for different
-/// values.
+/// values. `manifests` is only the enabled ones with a `[history]` section
+/// — both callers already filter to that before calling this — but `known`
+/// must be every id the registry has, enabled or not: `scan_root` checks a
+/// claimed path's stored owner against it to tell a provider merely
+/// disabled for this run (still a live claim) from one actually removed or
+/// renamed (a stale one, safe to hand to whoever asks).
 pub fn scan_tick(
     store: &mut store::HistoryStore,
     manifests: &[PluginManifest],
+    known: &std::collections::HashSet<&str>,
     options_for: &dyn Fn(&PluginManifest) -> BTreeMap<String, bool>,
 ) -> Vec<ProviderScan> {
     let with_history = manifests.iter().filter(|m| m.history.is_some()).count();
@@ -101,12 +107,6 @@ pub fn scan_tick(
         scanner::SCAN_WALL_BUDGET / with_history as u32
     };
     let mut scans = Vec::new();
-    // Every manifest id this tick is willing to run — the set `scan_root`
-    // checks a claimed path's stored owner against, so a manifest that
-    // was removed, renamed, or disabled since the claim was made is not
-    // read as a live competitor for it.
-    let enabled: std::collections::HashSet<&str> =
-        manifests.iter().map(|m| m.id.as_str()).collect();
     for m in manifests {
         let Some(h) = &m.history else { continue };
         // A fresh deadline per provider: one that finishes early simply
@@ -144,7 +144,7 @@ pub fn scan_tick(
             &glob,
             extractor.as_ref(),
             deadline,
-            &enabled,
+            known,
         );
         scans.push(ProviderScan {
             provider: m.id.clone(),

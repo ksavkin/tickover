@@ -6427,6 +6427,13 @@ fn spawn_history_scan(ctx: &Ctx) {
     {
         return;
     }
+    // Every manifest id the registry has, enabled or not — a provider
+    // merely toggled off for this run must keep whatever claim it holds
+    // on a shared path, not have it silently taken over and never handed
+    // back. Collected before the filter below, and as owned `String`s so
+    // it can move into the scan thread with `manifests`.
+    let known: std::collections::HashSet<String> =
+        ctx.plugins.borrow().iter().map(|m| m.id.clone()).collect();
     let manifests: Vec<PluginManifest> = ctx
         .plugins
         .borrow()
@@ -6460,11 +6467,17 @@ fn spawn_history_scan(ctx: &Ctx) {
                 // the lock serializes open+scan+commit across processes.
                 let _lock = tickover::history::store::lock_store(&dir).ok()?;
                 let mut store = tickover::history::store::HistoryStore::open(&dir).ok()?;
+                let known: std::collections::HashSet<&str> =
+                    known.iter().map(|s| s.as_str()).collect();
                 // Resumable ticks: a pass that stopped on its wall-clock
                 // budget reports `partial`; a cold corpus takes a few.
                 for _ in 0..8 {
-                    let scans =
-                        tickover::history::scan_tick(&mut store, &manifests, &plugin_options);
+                    let scans = tickover::history::scan_tick(
+                        &mut store,
+                        &manifests,
+                        &known,
+                        &plugin_options,
+                    );
                     if let Err(e) = store.commit() {
                         diag::line(format!("history: store commit failed: {e}"));
                         return None;

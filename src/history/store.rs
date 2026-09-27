@@ -19,8 +19,9 @@
 //!   edited in place: a file that was rewritten gets a new `gen`, and its
 //!   older lines stop counting at query time instead of being deleted. Once
 //!   the log passes a size threshold a compaction rewrite drops whatever has
-//!   become genuinely dead — a provider whose log only ever grows, never
-//!   rewritten, never reaches that condition and keeps growing past it.
+//!   become genuinely dead — a provider whose log only ever grows, or whose
+//!   rewrites never complete a pass long enough to seal a newer generation,
+//!   never produces anything genuinely dead and keeps growing past it.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -61,13 +62,17 @@ pub(crate) const PREFIX_BYTES: usize = 4096;
 
 /// [`HistoryStore::commit`] rewrites `days.jsonl` once it passes this size
 /// — but only the lines [`HistoryStore::compute_droppable_indices`] finds
-/// genuinely dead actually leave. A provider whose file gets rewritten
-/// stays bounded: each rewrite eventually seals a superseded generation,
-/// which is what makes its older lines droppable. A provider whose log
-/// only ever grows — new hours, sessions or models, never a stale
-/// generation to drop — is not bounded by this at all: every line stays
-/// live, compaction finds nothing to remove, and the file keeps growing
-/// past this size on every future check.
+/// genuinely dead actually leave, and being rewritten is not by itself
+/// enough to make a file's older generations droppable: it takes a *later*
+/// generation actually reaching a `full` seal to supersede an earlier one
+/// (see [`HistoryStore::generation_maps`]). A provider whose file keeps
+/// getting rewritten before any generation ever completes a pass — every
+/// attempt truncated, none reaching the end of the source — leaves every
+/// generation's lines live-or-unsealed forever, the same as a provider
+/// whose log only ever grows with new hours, sessions or models and never
+/// produces a stale generation to drop in the first place: either way,
+/// every line stays, compaction finds nothing to remove, and the file
+/// keeps growing past this size on every future check.
 const DAYS_COMPACT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// How many `state.corrupt-*.json` snapshots [`HistoryStore::open`] keeps —
@@ -138,6 +143,23 @@ pub struct FileState {
     /// owned entirely by the extractor.
     #[serde(default)]
     pub aux: BTreeMap<String, serde_json::Value>,
+    /// The highest generation of this file that a `full` line has ever
+    /// sealed, `None` for an entry that predates this field or has never
+    /// sealed anything. [`Self::gen`] deriving sealed-ness fresh from
+    /// `days.jsonl` on every call cannot survive a reopen: a seal's own
+    /// line can be superseded by a later same-bucket line (an ordinary,
+    /// correct supersession — a crash-then-deadline retry re-reading the
+    /// same bytes), and the moment that happens to coincide with a reopen,
+    /// `open`'s own load-time cleanup physically drops the now-dead row
+    /// before anything gets a chance to notice it was ever `full` —
+    /// there is no line left to read `full` from at all. This field is
+    /// the fact surviving in a *second* place on purpose: it is written
+    /// once, monotonically, the moment a `full` line is folded in, and
+    /// [`Self::reset`] does not clear it — a rewrite bumping the
+    /// generation is exactly when the older generation's sealed-ness
+    /// still matters.
+    #[serde(default)]
+    pub sealed_through: Option<u32>,
 }
 
 impl FileState {
@@ -157,6 +179,7 @@ impl FileState {
             skipped_unparsed: 0,
             provider: String::new(),
             aux: BTreeMap::new(),
+            sealed_through: None,
         }
     }
 
@@ -268,6 +291,20 @@ pub struct ScannerState {
     /// a restart can't reissue a batch id older lines already carry.
     #[serde(default)]
     pub next_batch: u64,
+    /// The generation a path was tracked at the moment
+    /// [`HistoryStore::prune_missing_files`] removed its `files` entry.
+    /// `days.jsonl` alone cannot tell a file recreated at a lower
+    /// generation from one whose higher-numbered history simply predates
+    /// it — both look like "the biggest generation this path has ever
+    /// recorded" to a reader with no other information — so the one
+    /// moment that does know which generation was truly current writes it
+    /// down here before the entry disappears. Cleared the moment the path
+    /// is tracked again (`begin_file`): a live `files` entry is always
+    /// the more accurate source once one exists, and leaving stale
+    /// entries behind would grow this map exactly the way pruning
+    /// `files` itself was meant to stop.
+    #[serde(default)]
+    pub pruned_generations: BTreeMap<String, u32>,
 }
 
 /// One aggregate line in `days.jsonl`. This is the *only* thing history
@@ -722,6 +759,24 @@ impl HistoryStore {
         // line must not seal at all: it re-derived a prefix, nothing
         // more.
         if d.full {
+            // Recorded on the tracked `FileState` itself, monotonically —
+            // see [`FileState::sealed_through`] for why a fact derived
+            // fresh from `days.jsonl` on every call is not enough to
+            // survive a reopen on its own. Untracked or pruned paths have
+            // nowhere to record this and don't need to: `target_gen`'s
+            // untracked arm has no notion of a sealed generation to defer
+            // to in the first place. Only marked dirty when the value
+            // actually moves — this runs on every `full` line folded,
+            // including every unchanged reload of an already-sealed file.
+            let sealed_grew = self.state.files.get_mut(&d.file).is_some_and(|st| {
+                let merged = st.sealed_through.map_or(d.gen, |s| s.max(d.gen));
+                let grew = st.sealed_through != Some(merged);
+                st.sealed_through = Some(merged);
+                grew
+            });
+            if sealed_grew {
+                self.mark_state_dirty();
+            }
             if let Some(idxs) = self.by_file.get_mut(&(d.file.clone(), d.gen)) {
                 let keep: std::collections::HashSet<usize> = idxs
                     .iter()
@@ -980,6 +1035,10 @@ impl HistoryStore {
     /// path new to `state.files` can flip day lines of the same file out of
     /// the deleted-file fallback [`Self::live_days`] otherwise uses, so this
     /// invalidates unconditionally rather than only on the fresh-entry case.
+    /// Also clears any [`ScannerState::pruned_generations`] entry for
+    /// `path`: a live `FileState` is always the more accurate source once
+    /// one exists again, and the recorded generation has done its job the
+    /// moment tracking resumes.
     pub fn begin_file(
         &mut self,
         path: &Path,
@@ -990,14 +1049,13 @@ impl HistoryStore {
     ) {
         self.invalidate_live_cache();
         self.mark_state_dirty();
-        self.state
-            .files
-            .entry(path.to_string_lossy().into_owned())
-            .or_insert_with(|| {
-                let mut st = FileState::fresh(digest, size, mtime);
-                st.provider = provider.to_string();
-                st
-            });
+        let key = path.to_string_lossy().into_owned();
+        self.state.pruned_generations.remove(&key);
+        self.state.files.entry(key).or_insert_with(|| {
+            let mut st = FileState::fresh(digest, size, mtime);
+            st.provider = provider.to_string();
+            st
+        });
     }
 
     /// Append finished buckets to `days.jsonl` — the only write the log
@@ -1144,8 +1202,9 @@ impl HistoryStore {
 
     /// [`Self::live_days`]'s answer, computed fresh: every non-dead index
     /// whose generation matches [`Self::target_gen`] for its file — or,
-    /// for a file [`Self::target_gen`] returns `None` for (no longer in
-    /// `state.files`), one at that file's own newest surviving
+    /// for a file [`Self::target_gen`] returns `None` for (neither tracked
+    /// nor in [`ScannerState::pruned_generations`]), one at that file's
+    /// own newest surviving
     /// generation. Split out so [`Self::live_days`] only ever calls it
     /// through the cache.
     fn compute_live_indices(&self) -> Vec<usize> {
@@ -1171,27 +1230,85 @@ impl HistoryStore {
     /// actually sealed (absent for a file still on its first, still-
     /// partial scan — there is nothing yet to fall back to for one).
     fn generation_maps(&self) -> GenerationMaps<'_> {
-        let current: HashMap<&str, u32> = self
+        let mut current: HashMap<&str, u32> = self
             .state
             .files
             .iter()
             .map(|(p, s)| (p.as_str(), s.gen))
             .collect();
+        // A path recorded in `pruned_generations` is treated exactly like
+        // a tracked one for `target_gen`'s purposes — its generation just
+        // came from the moment it stopped being tracked instead of from a
+        // live `FileState`. A path cannot be both tracked and recorded
+        // here (`begin_file` clears the entry the moment it retracks a
+        // path), so `files` and `pruned_generations` never really compete;
+        // `or_insert` is only defensive.
+        for (p, &g) in &self.state.pruned_generations {
+            current.entry(p.as_str()).or_insert(g);
+        }
         let mut last_live: HashMap<&str, u32> = HashMap::new();
-        let mut sealed_gen: HashMap<&str, u32> = HashMap::new();
+        // Seeded from each tracked file's own persisted high-water mark
+        // before the `days` walk below ever raises it — see
+        // [`FileState::sealed_through`] for why deriving this fresh from
+        // `days.jsonl` alone, every call, cannot survive a reopen: the
+        // seal's own line can die to an ordinary supersession, and if that
+        // coincides with a reopen, `open`'s load-time cleanup drops the
+        // now-dead row before any fresh derivation would ever see it was
+        // `full`. The seeded value needs no cap against `current` the way
+        // the walk's own contributions do: it was written at the moment
+        // that generation *was* current, so it can never be a relic of an
+        // unrelated later life the way a raw `days.jsonl` maximum can.
+        let mut sealed_gen: HashMap<&str, u32> = self
+            .state
+            .files
+            .iter()
+            .filter_map(|(p, s)| s.sealed_through.map(|g| (p.as_str(), g)))
+            .collect();
         for (i, d) in self.days.iter().enumerate() {
+            // A generation that once reached the end of its source has
+            // reached it, permanently — sealing is a fact about the
+            // generation, not about the one line that happened to record
+            // it. A later same-bucket line can still supersede *that
+            // line* (a crash-then-deadline retry re-reads the same bytes
+            // and legitimately wins the ordinary overlap rule), but it
+            // does not un-finish the pass that sealed the generation, so
+            // `sealed_gen` reads every `full` line regardless of whether
+            // it is still live. `sealed_gen` only ever increases for a
+            // file this way: nothing here, and no supersession elsewhere,
+            // can un-seal a generation once one of its lines has been
+            // `full` — which is what makes it safe for
+            // `compute_droppable_indices` to delete a generation the
+            // moment a higher one seals: no future call can walk that
+            // deletion back by falling to a lower target than the seal
+            // already promised.
+            //
+            // Capped at the file's current generation (tracked, or
+            // recorded in `pruned_generations`): a `full` line *above*
+            // that number is not a candidate a
+            // rewrite could ever have produced — cursors only move
+            // forward within a generation and a new one only ever starts
+            // at the file's own next number — so it can only be a relic
+            // of an earlier, unrelated life (the same recreate/rebuild/
+            // downgrade case `target_gen` already treats as a dead end).
+            // Taking the plain maximum over every `full` line regardless
+            // of that would let one such relic hide a *real*, lower
+            // sealed generation this file's current lineage actually
+            // produced — the newest sealed generation would silently stop
+            // being the newest one under this cap's number and start
+            // being the newest one under an unrelated life's, which is
+            // never the intended fallback.
+            if d.full && current.get(d.file.as_str()).is_none_or(|&cap| d.gen <= cap) {
+                let e = sealed_gen.entry(d.file.as_str()).or_insert(d.gen);
+                if d.gen > *e {
+                    *e = d.gen;
+                }
+            }
             if self.dead.contains(&i) {
                 continue;
             }
             let e = last_live.entry(d.file.as_str()).or_insert(d.gen);
             if d.gen > *e {
                 *e = d.gen;
-            }
-            if d.full {
-                let e = sealed_gen.entry(d.file.as_str()).or_insert(d.gen);
-                if d.gen > *e {
-                    *e = d.gen;
-                }
             }
         }
         (current, last_live, sealed_gen)
@@ -1202,27 +1319,39 @@ impl HistoryStore {
     /// [`Self::compute_droppable_indices`] both read, so the two can never
     /// disagree about which generation currently speaks for a file.
     ///
-    /// `None` for a file no longer in `state.files`: there is no current
+    /// `None` for a file with neither a `state.files` entry nor a
+    /// [`ScannerState::pruned_generations`] one: there is no current
     /// generation to target at all, and both callers fall back to the
-    /// file's newest surviving (non-dead) generation instead. For a
-    /// tracked file, the target is its current generation *if that
-    /// generation is sealed*, or otherwise the newest generation this
-    /// file *has* sealed — a rewrite bumps the tracked generation the
-    /// instant it is detected, before the rescan it triggers has
-    /// re-derived anything, so a not-yet-sealed current generation defers
-    /// to the last complete figure rather than the unsealed slice
-    /// produced so far. A file with no sealed generation *lower than its
-    /// current one* has nothing to defer to, so the target is simply the
-    /// current generation itself — whatever that generation's own lines
-    /// say, live or not yet begun. Two shapes reach this: a file still on
-    /// its first-ever, still-partial scan (no sealed generation exists at
+    /// file's newest surviving (non-dead) generation instead — the only
+    /// case this residual fallback still needs to cover is data from
+    /// before `pruned_generations` existed. For a tracked file, or one
+    /// recorded there, the target is its generation *if that generation
+    /// is sealed*, or otherwise the
+    /// newest generation this file *has* sealed at or below it — a
+    /// rewrite bumps the tracked generation the instant it is detected,
+    /// before the rescan it triggers has re-derived anything, so a
+    /// not-yet-sealed current generation defers to the last complete
+    /// figure rather than the unsealed slice produced so far.
+    ///
+    /// "At or below it" is load-bearing: [`Self::generation_maps`] caps
+    /// what counts as sealed for this purpose at the file's own
+    /// generation, so a `full` line above it — always a relic of an
+    /// unrelated earlier life, since a generation only ever advances by
+    /// one and cursors only move forward within it — cannot masquerade as
+    /// "the newest sealed generation" and hide a real, lower one this
+    /// file's actual lineage produced.
+    ///
+    /// A file with no sealed generation at or below its own has nothing to
+    /// defer to, so the target is simply the current generation itself,
+    /// tracked or recorded — whatever that generation's own lines say, live
+    /// or not yet begun. Two shapes reach this: a file still on its
+    /// first-ever, still-partial scan (no sealed generation exists at
     /// all), and a file whose state was dropped and recreated (deletion,
     /// a `prune_missing_files` sweep, a `SCHEMA_VERSION` reset, a
     /// downgrade) while a sealed generation from its previous life is
     /// still sitting in `days.jsonl` at a number *higher* than the fresh
-    /// one — that old sealed line is not a fallback candidate (it is
-    /// higher, not lower, than the current generation) and never lends
-    /// its figure to the file's new life.
+    /// one — capped out of consideration by the same rule above, so it
+    /// never lends its figure to the file's new life.
     fn target_gen(maps: &GenerationMaps<'_>, file: &str) -> Option<u32> {
         let (current, _, sealed_gen) = maps;
         let gen = *current.get(file)?;
@@ -1357,15 +1486,27 @@ impl HistoryStore {
     /// left in its place.
     ///
     /// Their day lines keep counting regardless (history once recorded
-    /// stays); if a path is recreated later, a fresh scan's overlapping
-    /// ranges supersede the old ones at load. A file leaving `state.files`
-    /// can flip its day lines onto the deleted-file fallback
-    /// [`Self::live_days`] uses, so the liveness cache invalidates even
-    /// when nothing was actually confirmed gone — but `state` itself is
-    /// only dirtied when something was actually removed: this runs on
-    /// every scan tick regardless, and a dirty mark on every no-op call
-    /// would leave `commit` rewriting `state.json` on every tick again,
-    /// the very rewrite the dirty flag exists to skip.
+    /// stays) — at whichever generation the path was tracked at just
+    /// before this call, recorded into
+    /// [`ScannerState::pruned_generations`] before the `files` entry
+    /// disappears. `days.jsonl` alone cannot tell that generation apart
+    /// from a higher one sitting in the same file from a still-earlier
+    /// life (delete-and-recreate, a `SCHEMA_VERSION` rebuild, a
+    /// downgrade): both look like "the biggest generation ever recorded
+    /// for this path" to a reader with nothing else to go on, and the
+    /// higher one is not always the more recent — this is the only moment
+    /// that knows which one actually was, and this record is what lets
+    /// [`Self::generation_maps`] answer correctly for however long the
+    /// path stays untracked. If a path is recreated later, a fresh scan's
+    /// overlapping ranges supersede the old lines at load, and
+    /// [`Self::begin_file`] clears the record the same moment. A file
+    /// leaving `state.files` can flip its day lines onto this fallback, so
+    /// the liveness cache invalidates even when nothing was actually
+    /// confirmed gone — but `state` itself is only dirtied when something
+    /// was actually removed: this runs on every scan tick regardless, and
+    /// a dirty mark on every no-op call would leave `commit` rewriting
+    /// `state.json` on every tick again, the very rewrite the dirty flag
+    /// exists to skip.
     ///
     /// Cost: a file that still exists but has fallen outside every
     /// enabled manifest's root — the root itself narrowed, not the file —
@@ -1405,7 +1546,9 @@ impl HistoryStore {
             return 0;
         }
         for p in &gone {
-            self.state.files.remove(p);
+            if let Some(st) = self.state.files.remove(p) {
+                self.state.pruned_generations.insert(p.clone(), st.gen);
+            }
         }
         self.mark_state_dirty();
         gone.len()
@@ -1575,6 +1718,67 @@ mod tests {
         assert_eq!(
             before, after,
             "the newer build's state.json must survive a downgraded run untouched"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_downgraded_run_never_compacts_days_jsonl() {
+        // `commit` skips `maybe_compact_days` whenever `foreign_newer_state`
+        // is set. A compacting rewrite always writes `days.jsonl` from this
+        // run's in-memory `days`, which never holds a newer schema's own
+        // lines (`open`'s load loop cannot parse them and drops them on the
+        // floor) — running it here would erase those lines from disk
+        // instead of merely leaving `state.json` alone, the same data loss
+        // the newer-schema guard exists to prevent for the other file.
+        let dir = tmpdir("downgrade-skips-compaction");
+        let newer = ScannerState {
+            version: SCHEMA_VERSION + 1,
+            ..Default::default()
+        };
+        fs::write(
+            HistoryStore::state_path(&dir),
+            serde_json::to_string(&newer).unwrap(),
+        )
+        .unwrap();
+        // A genuinely droppable line: with `state.files` trusted as empty
+        // (the whole point of the newer-schema guard), "/f" is untracked,
+        // so gen 0 — superseded by the later, also-untracked gen 1 — is
+        // droppable via `compute_droppable_indices`'s untracked-fallback
+        // rule without ever touching `self.dead`. That matters here: a
+        // range-overlap kill would be resolved in memory by `open`'s own
+        // `physically_drop_dead` before `commit` ever ran, leaving nothing
+        // for a later compaction to find either way and making this test
+        // pass whether or not the guard exists. This one stays droppable
+        // at `commit` time regardless.
+        let mut gen0 = day("/f", 0, 5);
+        gen0.full = true;
+        gen0.lo = 0;
+        gen0.hi = 100;
+        let mut gen1 = day("/f", 1, 7);
+        gen1.full = true;
+        gen1.lo = 0;
+        gen1.hi = 100;
+        let mut buf = Vec::new();
+        for d in [&gen0, &gen1] {
+            serde_json::to_writer(&mut buf, d).unwrap();
+            buf.push(b'\n');
+        }
+        // Past the compaction threshold, and unparseable to this build —
+        // exactly what a newer schema's own lines look like here.
+        buf.push(b'\n');
+        buf.extend_from_slice("x".repeat(17 * 1024 * 1024).as_bytes());
+        fs::write(HistoryStore::days_path(&dir), &buf).unwrap();
+        let before = fs::read(HistoryStore::days_path(&dir)).unwrap();
+
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store.begin_file(Path::new("/g"), "claude", "d".into(), 1, 1);
+        store.commit().unwrap();
+
+        let after = fs::read(HistoryStore::days_path(&dir)).unwrap();
+        assert_eq!(
+            before, after,
+            "a downgraded run must never rewrite days.jsonl"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1754,6 +1958,236 @@ mod tests {
     }
 
     #[test]
+    fn a_revoked_seal_does_not_resurrect_an_already_compacted_generation() {
+        // Sealing is a fact about a generation reaching the end of its
+        // source, not about the one line that happened to record it. Gen
+        // 1 seals at 7; a crash-then-deadline retry (a non-full line
+        // whose range overlaps the seal's own) supersedes that specific
+        // line by the ordinary same-bucket rule — the retry re-read
+        // bytes the seal already accounted for and simply ran out of
+        // budget, so its own count (3) is what survives. What must not
+        // happen is gen 1 reading as "never sealed" the moment its line
+        // dies: that would send `target_gen` looking for the newest
+        // *other* sealed generation, which is gen 0 — a generation
+        // compaction already trusted the gen-1 seal to justify deleting.
+        // Falling back to it here would be inconsistent at best (a
+        // number from a rewrite the file has since moved past) and, once
+        // compaction has actually removed it, unrecoverable at worst.
+        let dir = tmpdir("seal-survives-revocation");
+        let mut store = HistoryStore::open(&dir).unwrap();
+
+        let mut sealed0 = day("/f", 0, 10);
+        sealed0.full = true;
+        store.append_days(&[sealed0]).unwrap();
+        store
+            .state
+            .files
+            .insert("/f".to_string(), FileState::fresh("d".into(), 1, 1));
+        store
+            .file_state_mut(Path::new("/f"))
+            .unwrap()
+            .reset("d2".into(), 2, 2);
+
+        let mut sealed1 = day("/f", 1, 7);
+        sealed1.full = true;
+        sealed1.lo = 0;
+        sealed1.hi = 20;
+        store.append_days(&[sealed1]).unwrap();
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 7);
+
+        // The crash-then-deadline retry: a non-full re-read of an
+        // overlapping span. It legitimately supersedes the seal's own
+        // line through the ordinary same-bucket overlap rule — that part
+        // of the machinery is untouched and correct.
+        let mut retry = day("/f", 1, 3);
+        retry.lo = 0;
+        retry.hi = 15;
+        store.append_days(&[retry]).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            3,
+            "gen 1 is still the sealed generation — its own superseded \
+             line does not send the target back to gen 0"
+        );
+
+        // The log crosses the compaction threshold only now. Gen 0 is
+        // droppable exactly because gen 1 sealed at some point — a fact
+        // that stands regardless of what later happened to the line
+        // that recorded it.
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("days.jsonl"))
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{}", "x".repeat(17 * 1024 * 1024)).unwrap();
+        drop(f);
+        store.commit().unwrap(); // compacts
+
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            3,
+            "compaction must not have resurrected gen 0"
+        );
+        drop(store);
+        let store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            3,
+            "the figure must survive a reopen too"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_seal_below_the_tracked_generation_survives_a_reopen_after_its_line_dies() {
+        // The shape that actually exercises the persisted
+        // `FileState::sealed_through` field: the sealed generation stays
+        // *below* the tracked one across the reopen, so whether the
+        // target still resolves to it is the whole question. Deriving
+        // "was gen 0 ever sealed" fresh from `days.jsonl` alone cannot
+        // answer that once the seal's own line is superseded, because
+        // `open`'s load-time cleanup physically drops a dead row before
+        // anything gets a chance to read `full` off it — the previous
+        // test in this file (the revoked-seal one) never actually
+        // exercises this: there, the sealed generation *is* the tracked
+        // one, so `target_gen`'s fallback branch lands on the same
+        // number whether or not the seal is remembered.
+        let dir = tmpdir("seal-below-tracked-survives-reopen");
+        let mut store = HistoryStore::open(&dir).unwrap();
+
+        let mut sealed0 = day("/f", 0, 10);
+        sealed0.full = true;
+        sealed0.lo = 0;
+        sealed0.hi = 20;
+        store.append_days(&[sealed0]).unwrap();
+        store
+            .state
+            .files
+            .insert("/f".to_string(), FileState::fresh("d".into(), 1, 1));
+
+        // A crash-then-deadline retry at the same generation, overlapping
+        // the seal's own range — the ordinary same-bucket rule supersedes
+        // it, same as always.
+        let mut retry = day("/f", 0, 3);
+        retry.lo = 0;
+        retry.hi = 15;
+        store.append_days(&[retry]).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            3,
+            "gen 0's own superseded line does not stop gen 0 from still being live"
+        );
+
+        // The rewrite that closes gen 0 for good — nothing can ever change
+        // whether gen 0 was sealed again after this.
+        store
+            .file_state_mut(Path::new("/f"))
+            .unwrap()
+            .reset("d2".into(), 2, 2);
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            3,
+            "gen 1 hasn't produced anything yet — gen 0's held figure stands"
+        );
+        store.commit().unwrap();
+
+        drop(store);
+        let store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            3,
+            "the target must still resolve to gen 0 after a reopen, not \
+             fall through to gen 1's still-empty generation just because \
+             gen 0's seal's own line did not survive the reload"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pruned_files_stale_generation_does_not_outlive_its_recorded_prune_gen() {
+        // A file's old life sealed at gen 1 (999 tokens); it was deleted
+        // and rediscovered at gen 0 with its own, unrelated total (7).
+        // Both generations' lines still sit in `days.jsonl` — gen 1's
+        // because nothing physically removes a merely-not-live line on
+        // its own, gen 0's because it is the file's current, correct
+        // life. Deleting the file *again*, this time out of its gen-0
+        // life, must not let its day lines fall back to whichever
+        // generation number happens to be numerically largest.
+        let root = tmpdir("prune-gen-root");
+        let dir = tmpdir("prune-gen-store");
+        let f = root.join("f.jsonl");
+        fs::write(&f, b"x").unwrap();
+        let key = f.to_string_lossy().into_owned();
+        let mut store = HistoryStore::open(&dir).unwrap();
+
+        let mut old_life = day(&key, 1, 999);
+        old_life.full = true;
+        store.append_days(&[old_life]).unwrap();
+        store
+            .state
+            .files
+            .insert(key.clone(), FileState::fresh("d".into(), 1, 1));
+        let mut new_life = day(&key, 0, 7);
+        new_life.full = true;
+        store.append_days(&[new_life]).unwrap();
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 7);
+
+        fs::remove_file(&f).unwrap();
+        assert_eq!(store.prune_missing_files(), 1);
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            7,
+            "the file's true last life (gen 0, 7) must survive its \
+             deletion, not the numerically larger but unrelated gen 1 (999)"
+        );
+        store.commit().unwrap();
+
+        drop(store);
+        let store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            7,
+            "the recorded prune generation must survive a reopen too"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_sealed_generation_above_current_does_not_hide_a_real_one_below() {
+        // Current gen 2, still mid-rescan (no seal yet). Gen 1
+        // legitimately sealed at 10 before the rewrite to gen 2. An
+        // ancient, unrelated life also left a sealed gen 5 sitting in
+        // `days.jsonl` (from some earlier delete-and-recreate). Its mere
+        // presence must not hide gen 1's seal: taking the plain maximum
+        // sealed generation over all of history would let gen 5 —
+        // irrelevant, above the file's current lineage — stand in for
+        // "the newest sealed generation" instead of gen 1, the real one.
+        let dir = tmpdir("stale-above-hides-real-below");
+        let mut store = HistoryStore::open(&dir).unwrap();
+
+        let mut ancient = day("/f", 5, 2);
+        ancient.full = true;
+        store.append_days(&[ancient]).unwrap();
+
+        let mut real_seal = day("/f", 1, 10);
+        real_seal.full = true;
+        store.append_days(&[real_seal]).unwrap();
+
+        let mut current = FileState::fresh("d".into(), 1, 1);
+        current.gen = 2;
+        store.state.files.insert("/f".to_string(), current);
+
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            10,
+            "gen 1's real seal must stand in while gen 2 is still \
+             mid-rescan, not be hidden by the ancient, irrelevant gen 5"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn live_and_droppable_never_overlap_across_every_generation_shape() {
         // The shapes a file's (current, sealed) generations can take:
         // steady state, a rescan in progress, a rescan just sealed, and a
@@ -1764,6 +2198,15 @@ mod tests {
         // disagree, but a shared shortcut computing the same wrong answer
         // twice would still pass this test only by accident, so every
         // shape is checked by hand.
+        //
+        // This is a structural guard on the two sets agreeing with each
+        // other, not a guarantee that what they agree on is correct: a
+        // `target_gen` that is shared and wrong would still pass here.
+        // `a_revoked_seal_does_not_resurrect_an_already_compacted_generation`
+        // is what pins the target's correctness across time — a
+        // generation's sealed status must not change once compaction has
+        // relied on it, which no single-call snapshot of these two sets
+        // can show.
         let dir = tmpdir("live-droppable-invariant");
         let mut store = HistoryStore::open(&dir).unwrap();
 

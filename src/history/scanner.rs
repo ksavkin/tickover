@@ -75,10 +75,11 @@ struct FileSig {
 /// same matcher `engine_logfile` uses) and extract new usage into `store`.
 ///
 /// `provider` is the manifest id stamped onto every record's bucket.
-/// `enabled` is every manifest id this tick considers enabled — used only
-/// to tell a live competitor for a claimed path from an owner that is no
-/// longer one of them (a removed or renamed manifest id, or one the user
-/// disabled). Returns early with `partial` once `deadline` passes.
+/// `known` is every manifest id the registry has — not only the ones
+/// enabled this run — used only to tell a live claim on a path from a
+/// stale one: an owner still in `known` keeps its claim even while
+/// disabled, and only an id that has actually been removed or renamed
+/// gives it up. Returns early with `partial` once `deadline` passes.
 pub fn scan_root(
     store: &mut HistoryStore,
     provider: &str,
@@ -86,7 +87,7 @@ pub fn scan_root(
     glob: &str,
     extractor: &dyn HistoryExtractor,
     deadline: Instant,
-    enabled: &std::collections::HashSet<&str>,
+    known: &std::collections::HashSet<&str>,
 ) -> ScanOutcome {
     let mut outcome = ScanOutcome::default();
     let files = collect(root, glob);
@@ -122,11 +123,15 @@ pub fn scan_root(
         // counted usage and drift to the newcomer, and the cursor the two
         // would share already sits wherever the owner left it, so the
         // newcomer could only ever read the tail the owner already read.
-        // A stored owner that is no longer in `enabled` is not a
-        // competitor at all — its manifest was removed, renamed, or
-        // disabled — so the claim is stale and this walk may take it over
-        // rather than leaving the path orphaned forever (nothing else
-        // ever revisits an old owner's stamp). An empty stored provider
+        // "Live" is judged against `known` — every manifest id the
+        // registry has, not merely the ones enabled this run: a provider
+        // a user merely toggled off for one tick is still a live
+        // competitor and keeps its claim, so that re-enabling it later
+        // hands the file straight back rather than finding some other
+        // provider quietly took it over the one run it was off. Only an
+        // owner that is not in `known` at all — a manifest actually
+        // removed or renamed — is stale enough to give up, since nothing
+        // else will ever revisit its stamp. An empty stored provider
         // predates the field and is simply claimed on first sight, the
         // same as a stale one. Read-checked first: a mutable handout
         // dirties `state` unconditionally (see `file_state_mut`'s own
@@ -137,14 +142,14 @@ pub fn scan_root(
         // needs nothing here either — `begin_file` below stamps it
         // correctly the moment it exists.
         match store.file_state(&sig.path).map(|st| st.provider.clone()) {
-            Some(owner) if owner.is_empty() || !enabled.contains(owner.as_str()) => {
+            Some(owner) if owner.is_empty() || !known.contains(owner.as_str()) => {
                 if let Some(st) = store.file_state_mut(&sig.path) {
                     st.provider = provider.to_string();
                 }
             }
             Some(owner) if owner != provider => {
                 outcome.claimed_by_another += 1;
-                continue; // claimed by a live competitor
+                continue; // claimed by a live (or merely disabled) competitor
             }
             _ => {}
         }
@@ -1254,7 +1259,9 @@ glob   = "{glob}"
             "*.jsonl",
         )];
         let mut store = HistoryStore::open(&dir).unwrap();
-        let _ = crate::history::scan_tick(&mut store, &manifests, &|_| BTreeMap::new());
+        let _ = crate::history::scan_tick(&mut store, &manifests, &only("claude"), &|_| {
+            BTreeMap::new()
+        });
         store.commit().unwrap();
 
         let path = dir.join("state.json");
@@ -1264,7 +1271,9 @@ glob   = "{glob}"
         // Nothing on disk changed since the first tick: every signature
         // still matches, and the tracked file still exists, so
         // `prune_missing_files` confirms nothing gone either.
-        let scans = crate::history::scan_tick(&mut store, &manifests, &|_| BTreeMap::new());
+        let scans = crate::history::scan_tick(&mut store, &manifests, &only("claude"), &|_| {
+            BTreeMap::new()
+        });
         assert_eq!(scans[0].outcome.files_scanned, 0, "nothing needed reading");
         store.commit().unwrap();
 
@@ -1288,7 +1297,9 @@ glob   = "{glob}"
         use std::io::Write as _;
         writeln!(f, "{}", claude_line("m1", 100, 40)).unwrap();
         drop(f);
-        let scans = crate::history::scan_tick(&mut store, &manifests, &|_| BTreeMap::new());
+        let scans = crate::history::scan_tick(&mut store, &manifests, &only("claude"), &|_| {
+            BTreeMap::new()
+        });
         assert_eq!(scans[0].outcome.files_scanned, 1);
         store.commit().unwrap();
         let changed_bytes = fs::read(&path).unwrap();
@@ -1302,13 +1313,17 @@ glob   = "{glob}"
     }
 
     #[test]
-    fn a_claim_from_a_no_longer_enabled_provider_is_released() {
-        // A manifest id can change (a rename) or the manifest can simply
-        // be disabled: either way its old claim on a path is stale, not a
-        // live competitor, and a differently-provider'd walk over the
-        // same path may take it over — otherwise nothing ever recovers
-        // it, and the file reads as permanently claimed by a provider
-        // that no longer exists.
+    fn a_claim_from_a_manifest_no_longer_in_the_registry_is_released() {
+        // A manifest id can be renamed or removed outright: either way
+        // its old claim on a path is stale, not a live one, and a
+        // differently-provider'd walk over the same path may take it
+        // over — otherwise nothing ever recovers it, and the file reads
+        // as permanently claimed by a provider that no longer exists. A
+        // manifest merely *disabled* for one run is a different case
+        // entirely — see
+        // `a_merely_disabled_providers_claim_is_not_taken_over` — because
+        // it still answers to `known`, built from the whole registry, not
+        // from what is enabled this tick.
         let root = tmpdir("stale-claim-root");
         let dir = tmpdir("stale-claim-store");
         fs::write(root.join("t.jsonl"), claude_line("m1", 100, 10) + "\n").unwrap();
@@ -1332,8 +1347,8 @@ glob   = "{glob}"
             "codex-old"
         );
 
-        // "codex-old" is no longer among the enabled manifests this
-        // tick — renamed to "codex-new", or disabled outright.
+        // "codex-old" is gone from the registry entirely — renamed to
+        // "codex-new", or removed outright.
         let mut f = fs::OpenOptions::new()
             .append(true)
             .open(root.join("t.jsonl"))
@@ -1367,6 +1382,106 @@ glob   = "{glob}"
     }
 
     #[test]
+    fn a_merely_disabled_providers_claim_is_not_taken_over() {
+        // A provider toggled off for one run is not gone from the
+        // registry — `known` still names it, because it is built from
+        // every manifest the registry has, not from what is enabled this
+        // tick. An overlapping root's differently-provider'd walk must
+        // still be refused, or re-enabling the true owner later would
+        // find its file quietly reassigned to whichever provider
+        // happened to scan it while it was off.
+        let root = tmpdir("disabled-claim-root");
+        let dir = tmpdir("disabled-claim-store");
+        fs::write(root.join("t.jsonl"), claude_line("m1", 100, 10) + "\n").unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let ex = crate::history::formats::claude::ClaudeExtractor;
+        let far = Instant::now() + Duration::from_secs(30);
+        // The registry still knows both ids even though only "grok" is
+        // enabled this tick — "claude" is merely toggled off, not gone.
+        let known = only("claude")
+            .into_iter()
+            .chain(only("grok"))
+            .collect::<std::collections::HashSet<&str>>();
+
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far, &known);
+        store.commit().unwrap();
+        let key = root.join("t.jsonl").to_string_lossy().into_owned();
+        assert_eq!(
+            store.file_state(Path::new(&key)).unwrap().provider,
+            "claude"
+        );
+
+        // "claude" is disabled this tick; only "grok" runs, and its root
+        // happens to overlap.
+        let outcome = scan_root(&mut store, "grok", &root, "*.jsonl", &ex, far, &known);
+        store.commit().unwrap();
+
+        assert_eq!(
+            store.file_state(Path::new(&key)).unwrap().provider,
+            "claude",
+            "a disabled provider's claim must survive a run it does not take part in"
+        );
+        assert_eq!(
+            outcome.claimed_by_another, 1,
+            "grok's skip must be visible, not silent"
+        );
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            100,
+            "the disabled owner's figure is unaffected by the other provider's pass"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_tick_must_be_given_the_registrys_known_ids_not_just_the_enabled_ones() {
+        // The bug this pins lives one level up from `scan_root`'s own
+        // ownership check: `scan_tick` must be handed `known` built from
+        // *every* manifest the registry has, never derived from its own
+        // `manifests` parameter — that parameter is already filtered to
+        // enabled manifests by both real callers, so building `known` from
+        // it would make a merely-disabled provider indistinguishable from
+        // a removed one and hand its claim away for the one tick it is
+        // off.
+        let root = tmpdir("registry-known-root");
+        let dir = tmpdir("registry-known-store");
+        fs::write(root.join("t.jsonl"), claude_line("m1", 100, 10) + "\n").unwrap();
+        let claude = history_manifest("claude", "claude-transcripts", &root, "*.jsonl");
+        let grok = history_manifest("grok", "claude-transcripts", &root, "*.jsonl");
+        let registry: std::collections::HashSet<&str> = ["claude", "grok"].into_iter().collect();
+
+        let mut store = HistoryStore::open(&dir).unwrap();
+        // Tick 1: both enabled — "claude" reaches the file first.
+        crate::history::scan_tick(
+            &mut store,
+            &[claude.clone(), grok.clone()],
+            &registry,
+            &|_| BTreeMap::new(),
+        );
+        store.commit().unwrap();
+        let key = root.join("t.jsonl").to_string_lossy().into_owned();
+        assert_eq!(
+            store.file_state(Path::new(&key)).unwrap().provider,
+            "claude"
+        );
+
+        // Tick 2: "claude" is disabled for this run alone — only "grok" is
+        // in the manifests this tick scans — but the registry (and so
+        // `known`) still names both.
+        crate::history::scan_tick(&mut store, &[grok], &registry, &|_| BTreeMap::new());
+        store.commit().unwrap();
+
+        assert_eq!(
+            store.file_state(Path::new(&key)).unwrap().provider,
+            "claude",
+            "a provider disabled for one tick must not lose its claim"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_differently_resolved_root_between_ticks_does_not_prune_a_files_state() {
         // The panel and `tickover stats` can resolve the same provider's
         // root differently across processes (a different `CODEX_HOME` or
@@ -1382,7 +1497,9 @@ glob   = "{glob}"
         let mut store = HistoryStore::open(&dir).unwrap();
 
         let manifest_a = history_manifest("claude", "claude-transcripts", &root_a, "*.jsonl");
-        let _ = crate::history::scan_tick(&mut store, &[manifest_a], &|_| BTreeMap::new());
+        let _ = crate::history::scan_tick(&mut store, &[manifest_a], &only("claude"), &|_| {
+            BTreeMap::new()
+        });
         store.commit().unwrap();
         let a_key = root_a.join("a.jsonl").to_string_lossy().into_owned();
         assert!(store.file_state(Path::new(&a_key)).is_some());
@@ -1391,7 +1508,9 @@ glob   = "{glob}"
         // root — a different environment, not a manifest edit — and
         // scans that instead.
         let manifest_b = history_manifest("claude", "claude-transcripts", &root_b, "*.jsonl");
-        let _ = crate::history::scan_tick(&mut store, &[manifest_b], &|_| BTreeMap::new());
+        let _ = crate::history::scan_tick(&mut store, &[manifest_b], &only("claude"), &|_| {
+            BTreeMap::new()
+        });
         store.commit().unwrap();
 
         assert!(

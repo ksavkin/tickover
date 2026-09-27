@@ -193,12 +193,18 @@ its own and exists only for the flock below:
   whose every record failed to parse is not empty; its older lines
   hold the only copy of that usage.
 - `state.json` — per-file cursor, size/mtime, prefix digest (with the
-  span it covered), owning provider, generation, a recent dedup ring
-  that remembers the usage each id last carried, the extractor's
-  persisted `aux` (Grok's session map, Codex's turn context and
-  cumulative baseline, Antigravity's `max_idx` watermark and WAL
-  signature), plus a global dedup ring for ids that can appear in more
-  than one file. The per-file rings persist across commits on purpose:
+  span it covered), owning provider, generation, the highest generation
+  ever sealed by a `full` line, a recent dedup ring that remembers the
+  usage each id last carried, the extractor's persisted `aux` (Grok's
+  session map, Codex's turn context and cumulative baseline,
+  Antigravity's `max_idx` watermark and WAL signature), a global dedup
+  ring for ids that can appear in more than one file, plus one entry per
+  recently pruned path recording the generation it was tracked at when
+  its cursor entry was removed (see the pruning paragraph below). The
+  sealed-generation mark is what lets a later reopen still know a
+  generation was once sealed even after the specific line that recorded
+  it has been superseded and dropped from memory — re-deriving it fresh
+  from `days.jsonl` alone cannot survive that. The per-file rings persist across commits on purpose:
   a provider can re-log an id at a later byte offset (Claude rewrites an
   assistant message as it streams), and the ring is the only thing that
   recognizes the repeat on a later pass. A re-emission that carries a
@@ -206,16 +212,19 @@ its own and exists only for the flock below:
   mark of the id *within its owning file* (a regressed snapshot never
   lowers the baseline, and a duplicate sighted by a second file is
   skipped outright rather than delta'd). A path's owning provider is a
-  claim against every *currently enabled* manifest: if a second
-  manifest's root also reaches the same path (no shipped pair overlaps,
-  but a user's own manifest can), the walk that finds the path already
-  owned by a live competitor skips it outright rather than taking over
-  its cursor — the two providers would otherwise share one cursor, and
-  whichever scanned last would silently attribute the file's whole
-  history to itself. An owner that is no longer among the enabled
-  manifest ids (renamed, removed, or disabled) is not a live competitor,
-  so the claim is stale and the walk that reaches the path takes it
-  over instead of leaving it orphaned forever. A `state.json` written by
+  claim against every id the registry has, not only the ones enabled
+  this run: if a second manifest's root also reaches the same path (no
+  shipped pair overlaps, but a user's own manifest can), the walk that
+  finds the path already owned skips it outright rather than taking
+  over its cursor — the two providers would otherwise share one cursor,
+  and whichever scanned last would silently attribute the file's whole
+  history to itself. This holds even while the owner is disabled: a
+  provider toggled off for one run keeps its claim, so re-enabling it
+  later hands the file straight back rather than finding some other
+  provider quietly took it over the run it was off. Only an owner whose
+  id the registry no longer has at all (renamed or actually removed) is
+  stale, and only then does the walk that reaches the path take it over
+  instead of leaving it orphaned forever. A `state.json` written by
   a *newer* build is a downgrade, not corruption: it is left exactly
   where it is and this run starts empty instead, so the newer build
   finds its own file intact next time — this run remembers nothing
@@ -230,7 +239,7 @@ its own and exists only for the flock below:
 The whole open→scan→commit sequence runs under a `flock` on a `lock`
 file in the same directory, so the tray app and `tickover stats` can
 never interleave writes. After each scan, an entry leaves `state.json`
-only once `stat`ing its exact path confirms `NotFound` — never merely
+once `stat`ing its exact path confirms `NotFound` — never merely
 because no root this process resolved reached it this tick. The panel
 and `tickover stats` can resolve the same provider's root differently
 (a different `CODEX_HOME` or `CLAUDE_CONFIG_DIR` in one environment),
@@ -238,14 +247,19 @@ and pruning by "no active root reaches this path" let one process's
 tick drop state the other still needed; confirming against the
 filesystem itself needs no notion of roots, and both processes agree on
 what it says. A path a symlink has replaced (dangling or not) counts as
-gone too — the scan never follows symlinks and never re-offers one, so
-leaving its entry in place would strand it exactly like a deletion would.
-Any other outcome — the path exists as a regular file, or `stat` fails
-some other way (an unreadable root, an unmounted volume, a permission
-failure) — keeps the entry. Their day lines stay counted regardless, and
-a path that is recreated later rescans into place via range
-supersession. The sweep itself runs at most once per store instance, not
-once per scan tick — the same eight-tick loop that resumes a cold scan
+gone too — a successful `stat` reporting anything other than a regular
+file removes the entry exactly the same way, since the scan never
+follows symlinks and never re-offers one, so leaving its entry in place
+would strand it exactly like a deletion would. Any other outcome — the
+path exists as a regular file, or `stat` fails some other way (an
+unreadable root, an unmounted volume, a permission failure) — keeps the
+entry. Their day lines stay counted regardless, at the generation the
+path was tracked at when it was pruned (recorded into `state.json`
+rather than re-derived, since a later, unrelated generation can sit
+higher in `days.jsonl` without being more recent), and a path that is
+recreated later rescans into place via range supersession. The sweep
+itself runs at most once per store instance, not once per scan tick —
+the same eight-tick loop that resumes a cold scan
 would otherwise pay a `stat` per tracked entry up to eight times over for
 no new answer.
 
@@ -280,8 +294,31 @@ Several edges are accepted rather than chased:
   droppable (nothing has sealed a generation *past* it — the lower
   current one doesn't count): compaction keeps it, doing nothing,
   until the file's fresh life reaches and reseals past it in turn.
-  Bounded to one retained generation per such incident, and it never
-  contributes to any total in the meantime.
+  Bounded to one retained generation per such incident, and it does
+  not contribute to any total while the path stays tracked, or once it
+  is pruned by `prune_missing_files` (which records the path's
+  generation at removal for exactly this reason). A path whose
+  `state.files` entry disappears some other way — nothing in this
+  codebase does that outside tests — loses that protection and falls
+  back to the newest surviving generation `days.jsonl` happens to
+  contain, stale or not.
+- **A generation's seal survives the line that recorded it.** Sealing
+  is a fact about a generation reaching the end of its source, not
+  about the one line that happened to say so — a later same-bucket
+  line can still supersede that specific line by the ordinary overlap
+  rule (a crash-then-deadline retry re-reads the same bytes and
+  legitimately wins), but the generation itself is remembered as sealed
+  regardless, on the tracked `FileState` itself
+  (`sealed_through`), not only re-derived from whatever `days.jsonl`
+  still holds: a fact re-derived fresh on every call cannot survive a
+  reopen landing right after the seal's own line dies, because the
+  load path drops a dead row from memory before anything gets to read
+  `full` off it. What the generation *counts* is only whatever
+  currently survives at it, so the superseded seal's own tokens are
+  gone with it — narrow, and bounded to that one crash-plus-truncated-
+  retry sequence — but no amount of this can send a live figure back to
+  a generation compaction has already dropped, which is the property
+  this exists to hold.
 - **Owner-rewrite loses a shared id.** If a dedup id lives in two
   files, the first file to see it owns it; if that file is later
   rewritten without it, the second file has already moved past the

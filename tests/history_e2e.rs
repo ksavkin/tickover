@@ -163,9 +163,10 @@ fn scan_then_query_matches_the_fixture() {
         manifest("claude", "claude-transcripts", &claude_root, "**/*.jsonl"),
         manifest("codex", "codex-rollouts", &codex_root, "rollout-*.jsonl"),
     ];
+    let known: std::collections::HashSet<&str> = manifests.iter().map(|m| m.id.as_str()).collect();
     let mut store = HistoryStore::open(&store_dir).unwrap();
 
-    let scans = scan_tick(&mut store, &manifests, &|_| BTreeMap::new());
+    let scans = scan_tick(&mut store, &manifests, &known, &|_| BTreeMap::new());
     assert_eq!(scans.len(), 2, "both providers scanned");
     for s in &scans {
         assert!(!s.root_missing, "{} fixture root missing", s.provider);
@@ -193,7 +194,7 @@ fn scan_then_query_matches_the_fixture() {
     assert_eq!(cx.cache_read, 3000);
 
     // A second tick rescans nothing new and counts nothing twice.
-    let scans = scan_tick(&mut store, &manifests, &|_| BTreeMap::new());
+    let scans = scan_tick(&mut store, &manifests, &known, &|_| BTreeMap::new());
     for s in &scans {
         assert!(!s.root_missing);
     }
@@ -226,8 +227,9 @@ fn nothing_but_usage_metadata_leaves_the_extractor() {
         manifest("claude", "claude-transcripts", &claude_root, "**/*.jsonl"),
         manifest("codex", "codex-rollouts", &codex_root, "rollout-*.jsonl"),
     ];
+    let known: std::collections::HashSet<&str> = manifests.iter().map(|m| m.id.as_str()).collect();
     let mut store = HistoryStore::open(&store_dir).unwrap();
-    let scans = scan_tick(&mut store, &manifests, &|_| BTreeMap::new());
+    let scans = scan_tick(&mut store, &manifests, &known, &|_| BTreeMap::new());
     store.commit().unwrap();
 
     // The positive control: prove the scan actually extracted usage before
@@ -302,8 +304,9 @@ fn a_rewritten_file_replaces_its_contribution() {
         &root,
         "**/*.jsonl",
     )];
+    let known: std::collections::HashSet<&str> = manifests.iter().map(|m| m.id.as_str()).collect();
     let one_pass = |store: &mut HistoryStore| {
-        let _ = scan_tick(store, &manifests, &|_| BTreeMap::new());
+        let _ = scan_tick(store, &manifests, &known, &|_| BTreeMap::new());
         store.commit().unwrap();
     };
     let mut store = HistoryStore::open(&store_dir).unwrap();
@@ -347,8 +350,9 @@ fn a_state_loss_rebuild_does_not_double_count() {
         &root,
         "**/*.jsonl",
     )];
+    let known: std::collections::HashSet<&str> = manifests.iter().map(|m| m.id.as_str()).collect();
     let mut store = HistoryStore::open(&store_dir).unwrap();
-    let _ = scan_tick(&mut store, &manifests, &|_| BTreeMap::new());
+    let _ = scan_tick(&mut store, &manifests, &known, &|_| BTreeMap::new());
     store.commit().unwrap();
     let before: u64 = store.live_days().map(|d| d.sum()).sum();
     assert!(before > 0);
@@ -356,7 +360,7 @@ fn a_state_loss_rebuild_does_not_double_count() {
     // Lose the state file entirely — the rebuild path.
     fs::remove_file(store_dir.join("state.json")).unwrap();
     let mut store = HistoryStore::open(&store_dir).unwrap();
-    let _ = scan_tick(&mut store, &manifests, &|_| BTreeMap::new());
+    let _ = scan_tick(&mut store, &manifests, &known, &|_| BTreeMap::new());
     // Same-process read, before any reopen — the doubling window.
     let after: u64 = store.live_days().map(|d| d.sum()).sum();
     assert_eq!(
@@ -424,12 +428,15 @@ glob   = "rollout-{{option.enabled}}-*.jsonl"
         root = toml_escaped_path(&root),
     );
     let m = PluginManifest::from_str(&text).unwrap_or_else(|e| panic!("fixture manifest: {e}"));
+    let known: std::collections::HashSet<&str> = std::iter::once(m.id.as_str()).collect();
 
     let on_dir = tmpdir("option-glob-store-on");
     let mut store_on = HistoryStore::open(&on_dir).unwrap();
     let mut on = BTreeMap::new();
     on.insert("enabled".to_string(), true);
-    let scans = scan_tick(&mut store_on, std::slice::from_ref(&m), &|_| on.clone());
+    let scans = scan_tick(&mut store_on, std::slice::from_ref(&m), &known, &|_| {
+        on.clone()
+    });
     assert!(!scans[0].root_missing);
     assert_eq!(
         scans[0].outcome.files_seen, 1,
@@ -442,7 +449,9 @@ glob   = "rollout-{{option.enabled}}-*.jsonl"
     let mut store_off = HistoryStore::open(&off_dir).unwrap();
     let mut off = BTreeMap::new();
     off.insert("enabled".to_string(), false);
-    let scans = scan_tick(&mut store_off, std::slice::from_ref(&m), &|_| off.clone());
+    let scans = scan_tick(&mut store_off, std::slice::from_ref(&m), &known, &|_| {
+        off.clone()
+    });
     assert_eq!(
         scans[0].outcome.files_seen, 0,
         "a mismatched substituted glob must find nothing"
