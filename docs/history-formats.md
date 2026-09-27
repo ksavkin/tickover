@@ -205,16 +205,60 @@ its own and exists only for the flock below:
   larger count emits only its growth — totals converge on the high-water
   mark of the id *within its owning file* (a regressed snapshot never
   lowers the baseline, and a duplicate sighted by a second file is
-  skipped outright rather than delta'd).
+  skipped outright rather than delta'd). A path's owning provider is a
+  permanent, first-come claim: if a second manifest's root also reaches
+  the same path (no shipped pair overlaps, but a user's own manifest
+  can), the walk that finds the path already owned skips it outright
+  rather than taking over its cursor — the two providers would
+  otherwise share one cursor, and whichever scanned last would silently
+  attribute the file's whole history to itself. A `state.json` written
+  by a *newer* build is a downgrade, not corruption: it is left exactly
+  where it is and this run starts empty instead, so the newer build
+  finds its own file intact next time — this run remembers nothing
+  across restarts until then. An older or unreadable file is
+  quarantined to `state.corrupt-<epoch>.json`, keeping only the most
+  recent handful so repeated incidents don't accumulate one file per
+  run forever.
 
 The whole open→scan→commit sequence runs under a `flock` on a `lock`
 file in the same directory, so the tray app and `tickover stats` can
-never interleave writes. Entries under none of the active history roots
-are pruned after each scan — their day lines stay counted, and a path
-that re-enters a root rescans into place via range supersession.
+never interleave writes. After each scan, an entry leaves `state.json`
+only once `stat`ing its exact path confirms `NotFound` — never merely
+because no root this process resolved reached it this tick. The panel
+and `tickover stats` can resolve the same provider's root differently
+(a different `CODEX_HOME` or `CLAUDE_CONFIG_DIR` in one environment),
+and pruning by "no active root reaches this path" let one process's
+tick drop state the other still needed; confirming against the
+filesystem itself needs no notion of roots, and both processes agree on
+what it says. Any other outcome — the path exists, or `stat` fails some
+other way (an unreadable root, an unmounted volume, a permission
+failure) — keeps the entry. Their day lines stay counted regardless,
+and a path that is recreated later rescans into place via range
+supersession.
 
-Four edges are accepted rather than chased:
+Several edges are accepted rather than chased:
 
+- **A path claimed by one provider is invisible to a second.** No
+  shipped pair of manifests has overlapping roots, but a user's own
+  manifest can, or an unset `CLAUDE_CONFIG_DIR` resolving to the
+  current directory can. Whichever provider's walk reaches a path first
+  owns it for good; a second provider whose root also reaches it reads
+  nothing from that path, ever — not zero-then-recovering, permanently
+  zero. Bounded to the pathological case of two enabled manifests
+  actually sharing a root.
+- **A file outside every enabled root, but not yet deleted, keeps its
+  cursor.** Pruning confirms deletion against the filesystem rather
+  than a resolved root list, so a manifest edit that narrows a
+  provider's search (`~/.grok` → `~/.grok/logs`) no longer drops the
+  file it stopped walking — the entry sits in `state.json`,
+  unreachable, until the file itself is actually deleted. The cost is
+  one stale cursor per abandoned path, not a miscount.
+- **A provider whose log only ever grows is not size-bounded.**
+  Compaction rewrites `days.jsonl` past a size threshold, but only
+  lines a rewrite has made genuinely dead ever leave. A provider that
+  never rewrites its own log — new hours, sessions or models, never a
+  stale generation — has nothing to drop, and the file keeps growing
+  past the threshold on every future check.
 - **Owner-rewrite loses a shared id.** If a dedup id lives in two
   files, the first file to see it owns it; if that file is later
   rewritten without it, the second file has already moved past the

@@ -101,23 +101,33 @@ pub fn scan_root(
             (0, 0, 0)
         };
 
-        // Stamp the owning provider before the unchanged check can skip —
-        // the query layer attributes drift counts (and any future
-        // per-file figure) to a provider through it. Read-checked first: a
-        // mutable handout dirties `state` unconditionally (see
-        // `file_state_mut`'s own doc), and this runs for every file on
-        // every pass — a file whose provider already matches (every
-        // unchanged file, every pass after the first) must not force a
-        // `state.json` rewrite just for having been looked at. A file not
-        // yet in `state.files` at all needs nothing here either —
-        // `begin_file` below stamps it correctly the moment it exists.
-        if store
-            .file_state(&sig.path)
-            .is_some_and(|st| st.provider != provider)
-        {
-            if let Some(st) = store.file_state_mut(&sig.path) {
-                st.provider = provider.to_string();
+        // A path is keyed by itself alone, so the cursor belongs to
+        // whichever provider claimed it first — no shipped pair of roots
+        // overlaps, but a user's own manifest, or an unset
+        // `CLAUDE_CONFIG_DIR` resolving to the current directory, can hand
+        // the same path to a second provider's walk. Once claimed, a path
+        // stays claimed: flipping `provider` to whoever scanned it last
+        // would attribute the file's already-counted usage and drift to
+        // the newcomer, and the cursor the two would share already sits
+        // wherever the owner left it, so the newcomer could only ever
+        // read the tail the owner already read. An empty stored provider
+        // predates the field and is simply claimed on first sight.
+        // Read-checked first: a mutable handout dirties `state`
+        // unconditionally (see `file_state_mut`'s own doc), and this runs
+        // for every file on every pass — a file whose provider already
+        // matches (every unchanged file, every pass after the first) must
+        // not force a `state.json` rewrite just for having been looked
+        // at. A file not yet in `state.files` at all needs nothing here
+        // either — `begin_file` below stamps it correctly the moment it
+        // exists.
+        match store.file_state(&sig.path).map(|st| st.provider.clone()) {
+            Some(owner) if owner.is_empty() => {
+                if let Some(st) = store.file_state_mut(&sig.path) {
+                    st.provider = provider.to_string();
+                }
             }
+            Some(owner) if owner != provider => continue, // claimed by another provider
+            _ => {}
         }
 
         // Decide what this file needs. Three answers: nothing (unchanged),
@@ -172,8 +182,10 @@ pub fn scan_root(
             None => {
                 // No tracked state — either the file is genuinely new, or
                 // its state was dropped without its day lines dying (a
-                // manifest edit narrowing a root, `prune_files_outside`)
-                // and it is only now being rediscovered. Either way a new
+                // manifest edit narrowing a root leaves it unreachable but
+                // no longer pruned; `prune_missing_files` only drops a
+                // confirmed deletion) and it is only now being
+                // rediscovered. Either way a new
                 // life begins for it at generation 0, cursor 0: exactly
                 // when any ownership it held in a previous life goes
                 // stale. Releasing it here, rather than at the prune, is
@@ -807,6 +819,50 @@ mod tests {
     }
 
     #[test]
+    fn a_file_claimed_by_one_provider_is_refused_to_another() {
+        // Two manifests with overlapping roots (no shipped pair does this,
+        // but a user's own manifest can) can offer the same path to a
+        // second provider's scan. The path's cursor already sits at EOF
+        // from the first provider's pass, so the second provider gains
+        // nothing by touching it — but the owning stamp must not flip to
+        // it either, or the file's already-counted usage reads as the
+        // second provider's from here on.
+        let root = tmpdir("shared-root");
+        let dir = tmpdir("shared-store");
+        fs::write(root.join("t.jsonl"), claude_line("m1", 100, 10) + "\n").unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let ex = crate::history::formats::claude::ClaudeExtractor;
+        let far = Instant::now() + Duration::from_secs(30);
+
+        scan_root(&mut store, "claude", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 100);
+
+        // A second, differently-provider'd walk reaches the same file.
+        scan_root(&mut store, "codex", &root, "*.jsonl", &ex, far);
+        store.commit().unwrap();
+
+        let key = root.join("t.jsonl").to_string_lossy().into_owned();
+        let st = store.file_state(Path::new(&key)).unwrap();
+        assert_eq!(
+            st.provider, "claude",
+            "ownership must not flip to whoever scanned it last"
+        );
+        assert_eq!(
+            store.live_days().filter(|d| d.provider == "codex").count(),
+            0,
+            "the non-owning provider must not claim any of the file's coverage"
+        );
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            100,
+            "the owner's count is unaffected by the second provider's pass"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_failed_append_retries_the_file_in_full() {
         // If `days.jsonl` can't be written, nothing may move: cursor,
         // dedup rings and the global ring all gate the retry — a mark
@@ -1055,7 +1111,7 @@ glob   = "{glob}"
         // The store's dirty flag only pays off if the scanner stops
         // reaching for a mutable `FileState` merely to look at one: a tick
         // that changes nothing (every file's signature already matches,
-        // `prune_files_outside` removes nothing) must not rewrite
+        // `prune_missing_files` confirms nothing gone) must not rewrite
         // `state.json` at all, while a tick that does change a file must.
         let root = tmpdir("ticksave-root");
         let dir = tmpdir("ticksave-store");
@@ -1075,8 +1131,8 @@ glob   = "{glob}"
         let before_bytes = fs::read(&path).unwrap();
 
         // Nothing on disk changed since the first tick: every signature
-        // still matches, and the manifest's root is unchanged, so
-        // `prune_files_outside` finds nothing outside it either.
+        // still matches, and the tracked file still exists, so
+        // `prune_missing_files` confirms nothing gone either.
         let scans = crate::history::scan_tick(&mut store, &manifests, &|_| BTreeMap::new());
         assert_eq!(scans[0].outcome.files_scanned, 0, "nothing needed reading");
         store.commit().unwrap();
@@ -1111,6 +1167,43 @@ glob   = "{glob}"
         );
 
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_differently_resolved_root_between_ticks_does_not_prune_a_files_state() {
+        // The panel and `tickover stats` can resolve the same provider's
+        // root differently across processes (a different `CODEX_HOME` or
+        // `CLAUDE_CONFIG_DIR` in one of the two environments) while
+        // sharing one store. A tick that happens to resolve a different
+        // root must not read the other resolution's still-existing file
+        // as gone.
+        let root_a = tmpdir("resolve-a-root");
+        let root_b = tmpdir("resolve-b-root");
+        let dir = tmpdir("resolve-store");
+        fs::write(root_a.join("a.jsonl"), claude_line("m1", 100, 10) + "\n").unwrap();
+        fs::write(root_b.join("b.jsonl"), claude_line("m2", 50, 5) + "\n").unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+
+        let manifest_a = history_manifest("claude", "claude-transcripts", &root_a, "*.jsonl");
+        let _ = crate::history::scan_tick(&mut store, &[manifest_a], &|_| BTreeMap::new());
+        store.commit().unwrap();
+        let a_key = root_a.join("a.jsonl").to_string_lossy().into_owned();
+        assert!(store.file_state(Path::new(&a_key)).is_some());
+
+        // A later tick resolves the same provider id to a *different*
+        // root — a different environment, not a manifest edit — and
+        // scans that instead.
+        let manifest_b = history_manifest("claude", "claude-transcripts", &root_b, "*.jsonl");
+        let _ = crate::history::scan_tick(&mut store, &[manifest_b], &|_| BTreeMap::new());
+        store.commit().unwrap();
+
+        assert!(
+            store.file_state(Path::new(&a_key)).is_some(),
+            "a.jsonl still exists on disk — a different root resolution must not prune it"
+        );
+        let _ = fs::remove_dir_all(&root_a);
+        let _ = fs::remove_dir_all(&root_b);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1184,15 +1277,18 @@ glob   = "{glob}"
     #[test]
     fn a_pruned_files_from_scratch_rescan_recovers_its_own_ids() {
         // Ingest a file across two passes, then drop its state the way a
-        // manifest edit that narrows a root does (`prune_files_outside`
-        // without any change to the file itself). A rescan starts the file
-        // over from byte zero, but its *second* pass still resumes
-        // mid-file (`resume_from > 0`) — exactly the shape the ordinary
-        // rewrite path's `ring_evicted_self` exception was built for, so
-        // unless the file's stale ownership is released the moment
-        // `begin_file` gives it a fresh life, that pass reads its own
-        // already-owned ids as duplicates, seals over the line that held
-        // them, and the tokens vanish for good.
+        // manifest edit that narrows a provider's root can leave it —
+        // unreachable by that provider's own walk, but the file itself
+        // untouched (`prune_missing_files` no longer drops this case; the
+        // state is removed here directly to reach the same starting
+        // point). A rescan starts the file over from byte zero, but its
+        // *second* pass still resumes mid-file (`resume_from > 0`) —
+        // exactly the shape the ordinary rewrite path's
+        // `ring_evicted_self` exception was built for, so unless the
+        // file's stale ownership is released the moment `begin_file`
+        // gives it a fresh life, that pass reads its own already-owned
+        // ids as duplicates, seals over the line that held them, and the
+        // tokens vanish for good.
         let root = tmpdir("prune-rescan-root");
         let dir = tmpdir("prune-rescan-store");
         fs::write(root.join("t.jsonl"), "0123456789abcdef").unwrap();
@@ -1211,7 +1307,8 @@ glob   = "{glob}"
             "first(10) + second(20)"
         );
 
-        store.prune_files_outside(&[]);
+        let key = root.join("t.jsonl").to_string_lossy().into_owned();
+        store.state_mut().files.remove(&key);
         store.commit().unwrap();
 
         scan_root(&mut store, "p", &root, "*.jsonl", &ex, far);
@@ -1228,7 +1325,7 @@ glob   = "{glob}"
 
     #[test]
     fn pruning_one_file_leaves_another_files_ownership_alone() {
-        // `prune_files_outside` touches no ring entry at all — a and b's
+        // Dropping a file's state touches no ring entry at all — a and b's
         // ownership of an unrelated id must survive dropping c's state
         // exactly as if c had never existed for the ring's purposes.
         let root = tmpdir("prune-xfile-root");
@@ -1249,7 +1346,7 @@ glob   = "{glob}"
 
         // Drop only c.jsonl's state — a and b are untouched.
         let c_key = root.join("c.jsonl").to_string_lossy().into_owned();
-        store.prune_files_outside(&[root.join("a.jsonl"), root.join("b.jsonl")]);
+        store.state_mut().files.remove(&c_key);
         store.commit().unwrap();
         assert!(store.file_state(Path::new(&c_key)).is_none());
 
@@ -1313,7 +1410,7 @@ glob   = "{glob}"
             (kept_key, owner_key)
         };
         let kept_dir = Path::new(&kept_key).parent().unwrap().to_path_buf();
-        store.prune_files_outside(std::slice::from_ref(&kept_dir));
+        store.state_mut().files.remove(&owner_key);
         store.commit().unwrap();
         assert!(store.file_state(Path::new(&owner_key)).is_none());
         assert!(store.file_state(Path::new(&kept_key)).is_some());
