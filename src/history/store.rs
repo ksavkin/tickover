@@ -154,9 +154,14 @@ pub struct FileState {
     /// before anything gets a chance to notice it was ever `full` —
     /// there is no line left to read `full` from at all. This field is
     /// the fact surviving in a *second* place on purpose: it is written
-    /// once, monotonically, the moment a `full` line is folded in, and
-    /// [`Self::reset`] does not clear it — a rewrite bumping the
-    /// generation is exactly when the older generation's sealed-ness
+    /// monotonically, the moment a `full` line is folded in, capped at
+    /// [`Self::gen`] so a relic day line from an unrelated earlier life
+    /// (delete-and-recreate, a schema rebuild, a downgrade) can never
+    /// raise it — `open` parses `state.json`, and so this file's current
+    /// `gen`, before it ever folds a single line of `days.jsonl`, so that
+    /// cap is live on every reopen, not only the pass that first wrote
+    /// the value. [`Self::reset`] does not clear it — a rewrite bumping
+    /// the generation is exactly when the older generation's sealed-ness
     /// still matters.
     #[serde(default)]
     pub sealed_through: Option<u32>,
@@ -291,18 +296,23 @@ pub struct ScannerState {
     /// a restart can't reissue a batch id older lines already carry.
     #[serde(default)]
     pub next_batch: u64,
-    /// The generation a path was tracked at the moment
-    /// [`HistoryStore::prune_missing_files`] removed its `files` entry.
-    /// `days.jsonl` alone cannot tell a file recreated at a lower
-    /// generation from one whose higher-numbered history simply predates
-    /// it — both look like "the biggest generation this path has ever
-    /// recorded" to a reader with no other information — so the one
-    /// moment that does know which generation was truly current writes it
-    /// down here before the entry disappears. Cleared the moment the path
+    /// The generation a path had already *resolved to*
+    /// ([`HistoryStore::target_gen`]) the moment
+    /// [`HistoryStore::prune_missing_files`] removed its `files` entry —
+    /// not the raw tracked `gen`, which on its own would silently discard
+    /// whatever [`FileState::sealed_through`] was holding the figure back
+    /// to (a rewrite whose rescan had not produced anything yet, held at
+    /// its last sealed generation). `days.jsonl` alone cannot tell a file
+    /// recreated at a lower generation from one whose higher-numbered
+    /// history simply predates it — both look like "the biggest
+    /// generation this path has ever recorded" to a reader with no other
+    /// information — so the one moment that does know which generation
+    /// was truly current writes the already-resolved answer down here
+    /// before the entry, and the fact it depended on, disappears. A path
+    /// that no longer exists can never move again, so this number is
+    /// permanent for as long as the entry is. Cleared the moment the path
     /// is tracked again (`begin_file`): a live `files` entry is always
-    /// the more accurate source once one exists, and leaving stale
-    /// entries behind would grow this map exactly the way pruning
-    /// `files` itself was meant to stop.
+    /// the more accurate source once one exists.
     #[serde(default)]
     pub pruned_generations: BTreeMap<String, u32>,
 }
@@ -762,13 +772,24 @@ impl HistoryStore {
             // Recorded on the tracked `FileState` itself, monotonically —
             // see [`FileState::sealed_through`] for why a fact derived
             // fresh from `days.jsonl` on every call is not enough to
-            // survive a reopen on its own. Untracked or pruned paths have
-            // nowhere to record this and don't need to: `target_gen`'s
-            // untracked arm has no notion of a sealed generation to defer
-            // to in the first place. Only marked dirty when the value
-            // actually moves — this runs on every `full` line folded,
-            // including every unchanged reload of an already-sealed file.
+            // survive a reopen on its own. Capped at the file's own
+            // current generation, `st.gen`: `open` parses `state.json`
+            // before it folds `days.jsonl`, so a file is already tracked
+            // by the time this runs on the load loop, and a line whose
+            // `gen` exceeds `st.gen` can only be a relic of an earlier,
+            // unrelated life (delete-and-recreate, a schema rebuild, a
+            // downgrade) — the same relic [`Self::generation_maps`]'s own
+            // walk excludes. Without this cap here, that relic would be
+            // absorbed into the persisted high-water mark on every single
+            // reopen, permanently, since this path runs on every load —
+            // not merely once, the way appending the relic live would.
+            // Only marked dirty when the value actually moves — this runs
+            // on every `full` line folded, including every unchanged
+            // reload of an already-sealed file.
             let sealed_grew = self.state.files.get_mut(&d.file).is_some_and(|st| {
+                if d.gen > st.gen {
+                    return false;
+                }
                 let merged = st.sealed_through.map_or(d.gen, |s| s.max(d.gen));
                 let grew = st.sealed_through != Some(merged);
                 st.sealed_through = Some(merged);
@@ -1254,10 +1275,12 @@ impl HistoryStore {
         // seal's own line can die to an ordinary supersession, and if that
         // coincides with a reopen, `open`'s load-time cleanup drops the
         // now-dead row before any fresh derivation would ever see it was
-        // `full`. The seeded value needs no cap against `current` the way
-        // the walk's own contributions do: it was written at the moment
-        // that generation *was* current, so it can never be a relic of an
-        // unrelated later life the way a raw `days.jsonl` maximum can.
+        // `full`. The seeded value needs no cap against `current` here the
+        // way the walk's own contributions do below: `fold_line` already
+        // refuses to raise `sealed_through` past the file's own tracked
+        // `gen` at the point it is written (a relic day line above it is
+        // exactly the case that cap exists for), so by the time it lands
+        // in `state.files` it is already `<= current[file]`.
         let mut sealed_gen: HashMap<&str, u32> = self
             .state
             .files
@@ -1545,10 +1568,27 @@ impl HistoryStore {
         if gone.is_empty() {
             return 0;
         }
+        // Each swept path's resolved *target*, not its raw tracked `gen`
+        // — computed now, while the path is still tracked, because this
+        // is the last moment anything can compute it: `sealed_through`
+        // disappears the instant its `FileState` does. A file that no
+        // longer exists can never move again, so recording where it had
+        // already resolved to is exactly what stays true forever; the
+        // raw `gen` alone would silently discard whatever `sealed_through`
+        // was holding it back to. `generation_maps` borrows `&self`, so
+        // every target is read into an owned `Vec` before the removal
+        // loop below takes `&mut self.state.files`.
+        let maps = self.generation_maps();
+        let targets: Vec<(String, u32)> = gone
+            .iter()
+            .filter_map(|p| Self::target_gen(&maps, p).map(|g| (p.clone(), g)))
+            .collect();
+        drop(maps);
         for p in &gone {
-            if let Some(st) = self.state.files.remove(p) {
-                self.state.pruned_generations.insert(p.clone(), st.gen);
-            }
+            self.state.files.remove(p);
+        }
+        for (p, g) in targets {
+            self.state.pruned_generations.insert(p, g);
         }
         self.mark_state_dirty();
         gone.len()
@@ -2154,6 +2194,69 @@ mod tests {
     }
 
     #[test]
+    fn a_swept_files_held_figure_survives_the_sweep_that_drops_it() {
+        // Gen 0 seals at 10; a crash-then-deadline retry supersedes the
+        // seal's own line, so the honest figure is 3. A rewrite moves the
+        // file to gen 1, whose rescan has not produced anything yet, so
+        // the figure holds at 3 via `sealed_through = Some(0)` while the
+        // file stays tracked. The file is then deleted. Recording the raw
+        // tracked `gen` (1) at prune time would throw the held figure
+        // away — gen 1 has nothing in it — so `prune_missing_files` must
+        // record the *resolved target* (0), not the tracked generation.
+        let root = tmpdir("swept-held-root");
+        let dir = tmpdir("swept-held-store");
+        let f = root.join("f.jsonl");
+        fs::write(&f, b"x").unwrap();
+        let key = f.to_string_lossy().into_owned();
+        let mut store = HistoryStore::open(&dir).unwrap();
+
+        let mut sealed0 = day(&key, 0, 10);
+        sealed0.full = true;
+        sealed0.lo = 0;
+        sealed0.hi = 20;
+        store.append_days(&[sealed0]).unwrap();
+        store
+            .state
+            .files
+            .insert(key.clone(), FileState::fresh("d".into(), 1, 1));
+
+        let mut retry = day(&key, 0, 3);
+        retry.lo = 0;
+        retry.hi = 15;
+        store.append_days(&[retry]).unwrap();
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 3);
+
+        store.file_state_mut(&f).unwrap().reset("d2".into(), 2, 2);
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            3,
+            "held at gen 0's figure while gen 1 has not sealed anything"
+        );
+
+        // The file vanishes while still tracked at the unsealed gen 1.
+        fs::remove_file(&f).unwrap();
+        assert_eq!(store.prune_missing_files(), 1);
+        let swept = store.live_days().map(|d| d.input).sum::<u64>();
+        assert_eq!(
+            swept, 3,
+            "the file's held figure must survive the sweep, not fall to \
+             gen 1's empty generation just because that was the raw \
+             tracked value"
+        );
+        store.commit().unwrap();
+
+        drop(store);
+        let store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            3,
+            "the recorded target must survive a reopen too"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_stale_sealed_generation_above_current_does_not_hide_a_real_one_below() {
         // Current gen 2, still mid-rescan (no seal yet). Gen 1
         // legitimately sealed at 10 before the rewrite to gen 2. An
@@ -2163,6 +2266,14 @@ mod tests {
         // sealed generation over all of history would let gen 5 —
         // irrelevant, above the file's current lineage — stand in for
         // "the newest sealed generation" instead of gen 1, the real one.
+        //
+        // The reopen is load-bearing, not decoration: `open` parses
+        // `state.json` (gen 2) before it ever folds a single line of
+        // `days.jsonl`, so the file is already tracked by the time the
+        // ancient gen-5 line folds. Without a cap where `sealed_through`
+        // is written, that fold would absorb gen 5 into the persisted
+        // high-water mark on this very reopen — this test caught exactly
+        // that with only the walk capped and the write path left open.
         let dir = tmpdir("stale-above-hides-real-below");
         let mut store = HistoryStore::open(&dir).unwrap();
 
@@ -2178,11 +2289,27 @@ mod tests {
         current.gen = 2;
         store.state.files.insert("/f".to_string(), current);
 
+        let in_mem = store.live_days().map(|d| d.input).sum::<u64>();
+        assert_eq!(
+            in_mem, 10,
+            "gen 1's real seal must stand in while gen 2 is still \
+             mid-rescan, not be hidden by the ancient, irrelevant gen 5"
+        );
+
+        store.commit().unwrap();
+        drop(store);
+        let store = HistoryStore::open(&dir).unwrap();
         assert_eq!(
             store.live_days().map(|d| d.input).sum::<u64>(),
             10,
-            "gen 1's real seal must stand in while gen 2 is still \
-             mid-rescan, not be hidden by the ancient, irrelevant gen 5"
+            "the reload folds the ancient gen-5 line while the file is \
+             already tracked at gen 2 — it must not be absorbed into \
+             sealed_through and hide gen 1's real seal on this pass"
+        );
+        assert_eq!(
+            store.file_state(Path::new("/f")).unwrap().sealed_through,
+            Some(1),
+            "sealed_through must record gen 1, not the relic gen 5"
         );
         let _ = fs::remove_dir_all(&dir);
     }

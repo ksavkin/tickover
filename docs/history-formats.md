@@ -199,12 +199,25 @@ its own and exists only for the flock below:
   session map, Codex's turn context and cumulative baseline,
   Antigravity's `max_idx` watermark and WAL signature), a global dedup
   ring for ids that can appear in more than one file, plus one entry per
-  recently pruned path recording the generation it was tracked at when
-  its cursor entry was removed (see the pruning paragraph below). The
-  sealed-generation mark is what lets a later reopen still know a
-  generation was once sealed even after the specific line that recorded
-  it has been superseded and dropped from memory — re-deriving it fresh
-  from `days.jsonl` alone cannot survive that. The per-file rings persist across commits on purpose:
+  pruned path recording the generation its figure had already resolved
+  to (not the raw tracked generation, which would discard whatever the
+  sealed-generation mark was holding it back to) at the moment its
+  cursor entry was removed — see the pruning paragraph below. Nothing
+  expires this map: a path that is deleted and never comes back keeps
+  its entry forever, the same way `state.files` would have kept a
+  cursor forever without pruning, just at the cost of one integer
+  instead of a whole cursor. The sealed-generation mark is what lets a
+  later reopen still know a generation was once sealed even after the
+  specific line that recorded it has been superseded and dropped from
+  memory — re-deriving it fresh from `days.jsonl` alone cannot survive
+  that reopen. The two marks differ in one more way: a build without
+  them that opens a state file carrying both and then commits drops
+  both silently (its own `FileState`/`ScannerState` shapes have nowhere
+  to put them) — but the sealed-generation mark self-heals the next
+  time a build that knows it reopens, re-derived from whatever `full`
+  lines `days.jsonl` still holds, while the pruned-path mark does not:
+  once it is gone, the ambiguity it existed to resolve is back. The
+  per-file rings persist across commits on purpose:
   a provider can re-log an id at a later byte offset (Claude rewrites an
   assistant message as it streams), and the ring is the only thing that
   recognizes the repeat on a later pass. A re-emission that carries a
@@ -265,14 +278,18 @@ no new answer.
 
 Several edges are accepted rather than chased:
 
-- **A path claimed by one provider is invisible to a second.** No
-  shipped pair of manifests has overlapping roots, but a user's own
-  manifest can, or an unset `CLAUDE_CONFIG_DIR` resolving to the
-  current directory can. Whichever provider's walk reaches a path first
-  owns it for good; a second provider whose root also reaches it reads
-  nothing from that path, ever — not zero-then-recovering, permanently
-  zero. Bounded to the pathological case of two enabled manifests
-  actually sharing a root.
+- **A path claimed by one provider is invisible to a second, for as
+  long as the claim stays live.** No shipped pair of manifests has
+  overlapping roots, but a user's own manifest can, or an unset
+  `CLAUDE_CONFIG_DIR` resolving to the current directory can. Whichever
+  provider's walk reaches a path first owns it — disabling it for a run
+  does not release the claim (see the `state.json` bullet above) — and
+  a second provider whose root also reaches it reads nothing from that
+  path, not zero-then-recovering but zero for as long as the first
+  provider's id stays in the registry. The claim does move, the one way
+  it can: if that id is later renamed or actually removed, the next
+  walk to reach the path takes it over. Bounded to the pathological
+  case of two enabled manifests actually sharing a root.
 - **A file outside every enabled root, but not yet deleted, keeps its
   cursor.** Pruning confirms deletion against the filesystem rather
   than a resolved root list, so a manifest edit that narrows a
@@ -294,14 +311,20 @@ Several edges are accepted rather than chased:
   droppable (nothing has sealed a generation *past* it — the lower
   current one doesn't count): compaction keeps it, doing nothing,
   until the file's fresh life reaches and reseals past it in turn.
-  Bounded to one retained generation per such incident, and it does
-  not contribute to any total while the path stays tracked, or once it
-  is pruned by `prune_missing_files` (which records the path's
-  generation at removal for exactly this reason). A path whose
-  `state.files` entry disappears some other way — nothing in this
-  codebase does that outside tests — loses that protection and falls
-  back to the newest surviving generation `days.jsonl` happens to
-  contain, stale or not.
+  It does not contribute to any total while the path stays tracked, or
+  once it is pruned by `prune_missing_files` (which records the path's
+  *resolved* generation at removal for exactly this reason, not the
+  raw tracked one). Bounded to one retained generation per such
+  incident, but not to zero cost: that generation's lines are never
+  compacted away either, for as long as this file's fresh life hasn't
+  sealed past them — a permanent, if small, amount of disk space paid
+  per incident, not nothing. The protection needs a `files` entry or a
+  `pruned_generations` one to hang off; a path with neither — the
+  `SCHEMA_VERSION` rebuild or downgrade named above empties `files`
+  wholesale rather than one path at a time, and neither writes a
+  `pruned_generations` entry for what it empties — falls back to the
+  newest surviving generation `days.jsonl` happens to contain, stale or
+  not, same as data from before either field existed.
 - **A generation's seal survives the line that recorded it.** Sealing
   is a fact about a generation reaching the end of its source, not
   about the one line that happened to say so — a later same-bucket
@@ -318,7 +341,31 @@ Several edges are accepted rather than chased:
   gone with it — narrow, and bounded to that one crash-plus-truncated-
   retry sequence — but no amount of this can send a live figure back to
   a generation compaction has already dropped, which is the property
-  this exists to hold.
+  this exists to hold. The mark is capped at the file's own current
+  generation the moment it is written, not only when it is read: `open`
+  parses `state.json` before it folds a single line of `days.jsonl`, so
+  a file is already tracked by the time the load loop reaches a relic
+  line from an unrelated earlier life, and without that cap the relic
+  would be absorbed into the persisted mark on every single reopen —
+  not once, the way appending it live would cost, but permanently.
+- **A file deleted and recreated at the same path can seal away its own
+  previous life's held figure.** `begin_file` always starts a
+  rediscovered path at generation 0, the same number its previous life
+  started at — nothing here reads `pruned_generations` to pick a
+  number the old life never used. So when the new life's first pass
+  reaches the end of the (new, unrelated) file and writes its own `full`
+  line at generation 0, that line's from-origin seal reaches every older
+  line of `(file, 0)` it does not recognize as its own prefix chain —
+  which includes the previous life's generation-0 lines, since their
+  byte range has nothing to do with the new file's. They are marked
+  dead in the same pass, and the figure `pruned_generations` was holding
+  for them is gone the moment that seal lands. Pre-existing — the same
+  `(path, generation)` identity that lets an honest rescan supersede its
+  own prior pass is what a delete-and-recreate collides with — and not
+  addressed here: fixing it would mean `begin_file` consulting
+  `pruned_generations` to start a recreated path above its previous
+  life's held generation instead of at 0, which is a real change to a
+  function several other passages here depend on staying simple.
 - **Owner-rewrite loses a shared id.** If a dedup id lives in two
   files, the first file to see it owns it; if that file is later
   rewritten without it, the second file has already moved past the

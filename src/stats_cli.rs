@@ -100,6 +100,7 @@ fn run(output: Output, manifests: Vec<PluginManifest>) -> i32 {
     // other provider this run does scan.
     let known_ids: Vec<String> = manifests.iter().map(|m| m.id.clone()).collect();
     let known: std::collections::HashSet<&str> = known_ids.iter().map(String::as_str).collect();
+    let registry_size = manifests.len();
     // A provider the user disabled keeps its history files untouched and
     // drops out of the report entirely — same filter the tray scan
     // applies in `spawn_history_scan`.
@@ -107,6 +108,14 @@ fn run(output: Output, manifests: Vec<PluginManifest>) -> i32 {
         .into_iter()
         .filter(crate::plugin_enabled)
         .collect();
+    // If a later edit ever moved `known_ids`/`known` below this filter,
+    // this only fails once something is actually disabled — the same
+    // condition the bug itself needs to show up — but that is exactly
+    // when it matters.
+    debug_assert!(
+        known.len() == registry_size,
+        "known must mirror the full registry, taken before the enabled filter above"
+    );
     let Some(dir) = tickover::history::default_dir() else {
         eprintln!("tickover stats: no config directory on this platform");
         return 1;

@@ -6434,6 +6434,17 @@ fn spawn_history_scan(ctx: &Ctx) {
     // it can move into the scan thread with `manifests`.
     let known: std::collections::HashSet<String> =
         ctx.plugins.borrow().iter().map(|m| m.id.clone()).collect();
+    // If a later edit ever moved this below the enabled filter (deriving
+    // `known` from `manifests` instead of the full registry), a provider
+    // disabled this run would silently disappear from `known` too, and a
+    // live claim on a path a differently-provider'd walk also reaches
+    // would go stale and get taken over for no reason. This only catches
+    // the mistake when something is actually disabled, the same as the
+    // bug itself only shows up then.
+    debug_assert!(
+        ctx.plugins.borrow().iter().all(|m| known.contains(&m.id)),
+        "known must mirror the full registry, taken before the enabled filter below"
+    );
     let manifests: Vec<PluginManifest> = ctx
         .plugins
         .borrow()
