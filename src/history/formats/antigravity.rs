@@ -39,6 +39,11 @@ use crate::history::formats::{Extraction, HistoryExtractor};
 use crate::history::store::FileState;
 use crate::history::UsageRecord;
 
+/// A `gen_metadata.data` blob refused past this size — the other
+/// extractors cap a line at the same width; a generation whose usage
+/// message needs more than this is not one this parser trusts.
+const MAX_BLOB_BYTES: usize = 4 * 1024 * 1024;
+
 pub struct AntigravityExtractor;
 
 impl HistoryExtractor for AntigravityExtractor {
@@ -122,6 +127,14 @@ impl HistoryExtractor for AntigravityExtractor {
             };
             if idx > max_idx {
                 max_idx = idx;
+            }
+            if blob.len() > MAX_BLOB_BYTES {
+                // Past the cap the same way a decode failure is: skipped
+                // permanently — the watermark has already stepped past it
+                // above, so a single bloated row can't wedge every row
+                // after it, and it isn't re-fetched next pass either.
+                out.skipped_unparsed += 1;
+                continue;
             }
             match parse_generation(&blob) {
                 Gen::Record {
@@ -280,46 +293,63 @@ fn session_project(conn: &Connection) -> String {
 
 // ---- minimal protobuf wire decoder -------------------------------------
 
-/// Iterate a blob's fields as `(field_number, wire_type, value)` — varint
-/// fields yield the decoded u64, length-delimited fields yield the bytes;
-/// fixed32/64 are skipped over. Decoding stops at the first malformed tag.
-fn fields(blob: &[u8]) -> Vec<(u64, u8, Field<'_>)> {
-    let mut out = Vec::new();
-    let mut pos = 0;
-    while pos < blob.len() {
+/// Iterate a blob's fields lazily as `(field_number, wire_type, value)` —
+/// varint fields yield the decoded u64, length-delimited fields yield the
+/// bytes; fixed32/64 are skipped over without yielding. Decoding stops for
+/// good at the first malformed tag. Lazy on purpose: `parse_generation`
+/// calls this several times over the same blob to pick out a handful of
+/// fields, and a caller's `find_map` for an early field number should
+/// never have to materialise the rest, or scan past it, to get there.
+fn fields(blob: &[u8]) -> impl Iterator<Item = (u64, u8, Field<'_>)> + '_ {
+    let mut pos = 0usize;
+    std::iter::from_fn(move || loop {
+        if pos >= blob.len() {
+            return None;
+        }
         let Some((tag, p)) = read_varint(blob, pos) else {
-            break;
+            pos = blob.len();
+            return None;
         };
         pos = p;
         let (field, wire) = (tag >> 3, (tag & 7) as u8);
         if field == 0 {
-            break;
+            pos = blob.len();
+            return None;
         }
         match wire {
             0 => match read_varint(blob, pos) {
                 Some((v, p)) => {
-                    out.push((field, wire, Field::Varint(v)));
                     pos = p;
+                    return Some((field, wire, Field::Varint(v)));
                 }
-                None => break,
+                None => {
+                    pos = blob.len();
+                    return None;
+                }
             },
             1 if pos + 8 <= blob.len() => pos += 8,
             2 => match read_varint(blob, pos) {
                 Some((len, p)) => {
                     let (start, end) = (p, p.saturating_add(len as usize));
                     if end > blob.len() {
-                        break;
+                        pos = blob.len();
+                        return None;
                     }
-                    out.push((field, wire, Field::Bytes(&blob[start..end])));
                     pos = end;
+                    return Some((field, wire, Field::Bytes(&blob[start..end])));
                 }
-                None => break,
+                None => {
+                    pos = blob.len();
+                    return None;
+                }
             },
             5 if pos + 4 <= blob.len() => pos += 4,
-            _ => break,
+            _ => {
+                pos = blob.len();
+                return None;
+            }
         }
-    }
-    out
+    })
 }
 
 enum Field<'a> {
@@ -744,6 +774,59 @@ mod tests {
             .extract(&db, &dir, &mut st, u64::MAX, far)
             .unwrap();
         assert!(out.records.is_empty() && out.complete);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_oversized_blob_is_skipped_not_parsed() {
+        // The other extractors cap a line's byte size before parsing it;
+        // a `gen_metadata.data` blob had no such limit at all.
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-agy-oversized-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("conv.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
+                [],
+            )
+            .unwrap();
+            let huge = vec![0u8; MAX_BLOB_BYTES + 1];
+            conn.execute(
+                "INSERT INTO gen_metadata (idx, data) VALUES (0, ?1)",
+                [huge],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+                [generation_blob_keyed(b"dedup-1")],
+            )
+            .unwrap();
+        }
+        let size = std::fs::metadata(&db).unwrap().len();
+        let mut st = FileState::fresh("d".into(), size, 1);
+        let far = Instant::now() + std::time::Duration::from_secs(30);
+        let out = AntigravityExtractor
+            .extract(&db, &dir, &mut st, u64::MAX, far)
+            .unwrap();
+        assert_eq!(
+            out.records.len(),
+            1,
+            "the oversized row is skipped, the next one still reads"
+        );
+        assert_eq!(out.skipped_unparsed, 1);
+        assert_eq!(
+            st.aux["max_idx"].as_i64(),
+            Some(1),
+            "the watermark steps past it too"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

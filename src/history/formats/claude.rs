@@ -89,8 +89,11 @@ struct CacheCreation {
 
 impl Usage {
     /// Cache-write tokens, whichever shape the line carried. The nested
-    /// `cache_creation` object (when present) already includes the flat
-    /// `cache_creation_input_tokens` figure, so it wins when both exist.
+    /// `cache_creation` breakdown, when it reports anything, already
+    /// includes what the flat `cache_creation_input_tokens` figure would
+    /// say, so it wins whenever its own ephemeral sum is nonzero; a
+    /// present-but-empty `cache_creation` (or none at all) falls back to
+    /// the flat field.
     fn cache_write(&self) -> u64 {
         match &self.cache_creation {
             Some(cc) if cc.ephemeral_5m_input_tokens + cc.ephemeral_1h_input_tokens > 0 => {

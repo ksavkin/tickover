@@ -85,10 +85,13 @@ usage event itself lacks them: `session created` carries `ctx.cwd`, and
 `model changed` carries `ctx.model`. The extractor collects both into a
 per-pass map and joins them onto the records.
 
-Mapping: `prompt_tokens` → `input`, `cached_prompt_tokens` → `cache_read`,
-`completion_tokens` → `output`, `reasoning_tokens` → `thinking`. Grok
-reports no cache-write class; `sessions/*/updates.jsonl` is a session
-protocol log and carries no token counts.
+Mapping: like Codex's OpenAI Responses shape, `prompt_tokens` is a
+superset that already includes the cached share, so the stored `input` is
+the uncached remainder (`prompt_tokens` minus `cached_prompt_tokens`);
+`cached_prompt_tokens` → `cache_read`, `completion_tokens` → `output`,
+`reasoning_tokens` → `thinking`. Grok reports no cache-write class;
+`sessions/*/updates.jsonl` is a session protocol log and carries no token
+counts.
 
 ## `antigravity-sqlite`
 
@@ -140,6 +143,17 @@ Whatever the format, the same rules apply at the store boundary:
   Codex on the session's cumulative counters, Antigravity on the
   protobuf's dedup key, Grok on event identity. A record with no key
   counts toward the file's drift tally instead of being guessed at.
+- **A record's year must fit four digits.** A garbled timestamp past
+  year 9999 would format a bucket key the query layer can never parse
+  back; it is dropped and counted toward the file's drift tally instead
+  of silently vanishing from every total. The JSONL formats already
+  refuse a timestamp string RFC 3339 can't parse; a raw numeric
+  timestamp (Antigravity's protobuf seconds) is the one path that still
+  needs this check.
+- **The cross-file dedup ring is bounded, not absolute.** Past its
+  capacity the oldest untouched id ages out; a record for it arriving
+  through a second file afterward is indistinguishable from a genuinely
+  new one and counts again.
 - **Rewritten files are rescanned whole.** A changed prefix digest marks
   the file's generation; the store replaces its derived records rather
   than adding to them. The reset also drops the file's global-ring
@@ -196,10 +210,11 @@ its own and exists only for the flock below:
   span it covered), owning provider, generation, the highest generation
   ever sealed by a `full` line, a recent dedup ring that remembers the
   usage each id last carried, the extractor's persisted `aux` (Grok's
-  session map, Codex's turn context and cumulative baseline,
-  Antigravity's `max_idx` watermark and WAL signature), a global dedup
-  ring for ids that can appear in more than one file, plus one entry per
-  pruned path recording the generation its figure had already resolved
+  session map, Codex's turn context and cumulative baseline, Antigravity's
+  `max_idx` watermark) plus the scanner's own WAL signature kept under the
+  same map, a global dedup ring for ids that can appear in more than one
+  file, plus one entry per pruned path recording the generation its
+  figure had already resolved
   to (not the raw tracked generation, which would discard whatever the
   sealed-generation mark was holding it back to) at the moment its
   cursor entry was removed — see the pruning paragraph below. Nothing

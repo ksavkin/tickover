@@ -37,6 +37,14 @@ const TABLE: &[(&str, Price)] = &[
     ("claude-3-5-sonnet", p(3.0, 15.0, 0.30, 3.75)),
     ("claude-3-5-haiku", p(0.80, 4.0, 0.08, 1.0)),
     ("claude-3-opus", p(15.0, 75.0, 1.50, 18.75)),
+    // Anthropic's 5-generation line, from claude.com/pricing (checked
+    // 2026-09). That page also lists a "Fable" tier (Fable 5, Fable
+    // 5.1) — left out on purpose: nothing here can confirm the API
+    // model-id slug a real transcript would carry for it, and a guessed
+    // prefix risks silently mispricing whatever model actually owns it.
+    ("claude-opus-5.5", p(4.0, 20.0, 0.20, 5.0)),
+    ("claude-opus-5", p(5.0, 25.0, 0.50, 6.25)),
+    ("claude-sonnet-5", p(2.0, 10.0, 0.20, 2.50)),
     // OpenAI / Codex — cached input ~0.10×, no write premium reported.
     ("gpt-5.2-codex", p(1.75, 14.0, 0.175, 1.75)),
     ("gpt-5.1-codex", p(1.25, 10.0, 0.125, 1.25)),
@@ -46,6 +54,11 @@ const TABLE: &[(&str, Price)] = &[
     ("gpt-5", p(1.25, 10.0, 0.125, 1.25)),
     ("codex-mini", p(1.50, 6.0, 0.375, 1.50)),
     ("o4-mini", p(1.10, 4.40, 0.275, 1.10)),
+    // o3-mini's cached-input rate is half off input, not the 75% off
+    // o4-mini gets — sharing "o3"'s row would price it at o3's full
+    // rate instead. From developers.openai.com/api/docs/pricing
+    // (checked 2026-09).
+    ("o3-mini", p(1.10, 4.40, 0.55, 1.10)),
     ("o3", p(2.0, 8.0, 0.50, 2.0)),
     // Grok — no cache split exposed.
     ("grok-4.5", p(3.0, 15.0, 0.30, 3.0)),
@@ -106,6 +119,17 @@ pub fn cost_for_models(models: &[(String, Totals)]) -> Option<f64> {
     any.then_some(sum)
 }
 
+/// Whether every model in `models` that carries any usage also has a
+/// listed price — `false` means [`cost_for_models`]'s sum leaves out at
+/// least one model's whole share, not merely a light one, so a caller
+/// showing that sum as a headline figure should mark it partial.
+pub fn fully_priced(models: &[(String, Totals)]) -> bool {
+    models
+        .iter()
+        .filter(|(_, t)| t.sum() > 0)
+        .all(|(m, _)| price_for(m).is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +161,67 @@ mod tests {
     #[test]
     fn unknown_model_is_none_not_zero() {
         assert_eq!(cost_usd("madeup-9000", &Totals::default()), None);
+    }
+
+    #[test]
+    fn o3_mini_prices_differently_from_o3() {
+        // A shared "o3" prefix would price o3-mini at o3's much higher
+        // rate — o3-mini's real cached-input discount is also half off,
+        // not the 75% off a bare `o4-mini`-shaped guess would apply.
+        let t = Totals {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 1_000_000,
+            cache_write: 0,
+            thinking: 0,
+            messages: 0,
+        };
+        let mini = cost_usd("o3-mini-2026-01-31", &t).unwrap();
+        let full = cost_usd("o3-2026-01-31", &t).unwrap();
+        assert!(mini < full, "mini={mini} full={full}");
+        // 1.10 (input) + 4.40 (output) + 0.55 (cache read) = 6.05
+        assert!((mini - 6.05).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_5_generation_claude_session_is_priced_not_left_at_nothing() {
+        let t = Totals {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 0,
+            cache_write: 0,
+            thinking: 0,
+            messages: 0,
+        };
+        assert!(cost_usd("claude-sonnet-5-20260915", &t).is_some());
+        assert!(cost_usd("claude-opus-5-20260915", &t).is_some());
+        assert!(cost_usd("claude-opus-5.5-20260915", &t).is_some());
+        // The longer prefix must win: Opus 5.5 is not priced as Opus 5.
+        let opus5 = cost_usd("claude-opus-5-20260915", &t).unwrap();
+        let opus55 = cost_usd("claude-opus-5.5-20260915", &t).unwrap();
+        assert_ne!(opus5, opus55);
+    }
+
+    #[test]
+    fn fully_priced_flags_an_unpriced_model_in_the_mix() {
+        let known = ("gpt-5.1".to_string(), Totals::default());
+        let unknown = ("claude-fable-5".to_string(), Totals::default());
+        let some_usage = Totals {
+            input: 100,
+            ..Totals::default()
+        };
+        assert!(
+            fully_priced(&[("gpt-5.1".to_string(), some_usage)]),
+            "every model with usage is priced"
+        );
+        assert!(
+            !fully_priced(&[
+                ("gpt-5.1".to_string(), some_usage),
+                ("claude-fable-5".to_string(), some_usage),
+            ]),
+            "an unpriced model carrying usage must flag the mix as partial"
+        );
+        // A model with no usage at all doesn't matter either way.
+        assert!(fully_priced(&[known, (unknown.0, Totals::default())]));
     }
 }

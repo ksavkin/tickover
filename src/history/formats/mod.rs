@@ -23,8 +23,11 @@ use crate::plugin::manifest::HistoryFormat;
 pub struct Extraction {
     /// Usage records found, in file order.
     pub records: Vec<UsageRecord>,
-    /// The new cursor position — a byte offset for line formats, a
-    /// timestamp watermark for SQLite. Only ever advances on success.
+    /// The new cursor position — a byte offset for line formats. SQLite's
+    /// real watermark is a row index kept in `st.aux` instead; this field
+    /// is `0` while a pass is incomplete and the source's byte size once
+    /// it has read to the end, so the scanner's unchanged check still has
+    /// a byte to compare. Only ever advances on success.
     pub cursor: u64,
     /// The `[lo, hi)` range these records were aggregated from — defaults
     /// to the byte range read (`resume_from..cursor`). A format whose
@@ -45,9 +48,10 @@ pub struct Extraction {
 /// One history format's parser. Implemented per provider file shape; the
 /// scanner calls it only for files whose signature changed.
 pub trait HistoryExtractor: Send + Sync {
-    /// Extract usage records from `path`, resuming at `st.cursor` (byte
-    /// offset for JSONL formats, ms-timestamp watermark for SQLite),
-    /// reading at most `byte_cap` new bytes and stopping at `deadline`.
+    /// Extract usage records from `path`, resuming at `st.cursor` for
+    /// JSONL formats (a byte offset) — SQLite ignores it and resumes from
+    /// its own row watermark in `st.aux` instead — reading at most
+    /// `byte_cap` new bytes and stopping at `deadline`.
     /// `st.aux` is the format's own persisted scratch space (cumulative
     /// baselines and the like); `st.recent_ids`/`st.gen` are the scanner's.
     /// `root` is the manifest's own configured root `path` was found

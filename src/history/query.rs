@@ -61,7 +61,11 @@ pub struct SessionStat {
     pub session: String,
     pub provider: String,
     pub project: String,
-    pub model: String,
+    /// Per-model totals inside this session — a mid-session model switch
+    /// means `totals` alone can't price the session at a single rate, so
+    /// pricing sums each model's own share instead of guessing which
+    /// bucket's model should stand for the whole session.
+    pub models: BTreeMap<String, Totals>,
     pub first_hour: String,
     pub last_hour: String,
     pub totals: Totals,
@@ -220,12 +224,13 @@ pub fn compute(
                 session: d.session.clone(),
                 provider: d.provider.clone(),
                 project: d.project.clone(),
-                model: d.model.clone(),
+                models: BTreeMap::new(),
                 first_hour: d.hour.clone(),
                 last_hour: d.hour.clone(),
                 totals: Totals::default(),
             });
         sess.totals.add(d);
+        sess.models.entry(d.model.clone()).or_default().add(d);
         if d.hour < sess.first_hour {
             sess.first_hour = d.hour.clone();
         }
@@ -357,7 +362,9 @@ pub enum PanelRange {
 /// Which face the Activity card shows — the design's three panel states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PanelState {
-    /// Store has never seen a record: ghosted sparkline, explainer copy.
+    /// No enabled provider has ever produced a record — either a genuine
+    /// first run, or every provider that could show one is currently
+    /// disabled: ghosted sparkline, explainer copy.
     #[default]
     FirstRun,
     /// History exists, but the selected range is empty: `0`, quiet copy,
@@ -624,11 +631,9 @@ fn last_seen(
     store
         .live_days()
         .filter(|d| enabled.contains(&d.provider) && d.has_activity())
-        .filter_map(|d| {
-            parse_bucket_hour(&d.hour).map(|h| (h, d.project.clone(), d.session.clone()))
-        })
+        .filter_map(|d| parse_bucket_hour(&d.hour).map(|h| (h, d.project.clone())))
         .max_by(|a, b| a.0.cmp(&b.0))
-        .map(|(h, project, _)| (h.with_timezone(&Local), project))
+        .map(|(h, project)| (h.with_timezone(&Local), project))
 }
 
 /// Whether `hour` has exactly the shape every bucket the scanner writes
@@ -694,7 +699,8 @@ fn bucket_counts(hour: &str, since: DateTime<Utc>, since_hour: &str) -> bool {
 /// store.
 pub fn window_tokens(store: &HistoryStore, provider: &str, since_unix: u64) -> Option<u64> {
     let since = Utc.timestamp_opt(since_unix as i64, 0).single()?;
-    if since >= Utc::now() {
+    let now = Utc::now();
+    if since >= now {
         return None;
     }
     let since_hour = since.format("%Y-%m-%dT%H").to_string();
@@ -702,6 +708,11 @@ pub fn window_tokens(store: &HistoryStore, provider: &str, since_unix: u64) -> O
         .live_days()
         .filter(|d| d.provider == provider)
         .filter(|d| bucket_counts(&d.hour, since, &since_hour))
+        // A bucket's hour can never be later than now: with no upper
+        // bound, one garbled future timestamp would inflate the burn
+        // figure for as long as it stays inside the window (the panel's
+        // `slot_of` bounds `PanelRange::Day` the same way).
+        .filter(|d| parse_bucket_hour(&d.hour).is_some_and(|h| h <= now))
         // Burn excludes cache reads — a resent context is not fresh spend.
         .map(|d| d.active())
         .sum();
@@ -936,6 +947,56 @@ mod tests {
     }
 
     #[test]
+    fn a_session_spanning_two_models_tracks_each_ones_own_totals() {
+        // A mid-session model switch must not collapse into a single
+        // `model` field that then prices every bucket at whichever model
+        // happened to log first — each model's own share stays separate.
+        let dir = tmpdir("session-model-mix");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let hour0 = (Utc::now() - Duration::hours(1))
+            .format("%Y-%m-%dT%H")
+            .to_string();
+        let hour1 = Utc::now().format("%Y-%m-%dT%H").to_string();
+        let mut first = line(&hour0, "claude", "p", 1_000_000);
+        first.model = "claude-opus-4".into();
+        let mut second = line(&hour1, "claude", "p", 1_000_000);
+        second.model = "claude-haiku-4".into();
+        store.append_days(&[first, second]).unwrap();
+        store.commit().unwrap();
+        let store = HistoryStore::open(&dir).unwrap();
+
+        let st = compute(&store, 30, &enabled_all());
+        assert_eq!(st.sessions.len(), 1, "one provider:session pair");
+        let sess = &st.sessions[0];
+        assert_eq!(
+            sess.models.len(),
+            2,
+            "both models the session used must be tracked separately"
+        );
+        assert_eq!(sess.models["claude-opus-4"].input, 1_000_000);
+        assert_eq!(sess.models["claude-haiku-4"].input, 1_000_000);
+        assert_eq!(
+            sess.totals.input, 2_000_000,
+            "the combined total still sums both"
+        );
+
+        // Pricing every token at the first bucket's model must differ from
+        // the correct per-model blend — opus and haiku are priced far
+        // enough apart that a mixed session can't land on the same figure
+        // either way by coincidence.
+        let models: Vec<(String, Totals)> =
+            sess.models.iter().map(|(m, t)| (m.clone(), *t)).collect();
+        let blended = crate::history::pricing::cost_for_models(&models).unwrap();
+        let priced_at_first_model_only =
+            crate::history::pricing::cost_usd("claude-opus-4", &sess.totals).unwrap();
+        assert!(
+            (blended - priced_at_first_model_only).abs() > 1.0,
+            "blended={blended} single-model={priced_at_first_model_only}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn empty_store_computes_to_zeros_not_a_crash() {
         let dir = tmpdir("empty");
         let store = HistoryStore::open(&dir).unwrap();
@@ -1068,5 +1129,34 @@ mod tests {
             assert_eq!(new, old, "since={since}");
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn window_tokens_ignores_a_bucket_dated_in_the_future() {
+        // A bucket whose hour is later than "now" cannot be real usage
+        // yet — without an upper bound, a single garbled future timestamp
+        // would inflate the burn figure for as long as it stays inside
+        // the window.
+        let dir = tmpdir("window-future");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let real_hour = Utc::now().format("%Y-%m-%dT%H").to_string();
+        let future_hour = (Utc::now() + Duration::days(3650))
+            .format("%Y-%m-%dT%H")
+            .to_string();
+        let real_line = line(&real_hour, "claude", "p", 100);
+        store
+            .append_days(&[
+                real_line.clone(),
+                line(&future_hour, "claude", "p", 5_000_000),
+            ])
+            .unwrap();
+        let since = (Utc::now() - Duration::hours(2)).timestamp() as u64;
+        let tokens = window_tokens(&store, "claude", since).unwrap_or(0);
+        assert_eq!(
+            tokens,
+            real_line.active(),
+            "the future-dated bucket must not inflate the window's burn"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -23,6 +23,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use chrono::Datelike;
+
 use crate::history::formats::HistoryExtractor;
 use crate::history::store::{DayLine, HistoryStore};
 
@@ -35,8 +37,9 @@ pub const SCAN_WALL_BUDGET: Duration = Duration::from_millis(2000);
 /// hold a scan hostage; the remainder is picked up by later passes.
 pub const PER_FILE_BYTE_CAP: u64 = 32 * 1024 * 1024;
 
-/// A file larger than this is still scanned, but in slices of
-/// [`PER_FILE_BYTE_CAP`] per pass.
+/// How many files one root can have tracked at once. [`collect`] sorts by
+/// mtime and keeps the newest; past this count, the oldest files are not
+/// tracked this run at all, not merely deferred to a later pass.
 pub const MAX_TRACKED_FILES: usize = 50_000;
 
 /// What a scan pass did — the observability `stats` reports.
@@ -46,7 +49,10 @@ pub struct ScanOutcome {
     pub files_seen: usize,
     /// Files actually read this pass.
     pub files_scanned: usize,
-    /// New bytes consumed across all files.
+    /// New bytes consumed across all files — for a completing SQLite pass
+    /// this is the source's whole size, not just its newly read rows,
+    /// since that format's real progress is a row watermark, not a byte
+    /// offset (see [`crate::history::formats::HistoryExtractor::extract`]).
     pub bytes_read: u64,
     /// Records accepted after dedup.
     pub records: usize,
@@ -277,6 +283,10 @@ pub fn scan_root(
         let mut grouped: BTreeMap<(String, String, String, String), DayLine> = BTreeMap::new();
         let mut seen_keys: Vec<(String, [u64; 5])> = Vec::new();
         let mut global_keys: Vec<String> = Vec::new();
+        // Records dropped here for a timestamp no bucket key can carry —
+        // folded into `skipped_unparsed` below so the drop is counted, not
+        // silent.
+        let mut bad_timestamps: u64 = 0;
         // Skipped repeats that still prove an id is live — applied as LRU
         // touches after the append succeeds, so an actively re-emitted id
         // can't be evicted while the provider is still writing it.
@@ -303,6 +313,17 @@ pub fn scan_root(
         for mut rec in extraction.records {
             if rec.provider.is_empty() {
                 rec.provider = provider.to_string();
+            }
+            // A year outside four zero-padded digits formats a bucket key
+            // wider or narrower than `"YYYY-MM-DDTHH"` — `parse_bucket_hour`
+            // rejects it on every future read, so the tokens would land on
+            // disk and then vanish from every total with no visible cause.
+            // The JSONL extractors already refuse a timestamp string RFC
+            // 3339 can't parse; this is the one path a raw numeric
+            // timestamp (Antigravity's protobuf seconds) can still reach.
+            if !(0..=9999).contains(&rec.ts.year()) {
+                bad_timestamps += 1;
+                continue;
             }
             let usage = [
                 rec.input,
@@ -424,6 +445,7 @@ pub fn scan_root(
             }
             outcome.records += 1;
         }
+        outcome.skipped_unparsed += bad_timestamps;
         buckets.extend(grouped.into_values());
         if source_empty && full && extraction.skipped_unparsed == 0 {
             // A complete pass over a source with *no records* still owns
@@ -473,7 +495,7 @@ pub fn scan_root(
             st.cursor = extraction.cursor;
             st.size = sig.size;
             st.mtime = sig.mtime;
-            st.skipped_unparsed += extraction.skipped_unparsed;
+            st.skipped_unparsed += extraction.skipped_unparsed + bad_timestamps;
             if extractor.watches_wal() {
                 st.aux.insert(
                     "wal".into(),
@@ -1140,6 +1162,72 @@ mod tests {
             store.live_days().count(),
             0,
             "skipped records are not an empty source — no tombstone line"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A record whose timestamp's year cannot fit `"YYYY-MM-DDTHH"` —
+    /// Antigravity's protobuf seconds are the one path that can still
+    /// produce this; the JSONL extractors already refuse a timestamp
+    /// string RFC 3339 can't parse.
+    struct FarFutureStub;
+    impl HistoryExtractor for FarFutureStub {
+        fn extract(
+            &self,
+            _path: &Path,
+            _root: &Path,
+            st: &mut FileState,
+            _byte_cap: u64,
+            _deadline: Instant,
+        ) -> io::Result<Extraction> {
+            Ok(Extraction {
+                records: vec![UsageRecord {
+                    ts: chrono::DateTime::from_timestamp(253_402_300_800, 0).unwrap(),
+                    provider: String::new(),
+                    project: "p".into(),
+                    session_id: "s".into(),
+                    model: "m".into(),
+                    input: 999,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    thinking: 0,
+                    dedup_key: "future".into(),
+                }],
+                cursor: st.size,
+                complete: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[test]
+    fn a_record_with_a_year_past_9999_is_dropped_and_counted_as_drift() {
+        let root = tmpdir("future-ts-root");
+        let dir = tmpdir("future-ts-store");
+        fs::write(root.join("t.jsonl"), "x").unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let far = Instant::now() + Duration::from_secs(30);
+
+        let outcome = scan_root(
+            &mut store,
+            "p",
+            &root,
+            "*.jsonl",
+            &FarFutureStub,
+            far,
+            &only("p"),
+        );
+        store.commit().unwrap();
+        assert_eq!(
+            store.live_days().count(),
+            0,
+            "a bucket key the query layer can never parse back must not be written"
+        );
+        assert_eq!(
+            outcome.skipped_unparsed, 1,
+            "the drop must be visible, not silent"
         );
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&dir);

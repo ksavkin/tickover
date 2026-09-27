@@ -44,8 +44,12 @@ pub const SCHEMA_VERSION: u32 = 2;
 const RECENT_IDS_PER_FILE: usize = 512;
 
 /// How many dedup keys the store remembers across files — larger than the
-/// per-file ring because it is the only guard against a record arriving
-/// via a second file on a later pass.
+/// per-file ring because this is what stands between a record and being
+/// recounted when it arrives via a second file on a later pass. Bounded,
+/// not absolute: a live re-sighting keeps an id touched indefinitely, but
+/// one that goes quiet for longer than this ring holds ages out, and a
+/// second file emitting it afterward is indistinguishable from a
+/// genuinely new record.
 const GLOBAL_RECENT_IDS: usize = 8192;
 
 /// `serde` default for `digest_len` on state written before the field
@@ -89,9 +93,12 @@ pub struct FileState {
     /// Modification time at last scan, seconds since the epoch.
     pub mtime: i64,
     /// How far this file has been consumed. The meaning belongs to the
-    /// format: a byte offset past the last complete line for JSONL, a
-    /// timestamp watermark (ms) for SQLite — either way it only ever moves
-    /// forward within one `gen`.
+    /// format: a byte offset past the last complete line for JSONL. SQLite
+    /// does not resume from here at all — Antigravity keeps its own row
+    /// watermark in `aux["max_idx"]` and only ever writes `0` (pass
+    /// incomplete) or `size` (pass reached the end) here, so the
+    /// scanner's unchanged check still has a byte-shaped answer to
+    /// compare. Either way it only ever moves forward within one `gen`.
     pub cursor: u64,
     /// blake2b hex of the file's first [`Self::digest_len`] bytes,
     /// recomputed when `mtime` moves — a changed prefix means the file was
@@ -102,6 +109,12 @@ pub struct FileState {
     /// this is the whole file, and it is what lets an *append* to such a
     /// file still verify as append — comparing a fixed 4 KiB prefix would
     /// re-digest the newly grown tail and look like a rewrite every pass.
+    /// Set once, at [`Self::fresh`] or [`Self::reset`], and never widened
+    /// on the append path that follows: a file first seen at 600 bytes
+    /// keeps a 600-byte rewrite-detection span for as long as it is
+    /// tracked, even long after it has grown past [`PREFIX_BYTES`] — only
+    /// a genuine rewrite (which calls [`Self::reset`]) re-measures it
+    /// against the file's current size.
     #[serde(default = "default_digest_len")]
     pub digest_len: u64,
     /// Incremented on every reset; [`DayLine::gen`] lines from an older
@@ -139,8 +152,10 @@ pub struct FileState {
     /// events lack `last_token_usage`, or the session-attribution map Grok
     /// needs once the `session created` lines are behind the cursor.
     /// `serde_json::Value` rather than a narrower shape: what a format
-    /// needs remembered is the format's business. Opaque to the store;
-    /// owned entirely by the extractor.
+    /// needs remembered is the format's business, and the store never
+    /// reads or interprets a key here. Not exclusively the extractor's,
+    /// though: the scanner keeps its own `"wal"` key alongside them, for
+    /// the signature a `watches_wal` format's unchanged check needs.
     #[serde(default)]
     pub aux: BTreeMap<String, serde_json::Value>,
     /// The highest generation of this file that a `full` line has ever
@@ -294,6 +309,11 @@ pub struct ScannerState {
     global_map: std::collections::HashMap<String, String>,
     /// Id the next `append_days` batch stamps on its lines — persisted so
     /// a restart can't reissue a batch id older lines already carry.
+    /// [`HistoryStore::open`] advances this in memory on every open, a
+    /// read-only session that never calls `append_days` included — a
+    /// harmless waste rather than a leak, since the value is a pure
+    /// function of `days.jsonl`'s own recorded ids and is never persisted
+    /// unless something else already dirties `state`.
     #[serde(default)]
     pub next_batch: u64,
     /// The generation a path had already *resolved to*
@@ -1080,8 +1100,6 @@ impl HistoryStore {
     }
 
     /// Append finished buckets to `days.jsonl` — the only write the log
-    /// ever takes between compactions.
-    /// Append finished buckets to `days.jsonl` — the only write the log
     /// ever takes between compactions. Each line is folded through the
     /// same dedup/supersession the load path applies, so the in-memory
     /// view never double-counts a re-append even before the next open.
@@ -1091,6 +1109,12 @@ impl HistoryStore {
         }
         let batch = self.state.next_batch;
         let mut accepted: Vec<(String, DayLine)> = Vec::with_capacity(new.len());
+        // Lines already queued earlier in this same call: a caller
+        // offering the same line twice in one batch must not slip past
+        // `seen_lines` just because neither copy has reached disk yet —
+        // both would otherwise carry the same fresh `b` and be accepted
+        // as each other's batch-mate rather than caught as a repeat.
+        let mut batch_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
         for d in new {
             let mut d = d.clone();
             d.b = batch;
@@ -1099,9 +1123,10 @@ impl HistoryStore {
             // A post-crash retry carries a fresh `b`, so it serializes
             // differently — but its identical range still supersedes the
             // copy that made it to disk, so the duplicate can't count.
-            if !self.seen_lines.contains(&line) {
-                accepted.push((line, d));
+            if self.seen_lines.contains(&line) || !batch_lines.insert(line.clone()) {
+                continue;
             }
+            accepted.push((line, d));
         }
         if accepted.is_empty() {
             return Ok(());
@@ -2520,6 +2545,27 @@ mod tests {
         assert_eq!(
             before, after,
             "state.json must be byte-identical after an all-duplicate append"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_identical_lines_offered_in_one_call_fold_only_once() {
+        // `seen_lines` guards a repeat across calls (see the test above);
+        // a caller offering the very same line twice inside one call must
+        // not slip past that guard just because neither copy is on disk
+        // yet — both would otherwise carry the same fresh `b` and count
+        // as each other's batch-mate.
+        let dir = tmpdir("dup-same-batch");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store
+            .append_days(&[day("/f", 0, 10), day("/f", 0, 10)])
+            .unwrap();
+        store.commit().unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            10,
+            "two identical lines in one batch must fold once, not twice"
         );
         let _ = fs::remove_dir_all(&dir);
     }

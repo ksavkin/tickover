@@ -408,17 +408,30 @@ fn headline(h: &mut String, st: &Stats, cost_on: bool) {
     let cost_card = if cost_on {
         let models: Vec<(String, Totals)> = st.models.clone();
         let v = pricing::cost_for_models(&models);
+        // A model this table doesn't know still contributed tokens the sum
+        // leaves out entirely — the headline must say so rather than let a
+        // partial total pass for the whole picture.
+        let partial = v.is_some() && !pricing::fully_priced(&models);
         (
             "EST. COST".to_string(),
             v.map(|x| {
-                if x >= 1000.0 {
+                let s = if x >= 1000.0 {
                     format!("${:.1}K", x / 1000.0)
                 } else {
                     format!("${x:.0}")
+                };
+                if partial {
+                    format!("{s}*")
+                } else {
+                    s
                 }
             })
             .unwrap_or_else(|| "—".into()),
-            "at list price".to_string(),
+            if partial {
+                "at list price, partial — unpriced models excluded".to_string()
+            } else {
+                "at list price".to_string()
+            },
         )
     } else {
         (
@@ -593,7 +606,7 @@ fn tools(h: &mut String, st: &Stats, cost_on: bool) {
 <span style="display: inline-flex; align-items: center; gap: 7px;"><span style="width: 12px; height: 9px; border-radius: 2px; background: var(--input);"></span>input</span>
 <span style="display: inline-flex; align-items: center; gap: 7px;"><span style="width: 12px; height: 9px; border-radius: 2px; background: var(--output);"></span>output</span>
 <span class="spacer"></span>
-<span>Codex reports no cache-write class; Antigravity folds reasoning into output.</span>
+<span>Grok and Antigravity report no cache-write class.</span>
 </div>
 </div></div>
 "#,
@@ -938,7 +951,11 @@ fn habits_and_sessions(h: &mut String, st: &Stats, cost_on: bool) {
             .map(|d| d.format("%d %b %Y").to_string())
             .unwrap_or_else(|| s.first_hour.clone());
         let cost = if cost_on {
-            fmt_usd(pricing::cost_usd(&s.model, &s.totals))
+            // Priced per model the session actually used, never a guessed
+            // blend at whichever model its first bucket happened to log.
+            let models: Vec<(String, Totals)> =
+                s.models.iter().map(|(m, t)| (m.clone(), *t)).collect();
+            fmt_usd(pricing::cost_for_models(&models))
         } else {
             "—".into()
         };

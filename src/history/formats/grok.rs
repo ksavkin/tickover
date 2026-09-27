@@ -8,9 +8,12 @@
 //! `model changed` carries `ctx.model` — both keyed by the same `sid`,
 //! applied to the turns that follow them.
 //!
-//! Mapping to the shared record: `prompt_tokens` → `input`,
-//! `cached_prompt_tokens` → `cache_read`, `completion_tokens` → `output`,
-//! `reasoning_tokens` → `thinking`. Grok reports no cache-write class.
+//! Mapping to the shared record: like Codex's OpenAI Responses shape,
+//! `prompt_tokens` is a superset that already includes the cached share —
+//! so `input` is the uncached remainder (`prompt_tokens` minus
+//! `cached_prompt_tokens`); `cached_prompt_tokens` → `cache_read`,
+//! `completion_tokens` → `output`, `reasoning_tokens` → `thinking`. Grok
+//! reports no cache-write class.
 
 use std::collections::HashMap;
 use std::io;
@@ -155,7 +158,7 @@ impl HistoryExtractor for GrokExtractor {
                             .clone()
                             .or_else(|| info.and_then(|i| i.model.clone()))
                             .unwrap_or_else(|| "unknown".into()),
-                        input: ctx.prompt_tokens,
+                        input: ctx.prompt_tokens.saturating_sub(ctx.cached_prompt_tokens),
                         output: ctx.completion_tokens,
                         cache_read: ctx.cached_prompt_tokens,
                         cache_write: 0,
@@ -234,13 +237,35 @@ mod tests {
             .unwrap();
         assert_eq!(ex.records.len(), 1);
         let r = &ex.records[0];
+        // `prompt_tokens` is a superset that already includes the cached
+        // share, so `input` is the uncached remainder: 1000 - 600 = 400.
         assert_eq!(
             (r.input, r.cache_read, r.output, r.thinking),
-            (1000, 600, 200, 50)
+            (400, 600, 200, 50)
         );
         assert_eq!(r.project, "proj");
         assert_eq!(r.model, "grok-4.5");
         assert_eq!(r.session_id, "s1");
+    }
+
+    #[test]
+    fn cached_prompt_tokens_are_not_double_counted_in_input() {
+        // `prompt_tokens` is a superset that already includes the cached
+        // share (the OpenAI Responses convention Codex also follows) — a
+        // wholly-cached turn must show zero fresh input, not the full
+        // prompt size again on top of `cache_read`.
+        let tmp = TmpDir::new("grok-cache-superset");
+        let content = concat!(
+            r#"{"ts":"2026-09-22T10:00:00.000Z","sid":"s1","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":800,"cached_prompt_tokens":800,"completion_tokens":50}}"#,
+            "\n"
+        );
+        let p = tmp.write("unified.jsonl", content);
+        let ex = GrokExtractor
+            .extract(&p, tmp.as_ref(), &mut fresh(), u64::MAX, later())
+            .unwrap();
+        assert_eq!(ex.records.len(), 1);
+        let r = &ex.records[0];
+        assert_eq!((r.input, r.cache_read), (0, 800));
     }
 
     #[test]
