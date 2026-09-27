@@ -33,16 +33,36 @@ pub fn plugins_dir() -> PathBuf {
         .join("plugins")
 }
 
-/// Write every file in `templates` into `dir`, returning the paths written.
+/// What one call to [`write_templates`] managed for each name it was asked
+/// to write: [`written`](Self::written) got the shipped content, everything
+/// else in [`failed`](Self::failed) did not, paired with why. Never claims
+/// more than it can back: a name only lands in `failed` once something has
+/// actually been tried and refused it, so an untried name is in neither
+/// list only when the whole call returned `Err` before reaching it.
+#[derive(Debug, Default)]
+pub struct SeedOutcome {
+    /// Paths written this call, with the shipped content now at each of
+    /// them.
+    pub written: Vec<PathBuf>,
+    /// Paths this call could not write, and the error that refused each.
+    pub failed: Vec<(PathBuf, std::io::Error)>,
+}
+
+/// Write every file in `templates` into `dir`.
 ///
-/// Two phases, in this order, so a failure anywhere leaves every path in
-/// `dir` — built-in or not, whether it existed before this call or not —
-/// exactly as it was, never deleted:
+/// Two phases, in this order:
 ///
 ///   1. Every destination has to be a plain file or nothing at all, checked
-///      up front for the *whole* batch via [`check_replaceable`] before a
-///      single byte is written anywhere.
-///   2. Every template's content is staged into a sibling temp file
+///      via [`check_replaceable`]. When `all_or_nothing` is set (every
+///      caller but [`seed_if_empty`]), a single refusal here aborts the
+///      whole call before a byte is written anywhere — see
+///      [`reseed_defaults`]'s own doc for why that all-or-nothing shape is
+///      the point there. Otherwise a refused name is set aside in the
+///      returned [`SeedOutcome::failed`] and every other name is still
+///      attempted; this is what lets one obstruction (a directory or
+///      symlink planted at a single built-in's name) leave the rest of a
+///      fresh install's seeding intact instead of withholding all of it.
+///   2. Every checked template's content is staged into a sibling temp file
 ///      (`<name>.tmp<pid>`, the same shape `main.rs`'s `update_write` uses),
 ///      then renamed over its real destination.
 ///
@@ -55,20 +75,32 @@ pub fn plugins_dir() -> PathBuf {
 /// outright — worse than either state the rollback was meant to prevent.
 /// Checking every destination before touching any of them removes the need
 /// for a rollback at all: by the time anything is renamed into place, every
-/// destination in the batch is already known to be safe.
-fn write_templates(dir: &Path, templates: &[(&str, &str)]) -> std::io::Result<Vec<PathBuf>> {
+/// destination being renamed is already known to be safe.
+fn write_templates(
+    dir: &Path,
+    templates: &[(&str, &str)],
+    all_or_nothing: bool,
+) -> std::io::Result<SeedOutcome> {
     std::fs::create_dir_all(dir)?;
 
-    for (name, _) in templates {
-        check_replaceable(&dir.join(name))?;
+    let mut outcome = SeedOutcome::default();
+    let mut checked: Vec<(&str, &str)> = Vec::with_capacity(templates.len());
+    for &(name, contents) in templates {
+        match check_replaceable(&dir.join(name)) {
+            Ok(()) => checked.push((name, contents)),
+            Err(e) if all_or_nothing => return Err(e),
+            Err(e) => outcome.failed.push((dir.join(name), e)),
+        }
     }
 
-    // Stage every template's content before renaming any of it into place —
-    // a failure here (disk full, permissions) has touched no real
+    // Stage every checked template's content before renaming any of it into
+    // place — a failure here (disk full, permissions) has touched no real
     // destination yet, so only the temp files this loop itself created need
-    // cleaning up.
-    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(templates.len());
-    for (name, contents) in templates {
+    // cleaning up. Unconditionally all-or-nothing regardless of the flag
+    // above: nothing has been renamed into place yet for any of them, so
+    // there is nothing partial to preserve by continuing past one.
+    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(checked.len());
+    for (name, contents) in &checked {
         let target = dir.join(name);
         match write_temp(&target, contents) {
             Ok(tmp) => staged.push((tmp, target)),
@@ -81,24 +113,23 @@ fn write_templates(dir: &Path, templates: &[(&str, &str)]) -> std::io::Result<Ve
         }
     }
 
-    // The check above already confirmed every destination is replaceable, so
-    // this should never fail in the ordinary case. If it somehow does (a
-    // destination changed kind between the two phases), templates already
-    // renamed keep their new, valid content — this call has no business
-    // deleting a file it just correctly wrote — and only the not-yet-renamed
-    // temp files are cleaned up: the failing one *and* every sibling still
-    // staged behind it, which the previous shape left on disk.
-    let mut written = Vec::with_capacity(staged.len());
-    for (i, (tmp, target)) in staged.iter().enumerate() {
-        if let Err(e) = std::fs::rename(tmp, target) {
-            for (tmp, _) in &staged[i..] {
+    // The check above already confirmed every destination here is
+    // replaceable, so this should never fail in the ordinary case. If it
+    // somehow does (a destination changed kind between the two phases), that
+    // one name joins `failed` — this call has no business deleting a file it
+    // just correctly wrote, or withholding a sibling that was never in
+    // trouble, so every remaining rename is still attempted rather than the
+    // loop stopping at the first one to fail.
+    for (tmp, target) in &staged {
+        match std::fs::rename(tmp, target) {
+            Ok(()) => outcome.written.push(target.clone()),
+            Err(e) => {
                 let _ = std::fs::remove_file(tmp);
+                outcome.failed.push((target.clone(), e));
             }
-            return Err(e);
         }
-        written.push(target.clone());
     }
-    Ok(written)
+    Ok(outcome)
 }
 
 /// Whether `path` is safe for [`write_templates`]/[`write_new`] to replace: a
@@ -171,14 +202,27 @@ fn has_any_toml(dir: &Path) -> std::io::Result<bool> {
 
 /// First-run seeding: create `dir` if needed, then write the built-in
 /// templates only if it holds no `*.toml` manifest at all — including a
-/// third-party one the user (or another plugin) may have dropped in. Returns
-/// the paths written (empty if the directory was already non-empty).
-pub fn seed_if_empty(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+/// third-party one the user (or another plugin) may have dropped in.
+///
+/// Every name is attempted on its own (`write_templates`'s `all_or_nothing`
+/// off): a directory or symlink planted at one built-in's name must not
+/// withhold the other four from a machine that has never had any of them.
+/// [`SeedOutcome::failed`] names the one (or more) this call could not
+/// write, purely for the caller to log — the obstruction stays on disk
+/// either way, and it is that (not this list) that keeps
+/// `upgrade_builtin_manifests` in `main.rs` from settling the name right
+/// after: it reads back `OnDisk::Unreadable` at the same path and leaves the
+/// decision unmade, the same as it always has for anything else blocking a
+/// built-in's name. `reseed_defaults`'s all-or-nothing shape is deliberately
+/// not reused here: an install with none of these files yet has nothing a
+/// partial delivery could put in a worse state than it started in, unlike an
+/// already-settled one being reset.
+pub fn seed_if_empty(dir: &Path) -> std::io::Result<SeedOutcome> {
     std::fs::create_dir_all(dir)?;
     if has_any_toml(dir)? {
-        return Ok(Vec::new());
+        return Ok(SeedOutcome::default());
     }
-    write_templates(dir, DEFAULT_TEMPLATES)
+    write_templates(dir, DEFAULT_TEMPLATES, false)
 }
 
 /// "Reset plugins": overwrite every built-in manifest in
@@ -187,16 +231,15 @@ pub fn seed_if_empty(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// each even if the user edited or deleted it, as long as what's at that
 /// name is a plain file or nothing at all. A symlink (or directory, or FIFO)
 /// at any one of those five names stops the whole call before anything is
-/// written: [`write_templates`] checks every destination up front
-/// ([`check_replaceable`]) and only stages content into temp files once
-/// every one of them has passed, so a directory planted at, say, the third
-/// name never lets the first two be rewritten only to fail partway through —
-/// this call returns `Err` and every file in `dir`, built-in or not, is
-/// exactly as it was before it ran. Any other file in `dir` (a third-party
-/// manifest, a stray `.toml`) is left untouched either way. Returns the
-/// paths written on success.
-pub fn reseed_defaults(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    write_templates(dir, DEFAULT_TEMPLATES)
+/// written: [`write_templates`]'s `all_or_nothing` checks every destination
+/// up front ([`check_replaceable`]) and only stages content into temp files
+/// once every one of them has passed, so a directory planted at, say, the
+/// third name never lets the first two be rewritten only to fail partway
+/// through — this call returns `Err` and every file in `dir`, built-in or
+/// not, is exactly as it was before it ran. Any other file in `dir` (a
+/// third-party manifest, a stray `.toml`) is left untouched either way.
+pub fn reseed_defaults(dir: &Path) -> std::io::Result<SeedOutcome> {
+    write_templates(dir, DEFAULT_TEMPLATES, true)
 }
 
 // ── Built-in upgrades ────────────────────────────────────────────────────
@@ -1493,14 +1536,16 @@ mod tests {
     #[test]
     fn seed_if_empty_writes_every_built_in_template_into_a_fresh_dir() {
         let dir = temp_dir("fresh");
-        let written = seed_if_empty(&dir).expect("seed");
+        let outcome = seed_if_empty(&dir).expect("seed");
         std::fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(written.len(), DEFAULT_TEMPLATES.len());
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        assert_eq!(outcome.written.len(), DEFAULT_TEMPLATES.len());
         for (name, _) in DEFAULT_TEMPLATES {
             assert!(
-                written.iter().any(|p| p.ends_with(name)),
-                "{name} missing from what seed_if_empty wrote: {written:?}"
+                outcome.written.iter().any(|p| p.ends_with(name)),
+                "{name} missing from what seed_if_empty wrote: {:?}",
+                outcome.written
             );
         }
     }
@@ -1514,12 +1559,12 @@ mod tests {
         let codex_path = dir.join("codex.toml");
         std::fs::write(&codex_path, "id = \"codex\" # user edit").expect("overwrite");
 
-        let written_again = seed_if_empty(&dir).expect("second seed is a no-op");
+        let outcome_again = seed_if_empty(&dir).expect("second seed is a no-op");
         let contents = std::fs::read_to_string(&codex_path).expect("read back");
         std::fs::remove_dir_all(&dir).ok();
 
         assert!(
-            written_again.is_empty(),
+            outcome_again.written.is_empty() && outcome_again.failed.is_empty(),
             "must not write anything the second time"
         );
         assert_eq!(
@@ -1533,13 +1578,13 @@ mod tests {
         let dir = temp_dir("third-party");
         std::fs::write(dir.join("third-party.toml"), "id = \"third-party\"").expect("seed fixture");
 
-        let written = seed_if_empty(&dir).expect("seed");
+        let outcome = seed_if_empty(&dir).expect("seed");
         let has_codex = dir.join("codex.toml").is_file();
         let has_claude = dir.join("claude.toml").is_file();
         std::fs::remove_dir_all(&dir).ok();
 
         assert!(
-            written.is_empty(),
+            outcome.written.is_empty() && outcome.failed.is_empty(),
             "a non-empty plugins dir must not be touched"
         );
         assert!(
@@ -1559,11 +1604,12 @@ mod tests {
         let dir = temp_dir("dir-named-toml");
         std::fs::create_dir_all(dir.join("notes.toml")).expect("plant a directory, not a file");
 
-        let written = seed_if_empty(&dir).expect("seed");
+        let outcome = seed_if_empty(&dir).expect("seed");
         std::fs::remove_dir_all(&dir).ok();
 
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
         assert_eq!(
-            written.len(),
+            outcome.written.len(),
             DEFAULT_TEMPLATES.len(),
             "a directory merely named *.toml must not read as an existing manifest"
         );
@@ -1579,12 +1625,13 @@ mod tests {
         let codex_path = dir.join("codex.toml");
         std::fs::write(&codex_path, "not valid toml at all").expect("corrupt codex.toml");
 
-        let written = reseed_defaults(&dir).expect("reseed");
+        let outcome = reseed_defaults(&dir).expect("reseed");
         let restored = std::fs::read_to_string(&codex_path).expect("read back");
         let third_party = std::fs::read_to_string(dir.join("third-party.toml")).expect("read back");
         std::fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(written.len(), DEFAULT_TEMPLATES.len());
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        assert_eq!(outcome.written.len(), DEFAULT_TEMPLATES.len());
         assert!(
             PluginManifest::from_str(&restored).is_ok(),
             "codex.toml must be the valid built-in default again"

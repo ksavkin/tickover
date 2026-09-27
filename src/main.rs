@@ -1282,8 +1282,15 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
             // third-party manifest and every user config toggle untouched),
             // then reload the manifest set and re-fetch under it.
             let dir = seed::plugins_dir();
-            if let Err(e) = seed::reseed_defaults(&dir) {
-                diag::line(format!("could not reset plugins in {}: {e}", dir.display()));
+            match seed::reseed_defaults(&dir) {
+                Ok(outcome) => {
+                    for (path, e) in &outcome.failed {
+                        diag::line(format!("could not reset {}: {e}", path.display()));
+                    }
+                }
+                Err(e) => {
+                    diag::line(format!("could not reset plugins in {}: {e}", dir.display()));
+                }
             }
             let previous = ctx.plugins.borrow().clone();
             *ctx.plugins.borrow_mut() = load_plugins();
@@ -1535,6 +1542,12 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                         &ctx.cache,
                         &ctx.tray_key,
                     );
+                    // Not routed through `refresh_all`: `reload_and_fetch`
+                    // above already did its plugin-manager half. A manifest
+                    // that declares `[history]` must show the Activity card
+                    // the moment it is imported, same as every other path
+                    // that changes the provider set.
+                    sync_activity(&app, &ctx);
                 }
             }
             // Every path above closed with a native dialog (`choose file` or
@@ -2046,6 +2059,12 @@ fn run_fast_timer(
                 &ctx.cache,
                 &ctx.tray_key,
             );
+            // Not routed through `refresh_all`: `reload_and_fetch` above
+            // already did its plugin-manager half. Installing or updating a
+            // provider from the registry must show the Activity card the
+            // moment it lands, same as every other path that changes the
+            // provider set.
+            sync_activity(&app, &ctx);
         }
 
         drain_tray_clicks(&app, &ctx);
@@ -2828,23 +2847,40 @@ fn truly_fresh_install() -> bool {
 /// this function fixes went unnoticed by the tests already guarding
 /// `upgrade_builtin_manifests`.
 ///
-/// A seed that fails to write skips [`upgrade_builtin_manifests`] entirely
-/// this launch, rather than letting it read the still-empty `dir` the
-/// failure left behind. `codex.toml`/`claude.toml` ship
-/// `deliver_if_absent = false` — an install without them is assumed to have
-/// removed them on purpose — so `Absent` off an empty `dir` settles their
-/// marker for good whether or not a write ever actually ran; a disk full or
-/// read-only for one launch would otherwise cost either headline provider
-/// every future one. Leaving the markers untouched keeps `truly_fresh_install`
-/// true, so the whole sequence — seed included — simply retries next launch.
+/// A seed step that could not write *anything at all* (the whole directory
+/// is unwritable, say) skips [`upgrade_builtin_manifests`] entirely this
+/// launch, rather than letting it read the still-empty `dir` the failure
+/// left behind. `codex.toml`/`claude.toml` ship `deliver_if_absent = false`
+/// — an install without them is assumed to have removed them on purpose —
+/// so `Absent` off an empty `dir` settles their marker for good whether or
+/// not a write ever actually ran; a disk full or read-only for one launch
+/// would otherwise cost either headline provider every future one. Leaving
+/// every marker untouched keeps `truly_fresh_install` true, so the whole
+/// sequence — seed included — simply retries next launch.
+///
+/// A seed step that wrote *some* names and not others (an obstruction at a
+/// single built-in's path, in an otherwise writable directory) is not that
+/// case: [`seed::SeedOutcome::failed`] names what it could not write, and
+/// `upgrade_builtin_manifests` still runs — the names it did write read back
+/// as `AlreadyCurrent` and settle normally, and the obstructed one reads as
+/// `OnDisk::Unreadable` (something is there, just not a plain file), which
+/// `classify_builtin` never settles, so it is retried every later launch
+/// exactly as it was this one.
 fn seed_and_upgrade_builtins(dir: &std::path::Path) {
     if truly_fresh_install() {
-        if let Err(e) = seed::seed_if_empty(dir) {
-            diag::line(format!(
-                "could not seed plugin manifests in {}: {e}",
-                dir.display()
-            ));
-            return;
+        match seed::seed_if_empty(dir) {
+            Ok(outcome) => {
+                for (path, e) in &outcome.failed {
+                    diag::line(format!("could not seed {}: {e}", path.display()));
+                }
+            }
+            Err(e) => {
+                diag::line(format!(
+                    "could not seed plugin manifests in {}: {e}",
+                    dir.display()
+                ));
+                return;
+            }
         }
     }
     upgrade_builtin_manifests(dir);
@@ -6472,9 +6508,12 @@ fn scan_ended_without_a_store(card_shows_scanning: bool, still_busy: bool) -> bo
 }
 
 /// Push the Activity card's data to the window for whichever range its
-/// toggle currently shows. Start-up, each scan commit, and
-/// `activity-range-changed` all come through here — one code path, so a
-/// toggle and fresh data can never disagree about what the card means.
+/// toggle currently shows. Every caller that can change what the card should
+/// show — start-up, `refresh_all` (enable/disable, a surface opt-in, reset,
+/// an option change), remove, importing a manifest, an install or update
+/// from the registry, the range toggle, the first-run button, and either end
+/// of a history scan — comes through here, one code path, so a toggle and
+/// fresh data can never disagree about what the card means.
 ///
 /// Always calls [`activity_data`], even with no `[history]` manifest at
 /// all — that function's own `visible` decides whether the card shows,
@@ -12689,6 +12728,164 @@ mod title_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The narrower failure the test above does not reach: one obstructed
+    /// name in a directory that is otherwise perfectly writable must not
+    /// cost the other four built-ins their delivery. Planting a directory
+    /// (rather than `chmod`ing the whole plugins folder, as the test above
+    /// does) is also what makes this cross-platform: `grok` ships
+    /// `deliver_if_absent = true`, so clearing the obstruction later lets it
+    /// self-heal through the ordinary upgrade pass, with no second seed
+    /// attempt needed — this install stops being `truly_fresh_install` the
+    /// moment the other four settle.
+    #[test]
+    fn a_seed_write_failure_for_one_name_does_not_block_the_other_four() {
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-seed-one-blocked-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert!(
+            truly_fresh_install(),
+            "a scratch config with no markers at all is what a fresh install looks like"
+        );
+        // `has_any_toml` does not count a directory (it is not a file), so
+        // planting one here still leaves this read as "nothing seeded yet".
+        std::fs::create_dir_all(dir.join("grok.toml")).expect("plant a directory in its place");
+
+        seed_and_upgrade_builtins(&dir);
+
+        let grok = seed::BUILTIN_UPGRADES
+            .iter()
+            .find(|u| u.id == "grok")
+            .expect("grok ships as a built-in");
+        assert!(
+            config::builtin_migrated("grok").is_none(),
+            "the obstructed name must stay undecided, not settled as though deleted"
+        );
+        for upgrade in seed::BUILTIN_UPGRADES {
+            if upgrade.id == "grok" {
+                continue;
+            }
+            assert!(
+                dir.join(upgrade.file).is_file(),
+                "{} must still be delivered even though grok.toml was blocked",
+                upgrade.file
+            );
+            assert_eq!(
+                config::builtin_migrated(upgrade.id).as_deref(),
+                Some(upgrade.to_version),
+                "{} must be settled even though a sibling name failed",
+                upgrade.id
+            );
+        }
+
+        // Retried on the next launch, obstruction still in place: still
+        // undecided, not settled the wrong way and not forgotten either.
+        seed_and_upgrade_builtins(&dir);
+        assert!(
+            config::builtin_migrated("grok").is_none(),
+            "still undecided a launch later, while the obstruction remains"
+        );
+
+        // Clear it: the very next launch's upgrade pass delivers `grok` the
+        // same way it would reach an install that never had it at all.
+        std::fs::remove_dir_all(dir.join("grok.toml")).expect("clear the obstruction");
+        seed_and_upgrade_builtins(&dir);
+        assert!(
+            dir.join("grok.toml").is_file(),
+            "grok.toml must reach the machine once the obstruction is gone"
+        );
+        assert_eq!(
+            config::builtin_migrated("grok").as_deref(),
+            Some(grok.to_version),
+            "grok is settled once it actually reaches disk"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same obstruction, but at a name that ships
+    /// `deliver_if_absent = false` (`claude`) — and, unlike the `grok` case
+    /// above, this one does not end in a full recovery once the obstruction
+    /// is gone. The other four settling on the obstructed launch is what
+    /// ends `truly_fresh_install`, so no later launch ever calls
+    /// `seed_if_empty` again to retry `claude` specifically; once the
+    /// directory is removed, `upgrade_builtin` reads a plain `Absent` there
+    /// — indistinguishable from the user having deleted a delivered copy —
+    /// and `deliver_if_absent = false` means that settles for good, with the
+    /// file never actually written. Pinned here rather than left to be
+    /// rediscovered: closing it needs `truly_fresh_install`'s all-or-nothing
+    /// marker to track names rather than the whole install, which is a
+    /// larger change than this one name's seed step.
+    #[test]
+    fn a_seed_write_failure_for_a_never_redelivered_name_does_not_block_the_other_four() {
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-seed-one-blocked-never-redelivered-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert!(
+            truly_fresh_install(),
+            "a scratch config with no markers at all is what a fresh install looks like"
+        );
+        std::fs::create_dir_all(dir.join("claude.toml")).expect("plant a directory in its place");
+
+        seed_and_upgrade_builtins(&dir);
+
+        assert!(
+            config::builtin_migrated("claude").is_none(),
+            "the obstructed name must stay undecided, not settled as though deleted"
+        );
+        for upgrade in seed::BUILTIN_UPGRADES {
+            if upgrade.id == "claude" {
+                continue;
+            }
+            assert!(
+                dir.join(upgrade.file).is_file(),
+                "{} must still be delivered even though claude.toml was blocked",
+                upgrade.file
+            );
+            assert_eq!(
+                config::builtin_migrated(upgrade.id).as_deref(),
+                Some(upgrade.to_version),
+                "{} must be settled even though a sibling name failed",
+                upgrade.id
+            );
+        }
+
+        // Retried on the next launch, obstruction still in place.
+        seed_and_upgrade_builtins(&dir);
+        assert!(
+            config::builtin_migrated("claude").is_none(),
+            "still undecided a launch later, while the obstruction remains"
+        );
+        assert!(
+            !dir.join("claude.toml").is_file(),
+            "still just the planted directory — nothing this call may not make"
+        );
+
+        // Clearing the obstruction here does not self-heal `claude` the way
+        // it does `grok` above: this install stopped being
+        // `truly_fresh_install` the moment the other four settled, so this
+        // launch's upgrade pass, not another seed attempt, is what sees the
+        // now-empty path — and reads it exactly like a deliberate deletion.
+        std::fs::remove_dir_all(dir.join("claude.toml")).expect("clear the obstruction");
+        seed_and_upgrade_builtins(&dir);
+        assert!(
+            !dir.join("claude.toml").is_file(),
+            "never written — `deliver_if_absent = false` never promotes `Absent`"
+        );
+        assert!(
+            config::builtin_migrated("claude").is_some(),
+            "settled anyway: indistinguishable, from this path alone, from the user \
+             having deleted a copy that was actually delivered"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Every built-in whose file is missing from `dir` is named in `logged`,
     /// and **no** built-in whose file is there is.
     fn logged_exactly_for(dir: &std::path::Path, logged: &[String]) {
@@ -17937,28 +18134,37 @@ mod title_tests {
     /// `plugin::manifest::load_dir` actually keeps — lowest `order`, ties
     /// broken by path, the same rule `dedup_plugin_ids` relies on to call the
     /// loser a duplicate. Directory-listing order is neither, and is not even
-    /// alphabetical on every filesystem this runs on: these two names are
-    /// picked because `read_dir` on this machine's temp filesystem hands
-    /// `zzz-winner.toml` back before `aaa-shadowed.toml`, so a scan that
-    /// simply returns whichever file it meets first resolves to the
-    /// higher-`order` loser under this exact arrangement, which is why it
-    /// is the one pinned here.
+    /// alphabetical on every filesystem this runs on, so pinning a single
+    /// pair of names only ever proves the point on a filesystem whose
+    /// `read_dir` happens to disagree with the correct answer: one that
+    /// hands entries back in name order already puts the low-`order` file
+    /// first even to a scan that never sorts at all. Two pairs, with the
+    /// low-`order` file at opposite ends of the alphabet in each, closes
+    /// that gap — whichever way this filesystem's `read_dir` orders the two
+    /// names, at least one pair puts the correct answer somewhere other
+    /// than "whichever entry the scan meets first".
     #[test]
     fn find_plugin_manifest_path_resolves_a_duplicate_id_the_way_the_loader_would() {
-        let dir = temp_plugins_dir("duplicate-id");
-        let wins = dir.join("aaa-shadowed.toml");
-        let loses = dir.join("zzz-winner.toml");
-        std::fs::write(&wins, stub_manifest_toml("dup", 1)).expect("write fixture");
-        std::fs::write(&loses, stub_manifest_toml("dup", 9)).expect("write fixture");
+        for (low_name, high_name) in [
+            ("aaa-shadowed.toml", "zzz-winner.toml"),
+            ("zzz-shadowed.toml", "aaa-winner.toml"),
+        ] {
+            let dir = temp_plugins_dir("duplicate-id");
+            let wins = dir.join(low_name);
+            let loses = dir.join(high_name);
+            std::fs::write(&wins, stub_manifest_toml("dup", 1)).expect("write fixture");
+            std::fs::write(&loses, stub_manifest_toml("dup", 9)).expect("write fixture");
 
-        let found = find_plugin_manifest_path(&dir, "dup");
-        std::fs::remove_dir_all(&dir).ok();
+            let found = find_plugin_manifest_path(&dir, "dup");
+            std::fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(
-            found,
-            Some(wins),
-            "the lowest-`order` file wins a duplicate id, not whichever the scan meets first"
-        );
+            assert_eq!(
+                found,
+                Some(wins),
+                "the lowest-`order` file ({low_name}) wins a duplicate id, not whichever \
+                 the scan meets first"
+            );
+        }
     }
 
     /// A metadata read that fails for a reason other than absence — here, a

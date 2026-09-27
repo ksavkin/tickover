@@ -759,12 +759,17 @@ export component AppWindow inherits Window {
                 // each block now labels its own figures in place.
 
                 // ── Providers (Codex, Claude…) ──────────────────────────
+                // The empty-list placeholder echoes the header's own word for
+                // this state rather than assuming which one it is: an empty
+                // list is either still coming ("reading…") or the settled
+                // answer that there is nothing to show ("no data"), and the
+                // header already knows which.
                 if root.providers.length == 0 : HorizontalLayout {
                     alignment: center;
                     padding-top: 12px;
                     padding-bottom: 12px;
                     Text {
-                        text: "reading…";
+                        text: root.updated;
                         font-size: 10.5px;
                         color: Theme.text-faint;
                     }

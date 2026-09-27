@@ -781,10 +781,11 @@ fn get_u64(key: &str) -> u64 {
 }
 
 /// Returns whether `key` now holds `v` for certain — `true` when nothing
-/// needed writing (it already did) or the write landed, `false` when a write
-/// was attempted and failed. [`set_plugin_pinged_at`] is the one caller that
-/// reads this: everything else here still fires the write for its
-/// side effect alone, exactly as before.
+/// needed writing (it already did) or the write landed, `false` when it
+/// could not be confirmed on disk: either a write was attempted and failed,
+/// or there was no config path to write to at all. [`set_plugin_pinged_at`]
+/// is the one caller that reads this: everything else here still fires the
+/// write for its side effect alone, exactly as before.
 fn set_u64(key: &str, v: u64) -> bool {
     let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // One `load()` for both the comparison and the mutation below, not one
@@ -1851,10 +1852,15 @@ mod tests {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
                 .expect("restore permissions so the next write can land");
             set_plugin_pinged_at("acme", 5);
+            // Through `get_u64` rather than `plugin_pinged_at`: the shadow a
+            // landed write clears would answer with the same `5` even if
+            // this write had silently failed to reach the file, so only a
+            // read that bypasses it can tell "persisted" from "still just
+            // remembered".
             assert_eq!(
-                plugin_pinged_at("acme"),
+                get_u64("plugin.acme.pinged_at"),
                 5,
-                "a successful write persists it as before"
+                "a successful write persists it as before, on disk and not only in the shadow"
             );
 
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
