@@ -28,10 +28,14 @@ Rust knows how to read *a* manifest, never *the* Codex manifest, so when an
 undocumented endpoint changes shape the fix is a text edit and the binary
 is untouched. And **the app never prints a figure the provider did not
 state** — no scraped numbers, no percentage computed from something else —
-beyond two licensed exceptions: one unit change (a stated *remaining*
-fraction into the used percent) and one opt-in estimate (a dollar cost from
-locally counted tokens against a bundled list-price table, off by default
-and never presented as a bill). Both rules are written down in
+beyond the exceptions licensed in [`../CONTRIBUTING.md`](../CONTRIBUTING.md):
+one unit change (a stated *remaining* fraction into the used percent), one
+opt-in estimate (a dollar cost from locally counted tokens against a bundled
+list-price table, off by default and never presented as a bill), and the
+window's own pace — the hatched projection and its captions — drawn from the
+stated used percent and the window's clock, hatched and prefixed with `~`, and
+never allowed to stand in for the figure the provider reported. Both rules are
+written down in
 [`../CONTRIBUTING.md`](../CONTRIBUTING.md) and most design questions below
 were decided by them.
 

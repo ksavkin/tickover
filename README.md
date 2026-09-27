@@ -111,8 +111,9 @@ period over the time elapsed — so a build without local history draws the
 same band. It stays away until the window has run for ten minutes or a tenth
 of its period, whichever is longer: a pace read off the first few minutes of
 a five-hour window is noise wearing a percentage sign. The caption at the
-right of the reset line names it — `→ ~63%` on its own, `burn 41.2K/h →
-~63%` once local history has counted tokens for that window, and
+right of the reset line names it — `→ ~63%` on its own,
+`burn 41.2K/h → ~63%` once local history has counted tokens for that window,
+and
 `caps ~18:40`, the clock time the pace crosses 100 % and never later than
 the reset itself, in place of both once it projects a full window. The band
 takes the bar's three colours on its own thresholds: mint, amber from 90 %

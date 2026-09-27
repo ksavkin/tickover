@@ -43,6 +43,17 @@ Pill-shaped tracks with a gradient fill and a soft accent glow; the fill
 width animates (700ms `ease-out-quart`) when a reading changes; a tiny
 minimum width keeps low percentages visible.
 
+**Hatches.** A diagonal hatch means "not a measured solid". There are two:
+45° rising where a bar holds a slot nothing was reported for — an empty token
+class, a provider that declares history and contributed none — and 135°
+falling for a quota window's projection, the band reaching from the used fill
+to where the present pace lands by the reset. Slint has no repeating gradient,
+so each is a set of stroked paths on a 4px pitch with a 1.6px stroke. The
+projection sits *behind* the solid fill, so a pace that overshoots what has
+been measured still reads as the softer of the two, and it takes the palette on
+its own thresholds — mint, amber from 90% projected, red once it projects a
+full window; its caption sits at the right of the reset line.
+
 ## States
 
 Every element has enabled / hover / checked states (custom checkbox, ghost

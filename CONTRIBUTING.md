@@ -26,7 +26,14 @@ Two rules decide most questions before they are asked:
   reversible, information-preserving — and, opt-in and off by default, an
   estimated dollar cost computed from locally counted tokens against a
   bundled list-price table (`src/history/pricing.rs`), always labelled
-  "estimated" and never presented as a bill.
+  "estimated" and never presented as a bill. Statements about a window's
+  *future* are licensed on a narrower condition: the hatched projection band
+  and its `~63%`, the `caps ~18:40` it becomes, the `pace +22 pp` tooltip and
+  the `burn 41.2K/h` beside them come from figures the provider did state (the
+  used percent, the reset time, the window's period) or from this app's own
+  token count; they are drawn hatched and prefixed with `~` so they cannot be
+  read as a measurement, and they never replace the headline figure or the
+  solid fill, which stay exactly what the provider reported.
 - **A mechanism with no consumer is not shipped — with one named
   exception.** If a manifest key would have nothing to read on any account
   anyone here can see, it waits. `config::set_history_cost_estimate` ships
