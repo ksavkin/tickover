@@ -35,6 +35,40 @@ what it does with them — and what it refuses to do.
   allow-list is refused outright there, rather than read as "no restriction".
   The OAuth client id and secret the exchange needs are not shipped with
   this app; see the gap list below for where they come from.
+- **It also reads a local usage log, for every provider that keeps one —
+  read-only, the same as the credential stores above.** Claude's session
+  transcripts (`~/.claude/projects/**/*.jsonl`), Codex's rollout and
+  archived-session files (`~/.codex/sessions/**/rollout-*.jsonl`,
+  `~/.codex/archived_sessions/`), Grok's unified log
+  (`~/.grok/logs/unified.jsonl`), and Antigravity's conversation database
+  (`~/.gemini/antigravity-cli/conversations/*.db`, opened `mode=ro`) are all
+  files the provider's own CLI already wrote; Copilot keeps no such log and
+  is skipped. What an extractor is allowed to carry out of a line it reads
+  is fixed by the record type it returns (`src/history/formats/`,
+  `UsageRecord`): a timestamp, a project basename, a model name, a session
+  id (kept for per-session display, not as a lookup key), a dedup key used
+  only to drop a re-read duplicate, and the counted token classes — never
+  the prompt or the response that earned them. `tests/history_e2e.rs`
+  plants a marker string inside a fixture prompt and fails the build if it
+  is ever found in the store, the report, or anywhere past the extractor.
+- **What that reading produces is aggregated into its own store, never a
+  provider's.** `<config>/tickover/history/` holds `state.json` (per-file
+  scan progress) and `days.jsonl` (append-only hourly usage buckets) —
+  written owner-only (`0600`) on macOS; Windows has no code-level
+  equivalent for either and gets whatever default permissions the user's
+  own profile folder already carries. The same directory also holds a
+  `lock` file used only to keep the tray app's scan and `tickover stats`'s
+  from interleaving; it carries no data of its own and gets no explicit
+  permissions on either platform. `tickover stats --report`, and the
+  panel's own "Full report" pill, write one file more: a self-contained
+  HTML page under `<config>/tickover/reports/usage-<timestamp>.html`, the
+  same owner-only `0600` on macOS. Nothing here is pruned automatically —
+  each report is a separate file from the run that wrote it. Everything in
+  it is drawn from the aggregate above, so it inherits the same guarantee:
+  no prompt or message text, because none ever reached the store it reads
+  from. [`docs/PROVIDERS.md`](docs/PROVIDERS.md#local-usage-history) has
+  the per-provider table; this is the privacy account of that same
+  mechanism.
 
 ## What leaves the machine
 

@@ -616,9 +616,9 @@ pub fn set_menu_bar_text(v: bool) {
 pub fn history_cost_estimate() -> bool {
     get_bool("history_cost_estimate_opt_in")
 }
-/// Bound by the settings sheet's cost-toggle (T15); until then the setter
-/// has no caller — `allow` rather than delete because the toggle is part
-/// of the same feature landing.
+/// Bound by the settings sheet's cost-toggle; until then the setter has no
+/// caller — `allow` rather than delete because the toggle is part of the
+/// same feature landing.
 #[allow(dead_code)]
 pub fn set_history_cost_estimate(v: bool) {
     set_bool("history_cost_estimate_opt_in", v);

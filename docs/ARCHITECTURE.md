@@ -12,7 +12,9 @@ plugins/*.toml         five provider manifests + the registry index      (data)
 src/lib.rs             the library crate root: `plugin`, `model`, `menubar`
 src/plugin/            the library: manifest → capability gate → engine  (no UI)
 src/model.rs           one provider-neutral reading every consumer draws from
+src/history/           local usage history: scan, store, query, report   (feature "history")
 src/main.rs            the binary: tray, panel, timers, dialogs, auto-ping (Slint)
+src/stats_cli.rs       the binary: `tickover stats` — no Slint, no tray
 src/menubar.rs         rasterises the tray reading (pill on macOS, badge on Windows)
 src/platform.rs        accessory policy, single instance, dock mode
 src/config.rs          persisted settings (JSON under the OS config dir)
@@ -25,10 +27,13 @@ Two decisions shape everything else. **A provider is data, not code**: the
 Rust knows how to read *a* manifest, never *the* Codex manifest, so when an
 undocumented endpoint changes shape the fix is a text edit and the binary
 is untouched. And **the app never prints a figure the provider did not
-state** — no estimates from logs, no derived percentages, one licensed unit
-change (a stated *remaining* fraction into the used percent). Both rules
-are written down in [`../CONTRIBUTING.md`](../CONTRIBUTING.md) and most design
-questions below were decided by them.
+state** — no scraped numbers, no percentage computed from something else —
+beyond two licensed exceptions: one unit change (a stated *remaining*
+fraction into the used percent) and one opt-in estimate (a dollar cost from
+locally counted tokens against a bundled list-price table, off by default
+and never presented as a bill). Both rules are written down in
+[`../CONTRIBUTING.md`](../CONTRIBUTING.md) and most design questions below
+were decided by them.
 
 The library under `src/plugin/` has no UI dependency and is exercised by
 the whole test suite; the binary's `main.rs` is the largest file in the
@@ -225,10 +230,11 @@ by `src/menubar.rs`.
 
 ## Numbers
 
-About 60,000 lines of Rust (roughly half of it tests), three Slint files,
-some 970 test functions, a release binary of about 8 MB per architecture
-(the macOS binary is universal, so twice that on disk; the zip is about
-8 MB). CI builds and tests on macOS and Windows,
+About 75,000 lines of Rust (roughly half of it tests), three Slint files,
+some 1,150 test functions, a release binary of about 11 MB on Apple silicon
+(bundling SQLite for Antigravity's history pushed this up from the roughly
+8 MB before it; the macOS binary is universal, so roughly twice that on
+disk). CI builds and tests on macOS and Windows,
 with clippy at `-D warnings` on macOS — the half that can be reproduced on
 the machine this is developed on — actions pinned by commit, and the
 checkout token not persisted. A release run repeats the suite on both

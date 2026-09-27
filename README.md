@@ -5,12 +5,13 @@ provider's 5-hour window has reset and is sitting empty, Tickover — once you
 switch it on for that provider; Codex and Claude today — sends one tiny
 prompt so the new window starts counting now, not at your first real
 request hours later. It also meters what is left: the 5-hour and weekly
-windows of Codex, Claude and Antigravity, Grok's weekly credit usage, the
-balances of Grok, GitHub Copilot and Codex credits, in the macOS menu bar or
-the Windows system tray, with a countdown that ticks every second.
+windows of Codex, Claude and Antigravity, Grok's credit usage for its
+current billing period, the balances of Grok, GitHub Copilot and Codex
+credits, in the macOS menu bar or the Windows system tray, with a countdown
+that ticks every second.
 
-Rust + [Slint](https://slint.dev). One small native binary (about 8 MB per
-architecture), no runtime, no account to create, no telemetry. **Every
+Rust + [Slint](https://slint.dev). One small native binary (about 11 MB on
+Apple silicon), no runtime, no account to create, no telemetry. **Every
 provider is a TOML file**, not a module: when an endpoint changes shape, the
 fix is an edit, not a release.
 
@@ -30,6 +31,10 @@ fix is an edit, not a release.
 </p>
 
 ## Download
+
+This repository is currently private, so the link below resolves only for
+an account it has been shared with — there is no public download yet; see
+[`docs/RELEASING.md`](docs/RELEASING.md) for what changes once it is public.
 
 [**Latest release**](https://github.com/ksavkin/tickover/releases/latest):
 
@@ -116,8 +121,9 @@ popover still lists all of them.
   VS Code, and the desktop app as an opt-in), per-model weekly limits;
   reuses `~/.claude/.credentials.json`, else the macOS Keychain item, or on
   Windows the same file, the only store the CLI writes there.
-- **Grok** — credits used in the current weekly usage period, plus prepaid
-  credit and pay-as-you-go spend; `~/.grok/auth.json`.
+- **Grok** — credits used in the current usage period (its own stated
+  bounds, a week when none is given), plus prepaid credit and pay-as-you-go
+  spend; `~/.grok/auth.json`.
 - **Antigravity** — 5-hour and weekly allowances for Gemini and third-party
   models; the Keychain item its CLI writes (Windows Credential Manager on
   Windows), refreshed through its own OAuth flow.
@@ -127,6 +133,20 @@ popover still lists all of them.
 Every endpoint is the provider's own, undocumented and unofficial, and each
 manifest pins its host. Endpoints, cadences and the rough edges:
 [`docs/PROVIDERS.md`](docs/PROVIDERS.md).
+
+## Local usage history
+
+Four of the five — every provider but Copilot — also write a local log of
+what they have actually used: Claude's and Codex's own session transcripts,
+Grok's unified log, Antigravity's conversation database. Tickover turns
+that into the panel's Activity card (today, this week, this month, a
+cache-hit rate, your top projects) and into `tickover stats` on the command
+line, which adds `--json` for scripts and `--report` for a self-contained
+HTML page. Nothing but a timestamp, a project name, a model name and token
+counts is ever kept from what it reads — never a prompt or a response; see
+[`docs/PROVIDERS.md`](docs/PROVIDERS.md#local-usage-history) for the
+per-provider table and [`SECURITY.md`](SECURITY.md) for what that guarantee
+rests on.
 
 ## Providers are plugins
 
@@ -165,7 +185,7 @@ reporting, nothing on a timer against a host this project controls.
 
 ## Engineering notes
 
-About 60,000 lines of Rust, roughly half of it tests — some 970 test
+About 75,000 lines of Rust, roughly half of it tests — some 1,150 test
 functions — one tree for both desktops.
 Six things worth a look:
 
@@ -205,6 +225,7 @@ The guided tour is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 [Dock mode](docs/DOCK-MODE.md) ·
 [Design](docs/DESIGN.md) ·
 [Development](docs/DEVELOPMENT.md) ·
+[History formats](docs/history-formats.md) ·
 [Releasing](docs/RELEASING.md) ·
 [Contributing](CONTRIBUTING.md) ·
 [Security](SECURITY.md)
@@ -234,7 +255,12 @@ Tests run under a substituted `HOME` — the invocation and the reason are in
 - **A provider you are not signed into is hidden, not announced** — except
   Codex, the one shipped manifest that sets a message for it.
 - **The panel is dark only**; the tray pill follows the system theme. No
-  notifications, no cost accounting, no Linux.
+  notifications, no Linux.
+- **No cost accounting by default.** An estimated dollar figure from
+  published list prices exists (`tickover stats`, the panel's Activity
+  card, the HTML report) but only once switched on by hand-editing the
+  settings file — see [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) —
+  and it is always an estimate against a bundled price table, never a bill.
 
 ## License
 

@@ -35,7 +35,7 @@ set once as the window's default font and inherited by every label.
 Monospace gives tabular figures so the ticking countdown never shifts width,
 and using the OS font keeps it native and dependency-free. Hierarchy comes
 from weight, size and letter-spacing, not extra fonts — the sizes in use run
-from 14px down to 8.5px across figures, labels and captions.
+from 22px down to 8px across figures, labels and captions.
 
 ## Meters
 

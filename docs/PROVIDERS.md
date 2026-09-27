@@ -37,7 +37,7 @@ read-only — the scanner never writes into a provider's directory.
 | Provider | History source | Format |
 |---|---|---|
 | **Claude** | `~/.claude/projects/**/*.jsonl` (or `$CLAUDE_CONFIG_DIR/projects`) | one JSON object per line; `type = "assistant"` lines carry `message.usage` with input/output/cache classes |
-| **Codex** | `~/.codex/sessions/**/rollout-*.jsonl` + `archived_sessions/` (`$CODEX_HOME` honoured) | `token_count` events whose cumulative counters are differenced per session |
+| **Codex** | `~/.codex`, matched by basename against `rollout-*.jsonl` anywhere under it — reaches `sessions/**/` and `archived_sessions/` alike, but only a file still named that way (`$CODEX_HOME` relocates the root) | `token_count` events whose cumulative counters are differenced per session |
 | **Grok** | `~/.grok/logs/unified.jsonl` | `shell.turn.inference_done` events carrying per-turn token counts |
 | **Antigravity** | `~/.gemini/antigravity-cli/conversations/*.db` | per-conversation SQLite (opened `mode=ro`); protobuf-encoded generation records |
 | **Copilot** | none | Copilot publishes no local token history — it appears under "not counted" in the Activity card and `quota only` on its row |
@@ -194,4 +194,5 @@ A sixth provider is a TOML file dropped into the plugins folder — see
 [`PLUGIN-ARCHITECTURE.md`](PLUGIN-ARCHITECTURE.md) for the field reference and
 [`../CONTRIBUTING.md`](../CONTRIBUTING.md) for the two rules that decide most
 questions: the app never prints a figure the provider did not state, and a
-mechanism with no consumer is not shipped.
+mechanism with no consumer waits rather than ships — each with a named
+exception, spelled out there.

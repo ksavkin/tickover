@@ -736,7 +736,7 @@ Required when `engine = "log-file"`.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `root_env` | string | — (optional) | name of an env var that, if set in the process environment, overrides where the engine searches (mirrors the existing `CODEX_HOME` override) |
+| `root_env` | string | — (optional) | name of an env var that, if set in the process environment, overrides where the engine searches (mirrors the existing `CODEX_HOME` override). The name itself is validated only by exclusion — non-empty, no `=`, no NUL byte — never by shell-identifier shape, so a literal value like Windows' `ProgramFiles(x86)` is accepted; every other `_env` field below carries the same rule |
 | `root_env_join` | string | — (optional) | subdirectory appended onto `root_env`'s value when it is set (`"sessions"` so `$CODEX_HOME` resolves to `$CODEX_HOME/sessions`); ignored otherwise. Must be a relative path with no `..` component — it is joined onto the env var's value, never used in its place |
 | `root` | string | — (required) | root directory to search; `~` and `{config_dir}` expand (see [Path expansion](#path-expansion)); no `..` component |
 | `glob` | string | — (required) | glob, relative to `root`, matching the provider's log files (e.g. `"**/rollout-*.jsonl"`) |
@@ -799,7 +799,7 @@ speaks for is named in `~/.codex/auth.json`, not in the URL.
 | `name` | string | placeholder name; ASCII letters, digits and underscores, unique within the manifest |
 | `type` | `"json-file"` | where to read it from |
 | `path` | string | file to read (`~` / `{config_dir}` expanded) |
-| `path_env` | string | env var that, if set to an absolute path, overrides `path`'s directory — the same rule `[[surface.auth]]` `path_env` carries, including the empty/relative fallback to `path`. Needs `requires_reader = ["http-value-path-env"]` |
+| `path_env` | string | env var that, if set to an absolute path, overrides `path`'s directory — the same rule `[[surface.auth]]` `path_env` carries, including the empty/relative fallback to `path` and the name-validation rule stated at `[logfile] root_env` above. Needs `requires_reader = ["http-value-path-env"]` |
 | `path_env_join` | string | filename appended onto the `path_env` override, if set; ignored under the same conditions as the auth-step variant. Must be relative with no `..` component |
 | `json_path` | string | dotted JSON path to a non-empty string inside that file |
 
@@ -853,15 +853,15 @@ needs and ignores the rest.
 |---|---|---|---|
 | `type` | `"credentials-file"` \| `"credentials-map"` \| `"keychain"` \| `"env"` \| `"electron-safe-storage"` \| `"win-credential"` \| `"reject-when"` \| `"oauth-refresh"` | all | which credential store this step reads from (`reject-when` reads none, `oauth-refresh` reads one and spends it — see below) |
 | `path` | string | `credentials-file`, `credentials-map`, `reject-when`, `oauth-refresh` | path to the JSON file |
-| `path_env` | string | `credentials-file`, `reject-when` — refused on any other step kind | env var that, if set to an absolute path, overrides `path`'s directory — the credential variant of `[logfile] root_env`, additionally ignoring an env value that is empty or relative and falling back to `path` as if the variable were unset. `reject-when` honours it because a provider that relocates its config dir puts the whole directory there, not just the token file. Needs `requires_reader = ["credentials-file-path-env"]` |
+| `path_env` | string | `credentials-file`, `reject-when` — refused on any other step kind | env var that, if set to an absolute path, overrides `path`'s directory — the credential variant of `[logfile] root_env`, additionally ignoring an env value that is empty or relative and falling back to `path` as if the variable were unset. `reject-when` honours it because a provider that relocates its config dir puts the whole directory there, not just the token file. The variable's own name is validated the same way as `[logfile] root_env`'s — by exclusion, not identifier shape. Needs `requires_reader = ["credentials-file-path-env"]` |
 | `path_env_join` | string | `credentials-file`, `reject-when` | filename appended onto the `path_env` override, if set (e.g. `".credentials.json"` so `$CLAUDE_CONFIG_DIR` resolves to `$CLAUDE_CONFIG_DIR/.credentials.json`); ignored when `path_env` is unset, the env var itself isn't, or its value is empty or not absolute. Must be relative with no `..` component — mirrors `[logfile] root_env_join` exactly |
 | `token_json_path` | string | `credentials-file`, `credentials-map`, `keychain`, `win-credential`, `oauth-refresh`; optional on `electron-safe-storage` (default `"claudeAiOauth.accessToken\|access_token"`) | `\|`-separated fallback JSON paths to the token (e.g. `"claudeAiOauth.accessToken\|access_token"` — try camelCase, then snake_case). For `credentials-map` it is read inside the *matched entry*; for `oauth-refresh` it names the **refresh** token |
 | `key_prefix` | string | `credentials-map` | prefix the entry's key in the top-level object at `path` must start with. Needs `requires_reader = ["credentials-map"]` |
 | `service` | string | `keychain` | Keychain service name to query |
-| `service_env` | string | `keychain` — refused on any other step kind | env var that, if set and non-empty, re-keys `service`: the value is Unicode-NFC-normalised, hashed with sha256, and the first N hex characters (per `service_env_suffix`) are appended after a `-`, mirroring the credential variant of `[logfile] root_env`. Empty is treated as unset. Needs `requires_reader = ["keychain-service-env"]` |
+| `service_env` | string | `keychain` — refused on any other step kind | env var that, if set and non-empty, re-keys `service`: the value is Unicode-NFC-normalised, hashed with sha256, and the first N hex characters (per `service_env_suffix`) are appended after a `-`, mirroring the credential variant of `[logfile] root_env`. Empty is treated as unset; the variable's own name is validated the same way as `[logfile] root_env`'s — by exclusion, not identifier shape. Needs `requires_reader = ["keychain-service-env"]` |
 | `service_env_suffix` | string | `keychain`, and only beside `service_env` | how many leading hex characters of the sha256 to append; the only supported value is `"sha256:8"` |
 | `expiry_json_path` | string | `keychain`, `credentials-file`, `win-credential`, `credentials-map` — refused on any other step kind (the error names the step's own index and kind) | JSON path to an expiry beside the token (for `credentials-map`, inside the *matched entry*) — an RFC3339 string, or a JSON number/numeric string read as epoch seconds or milliseconds (told apart by magnitude); a lapsed one makes the step **Absent** instead of handing back a stale token. Needs `requires_reader = ["keychain-expiry"]` |
-| `var` | string | `env` | environment variable name holding the token |
+| `var` | string | `env` | environment variable name holding the token — validated the same way as `[logfile] root_env`'s name, by exclusion rather than identifier shape |
 | `config_path` | string | `electron-safe-storage` | path to the Electron config/state file holding the encrypted blob |
 | `blob_json_path` | string | `electron-safe-storage` | `\|`-separated fallback JSON paths to the blob inside `config_path` |
 | `macos_keychain_key` | string | `electron-safe-storage` (macOS only) | Keychain service name holding the Safe Storage password; ignored on Windows, where the blob is decrypted via DPAPI instead — no manifest field needed there |
@@ -933,8 +933,8 @@ an order silently.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `id_env` | string | no | environment variable naming the client id; must match `^[A-Za-z_][A-Za-z0-9_]*$` |
-| `secret_env` | string | no | environment variable naming the client secret; same charset |
+| `id_env` | string | no | environment variable naming the client id — validated only by exclusion: non-empty, no `=`, no NUL byte, not restricted to identifier shape |
+| `secret_env` | string | no | environment variable naming the client secret; same rule |
 | `id_pattern` | string | **yes** | regular expression (`regex` crate syntax, compiled as `regex::bytes::Regex` — the engine the scan actually uses) matched against a candidate file's bytes; the first match is the client id |
 | `secret_pattern` | string | **yes** | same, for the client secret |
 | `files` | array of strings | no\* | absolute paths (`~` expanded), with no `..` component, to scan first, in order — at most 16 |
@@ -1121,7 +1121,7 @@ means something. Requires `requires_reader = ["reading-history"]`.
 | `format` | `"claude-transcripts"` \| `"codex-rollouts"` \| `"grok-unified"` \| `"antigravity-sqlite"` | — (required) | which extractor parses the matched files. There is no default: every format's correctness rules differ (dedup keys, cumulative counters, sub-agent filtering), and guessing one is how double-counted histories are born. An unknown value is refused at load, like an unknown `engine` — a new format ships as an app release |
 | `root` | string | — (required) | root directory the scanner walks; `~` and `{config_dir}` expand (see [Path expansion](#path-expansion)); no `..` component |
 | `glob` | string | — (required) | glob, relative to `root`, matching history files — `"**/*.jsonl"` for the JSONL formats, `"*.db"` for `antigravity-sqlite` |
-| `root_env` | string | — (optional) | env var that overrides where the scanner searches — same semantics as `[logfile] root_env` (Claude's `CLAUDE_CONFIG_DIR` relocates the transcripts root) |
+| `root_env` | string | — (optional) | env var that overrides where the scanner searches — same semantics, and the same by-exclusion name validation, as `[logfile] root_env` (Claude's `CLAUDE_CONFIG_DIR` relocates the transcripts root) |
 | `root_env_join` | string | — (optional) | subdirectory appended onto `root_env`'s value when set — same rules as `[logfile] root_env_join`: refused without `root_env`, relative, no `..` |
 
 The scanner (`src/history/scanner.rs`) treats the matched corpus as strictly

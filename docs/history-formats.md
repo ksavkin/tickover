@@ -44,8 +44,12 @@ Two rules keep the count honest:
 
 ## `codex-rollouts`
 
-**Files:** `~/.codex/sessions/**/rollout-*.jsonl` plus
-`~/.codex/archived_sessions/*.jsonl` (honours `CODEX_HOME`).
+**Files:** the shipped manifest's `root` is `~/.codex` and its `glob` is
+`rollout-*.jsonl`, matched against a file's basename anywhere under that
+root — which is what actually reaches both `sessions/**/` and
+`archived_sessions/`, but only a file whose name still starts with
+`rollout-`; nothing here asserts what Codex itself names an archived file.
+`CODEX_HOME` relocates the whole root.
 
 One JSON object per line, `ordinal`-numbered. The shapes that matter:
 
@@ -153,7 +157,9 @@ Whatever the format, the same rules apply at the store boundary:
 ## The store
 
 Aggregates land in `<config>/tickover/history/` as two files, both
-created `0600`:
+created `0600` on macOS (Windows has no code-level equivalent for either),
+beside a third file in the same directory, `lock`, which carries no data of
+its own and exists only for the flock below:
 
 - `days.jsonl` — append-only bucket lines: hour, provider, project,
   model, session, the five token classes, message count, the source
@@ -207,7 +213,7 @@ never interleave writes. Entries under none of the active history roots
 are pruned after each scan — their day lines stay counted, and a path
 that re-enters a root rescans into place via range supersession.
 
-Two edges are accepted rather than chased:
+Four edges are accepted rather than chased:
 
 - **Owner-rewrite loses a shared id.** If a dedup id lives in two
   files, the first file to see it owns it; if that file is later

@@ -21,11 +21,18 @@ Two rules decide most questions before they are asked:
 
 - **The app never prints a figure the provider did not state.** A percentage
   computed from something else is out, and so is a number scraped from a web
-  page or estimated from local logs. The one licensed conversion is
-  complementing a stated *remaining* fraction into the consumed percent a
-  window holds — a change of units, reversible, information-preserving.
-- **A mechanism with no consumer is not shipped.** If a manifest key would have
-  nothing to read on any account anyone here can see, it waits.
+  page. Two conversions are licensed: complementing a stated *remaining*
+  fraction into the consumed percent a window holds — a change of units,
+  reversible, information-preserving — and, opt-in and off by default, an
+  estimated dollar cost computed from locally counted tokens against a
+  bundled list-price table (`src/history/pricing.rs`), always labelled
+  "estimated" and never presented as a bill.
+- **A mechanism with no consumer is not shipped — with one named
+  exception.** If a manifest key would have nothing to read on any account
+  anyone here can see, it waits. `config::set_history_cost_estimate` ships
+  ahead of the settings-sheet toggle that will call it: the same
+  `#[allow(dead_code)]` that lets it compile says, at the definition, that
+  nothing calls it yet.
 
 ## Building and running
 
