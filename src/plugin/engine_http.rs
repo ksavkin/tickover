@@ -302,37 +302,22 @@ fn fetch_surface(
     });
 
     match perform(&url, req.method, body.as_deref(), &headers, timeout) {
-        Ok(value) => {
-            if reading.tag.is_none() {
-                reading.tag = resolve_tag(m, surface, Some(&value));
-            }
-            if reading.account.is_none() {
-                reading.account = resolve_account_from_response(m, &value);
-            }
-            match parse_usage(&value, m) {
-                Ok(windows) => {
-                    reading.windows = windows;
-                    // Inside the `Ok` arm deliberately: a `required` window
-                    // that did not arrive means the manifest's author declared
-                    // the whole response untrustworthy, and a balance parsed
-                    // out of an untrustworthy response is untrustworthy too.
-                    // `fail()` clears all three together.
-                    reading.balances = parse_balances(&value, m);
-                    // Read after the windows and kept independently of them:
-                    // the case this exists for is a quota that arrives blocked
-                    // with no window at all, where `windows` is legitimately
-                    // empty and the status is the only thing the provider said.
-                    reading.quota_status = parse_quota(&value, m);
-                }
-                Err(message) => reading.fail(message),
-            }
-            // Cached even when the body carried no window: the provider did
-            // answer, and asking it again a second later would get the same
-            // answer. What it costs is one stale minute after the quota
-            // starts reporting again; what it saves is a request per panel
-            // open, forever.
-            throttle::record_success(&throttle_key, fingerprint, reading.clone());
-        }
+        // Measured from when the request *finished*, not from when it was
+        // sent — the same reasoning the `Err(failure)` arm's own stamp gives
+        // below, and for the same reason: a slow answer has already spent
+        // real time before this function ever sees it.
+        Ok(value) => apply_usage_response(
+            &mut reading,
+            m,
+            surface,
+            &value,
+            ThrottleContext {
+                key: &throttle_key,
+                fingerprint,
+                limits,
+            },
+            Instant::now(),
+        ),
         Err(failure) => {
             // A 401 is the one `Failure` this app ever rewrites — see
             // `unauthorized_outcome`'s own doc for why. `failure.terminal`
@@ -369,6 +354,86 @@ fn fetch_surface(
         }
     }
     reading
+}
+
+/// The half of [`fetch_surface`] that turns a `200`'s JSON body into
+/// `reading`'s tag/account/windows/balances/quota and this surface's
+/// throttle state — pulled out on its own, network-free (`value` is already
+/// in hand), so the one rule that actually matters here is directly testable
+/// against a `Value` this module built, the same reason `on_exchange_error`
+/// in `auth.rs` is its own function rather than inlined where it is used.
+///
+/// That rule: [`parse_usage`] failing is this surface's own failure, not a
+/// quieter cousin of success. A `required` window that never arrived means
+/// the body cannot be trusted, and recording it as a success anyway — as
+/// this used to — reset the failure count and `next_allowed` on every single
+/// occurrence, so a provider that started sending window-less bodies was
+/// polled at the retry floor forever instead of backing off like any other
+/// failure, and the panel was served this error fresh out of `perform` every
+/// time rather than the last good `cached` reading [`throttle::State::hold`]
+/// would otherwise still have. `terminal: false` on that failure: nothing
+/// here says the session is dead, only that this one response could not be
+/// trusted, so it must not buy the long `unauthorized_retry` wait or clear
+/// `cached` the way a 401 does.
+///
+/// The three values [`apply_usage_response`] needs to record this surface's
+/// throttle state — bundled only to keep that function's own argument count
+/// down, the same reason [`RequestContext`] exists for [`resolve_account`].
+struct ThrottleContext<'a> {
+    key: &'a str,
+    fingerprint: u64,
+    limits: throttle::Limits,
+}
+
+/// `now` is the moment `perform` returned, not any earlier — see the call
+/// site's own comment for why.
+fn apply_usage_response(
+    reading: &mut ProviderReading,
+    m: &PluginManifest,
+    surface: &SurfaceConfig,
+    value: &Value,
+    throttle: ThrottleContext<'_>,
+    now: Instant,
+) {
+    if reading.tag.is_none() {
+        reading.tag = resolve_tag(m, surface, Some(value));
+    }
+    if reading.account.is_none() {
+        reading.account = resolve_account_from_response(m, value);
+    }
+    match parse_usage(value, m) {
+        Ok(windows) => {
+            reading.windows = windows;
+            // Inside the `Ok` arm deliberately: a `required` window that did
+            // not arrive means the manifest's author declared the whole
+            // response untrustworthy, and a balance parsed out of an
+            // untrustworthy response is untrustworthy too. `fail()` clears
+            // all three together.
+            reading.balances = parse_balances(value, m);
+            // Read after the windows and kept independently of them: the
+            // case this exists for is a quota that arrives blocked with no
+            // window at all, where `windows` is legitimately empty and the
+            // status is the only thing the provider said.
+            reading.quota_status = parse_quota(value, m);
+            // Cached only on this arm, not for a body that failed to parse:
+            // the provider did answer, and asking it again a second later
+            // would get the same answer. What it costs is one stale minute
+            // after the quota starts reporting again; what it saves is a
+            // request per panel open, forever.
+            throttle::record_success(throttle.key, throttle.fingerprint, reading.clone());
+        }
+        Err(message) => {
+            throttle::record_failure(
+                throttle.key,
+                throttle.fingerprint,
+                &message,
+                false,
+                throttle.limits,
+                now,
+            );
+            reading.fail(message);
+        }
+    }
 }
 
 /// The text an engine hands back when a surface's credential has lapsed (or
@@ -507,7 +572,11 @@ struct RequestContext<'a> {
 /// its caller. [`account_lookup_recently_failed`] holds it back instead,
 /// keyed the same way the main request's throttle state is (`m.id` +
 /// `surface.id`, a *different* map — this is not that pacing, only the same
-/// key shape).
+/// key shape). That cool-off only ever fires for a `None` [`account_lookup_outcome`]
+/// actually recorded as a failure — a `200` this endpoint answers with is
+/// exactly as retryable-forever as a network error when it never carries
+/// `json_path`, so that case has to be counted as a failure too, not treated
+/// as the endpoint having done its job.
 ///
 /// `ctx` bundles the four values a header substitution needs
 /// (`token`/`version`/`options`/`values`) — for this function's own argument
@@ -541,17 +610,45 @@ fn resolve_account(
     }
     let timeout = Duration::from_secs(req.timeout_secs);
     match perform(&url, HttpMethod::Get, None, &headers, timeout) {
-        Ok(value) => {
-            record_account_lookup_success(&key);
-            sanitized_account(json_path_get(&value, json_path)?.as_str()?)
-        }
+        // Stamped *now*, not with the `now` the gate was asked with:
+        // `perform` may have spent up to `timeout` reaching this arm, and a
+        // stamp taken before it would silently spend that whole timeout out
+        // of `min_interval` — the main request's own pacing stamps at the
+        // end of the attempt for the same reason. Both arms below share this
+        // one reading rather than each taking their own.
+        Ok(value) => account_lookup_outcome(&key, &value, json_path, Instant::now()),
         Err(_) => {
-            // Stamped *now*, not with the `now` the gate was asked with:
-            // `perform` may have spent up to `timeout` reaching this arm,
-            // and a stamp taken before it would silently spend that whole
-            // timeout out of `min_interval` — the main request's own pacing
-            // stamps at the end of the attempt for the same reason.
             record_account_lookup_failure(&key, Instant::now());
+            None
+        }
+    }
+}
+
+/// What a `200` from the profile endpoint is worth: success — and the lifted
+/// cool-off that comes with it — recorded only once `json_path` has actually
+/// named an account, never merely because the endpoint answered at all. A
+/// response that parses fine but never carries that field is the same dead
+/// end a network error is from this lookup's own point of view, and has to
+/// be recorded the same way, or [`account_lookup_recently_failed`]'s cool-off
+/// never engages for it: the very next fetch would spend the bearer token on
+/// this endpoint again, forever, with none of the backoff a real failure
+/// earns.
+fn account_lookup_outcome(
+    key: &str,
+    value: &Value,
+    json_path: &str,
+    now: Instant,
+) -> Option<String> {
+    match json_path_get(value, json_path)
+        .and_then(Value::as_str)
+        .and_then(sanitized_account)
+    {
+        Some(account) => {
+            record_account_lookup_success(key);
+            Some(account)
+        }
+        None => {
+            record_account_lookup_failure(key, now);
             None
         }
     }
@@ -3513,6 +3610,178 @@ mod tests {
         assert_eq!(whole.len(), 2);
     }
 
+    /// A blank reading in the shape [`fetch_surface`] builds before any
+    /// request runs — enough for [`apply_usage_response`]'s own tests to
+    /// mutate and inspect, without going through `auth::resolve_token` or a
+    /// network call.
+    fn blank_reading(id: &str) -> crate::model::ProviderReading {
+        crate::model::ProviderReading {
+            id: id.to_string(),
+            name: "Test".to_string(),
+            short: "Ts".to_string(),
+            tag: None,
+            account: None,
+            windows: Vec::new(),
+            quota_status: None,
+            balances: Vec::new(),
+            error: None,
+            token_renewal: TokenRenewal::No,
+            in_menu_bar: true,
+            bare_when_sole: false,
+        }
+    }
+
+    /// [`apply_usage_response`] is what [`fetch_surface`] reaches once
+    /// `perform` comes back `Ok` — exercised on its own because
+    /// `fetch_surface` itself reaches the network. A body missing a
+    /// `required` window must go through the same backing-off `decide`
+    /// gives any other failure, not the reset a success records.
+    #[test]
+    fn a_response_missing_a_required_window_backs_off_like_any_other_failure() {
+        let mut strict = claude_like_manifest();
+        strict.windows[1].required = true; // the weekly one
+        let surface = strict.surface[0].clone();
+        let limits = throttle::Limits::from_http(strict.http.as_ref().unwrap());
+        let key = "test-apply-usage-response-required-window-missing";
+        let fingerprint = 9001u64;
+        let mut reading = blank_reading(&strict.id);
+
+        let t0 = Instant::now();
+        assert_eq!(
+            throttle::decide(key, fingerprint, limits, t0),
+            throttle::Decision::Fetch,
+            "nothing has been asked for yet"
+        );
+        let missing_weekly = json!({ "five_hour": { "utilization": 1.0 } });
+        apply_usage_response(
+            &mut reading,
+            &strict,
+            &surface,
+            &missing_weekly,
+            ThrottleContext {
+                key,
+                fingerprint,
+                limits,
+            },
+            t0,
+        );
+        assert_eq!(
+            reading.error.as_deref(),
+            Some("no \"WK\" window in the response")
+        );
+
+        // `min_interval_secs` defaults to 55, `backoff_start_secs` to 60 —
+        // the floor a resurrected success path would use is shorter than
+        // the backoff a genuine failure earns. Just past the floor and
+        // still short of the backoff, a retry must still be held back.
+        match throttle::decide(key, fingerprint, limits, t0 + Duration::from_secs(56)) {
+            throttle::Decision::Blocked(message) => {
+                assert_eq!(message, "no \"WK\" window in the response");
+            }
+            other => panic!(
+                "a body missing a required window must back off past the \
+                 floor like any other failure, got {other:?}"
+            ),
+        }
+
+        // Past the backoff too, an attempt is allowed again — this is a
+        // wait, never a stop.
+        let released_at = t0 + Duration::from_secs(61);
+        assert_eq!(
+            throttle::decide(key, fingerprint, limits, released_at),
+            throttle::Decision::Fetch
+        );
+
+        // A second, *consecutive* failure must double the wait rather than
+        // fall back to the same floor every time — the "indefinitely" half
+        // of the defect this fixes: a body that keeps missing its required
+        // window must keep backing off further, not settle into repeating
+        // the first failure's own interval forever.
+        apply_usage_response(
+            &mut reading,
+            &strict,
+            &surface,
+            &missing_weekly,
+            ThrottleContext {
+                key,
+                fingerprint,
+                limits,
+            },
+            released_at,
+        );
+        // One `min_interval` (55s) past the second attempt, the floor a
+        // resurrected success path would use has already lifted the request
+        // — but the doubled backoff (60 * 2 = 120s) has not, so this must
+        // still be held back.
+        match throttle::decide(
+            key,
+            fingerprint,
+            limits,
+            released_at + Duration::from_secs(61),
+        ) {
+            throttle::Decision::Blocked(_) => {}
+            other => panic!(
+                "a second consecutive failure must double the wait, not repeat the \
+                 first failure's own interval, got {other:?}"
+            ),
+        }
+        // And once the doubled interval has actually passed, it is still
+        // only a wait.
+        assert_eq!(
+            throttle::decide(
+                key,
+                fingerprint,
+                limits,
+                released_at + Duration::from_secs(121)
+            ),
+            throttle::Decision::Fetch
+        );
+    }
+
+    /// The other half of the same rule: a body that *does* carry the
+    /// required window resets the failure count and caches the reading.
+    #[test]
+    fn a_response_carrying_the_required_window_still_resets_and_caches() {
+        let mut strict = claude_like_manifest();
+        strict.windows[1].required = true;
+        let surface = strict.surface[0].clone();
+        let limits = throttle::Limits::from_http(strict.http.as_ref().unwrap());
+        let key = "test-apply-usage-response-required-window-present";
+        let fingerprint = 9002u64;
+        let mut reading = blank_reading(&strict.id);
+
+        let t0 = Instant::now();
+        assert_eq!(
+            throttle::decide(key, fingerprint, limits, t0),
+            throttle::Decision::Fetch
+        );
+        let whole = json!({
+            "five_hour": { "utilization": 1.0 },
+            "seven_day": { "utilization": 2.0 },
+        });
+        apply_usage_response(
+            &mut reading,
+            &strict,
+            &surface,
+            &whole,
+            ThrottleContext {
+                key,
+                fingerprint,
+                limits,
+            },
+            t0,
+        );
+        assert!(reading.error.is_none());
+        assert_eq!(reading.windows.len(), 2);
+
+        // Immediately re-asking within `min_interval` is served the cached
+        // reading, not blocked as though the last attempt had failed.
+        match throttle::decide(key, fingerprint, limits, t0 + Duration::from_secs(1)) {
+            throttle::Decision::Serve(cached) => assert_eq!(cached.windows.len(), 2),
+            other => panic!("a good reading must be served from cache, got {other:?}"),
+        }
+    }
+
     #[test]
     fn build_window_unix_format_reads_an_integer_timestamp() {
         let w = win(ManifestRole::Primary, PeriodMode::Assumed, None, Some(300));
@@ -4457,6 +4726,57 @@ mod tests {
         assert!(
             !account_lookup_recently_failed(key, min_interval, t0 + Duration::from_secs(1)),
             "a recorded success lifts the cool-off a failure set"
+        );
+    }
+
+    /// [`account_lookup_outcome`] is the decision `resolve_account` reaches
+    /// once `perform` comes back `Ok` — exercised on its own for the same
+    /// reason as the test above: `resolve_account` itself reaches the
+    /// network. A `200` that never carries `json_path` must count as this
+    /// endpoint's own failure, or the cool-off above never engages for it and
+    /// every fetch of the main usage endpoint spends the bearer token on this
+    /// one too.
+    #[test]
+    fn account_lookup_outcome_only_succeeds_once_the_field_is_actually_read() {
+        let key = "test-account-lookup-outcome";
+        let min_interval = Duration::from_secs(60);
+        let t0 = Instant::now();
+
+        // A body that answers but never carries the field: recorded as a
+        // failure, not a success, and returns nothing to the caller.
+        let no_field = json!({ "account": {} });
+        assert_eq!(
+            account_lookup_outcome(key, &no_field, "account.email", t0),
+            None
+        );
+        assert!(
+            account_lookup_recently_failed(key, min_interval, t0 + Duration::from_secs(1)),
+            "a 200 without the field must back off exactly like a network error"
+        );
+
+        // Past the interval, `resolve_account` would try again. A second
+        // fieldless body must not have cleared the cool-off it just set —
+        // repeated misses keep failing, not alternate as pretend-successes.
+        record_account_lookup_failure(key, t0);
+        assert_eq!(
+            account_lookup_outcome(key, &no_field, "account.email", t0),
+            None
+        );
+        assert!(
+            account_lookup_recently_failed(key, min_interval, t0 + Duration::from_secs(1)),
+            "a second fieldless body must not clear the backoff the first one set"
+        );
+
+        // A body that does carry the field behaves as before: the account
+        // comes back and the cool-off lifts.
+        let with_field = json!({ "account": { "email": "user@example.com" } });
+        assert_eq!(
+            account_lookup_outcome(key, &with_field, "account.email", t0),
+            Some("user@example.com".to_string())
+        );
+        assert!(
+            !account_lookup_recently_failed(key, min_interval, t0 + Duration::from_secs(1)),
+            "a body that names the account clears any standing cool-off"
         );
     }
 

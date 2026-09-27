@@ -208,15 +208,17 @@ fn reject_when_step(step: &AuthStep) -> Result<Option<String>, String> {
 /// Whether a dotted path resolves to a value that is actually *there* — a
 /// JSON `null` counts as absent, which is how `~/.codex/auth.json` spells "no
 /// API key" (`"OPENAI_API_KEY": null`) while the key is present.
+///
+/// Goes through the shared [`super::json_path_get`] — the same reader every
+/// other path on a manifest resolves with, `[[windows.source]]` and
+/// `[account] json_path` included — rather than a private split on `.` of
+/// its own: a selector this rule's own `path`/`unless_json_path` can spell
+/// (`limits[kind=weekly_scoped]`, an array index) is exactly the syntax a
+/// bare `cur.get(seg)` walk cannot follow, so a manifest that needed one here
+/// would have had this rule silently never fire — a rule whose whole purpose
+/// is to refuse.
 fn json_path_present(root: &Value, path: &str) -> bool {
-    let mut cur = root;
-    for seg in path.split('.') {
-        match cur.get(seg) {
-            Some(next) => cur = next,
-            None => return false,
-        }
-    }
-    !cur.is_null()
+    super::json_path_get(root, path).is_some_and(|v| !v.is_null())
 }
 
 // ── Host allowlist ────────────────────────────────────────────────────────
@@ -275,6 +277,23 @@ fn credentials_file_step(
     let file = resolve_credentials_file_path(step, path);
     if !file.is_file() {
         return Ok(None); // surface not present on this machine
+    }
+    // Named ahead of `read_regular_file`'s own cap so the refusal names it:
+    // that function returns the same bare `None` whether a file is too large
+    // or changed kind between this check and the open (the TOCTOU its own
+    // doc describes), and the `is_file()` check just above has already
+    // excluded everything else "not a readable regular file" would
+    // otherwise be honest about — a file too big for the cap is neither
+    // missing nor the wrong kind, and deserves its own sentence rather than
+    // the one written for those.
+    if let Ok(meta) = std::fs::metadata(&file) {
+        if meta.len() > super::SMALL_FILE_MAX_BYTES {
+            return Err(format!(
+                "{} is larger than the {}-byte cap this app reads credentials files up to",
+                file.display(),
+                super::SMALL_FILE_MAX_BYTES
+            ));
+        }
     }
     // Regular and bounded: a credentials path comes from a manifest, and a
     // fetch thread blocked reading a FIFO never reports back at all.
@@ -1461,47 +1480,16 @@ fn oauth_refresh_step(
         }
     };
 
-    // A failed exchange, and a 200 that carried no usable token, both back
-    // off, so a stuck endpoint is not hit on every tick with no exchange
-    // ever succeeding. The message is stored alongside it, so a later
-    // `Backoff` hit that is not retried can report exactly this failure
-    // rather than a placeholder that only says one happened.
-    let store_backoff = |message: String| {
-        refresh_cache_store(
-            key,
-            CacheEntry::Failed {
-                retry_after_unix: now.saturating_add(REFRESH_BACKOFF_SECS),
-                client_id: client_id.clone(),
-                secret_hash: secret_hash(&client_secret),
-                message,
-            },
-        );
-    };
-    let response = match oauth_refresh_request(
-        token_url,
-        &client_id,
-        &client_secret,
-        &refresh_token,
-        provider,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            store_backoff(e.clone());
-            on_exchange_error(step, &e);
-            return Err(e);
-        }
-    };
-    let (access_token, expires_in) = match extract_access_token(&response) {
-        Some(v) => v,
-        None => {
-            // A 200 with no token (or one too short-lived to cache usefully) is
-            // still a reason to back off — otherwise a stuck endpoint is hit
-            // every tick with no exchange ever succeeding.
-            let message = "token refresh response carried no usable access_token".to_string();
-            store_backoff(message.clone());
-            return Err(message);
-        }
-    };
+    let (access_token, expires_in) =
+        resolve_access_token(key, &client_id, &client_secret, step, || {
+            oauth_refresh_request(
+                token_url,
+                &client_id,
+                &client_secret,
+                &refresh_token,
+                provider,
+            )
+        })?;
     // A 60s margin, same as the keychain step's, so the cached token is
     // retired before a request would 401 on it. `saturating_*` so a
     // hostile/huge `expires_in` cannot overflow the clock — belt and braces
@@ -1510,6 +1498,12 @@ fn oauth_refresh_step(
     // (see that constant's own doc). `extract_access_token` already
     // rejected anything `<= 60`, so `expires_at` is always ahead of `now`
     // here.
+    //
+    // `now`, from before the exchange, deliberately — unlike a failure's own
+    // backoff (see `resolve_access_token`'s doc), retiring a fresh token a
+    // few seconds earlier than its declared life is the safe direction: it
+    // only shortens how long the cache serves it, never lets a request go
+    // out on one already dead.
     let expires_at = now.saturating_add(expires_in).saturating_sub(60);
     refresh_cache_store(
         key,
@@ -1519,6 +1513,68 @@ fn oauth_refresh_step(
         },
     );
     Ok(Some(access_token))
+}
+
+/// Runs the token exchange and turns its outcome into the access token
+/// [`oauth_refresh_step`] wants, or the backoff a failure earns. `exchange`
+/// stands in for [`oauth_refresh_request`] — a free function, not inlined
+/// into `oauth_refresh_step`, for the same reason [`on_exchange_error`] just
+/// below is its own function: it is directly testable against a stubbed
+/// exchange rather than a live one, this crate having no HTTPS test-server
+/// infrastructure.
+///
+/// A failed exchange, and a 200 that carried no usable token, both back off,
+/// so a stuck endpoint is not hit on every tick with no exchange ever
+/// succeeding. The message is stored alongside it, so a later `Backoff` hit
+/// that is not retried can report exactly this failure rather than a
+/// placeholder that only says one happened.
+///
+/// The backoff is stamped from a fresh [`cache_now`] read taken here, once
+/// `exchange` has actually returned — never from a `now` captured before it
+/// ran: `exchange` can spend real time, up to its own timeout, getting an
+/// answer, and a stamp taken earlier would silently spend that whole span
+/// out of [`REFRESH_BACKOFF_SECS`], so a slow-but-failing endpoint would be
+/// retried sooner than the backoff promises, by however long the exchange
+/// took. [`client_discovery_evict`] and [`discover_client_within`]'s own
+/// backoff stamp read the clock the same way, at the point of failure,
+/// rather than reusing a reading from before the work they are timing.
+fn resolve_access_token(
+    key: u64,
+    client_id: &str,
+    client_secret: &str,
+    step: &AuthStep,
+    exchange: impl FnOnce() -> Result<Value, String>,
+) -> Result<(String, i64), String> {
+    let store_backoff = |message: String| {
+        refresh_cache_store(
+            key,
+            CacheEntry::Failed {
+                retry_after_unix: cache_now().saturating_add(REFRESH_BACKOFF_SECS),
+                client_id: client_id.to_string(),
+                secret_hash: secret_hash(client_secret),
+                message,
+            },
+        );
+    };
+    let response = match exchange() {
+        Ok(r) => r,
+        Err(e) => {
+            store_backoff(e.clone());
+            on_exchange_error(step, &e);
+            return Err(e);
+        }
+    };
+    match extract_access_token(&response) {
+        Some(pair) => Ok(pair),
+        None => {
+            // A 200 with no token (or one too short-lived to cache usefully) is
+            // still a reason to back off — otherwise a stuck endpoint is hit
+            // every tick with no exchange ever succeeding.
+            let message = "token refresh response carried no usable access_token".to_string();
+            store_backoff(message.clone());
+            Err(message)
+        }
+    }
 }
 
 /// Reacts to a failed exchange the one way that matters beyond the caller's
@@ -5653,6 +5709,57 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// [`resolve_access_token`] stamps its failure backoff from the moment
+    /// `exchange` actually returned, not from before it ran — the stub
+    /// exchange here sleeps first, standing in for a slow-but-failing
+    /// endpoint no local test server could otherwise simulate ( `oauth_refresh_step`
+    /// refuses anything but `https://`, which rules out a plain-HTTP stub;
+    /// see `on_exchange_error`'s own doc for why this crate has no HTTPS
+    /// test-server infrastructure at all).
+    #[test]
+    fn resolve_access_token_backs_off_from_the_moment_the_exchange_actually_failed() {
+        let key = refresh_cache_key(
+            "resolve-access-token-timing",
+            &format!("rt-{}", std::process::id()),
+        );
+        let step = auth_step(AuthType::OauthRefresh);
+        let t0 = cache_now();
+        let slept = std::time::Duration::from_secs(3);
+
+        let err = resolve_access_token(key, "client-id", "client-secret", &step, || {
+            std::thread::sleep(slept);
+            Err("exchange failed".to_string())
+        })
+        .expect_err("the stubbed exchange always fails");
+        assert_eq!(err, "exchange failed");
+
+        // A backoff stamped from `t0` (before the 3s exchange) would already
+        // have lapsed by `t0 + REFRESH_BACKOFF_SECS + 1`; one stamped after
+        // the exchange, as this must be, is still armed there. `cache_now`
+        // floors to whole seconds and its own doc warns that one second of
+        // slack can flip a boundary assertion — `+ 1` alone would be too
+        // tight against a 3s sleep, so the margin here is wide on both
+        // sides.
+        assert!(
+            matches!(
+                refresh_cache_lookup(key, t0 + REFRESH_BACKOFF_SECS + 1),
+                CacheLookup::Backoff { .. }
+            ),
+            "a slow-but-failing exchange must wait the full interval from its own \
+             failure, not from before it started"
+        );
+
+        // And it is a wait, not a stop: comfortably past `slept` plus the
+        // full backoff, the entry has lapsed.
+        assert!(
+            matches!(
+                refresh_cache_lookup(key, t0 + slept.as_secs() as i64 + REFRESH_BACKOFF_SECS + 5),
+                CacheLookup::Miss
+            ),
+            "the backoff must still lapse once its own interval has actually passed"
+        );
+    }
+
     #[test]
     fn bin_candidates_ignores_relative_path_entries() {
         let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -7461,6 +7568,54 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `json_path_present` has to resolve everything [`super::json_path_get`]
+    /// does, `[selector]` array picks included, or a manifest that named one
+    /// here would have this rule silently never fire — a rule whose whole
+    /// purpose is to refuse.
+    #[test]
+    fn reject_when_fires_through_a_selector_the_shared_reader_resolves() {
+        let dir = temp_dir("rw-selector");
+        let file = dir.join("auth.json");
+        std::fs::write(
+            &file,
+            r#"{"limits":[{"kind":"weekly_scoped","blocked":true}]}"#,
+        )
+        .unwrap();
+        let step = AuthStep {
+            path: Some(file.to_string_lossy().into_owned()),
+            json_path: Some("limits[kind=weekly_scoped].blocked".to_string()),
+            message: Some("a weekly-scoped block has no session limits".to_string()),
+            ..auth_step(AuthType::RejectWhen)
+        };
+        assert_eq!(
+            reject_when_step(&step),
+            Err("a weekly-scoped block has no session limits".to_string())
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The one behavioral risk in routing through the shared reader: a
+    /// provider is entitled to a field literally named with brackets
+    /// (`counts[daily]`), and `json_path_get`'s selector syntax must not take
+    /// that name away from it — see its own doc.
+    #[test]
+    fn reject_when_still_resolves_a_field_literally_named_with_brackets() {
+        let dir = temp_dir("rw-literal-brackets");
+        let file = dir.join("auth.json");
+        std::fs::write(&file, r#"{"counts[daily]":"sk-x"}"#).unwrap();
+        let step = AuthStep {
+            path: Some(file.to_string_lossy().into_owned()),
+            json_path: Some("counts[daily]".to_string()),
+            message: Some("a literal bracketed field name still resolves".to_string()),
+            ..auth_step(AuthType::RejectWhen)
+        };
+        assert_eq!(
+            reject_when_step(&step),
+            Err("a literal bracketed field name still resolves".to_string())
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// `CODEX_HOME` relocates the whole auth file, so the rule has to look
     /// where `path_env`/`path_env_join` point, not only at `path` — a
     /// reject-when that checked the default location on a relocated install
@@ -7565,6 +7720,78 @@ mod tests {
     fn credentials_file_step_missing_required_field_is_error() {
         let step = auth_step(AuthType::CredentialsFile); // no path, no token_json_path
         assert!(credentials_file_step(&step, &mut None).is_err());
+    }
+
+    /// The two ways a credentials file can be refused past the `is_file()`
+    /// check must say different things: one is oversized, the other is not
+    /// a regular, readable file — and neither sentence is honest about the
+    /// other's cause.
+    #[test]
+    fn credentials_file_step_names_the_cap_for_an_oversized_file_not_the_generic_refusal() {
+        let dir = temp_dir("cf-oversized");
+        let file = dir.join("creds.json");
+        // One byte past the cap: the content itself is irrelevant, since the
+        // size check runs before anything here is ever parsed as JSON.
+        let oversized = vec![b'a'; (crate::plugin::SMALL_FILE_MAX_BYTES + 1) as usize];
+        std::fs::write(&file, &oversized).unwrap();
+        let step = AuthStep {
+            path: Some(file.to_string_lossy().into_owned()),
+            token_json_path: Some("claudeAiOauth.accessToken".to_string()),
+            ..auth_step(AuthType::CredentialsFile)
+        };
+        let err =
+            credentials_file_step(&step, &mut None).expect_err("must refuse an oversized file");
+        assert!(
+            err.contains(&crate::plugin::SMALL_FILE_MAX_BYTES.to_string()),
+            "the refusal must name the cap: {err}"
+        );
+        assert!(
+            !err.contains("is not a readable regular file"),
+            "an oversized file is neither missing nor the wrong kind: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credentials_file_step_reports_a_permission_denial_distinctly_from_an_oversized_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("cf-unreadable");
+        let file = dir.join("creds.json");
+        std::fs::write(&file, r#"{"claudeAiOauth":{"accessToken":"tok-1"}}"#).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Root (and this crate's own CI, some sandboxes) ignores file
+        // permissions outright — skip rather than false-fail somewhere that
+        // isn't actually exercising the denial this test is about.
+        if std::fs::File::open(&file).is_ok() {
+            eprintln!(
+                "skip: credentials_file_step_reports_a_permission_denial_distinctly_from_an_oversized_file \
+                 — running as root (or a sandbox that ignores file permissions)"
+            );
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).ok();
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        let step = AuthStep {
+            path: Some(file.to_string_lossy().into_owned()),
+            token_json_path: Some("claudeAiOauth.accessToken".to_string()),
+            ..auth_step(AuthType::CredentialsFile)
+        };
+        let err =
+            credentials_file_step(&step, &mut None).expect_err("must refuse an unreadable file");
+        assert!(
+            err.contains("is not a readable regular file"),
+            "a permission-denied open keeps the generic refusal: {err}"
+        );
+        assert!(
+            !err.contains(&crate::plugin::SMALL_FILE_MAX_BYTES.to_string()),
+            "a permission denial is not the size refusal: {err}"
+        );
+
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

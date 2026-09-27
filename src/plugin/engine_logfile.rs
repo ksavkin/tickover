@@ -159,6 +159,14 @@ fn resolve_root(lf: &LogFileConfig, options: &BTreeMap<String, bool>) -> PathBuf
 /// `root`/`root_env`/`root_env_join` resolution shared by `[logfile]` and
 /// `[history]` — both describe a provider-owned directory tree the app
 /// only reads.
+///
+/// An env value that is empty, whitespace-only or relative reads exactly as
+/// if the variable were unset, falling back to `root` — the same rule
+/// [`crate::plugin::resolve_env_overridden_path`] applies to a manifest's
+/// other env-relocatable paths (see its own doc for why), applied here too:
+/// a scan root must never be read relative to this process's own working
+/// directory, which is what an exported-but-empty variable would otherwise
+/// do (`PathBuf::from("").join(…)` resolves against the CWD).
 pub(crate) fn resolve_root_fields(
     root: &str,
     root_env: &Option<String>,
@@ -168,10 +176,12 @@ pub(crate) fn resolve_root_fields(
     if let Some(env_name) = root_env {
         if let Some(v) = std::env::var_os(env_name) {
             let base = PathBuf::from(v);
-            return match root_env_join {
-                Some(sub) => base.join(crate::plugin::substitute_options(sub, options)),
-                None => base,
-            };
+            if base.is_absolute() {
+                return match root_env_join {
+                    Some(sub) => base.join(crate::plugin::substitute_options(sub, options)),
+                    None => base,
+                };
+            }
         }
     }
     crate::plugin::expand_home(&crate::plugin::substitute_options(root, options))
@@ -3265,6 +3275,47 @@ mod tests {
         // No suffix appended onto the plain `root` fallback.
         let expected = dirs::home_dir().unwrap().join(".codex").join("sessions");
         assert_eq!(resolve_root(&lf, &no_options()), expected);
+    }
+
+    /// An exported-but-empty, whitespace-only or relative override must read
+    /// as though the variable were never set at all — the same rule
+    /// `resolve_env_overridden_path` gives a manifest's other env-relocatable
+    /// paths. Before this, an empty value in particular (`PathBuf::from("")`)
+    /// made the scan root relative to whatever this process's own working
+    /// directory happened to be.
+    #[test]
+    fn resolve_root_treats_an_empty_whitespace_or_relative_override_as_unset() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env_name = "TICKOVER_TEST_ENGINE_LOGFILE_ROOT_NOT_ABSOLUTE";
+        let lf = LogFileConfig {
+            root_env: Some(env_name.to_string()),
+            root_env_join: None,
+            root: "~/.codex/sessions".to_string(),
+            glob: "rollout-*.jsonl".to_string(),
+            format: LogFileFormat::Jsonl,
+            select: LogFileSelect::Last,
+            container_key: "rate_limits".to_string(),
+            classify_threshold_minutes: 720,
+            detect_bin: None,
+            not_installed_message: None,
+            no_data_message: None,
+            account_match: None,
+        };
+        let expected = dirs::home_dir().unwrap().join(".codex").join("sessions");
+
+        for not_absolute in ["", "   ", "relative/sessions"] {
+            std::env::set_var(env_name, not_absolute);
+            assert_eq!(
+                resolve_root(&lf, &no_options()),
+                expected,
+                "{not_absolute:?} must fall back to the declared root, not be read verbatim"
+            );
+        }
+
+        // An absolute value is still honoured exactly as before.
+        std::env::set_var(env_name, "/tmp/x");
+        assert_eq!(resolve_root(&lf, &no_options()), PathBuf::from("/tmp/x"));
+        std::env::remove_var(env_name);
     }
 
     // ── installed vs no-data messaging ───────────────────────────────────
