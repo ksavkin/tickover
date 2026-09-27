@@ -1653,6 +1653,15 @@ fn path_of(path: &Option<String>) -> Option<&str> {
     path.as_deref().map(str::trim).filter(|p| !p.is_empty())
 }
 
+/// The most digits of scale a `MoneyMinor` amount's `exponent` may declare
+/// before [`read_amount`] refuses the whole figure — not a scale any real
+/// currency needs, but the bound `format_money_minor` (`src/main.rs`) leans
+/// on for its own freedom from a divide-by-zero: `10u64.pow(exponent)` stays
+/// well clear of overflowing back to a wrapped zero as long as `exponent`
+/// never reaches this crate's other bound on it (`u64::pow`'s own ceiling,
+/// 19), and the `const` assertion beside that function checks exactly that.
+pub const MONEY_EXPONENT_MAX: u32 = 9;
+
 /// One figure, in whichever form its entry declares.
 ///
 /// Every kind is all-or-nothing. A money triplet missing its currency or its
@@ -1671,7 +1680,7 @@ fn read_amount(value: &Value, cfg: &AmountConfig) -> Option<crate::model::Balanc
             // currency has — it is a response that changed shape, and
             // rendering it would produce a number off by orders of magnitude.
             let currency = crate::plugin::sanitize_provider_text(currency);
-            if currency.is_empty() || exponent > 9 {
+            if currency.is_empty() || exponent > MONEY_EXPONENT_MAX as u64 {
                 return None;
             }
             Some(crate::model::BalanceAmount::Money {
@@ -5241,7 +5250,9 @@ mod tests {
         assert_eq!(
             encode_key_part("a~b"),
             "a%7Eb",
-            "a tilde is the boundary between element parts"
+            "outside this encoder's own unreserved set, same as any other byte \
+             not in [A-Za-z0-9_-] — the key grammar has one separator, `:`, and \
+             `~` plays no part in it"
         );
         assert_eq!(
             encode_key_part("100%"),

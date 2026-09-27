@@ -281,13 +281,17 @@ pub fn sanitize_description(text: &str) -> String {
         .filter(|c| !c.is_control() && !super::is_invisible_or_directional(*c))
         .collect();
     // Trimmed again for whatever the strip above exposed, before the cap
-    // below decides whether there is still something to mark as cut. The
-    // two trims land in the same relative order
-    // [`crate::plugin::sanitize_provider_text`] uses for its own — trailing,
-    // then leading — but not on the same side of the cap: that function
-    // caps inside its iterator chain before either trim runs; this one
-    // trims twice first and only then caps, trimming a third time on
-    // whatever the cut itself exposes.
+    // below decides whether there is still something to mark as cut. Both
+    // functions trim once before the filter runs, then filter, then trim
+    // again — trailing, then leading — outside that chain, and both cap the
+    // result at their own limit; only the order of that second trim and the
+    // cap differs. [`crate::plugin::sanitize_provider_text`] caps inside the
+    // chain, right after its own filter, so its outside-the-chain trim
+    // cleans up whatever the cap exposed as well as whatever the filter did;
+    // this one has no cap yet when its own outside-the-chain trim runs, so
+    // that pair only ever cleans up what the filter exposed, and the cap
+    // comes afterwards, trimming a third time on whatever the cut itself
+    // exposes.
     out.truncate(out.trim_end().len());
     let leading = out.len() - out.trim_start().len();
     out.drain(..leading);

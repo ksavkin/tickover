@@ -867,10 +867,13 @@ fn latest_reading(
 /// about the provider's own data directory, not data it trusts to be small,
 /// and a mistyped one (or an env var pointed at something far wider) could
 /// hand this walk a home directory instead of a session tree. `LOG_WALK_MAX_ENTRIES`
-/// caps how many directory entries a single collection visits before it stops
-/// and reports whatever it already found; a session tree this engine has ever
-/// been measured against (`fetch`'s doc: 3975 files) is nowhere near the cap,
-/// so this only ever bites a manifest that got its root wrong.
+/// caps how many entries [`collect_log_files`] takes off the walk after
+/// `filter_map(Result::ok)` has already dropped the unreadable ones — so it
+/// bounds successfully-read entries, not every directory entry the walk
+/// itself visits, before it stops and reports whatever it already found; a
+/// session tree this engine has ever been measured against (`fetch`'s doc:
+/// 3975 files) is nowhere near the cap, so this only ever bites a manifest
+/// that got its root wrong.
 const LOG_WALK_MAX_ENTRIES: usize = 200_000;
 
 /// All files under `root` whose basename matches `glob` — including a

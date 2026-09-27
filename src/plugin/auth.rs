@@ -2386,8 +2386,8 @@ fn compile_scan_pattern(pattern: &str) -> Option<ScanPattern> {
 
 /// One pattern's match attempt against the bytes read so far — factored out
 /// of [`scan_candidate`]'s loop because the id and secret halves were
-/// otherwise identical apart from which `Option<String>` they wrote into and
-/// which word appeared in the `debug_assert!`.
+/// otherwise identical apart from which pattern they matched against and
+/// which `Option<String>` they wrote into.
 ///
 /// `eof` is most of the reason this exists rather than being a one-line
 /// `if let`: `pattern.re.find(carry)` on a still-growing buffer can return a
@@ -6141,9 +6141,9 @@ mod tests {
         // file at production's own limits, and `secret_pattern`'s `{10,}`
         // has no upper bound of its own — alphanumeric padding right after
         // the real secret would extend that match into the padding itself,
-        // well past `CLIENT_PATTERN_MAX_MATCH_BYTES`, and trip the
-        // `debug_assert` in `scan_candidate` on a match this test never
-        // meant to produce.
+        // well past `CLIENT_PATTERN_MAX_MATCH_BYTES`, and `accept_settled_match`
+        // would silently refuse a match that long rather than settle it — the
+        // secret this test means to find would never be found at all.
         let mut content = vec![b'x'; 6000];
         content.extend_from_slice(id.as_bytes());
         content.push(b' ');

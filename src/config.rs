@@ -364,10 +364,22 @@ fn take_write_count() -> u64 {
 /// A plain `Mutex`, not a `RwLock`: every caller through here writes, so
 /// there is no reader-heavy case to give a second lock kind a reason to
 /// exist. Poisoning is recovered (`unwrap_or_else(|e| e.into_inner())`) the
-/// same way `plugin::throttle::STATES`'s lock is — a panic mid-write on some
-/// future background thread must not turn every later config write into a
-/// permanent failure for a process this crate's own `panic = "abort"`
-/// decision (see `Cargo.toml`) never unwinds out of anyway.
+/// same way `plugin::throttle::STATES`'s lock is — precisely *because* this
+/// crate declines `panic = "abort"` (see `Cargo.toml` for the guards that
+/// depend on unwinding), a panic on a background thread unwinds rather than
+/// ending the process, so a poisoned guard here is a real, survivable event,
+/// not a dead-process formality.
+/// Safe to recover from: every writer's own persisted `Value` is build-
+/// mutate-write-once — one `load()`, a mutation on a freshly cloned copy, one
+/// [`write_atomically`] call before releasing the guard — so a panic here can
+/// only ever discard that local, not-yet-written copy, never a value torn
+/// mid-mutation; the file on disk stays whatever the last completed write
+/// left it as. (`remove_plugin_keys` also clears its own in-memory
+/// ping-throttle entry under this guard, before any of that — independently
+/// of whether the write that follows lands at all, per its own comment, so a
+/// panic there leaves the same drift between the two a plain early return
+/// already can.) Not recovering would instead turn one such panic into every
+/// later config write panicking too, for the rest of the process's life.
 static CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Write `text` to `path` without ever leaving a half-written file behind —

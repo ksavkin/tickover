@@ -2340,6 +2340,37 @@ fn no_two_shipped_manifests_share_an_id_a_menu_label_or_a_sort_order() {
     }
 }
 
+/// A window and a balance in the same manifest can resolve to one registry
+/// key: `validate_windows`/`validate_balances` each refuse a duplicate
+/// within their own section, but neither compares a window's `entry_key`
+/// against a balance's, so a window declaring `id = "b0"` collides with an
+/// anonymous first balance without either check ever seeing it (see
+/// `plugin::balance_key`'s own doc). None of the built-ins does this today —
+/// this is what keeps that true rather than assumed.
+#[test]
+fn no_shipped_manifest_lets_a_window_and_a_balance_resolve_to_the_same_key() {
+    for (name, contents) in DEFAULT_TEMPLATES {
+        let m = PluginManifest::from_str(contents).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let entries: Vec<(String, String)> = m
+            .windows
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (format!("windows[{i}]"), tickover::plugin::window_key(w, i)))
+            .chain(m.balances.iter().enumerate().map(|(i, b)| {
+                (
+                    format!("balances[{i}]"),
+                    tickover::plugin::balance_key(b, i),
+                )
+            }))
+            .collect();
+        for (i, (label, key)) in entries.iter().enumerate() {
+            if let Some((other_label, _)) = entries[..i].iter().find(|(_, k)| k == key) {
+                panic!("{name}: {other_label} and {label} resolve to the same key {key:?}");
+            }
+        }
+    }
+}
+
 /// `grok.toml` on its own, read straight off disk rather than through
 /// [`DEFAULT_TEMPLATES`] — wiring a manifest into that constant is
 /// `plugin::seed`'s job, a separate change from writing the manifest itself.

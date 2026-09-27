@@ -171,7 +171,7 @@ fn run(output: Output, manifests: Vec<PluginManifest>) -> i32 {
 /// Providers whose manifests carry no `[history]` — shown as quota-only
 /// rather than averaged into anything. A provider that declares history
 /// but simply had no usage in range is counted, not quota-only.
-fn quota_only(manifests: &[PluginManifest], _stats: &query::Stats) -> Vec<String> {
+fn quota_only(manifests: &[PluginManifest]) -> Vec<String> {
     manifests
         .iter()
         .filter(|m| m.history.is_none())
@@ -254,7 +254,7 @@ fn text_out(
             s.push('\n');
         }
     }
-    let qo = quota_only(manifests, st);
+    let qo = quota_only(manifests);
     if !qo.is_empty() {
         s.push_str(&format!("quota only: {}\n", qo.join(", ")));
     }
@@ -305,7 +305,7 @@ fn json_out(
         "providers": st.by_provider.iter()
             .map(|(k, t)| (k.clone(), totals_json(t)))
             .collect::<serde_json::Map<_, _>>(),
-        "quota_only": quota_only(manifests, st),
+        "quota_only": quota_only(manifests),
         "top_projects": st.projects.iter().take(10)
             .map(|(p, t)| serde_json::json!({"project": p, "tokens": t.sum()}))
             .collect::<Vec<_>>(),

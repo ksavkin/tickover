@@ -7273,13 +7273,56 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_without_an_id_falls_back_to_a_position_that_cannot_collide_with_a_window() {
+    fn an_entry_without_an_id_falls_back_to_a_b_prefixed_position_not_a_w_prefixed_one() {
         let m = PluginManifest::from_str(&BALANCES_ONLY.replace("id    = \"monthly\"\n", ""))
             .expect("an id is optional");
-        // `b0`, not `w0`: a balance and a window at the same index are two
-        // different rows, and one registry key for both would file them
-        // together the first time an entry drops its `id`.
+        // `b0`, not `w0`: two anonymous entries at the same index, one from
+        // each section, fall back to different strings — see
+        // `an_explicit_window_id_can_still_collide_with_an_anonymous_balance`
+        // right below for the case this prefix does not save.
         assert_eq!(m.balances[0].entry_key(0), "b0");
+    }
+
+    /// The case `BalanceConfig::entry_key`'s own doc names as the reason the
+    /// two sections "cannot collide" is only the case above, where both
+    /// sides are anonymous and the `b`/`w` prefixes tell them apart. Nothing
+    /// stops a *declared* `id` from spelling out the other section's fallback
+    /// shape: `windows`/`balances` are validated for internal duplicates only
+    /// (`validate_windows`/`validate_balances`, each walking its own
+    /// section), never against each other, so a window that declares
+    /// `id = "b0"` reaches [`PluginManifest::validate`] clean while resolving
+    /// to the exact string an anonymous first balance already falls back to.
+    #[test]
+    fn an_explicit_window_id_can_still_collide_with_an_anonymous_balance() {
+        let toml = BALANCES_ONLY
+            .replace("id    = \"monthly\"\n", "")
+            .replace(
+                "requires_reader = [\"reading-balances\"]",
+                "requires_reader = [\"reading-balances\", \"window-identity\"]",
+            )
+            .replace(
+                "[[balances]]",
+                r#"[[windows]]
+        id    = "b0"
+        label = "5H"
+        role  = "primary"
+        [windows.period]
+        mode    = "assumed"
+        assumed = 300
+        [windows.source]
+        used_percent_path = "five_hour.utilization"
+        resets_at_path    = "five_hour.resets_at"
+
+        [[balances]]"#,
+            );
+        let m = PluginManifest::from_str(&toml).expect("no rule refuses this combination");
+        assert_eq!(m.windows[0].entry_key(0), "b0");
+        assert_eq!(m.balances[0].entry_key(0), "b0");
+        assert_eq!(
+            crate::plugin::window_key(&m.windows[0], 0),
+            crate::plugin::balance_key(&m.balances[0], 0),
+            "the declared window and the anonymous balance resolve to one registry key"
+        );
     }
 
     /// `path` is `number`/`text`'s own field — neither engine ever reads it
@@ -7581,6 +7624,65 @@ mod tests {
         assert_eq!(h.glob, "**/*.jsonl");
         assert_eq!(h.root_env.as_deref(), Some("CODEX_HOME"));
         assert_eq!(h.root_env_join.as_deref(), Some("sessions"));
+    }
+
+    /// Same shape as the `[logfile]` trio above, for `[history] root` —
+    /// `option_templates` in `validate_engine_sections` sweeps this section's
+    /// `root`/`root_env_join`/`glob` too, the same substituted fields
+    /// `[logfile]` has, and this had no test proving it.
+    #[test]
+    fn a_history_root_swallows_its_own_placeholder() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format        = \"codex-rollouts\"\n        \
+             root          = \"~/{\\\"a\\\":\\\"{option.deep}\\\"}\"\n        \
+             glob          = \"**/*.jsonl\"\n";
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a JSON-shaped root swallows its own placeholder");
+        assert!(err.contains("{option.<key>}"), "{err}");
+        assert!(err.contains("`[history] root`"), "{err}");
+    }
+
+    /// Same shape, for `[history] glob`.
+    #[test]
+    fn a_history_glob_swallows_its_own_placeholder() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format        = \"codex-rollouts\"\n        \
+             root          = \"~/.codex/sessions\"\n        \
+             glob          = \"{\\\"a\\\":\\\"{option.deep}\\\"}\"\n";
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a JSON-shaped glob swallows its own placeholder");
+        assert!(err.contains("{option.<key>}"), "{err}");
+        assert!(err.contains("`[history] glob`"), "{err}");
+    }
+
+    /// Same shape, for `[history] root_env_join`.
+    #[test]
+    fn a_history_root_env_join_swallows_its_own_placeholder() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format        = \"codex-rollouts\"\n        \
+             root          = \"~/.codex/sessions\"\n        \
+             glob          = \"**/*.jsonl\"\n        \
+             root_env      = \"CODEX_HOME\"\n        \
+             root_env_join = \"{\\\"a\\\":\\\"{option.deep}\\\"}\"\n";
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a JSON-shaped root_env_join swallows its own placeholder");
+        assert!(err.contains("{option.<key>}"), "{err}");
+        assert!(err.contains("`[history] root_env_join`"), "{err}");
     }
 
     /// The gate half: `[history]` keys with no `reading-history` declared is

@@ -442,12 +442,13 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
         // without it is one where the user removed it.
         deliver_if_absent: false,
     },
-    // grok.toml's first entry, and the first built-in that ships *new* rather
-    // than changed. Nothing on disk to recognise, so `previous_sha256` is
-    // empty and `deliver_if_absent` carries the whole decision: an install
-    // that already has a plugins directory never runs seeding again, so
-    // without this Grok would reach only machines installing the app for the
-    // first time.
+    // grok.toml's entry, the first built-in that shipped *new* rather than
+    // changed: at 1.0.0 there was nothing on disk yet to recognise, and
+    // `deliver_if_absent` carried the whole decision — an install that
+    // already has a plugins directory never runs seeding again, so without
+    // it Grok would reach only machines installing the app for the first
+    // time. `previous_sha256` has since grown one entry per shipped
+    // revision, same as every other built-in below.
     //
     // Once per version, like every other entry: the marker is recorded whether
     // the file was written or not, so deleting grok.toml afterwards keeps it
@@ -722,12 +723,12 @@ mod tests {
     fn every_entry_in_the_table_correctly_classifies_an_unrecognised_file_and_its_own_current_template(
     ) {
         for upgrade in BUILTIN_UPGRADES {
-            // A built-in shipping for the first time has no previous version
-            // to migrate from at all — that path is `deliver_if_absent`, and
-            // it has its own test below.
-            if upgrade.previous_sha256.is_empty() {
-                continue;
-            }
+            // Every entry in the table has at least one recognised previous
+            // version by now — a fresh entry with none yet would still
+            // classify correctly here: the fixture's hash is never in
+            // `previous_sha256` (short of a collision) whether that list is
+            // empty or not, so both assertions below hold either way, and
+            // `deliver_if_absent` has its own test below regardless.
             let dir = temp_dir(&format!("table-{}", upgrade.id));
             // Not real previous-version bytes — see this test's own doc for
             // why there are none left to write here. Its hash will not be in
@@ -899,6 +900,8 @@ mod tests {
             "window-identity",
             "reading-status",
             "reading-balances",
+            "credentials-file-path-env",
+            "http-value-path-env",
             "reading-history",
         ] {
             assert!(
@@ -906,6 +909,7 @@ mod tests {
                 "the manifest has to declare {name}, or an older build reads its fields as ours"
             );
         }
+        assert_eq!(m.requires_reader.len(), 7, "and nothing else is claimed");
 
         // One surface, and it must be spelled "default": any other id would
         // change this provider's reading id from "codex" to "codex-<id>" and

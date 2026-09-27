@@ -2542,19 +2542,6 @@ fn run_slow_timer(
     tick_timer
 }
 
-/// Dock mode: clicking the Dock icon of a running app is an app-level
-/// reopen that never reaches the winit event loop, so a hidden panel would
-/// stay hidden with no way back. Watch the activation flag's rising edge
-/// instead — an edge, not the level, so hiding the window while the app is
-/// still frontmost doesn't immediately re-present it.
-///
-/// `panel_target_visibility` resolves each tick to a single target state
-/// rather than reacting per event, because several clicks can land inside
-/// one interval and their order is not recoverable afterwards.
-///
-/// Outside dock mode the returned [`Timer`] is simply never started — cheap
-/// to always build, so `main` can hold one `Timer` binding for it
-/// unconditionally, the same as every other timer here.
 /// Drain every queued status-item event, applying each left-button release
 /// as the panel toggle it asks for. Returns how many left clicks it
 /// applied — including ones absorbed or dismissed without a visible toggle,
@@ -2699,6 +2686,19 @@ fn drain_tray_clicks(app: &AppWindow, ctx: &Ctx) -> usize {
     tray_clicks
 }
 
+/// Dock mode: clicking the Dock icon of a running app is an app-level
+/// reopen that never reaches the winit event loop, so a hidden panel would
+/// stay hidden with no way back. Watch the activation flag's rising edge
+/// instead — an edge, not the level, so hiding the window while the app is
+/// still frontmost doesn't immediately re-present it.
+///
+/// `panel_target_visibility` resolves each tick to a single target state
+/// rather than reacting per event, because several clicks can land inside
+/// one interval and their order is not recoverable afterwards.
+///
+/// Outside dock mode the returned [`Timer`] is simply never started — cheap
+/// to always build, so `main` can hold one `Timer` binding for it
+/// unconditionally, the same as every other timer here.
 fn run_dock_reopen_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
     let reopen_timer = Timer::default();
     if platform::dock_mode() {
@@ -2759,9 +2759,9 @@ fn run_dock_reopen_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
             if want_visible && !visible {
                 // The panel was hidden — the tick timer's own gate has been
                 // skipping `refresh_model_from` for it — so it must be forced
-                // fresh here, the same `should_refresh_panel` idiom as every
-                // other `present_popover` call site in this file, rather than
-                // showing whatever the model last held.
+                // fresh here, the same `should_refresh_panel` idiom every
+                // other `present_popover` call site but the startup ones
+                // uses, rather than showing whatever the model last held.
                 if should_refresh_panel(visible, true) {
                     refresh_model(
                         &app,
@@ -3853,10 +3853,10 @@ fn drain_engine_diagnostics() {
 /// Kick off a background fetch for one plugin, unless it is disabled, or a
 /// fetch is already in flight for it (dedup by plugin id, so any number of
 /// plugins can be tracked with one `fetching` map). `active_surface_ids`/
-/// `options` are resolved by the caller at
-/// spawn time — the same instant a fetch is decided to happen — not inside
-/// the background thread, so a config change mid-flight can't retroactively
-/// alter an already-dispatched fetch.
+/// `options` are resolved by the caller, before this function decides
+/// whether a fetch actually happens — not inside the background thread, so
+/// a config change mid-flight can't retroactively alter an already-
+/// dispatched fetch.
 ///
 /// `now` is a parameter rather than read here with `Instant::now()`, the
 /// same reason [`ping_probe_decision`] takes one: a test that wants to prove
@@ -5289,12 +5289,13 @@ fn plugin_ping_armed(enabled: bool, ping_on: bool) -> bool {
 /// the popover is on screen and could otherwise show a tick-old number — or
 /// `forced` — it is about to be shown and would open on a tick-old number the
 /// instant it appeared, whether or not it happened to already be on screen.
-/// The tick's own gate and every `present_popover` call site but one — the
-/// unconditional refresh right after startup, which runs whether or not a
-/// popover is ever about to follow it — go through this same predicate, so
-/// "does a refresh belong here" has one answer for the tick and for showing
-/// the panel again later, rather than a hidden agreement between several
-/// `if`s that happen to match today.
+/// The tick's own gate and three of the five `present_popover` call sites go
+/// through this same predicate; the other two are the startup-only ones
+/// right after the unconditional first `refresh_model` — a popover shown
+/// there is already caught up, with nothing left for this predicate to
+/// decide. So "does a refresh belong here" has one answer for the tick and
+/// for showing the panel again later, rather than a hidden agreement between
+/// several `if`s that happen to match today.
 fn should_refresh_panel(visible: bool, forced: bool) -> bool {
     visible || forced
 }
@@ -7251,12 +7252,23 @@ fn format_amount(a: &BalanceAmount) -> String {
     }
 }
 
+/// `10u64.pow(exponent)` below never wraps to zero and hands
+/// `format_money_minor` a `scale` to divide by that turns out to be none:
+/// [`engine_http::MONEY_EXPONENT_MAX`] is the only bound this app ever puts
+/// on `exponent`, so checked here, at the constant, is the only place a
+/// widened bound could reopen the divide-by-zero this function's own doc
+/// otherwise only asserts in prose.
+const _: () = assert!(10u64.checked_pow(engine_http::MONEY_EXPONENT_MAX).is_some());
+
 /// `minor` at `exponent` digits of scale, as a plain decimal string —
 /// integer arithmetic throughout, because `minor as f64 / 10f64.powi(e)`
 /// loses precision exactly where money can least afford it, and
 /// `minor.abs()` panics on `i64::MIN`. `exponent == 0` (a currency with no
 /// minor unit) prints no decimal point at all: there is nothing after it to
-/// show.
+/// show. Never divides by a `scale` of zero: [`engine_http::MONEY_EXPONENT_MAX`]
+/// is the only bound anything in this app puts on `exponent` before it
+/// reaches here, and the `const` assertion right above this function checks
+/// that bound keeps `10u64.pow` from wrapping.
 fn format_money_minor(minor: i64, exponent: u32) -> String {
     let sign = if minor < 0 { "-" } else { "" };
     let scale = 10u64.pow(exponent);
@@ -7786,9 +7798,12 @@ fn sync_tray_indicator_from(
     if last_key.get() == Some(key) {
         return;
     }
-    // The figures move once a minute even when the widget's own rounded
-    // numbers have not, so this is set on every key change rather than only
-    // alongside an icon that actually changed.
+    // Set once here, ahead of the three branches below, rather than once in
+    // each: whichever of them runs — a redrawn icon, the fallback text
+    // title, or the disabled/no-data glyph — the tooltip needs the same
+    // figures either way, and `key` already folds this string in on its own
+    // (see `tray_indicator_key`'s own doc), so a change here that never
+    // moves the widget's own rendered bits still has to reach the tray.
     let _ = tray.set_tooltip(Some(&tooltip));
 
     if let Some((rows, dark)) = widget {
@@ -7837,9 +7852,11 @@ fn sync_tray_indicator_from(
 /// single `u64` rather than a `String`: a leading discriminant, mirroring
 /// what a derived `Hash` impl on an enum would produce, tells the
 /// disabled/empty/rendered shapes apart before [`menubar::cache_key`]'s own
-/// bits (only present for the rendered shape) get mixed in, then the
-/// tooltip — which changes on its own cadence (once a minute) independent of
-/// the widget.
+/// bits (only present for the rendered shape) get mixed in, then `tooltip`
+/// itself. Hashed unconditionally rather than folded in only alongside
+/// `cache_key`: the two disabled/no-data shapes below never hash
+/// `cache_key` at all, so for either of them `tooltip` is the only thing
+/// that can still tell two ticks apart.
 fn tray_indicator_key(
     widget: &Option<(Vec<menubar::ProviderRow>, bool)>,
     enabled: bool,
@@ -10165,6 +10182,7 @@ fn fold_registry_diff(
                         "the installed {stem}.toml cannot be read — {msg}. \
                          Remove or fix that file to install this plugin.",
                         stem = entry.id,
+                        msg = sanitize_trust_item(msg),
                     ));
                 }
                 diff.new_rows.push(row);
@@ -10721,9 +10739,12 @@ fn update_target_unchanged(recorded_sha256: Option<&str>, current_sha256: &str) 
 /// [`handle_install_outcome`] reaches this from two unrelated places that
 /// both fold in text this app didn't author itself: a validator refusal
 /// quoting a manifest's own offending text, and an `install_write`/
-/// `update_write` error folding an `io::Error` in with `.to_string()`.
-/// Neither is any more this app's own text than the other, so both get the
-/// same cap and the same control/bidi strip before either row shows them.
+/// `update_write` error — an `io::Error` folded in with `.to_string()` on
+/// most paths, but "plugin id ... is not a valid filename" or "no installed
+/// manifest file found for id ..." on the two that fail before any I/O is
+/// attempted. Neither place is any more this app's own text than the other,
+/// so both get the same cap and the same control/bidi strip before either
+/// row shows them.
 /// Always returns `false`, matching [`handle_install_outcome`]'s own "no
 /// manifest was written" contract for every path through it that isn't a
 /// landed write.
@@ -14807,6 +14828,12 @@ mod title_tests {
             at: NOW + 600,
             period_minutes: Some(300),
         };
+        // Pinned against the real key generator: `seen_only` below only ever
+        // answers `"w0:"`, so a `window_key` shape that moved would make
+        // `window_rows` ask under a different string, get `None` back either
+        // way, and pass the `is_empty()` below without the TTL logic under
+        // test ever running.
+        assert_eq!(tickover::plugin::window_key(&m.windows[0], 0), "w0:");
         assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", seen), &NO_PROJ).is_empty());
     }
 
@@ -14823,6 +14850,9 @@ mod title_tests {
             at: NOW - 600,
             period_minutes: Some(300),
         };
+        // See `a_window_that_has_not_ended_yet_gets_no_not_started_row` for
+        // why this pins the key `seen_only` below is keyed on.
+        assert_eq!(tickover::plugin::window_key(&m.windows[0], 0), "w0:");
         assert!(window_rows(Some(&m), &broken, NOW, &seen_only("w0:", seen), &NO_PROJ).is_empty());
     }
 
@@ -14845,6 +14875,9 @@ mod title_tests {
     fn a_remembered_window_with_no_remembered_length_gets_no_row() {
         let m = two_window_manifest();
         let nothing = reading_with(Vec::new(), None);
+        // See `a_window_that_has_not_ended_yet_gets_no_not_started_row` for
+        // why this pins the key `seen_only` below is keyed on.
+        assert_eq!(tickover::plugin::window_key(&m.windows[0], 0), "w0:");
         let no_length = config::SeenWindow {
             at: NOW - 600,
             period_minutes: None,
@@ -15638,6 +15671,7 @@ mod title_tests {
         let was = model.row_data(0).expect("one row");
         assert!(!was.not_started);
         assert_ne!(was.reset_rel, "");
+        let inner_before = Rc::as_ptr(&models.get("codex").expect("model stored").model);
 
         let gone = reading_with(Vec::new(), None);
         let after = window_rows(Some(&m), &gone, NOW, &seen_only("w0:", seen), &NO_PROJ);
@@ -15645,7 +15679,17 @@ mod title_tests {
         assert_eq!(
             model.row_count(),
             1,
-            "same count: the in-place path is the one under test"
+            "the key sequence is unchanged: one row before and after"
+        );
+        // The count alone does not tell in-place from rebuilt — a rebuild
+        // that happened to land on the same length would pass it too. The
+        // `Rc` pointer does: only the in-place branch of
+        // `reconcile_window_model` returns the same allocation the previous
+        // call stored.
+        let inner_after = Rc::as_ptr(&models.get("codex").expect("model stored").model);
+        assert_eq!(
+            inner_before, inner_after,
+            "the in-place path is the one under test"
         );
 
         let now_row = model.row_data(0).expect("still one row");
@@ -18564,9 +18608,11 @@ mod title_tests {
         assert!(!row.error.contains('\u{202E}'));
     }
 
-    /// `install_write`/`update_write` fold an `io::Error` in with
-    /// `.to_string()` — a path or id spelled out in the message, no more
-    /// this app's own text than a validator's refusal is —
+    /// `install_write`/`update_write` can fail with an `io::Error` folded in
+    /// with `.to_string()`, or with a string of their own before any I/O is
+    /// attempted (this one: `update_write`'s "no installed manifest file
+    /// found for id") — a path or id spelled out in the message either way,
+    /// no more this app's own text than a validator's refusal is —
     /// `fail_pending_row` is the same sanitiser [`handle_install_outcome`]
     /// routes both through. Pinned directly against `fail_pending_row`
     /// rather than through `handle_install_outcome` itself: reaching this
@@ -18710,6 +18756,43 @@ mod title_tests {
             has_local_edits,
             "the installed file diverged from its recorded origin"
         );
+    }
+
+    /// `broken`'s message comes straight from [`manifest::load_dir`], which
+    /// quotes the unparsable file's own bytes back in its error — a bidi
+    /// override or a run past [`TRUST_ITEM_MAX_CHARS`] must not reach this
+    /// row any more than a validator refusal does on the sibling path
+    /// [`handle_install_outcome`] routes through `fail_pending_row`.
+    #[test]
+    fn fold_registry_diff_sanitizes_an_unparsable_manifest_s_message_before_it_reaches_the_row() {
+        let index = RegistryIndex {
+            schema_version: 1,
+            plugins: vec![make_registry_entry(
+                "brandnew",
+                "Brand New",
+                "0.3.0",
+                &registry::sha256_hex(b"brandnew-bytes"),
+            )],
+        };
+        let lockfile = registry::RegistryLockState::default();
+        let raw_msg = format!(
+            "expected a table, found a string\u{202E}{}",
+            "x".repeat(TRUST_ITEM_MAX_CHARS)
+        );
+        let broken = vec![("brandnew".to_string(), raw_msg.clone())];
+
+        let diff = fold_registry_diff(&index, &[], &lockfile, &broken);
+
+        assert_eq!(diff.new_rows.len(), 1);
+        let row = &diff.new_rows[0];
+        assert_eq!(row.status, InstallStatus::Failed);
+        let expected = format!(
+            "the installed brandnew.toml cannot be read — {}. \
+             Remove or fix that file to install this plugin.",
+            sanitize_trust_item(&raw_msg),
+        );
+        assert_eq!(row.error.as_str(), expected);
+        assert!(!row.error.contains('\u{202E}'));
     }
 
     #[test]
