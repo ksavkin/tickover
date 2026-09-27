@@ -286,10 +286,15 @@ Several edges are accepted rather than chased:
   does not release the claim (see the `state.json` bullet above) — and
   a second provider whose root also reaches it reads nothing from that
   path, not zero-then-recovering but zero for as long as the first
-  provider's id stays in the registry. The claim does move, the one way
-  it can: if that id is later renamed or actually removed, the next
-  walk to reach the path takes it over. Bounded to the pathological
-  case of two enabled manifests actually sharing a root.
+  provider's id stays in the registry. The claim does move, two ways:
+  if that id is later renamed or actually removed, the next walk to
+  reach the path takes it over; or the path itself is deleted and
+  recreated (see the delete-and-recreate bullet below) — that drops the
+  `FileState` the claim was stamped on, and whichever provider's walk
+  reaches the recreated path first claims it fresh, live competitor or
+  not, since there is no owner left on record to weigh it against.
+  Bounded to the pathological case of two enabled manifests actually
+  sharing a root.
 - **A file outside every enabled root, but not yet deleted, keeps its
   cursor.** Pruning confirms deletion against the filesystem rather
   than a resolved root list, so a manifest edit that narrows a

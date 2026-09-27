@@ -1287,6 +1287,27 @@ impl HistoryStore {
             .iter()
             .filter_map(|(p, s)| s.sealed_through.map(|g| (p.as_str(), g)))
             .collect();
+        // A pruned path's recorded generation is already the resolved
+        // target — `prune_missing_files` computed it by calling
+        // `target_gen` itself, at the moment the `FileState` (and its
+        // `sealed_through`) was still there to read. Once that entry is
+        // gone, nothing seeds `sealed_gen` for the path any more, so the
+        // walk below would start it from scratch and could rebuild it
+        // from whatever `full` line it finds — including one at a lower
+        // generation the file had already moved past before it was ever
+        // swept, which reads as "sealed" only because sealing never un-
+        // happens, not because it is still the file's newest one. Seeding
+        // here pins the entry at the recorded number before that walk
+        // runs: `current[file]` for a pruned path is exactly that same
+        // number, so the walk's own cap keeps it from ever being raised
+        // any further, and the plain-max fold it performs can never lower
+        // it either. `or_insert` only matters for a path recorded here
+        // while still tracked — normally impossible (`begin_file` clears
+        // the entry the moment it retracks a path) — so an existing
+        // `state.files`-seeded value always wins.
+        for (p, &g) in &self.state.pruned_generations {
+            sealed_gen.entry(p.as_str()).or_insert(g);
+        }
         for (i, d) in self.days.iter().enumerate() {
             // A generation that once reached the end of its source has
             // reached it, permanently — sealing is a fact about the
@@ -2251,6 +2272,85 @@ mod tests {
             store.live_days().map(|d| d.input).sum::<u64>(),
             3,
             "the recorded target must survive a reopen too"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_swept_files_recorded_target_is_not_pulled_down_by_a_lower_relic_seal() {
+        // Gen 0 seals at 10, and nothing ever marks that line dead — dead-
+        // marking only ever competes lines within the same (file, gen)
+        // bucket, and gen 0's bucket never sees another line. A rewrite
+        // moves the file to gen 1, which also seals, this time at 7; a
+        // crash-then-deadline retry then supersedes gen 1's own seal line,
+        // settling the figure at 3. `prune_missing_files` must record 1 —
+        // the generation the file actually settled at — as the swept
+        // path's target, not 0.
+        //
+        // The reopen before the sweep is load-bearing: it is what
+        // physically drops gen 1's now-dead seal line, leaving gen 0's
+        // already-superseded seal as the only `full` line still present
+        // once the `FileState` is gone. A `sealed_gen` built from scratch
+        // by the day-log walk at that point would find only that relic
+        // and settle on 0 — a generation the file had already moved past,
+        // long before it was ever swept — and drag the recorded target
+        // back down to it.
+        let root = tmpdir("swept-relic-seal-root");
+        let dir = tmpdir("swept-relic-seal-store");
+        let f = root.join("f.jsonl");
+        fs::write(&f, b"x").unwrap();
+        let key = f.to_string_lossy().into_owned();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store
+            .state
+            .files
+            .insert(key.clone(), FileState::fresh("d".into(), 1, 1));
+
+        let mut sealed0 = day(&key, 0, 10);
+        sealed0.full = true;
+        sealed0.lo = 0;
+        sealed0.hi = 20;
+        store.append_days(&[sealed0]).unwrap();
+
+        store.file_state_mut(&f).unwrap().reset("d2".into(), 2, 2);
+        let mut sealed1 = day(&key, 1, 7);
+        sealed1.full = true;
+        sealed1.lo = 0;
+        sealed1.hi = 20;
+        store.append_days(&[sealed1]).unwrap();
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 7);
+
+        let mut retry = day(&key, 1, 3);
+        retry.lo = 0;
+        retry.hi = 15;
+        store.append_days(&[retry]).unwrap();
+        assert_eq!(store.live_days().map(|d| d.input).sum::<u64>(), 3);
+
+        store.commit().unwrap();
+        drop(store);
+        let mut store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            3,
+            "the tracked figure survives the reopen that drops gen 1's now-dead seal line"
+        );
+
+        fs::remove_file(&f).unwrap();
+        assert_eq!(store.prune_missing_files(), 1);
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            3,
+            "gen 0's relic seal must not pull the recorded target down to itself"
+        );
+        store.commit().unwrap();
+
+        drop(store);
+        let store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(
+            store.live_days().map(|d| d.input).sum::<u64>(),
+            3,
+            "the recorded target must hold at 1, not the relic's 0, after a further reopen"
         );
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&dir);

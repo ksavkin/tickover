@@ -92,29 +92,34 @@ fn usage() -> &'static str {
 }
 
 fn run(output: Output, manifests: Vec<PluginManifest>) -> i32 {
-    // Every manifest id the registry has, enabled or not, taken before
-    // the filter below (as owned `String`s — the filter drops disabled
-    // manifests outright, which would leave a borrowed `&str` dangling) —
-    // a provider merely disabled for this run must keep whatever claim it
-    // holds on a shared path, not have it quietly taken over by whichever
-    // other provider this run does scan.
+    // Every manifest id the registry has, enabled or not (as owned
+    // `String`s — the filter below drops disabled manifests outright,
+    // which would leave a borrowed `&str` dangling) — a provider merely
+    // disabled for this run must keep whatever claim it holds on a shared
+    // path, not have it quietly taken over by whichever other provider
+    // this run does scan.
     let known_ids: Vec<String> = manifests.iter().map(|m| m.id.clone()).collect();
     let known: std::collections::HashSet<&str> = known_ids.iter().map(String::as_str).collect();
-    let registry_size = manifests.len();
     // A provider the user disabled keeps its history files untouched and
     // drops out of the report entirely — same filter the tray scan
-    // applies in `spawn_history_scan`.
-    let manifests: Vec<PluginManifest> = manifests
+    // applies in `spawn_history_scan`. Filtered from a clone into its own
+    // binding, never back into `manifests` itself: `manifests` stays the
+    // true, full registry for the rest of this function, so the check
+    // below reads it directly rather than a snapshot taken before the
+    // filter — the same guarantee `spawn_history_scan`'s equivalent check
+    // gets from re-borrowing `ctx.plugins` instead of a filtered copy,
+    // and one a moved snapshot could not give: a `usize` copied before
+    // the filter says nothing about which registry it was copied from,
+    // so it stays numerically consistent even read back after a filter
+    // that also shadowed the source it was copied from.
+    let enabled_manifests: Vec<PluginManifest> = manifests
+        .clone()
         .into_iter()
         .filter(crate::plugin_enabled)
         .collect();
-    // If a later edit ever moved `known_ids`/`known` below this filter,
-    // this only fails once something is actually disabled — the same
-    // condition the bug itself needs to show up — but that is exactly
-    // when it matters.
     debug_assert!(
-        known.len() == registry_size,
-        "known must mirror the full registry, taken before the enabled filter above"
+        manifests.iter().all(|m| known.contains(m.id.as_str())),
+        "known must mirror the full registry, independent of the enabled filter above"
     );
     let Some(dir) = tickover::history::default_dir() else {
         eprintln!("tickover stats: no config directory on this platform");
@@ -142,8 +147,12 @@ fn run(output: Output, manifests: Vec<PluginManifest>) -> i32 {
     let mut scans;
     let mut guard = 0;
     loop {
-        scans =
-            tickover::history::scan_tick(&mut store, &manifests, &known, &crate::plugin_options);
+        scans = tickover::history::scan_tick(
+            &mut store,
+            &enabled_manifests,
+            &known,
+            &crate::plugin_options,
+        );
         let _ = store.commit();
         guard += 1;
         if !scans.iter().any(|s| s.outcome.partial) || guard >= 60 {
@@ -152,15 +161,15 @@ fn run(output: Output, manifests: Vec<PluginManifest>) -> i32 {
     }
 
     // Buckets from a disabled provider stay on disk but leave every
-    // figure — `manifests` was already filtered to enabled above.
+    // figure — `enabled_manifests` was already filtered to enabled above.
     let enabled: std::collections::HashSet<String> =
-        manifests.iter().map(|m| m.id.clone()).collect();
+        enabled_manifests.iter().map(|m| m.id.clone()).collect();
     let stats = query::compute(&store, 30, &enabled);
     let cost_on = crate::config::history_cost_estimate();
 
     match output {
         Output::Report(path) => {
-            let sources: Vec<String> = manifests
+            let sources: Vec<String> = enabled_manifests
                 .iter()
                 .filter_map(|m| m.history.as_ref().map(|h| h.root.clone()))
                 .collect();
@@ -176,11 +185,11 @@ fn run(output: Output, manifests: Vec<PluginManifest>) -> i32 {
             open_in_browser(&path);
         }
         Output::Json => {
-            let out = json_out(&stats, &scans, &manifests, cost_on);
+            let out = json_out(&stats, &scans, &enabled_manifests, cost_on);
             let _ = writeln!(std::io::stdout(), "{out}");
         }
         Output::Text => {
-            print!("{}", text_out(&stats, &scans, &manifests, cost_on));
+            print!("{}", text_out(&stats, &scans, &enabled_manifests, cost_on));
         }
     }
     0
