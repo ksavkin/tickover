@@ -1388,6 +1388,16 @@ mod tests {
     /// queued behind it.
     static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Guards every test that drains [`take_pending_diagnostics`] —
+    /// `PENDING_DIAGNOSTICS` is one process-wide queue shared by every test
+    /// in this module, not one per plugin id. A unique id stops a test from
+    /// *misreading* another's line but not from *stealing* it: two tests
+    /// draining at once each walk away with part of what was queued, and the
+    /// one that queued a line a moment earlier finds an empty vec. The
+    /// sibling modules carry the same lock for the same reason. Poison
+    /// discipline as above: `.unwrap_or_else(|e| e.into_inner())`.
+    static DIAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The invariant is stated as a property of **every path that builds a
     /// reading**, not of `ProviderReading::fail`: a test that calls `fail` and
     /// checks it emptied three fields proves the method works and says nothing
@@ -1659,6 +1669,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unopenable_matched_file_queues_a_read_error_diagnostic() {
+        let _diag_guard = DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir("open-error");
         let path = write_file(
@@ -1761,6 +1772,7 @@ mod tests {
 
     #[test]
     fn cap_to_newest_files_keeps_the_newest_and_reports_the_drop_once() {
+        let _diag_guard = DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::time::SystemTime::now();
         // Already newest-first by construction (index 0 is `base` itself,
         // increasing index moves further into the past) — `cap_to_newest_files`
@@ -1803,6 +1815,7 @@ mod tests {
 
     #[test]
     fn cap_to_newest_files_is_a_no_op_under_the_cap() {
+        let _diag_guard = DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let files = vec![(PathBuf::from("a"), std::time::SystemTime::now(), 0u64)];
         let capped = cap_to_newest_files(files.clone(), "under-cap-plugin");
         assert_eq!(capped, files);
@@ -1811,6 +1824,7 @@ mod tests {
 
     #[test]
     fn latest_reading_stops_once_its_byte_budget_is_spent() {
+        let _diag_guard = DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Filler files sized just over `TAIL_BYTES`, so each costs exactly
         // `TAIL_BYTES` against the budget regardless of the (sparse, near-
         // free to create) size actually claimed on disk. Enough of them to
