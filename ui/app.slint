@@ -242,6 +242,18 @@ component Chip inherits Rectangle {
             letter-spacing: root.tracking;
             color: root.tint;
             vertical-alignment: center;
+            // Elided past 120px rather than left to its default clip: a
+            // `Text` with no `overflow` set claims its whole string as this
+            // layout's minimum width, and every caller sits this chip beside
+            // a name, an account label or a Retry/Install button in a row
+            // that neither wraps nor scrolls sideways. 120px is well past
+            // the longest real content any caller shows — a version
+            // transition badge like "1.10.20 → 1.11.0" — so ordinary text
+            // never elides; a caller passing the raw 64-char field this app
+            // caps names/versions/tags at cannot claim more of the row than
+            // a badge should.
+            overflow: elide;
+            max-width: 120px;
         }
     }
 }
@@ -1512,7 +1524,15 @@ export component AppWindow inherits Window {
                                                     vertical-alignment: center;
                                                 }
                                                 Text {
-                                                    text: p.update-status == UpdateStatus.failed ? p.update-error : "Update available";
+                                                    // A short, fixed label rather than `update-error`
+                                                    // itself: that text is capped at
+                                                    // `TRUST_ITEM_MAX_CHARS` (a sentence, not a
+                                                    // caption) and this row has no wrap or elide to
+                                                    // give it, sitting beside the Retry button in a
+                                                    // fixed-height row that does not scroll sideways.
+                                                    // The row below, which does wrap, shows the text
+                                                    // itself.
+                                                    text: p.update-status == UpdateStatus.failed ? "Update failed" : "Update available";
                                                     font-size: 10.5px;
                                                     color: p.update-status == UpdateStatus.failed ? Theme.crit : Theme.text-dim;
                                                     vertical-alignment: center;
@@ -1533,6 +1553,19 @@ export component AppWindow inherits Window {
                                                     tint: p.update-status == UpdateStatus.failed ? Theme.crit : Theme.warn;
                                                     button-height: 22px;
                                                     clicked => { root.update-plugin(p.id); }
+                                                }
+                                            }
+                                            // The error itself, on its own wrapped line — same idiom
+                                            // as the locally-modified warning below, so the row's
+                                            // width is the whole card's, not whatever the header row
+                                            // has left beside its Retry button.
+                                            if p.update-status == UpdateStatus.failed : HorizontalLayout {
+                                                padding-left: 30px;
+                                                Text {
+                                                    text: p.update-error;
+                                                    font-size: 9.5px;
+                                                    color: Theme.crit;
+                                                    wrap: word-wrap;
                                                 }
                                             }
                                             if p.update-status == UpdateStatus.updating : HorizontalLayout {

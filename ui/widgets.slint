@@ -67,11 +67,18 @@ export component HatchFill inherits Rectangle {
     // the repeater below is sized once per layout rather than once per
     // frame — `clip: true` trims whatever of it falls outside the box's
     // current, narrower width, the same as it always trimmed a static one.
+    // The trade this makes: the repeater is sized for that full, final
+    // width the whole time the box is narrower than it, not only while it
+    // tweens, so a projecting window's fill keeps roughly
+    // `pattern-width / 4 + root.vbh / 4 + 1` `Path` elements resident at
+    // rest — not the three or so its current, pre-tween width alone would
+    // call for. `clip: true` hides what falls outside the box's edge; it
+    // does not uninstantiate them.
     in property <length> pattern-width: self.width;
     clip: true;
     property <float> vbw: self.width / 1px;
     property <float> vbh: self.height / 1px;
-    for i in max(0, round(pattern-width / 1px / 4 + root.vbh / 4)) + 1 : Path {
+    for i in max(0, round(root.pattern-width / 1px / 4 + root.vbh / 4)) + 1 : Path {
         width: root.width;
         height: root.height;
         viewbox-width: root.vbw;

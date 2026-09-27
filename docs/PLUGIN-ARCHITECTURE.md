@@ -2522,6 +2522,9 @@ trusted:
 - `id`: non-blank, restricted to `[A-Za-z0-9_-]+` — same rule, and the
   same reason, as a manifest's own `id`: it becomes a filename.
 - `name` / `version`: non-blank.
+- `name` and `version` are capped at 64 characters, `description` at 256 —
+  a field over its own cap refuses the whole index, the same as a
+  malformed one.
 - `sha256`: exactly 64 characters, every one a lowercase hex digit;
   uppercase is **rejected outright, not normalized**, keeping every
   stored/compared hash in one canonical form.

@@ -10186,16 +10186,40 @@ fn fold_registry_diff(
 /// `name`/`description`/`version` come from `index.toml` on whatever host
 /// serves this registry, not from the manifest being installed — a registry
 /// entry is remote input, the same untrusted class
-/// [`tickover::plugin::sanitize_provider_text`] exists for. Any length cap
-/// belongs to `RegistryIndex::validate` at load time, not here; this is only
-/// the control/bidi stripping every other sink of response-fed text gets —
-/// on every field, not only the two `validate` happened to check first.
+/// [`tickover::plugin::sanitize_provider_text`] exists for, and every field
+/// gets its control/bidi stripping here, not only the two
+/// `RegistryIndex::validate` happened to check first.
+///
+/// `name` and `version` go through `sanitize_provider_text` itself, capped
+/// at [`tickover::plugin::PROVIDER_TEXT_MAX_CHARS`] (64) — the same 64
+/// `validate` already enforced on both at load. On validated input that cap
+/// never actually fires, so the sanitiser only ever repeats a check
+/// `validate`'s own `refuse_control_chars` already made: nothing control,
+/// invisible or directional is left to strip, and with the string already
+/// under the cap, nothing is left to cut either — in particular, it cannot
+/// turn a non-empty `version` into `""`. That matters past this row too:
+/// [`apply_update_badge`] sanitises `available_version` the same way, and
+/// `""` there would hide the whole update sub-row behind
+/// `if p.available-version != ""` in `ui/app.slint`. Keep
+/// `PROVIDER_TEXT_MAX_CHARS` and the registry's own name/version caps equal,
+/// or a widened validator cap starts handing this sink text longer than the
+/// cap it was sized for.
+///
+/// `description` does not share that identity: `validate` lets it run to
+/// `registry::REGISTRY_DESCRIPTION_MAX_CHARS` (256), four times
+/// `PROVIDER_TEXT_MAX_CHARS`'s 64, since it is a one-line summary rather
+/// than a caption. [`registry::sanitize_description`] applies the same
+/// control/bidi stripping at that field's own cap instead of
+/// `sanitize_provider_text`'s, ending in `…` rather than cutting silently on
+/// whatever is past it — reachable only through a caller that skips
+/// `validate`, since `validate` itself never lets a description this sees
+/// run past its own cap in the first place.
 fn registry_entry_row(entry: &RegistryEntry) -> RegistryPluginRow {
     RegistryPluginRow {
         id: ss(&entry.id),
         name: ss(tickover::plugin::sanitize_provider_text(&entry.name)),
         version: ss(tickover::plugin::sanitize_provider_text(&entry.version)),
-        description: ss(tickover::plugin::sanitize_provider_text(
+        description: ss(registry::sanitize_description(
             entry.description.as_deref().unwrap_or_default(),
         )),
         status: InstallStatus::Available,
@@ -18436,7 +18460,7 @@ mod title_tests {
         );
         assert_eq!(
             row.description.as_str(),
-            tickover::plugin::sanitize_provider_text("reads\u{200B}your\ncredentials")
+            registry::sanitize_description("reads\u{200B}your\ncredentials")
         );
         assert_eq!(
             row.version.as_str(),
@@ -18445,6 +18469,39 @@ mod title_tests {
         assert!(!row.name.contains('\n') && !row.name.contains('\u{202E}'));
         assert!(!row.description.contains('\n') && !row.description.contains('\u{200B}'));
         assert!(!row.version.contains('\u{202E}'));
+    }
+
+    /// `RegistryIndex::validate` lets a description run to
+    /// `registry::REGISTRY_DESCRIPTION_MAX_CHARS` (256) — well past
+    /// `tickover::plugin::PROVIDER_TEXT_MAX_CHARS`'s 64. Built at the length
+    /// the longest description this repo ships happens to be, rather than
+    /// read off `plugins/index.toml` itself, so this pins the sink's own cap
+    /// instead of whatever that file says today.
+    #[test]
+    fn registry_entry_row_keeps_a_shipped_length_description_whole() {
+        let longest_shipped: String = "x".repeat(83);
+        let mut entry = make_registry_entry("acme", "Acme", "1.0.0", "deadbeef");
+        entry.description = Some(longest_shipped.clone());
+
+        let row = registry_entry_row(&entry);
+        assert_eq!(row.description.as_str(), longest_shipped.as_str());
+    }
+
+    /// Past its own cap, the row's description ends in `…` rather than
+    /// being cut silently the way `tickover::plugin::sanitize_provider_text`
+    /// cuts a caption — reachable here only because this test, like the one
+    /// above, builds the `RegistryEntry` directly rather than through
+    /// `RegistryIndex::validate`, which never lets a description run this
+    /// long in the first place.
+    #[test]
+    fn registry_entry_row_ellipsises_a_description_past_its_own_cap() {
+        let over_cap = "x".repeat(registry::REGISTRY_DESCRIPTION_MAX_CHARS + 1);
+        let mut entry = make_registry_entry("acme", "Acme", "1.0.0", "deadbeef");
+        entry.description = Some(over_cap);
+
+        let row = registry_entry_row(&entry);
+        assert!(row.description.chars().count() <= registry::REGISTRY_DESCRIPTION_MAX_CHARS);
+        assert!(row.description.ends_with('…'), "{}", row.description);
     }
 
     /// A validator refusal embeds the manifest's own offending text (a

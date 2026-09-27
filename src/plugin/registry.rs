@@ -176,8 +176,12 @@ impl RegistryIndex {
 const REGISTRY_NAME_MAX_CHARS: usize = 64;
 
 /// [`RegistryEntry::description`]'s cap — a one-line summary shown before
-/// install, not a changelog.
-const REGISTRY_DESCRIPTION_MAX_CHARS: usize = 256;
+/// install, not a changelog. `pub`, unlike [`REGISTRY_NAME_MAX_CHARS`] and
+/// [`REGISTRY_VERSION_MAX_CHARS`]: [`sanitize_description`] and the row it
+/// feeds need this exact number too, and a caller reaching for it from
+/// outside this module gets the one `validate` enforces rather than a
+/// second definition that could drift from it.
+pub const REGISTRY_DESCRIPTION_MAX_CHARS: usize = 256;
 
 /// [`RegistryEntry::version`]'s cap — no real semver string (with a
 /// prerelease and build metadata included) comes close, and a hostile index
@@ -229,6 +233,54 @@ fn refuse_too_long(id: &str, field: &str, value: &str, max_chars: usize) -> Resu
         ));
     }
     Ok(())
+}
+
+/// Make a [`RegistryEntry::description`] safe to put on the install/update
+/// row, at this field's own cap rather than
+/// [`crate::plugin::PROVIDER_TEXT_MAX_CHARS`]'s 64 —
+/// [`RegistryIndex::validate`] already lets a description run to
+/// [`REGISTRY_DESCRIPTION_MAX_CHARS`], four times that, since it is a
+/// one-line summary rather than a caption, and truncating one at the
+/// caption-sized cap would silently shorten text `validate` accepted whole.
+/// Strips the same control and invisible/directional characters
+/// [`crate::plugin::sanitize_provider_text`] does, and for the same reason:
+/// on a description that already passed `validate`'s own
+/// `refuse_control_chars`, there is nothing left to strip and nothing past
+/// this cap to cut, so the result is the input unchanged, trimmed. Ends in
+/// `…` instead of cutting silently on whatever *is* past the cap — reachable
+/// only through a caller that skips `validate`, since `validate` itself
+/// never lets a description this sees run longer than the cap in the first
+/// place.
+pub fn sanitize_description(text: &str) -> String {
+    let mut out: String = text
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control() && !super::is_invisible_or_directional(*c))
+        .collect();
+    // Trimmed again for whatever the strip above exposed, before the cap
+    // below decides whether there is still something to mark as cut — the
+    // same order [`crate::plugin::sanitize_provider_text`] applies its own
+    // two trims in.
+    out.truncate(out.trim_end().len());
+    let leading = out.len() - out.trim_start().len();
+    out.drain(..leading);
+
+    if out.chars().count() <= REGISTRY_DESCRIPTION_MAX_CHARS {
+        return out;
+    }
+    // One fewer than the cap, so the `…` appended after it leaves the whole
+    // result at no more than the cap rather than one over it — not always
+    // exactly the cap: if the character right at this cut is trailing
+    // whitespace, the second trim below removes it before `…` goes on, the
+    // same as the first trim can shorten what `sanitize_provider_text`
+    // takes.
+    let mut cut: String = out
+        .chars()
+        .take(REGISTRY_DESCRIPTION_MAX_CHARS - 1)
+        .collect();
+    cut.truncate(cut.trim_end().len());
+    cut.push('…');
+    cut
 }
 
 /// Same charset rule as [`PluginManifest::validate`]'s `id` check — the
@@ -2016,6 +2068,69 @@ mod tests {
         let idx = entry_with("version", &"1".repeat(REGISTRY_VERSION_MAX_CHARS + 1));
         let err = RegistryIndex::from_str(&idx).expect_err("an overlong version must be rejected");
         assert!(err.contains("version"), "unexpected error: {err}");
+    }
+
+    // ── sanitize_description ─────────────────────────────────────────────
+
+    /// `RegistryIndex::validate` lets a description run to
+    /// `REGISTRY_DESCRIPTION_MAX_CHARS`, four times
+    /// `crate::plugin::PROVIDER_TEXT_MAX_CHARS`'s 64 — a validated
+    /// shipped-length description must reach the screen whole, not arrive
+    /// cut mid-word at the caption-sized cap. Built here at the length the
+    /// longest description this repo ships happens to be, rather than read
+    /// off `plugins/index.toml` itself, so this pins the cap this function
+    /// enforces rather than whatever that file happens to say today.
+    #[test]
+    fn sanitize_description_keeps_a_shipped_length_description_whole() {
+        let longest_shipped: String = "x".repeat(83);
+        assert_eq!(sanitize_description(&longest_shipped), longest_shipped);
+    }
+
+    /// Past its own cap, this ends in `…` rather than cutting silently the
+    /// way `crate::plugin::sanitize_provider_text` does for a caption — a
+    /// description is prose, and a cut with nothing to mark it reads as the
+    /// whole sentence.
+    #[test]
+    fn sanitize_description_ellipsises_rather_than_silently_cutting_past_the_cap() {
+        let over_cap = "x".repeat(REGISTRY_DESCRIPTION_MAX_CHARS + 1);
+        let sanitized = sanitize_description(&over_cap);
+        assert_eq!(sanitized.chars().count(), REGISTRY_DESCRIPTION_MAX_CHARS);
+        assert!(sanitized.ends_with('…'), "{sanitized}");
+        assert_ne!(
+            sanitized,
+            "x".repeat(REGISTRY_DESCRIPTION_MAX_CHARS),
+            "a silent cut with no ellipsis must not pass for this"
+        );
+    }
+
+    /// The same control/bidi class [`crate::plugin::sanitize_provider_text`]
+    /// strips reaches this sanitiser too — the field is optional and this
+    /// runs on whatever `Option::unwrap_or_default` produces for `None`,
+    /// the same as every other sink of registry text.
+    #[test]
+    fn sanitize_description_strips_control_and_bidi_characters() {
+        assert_eq!(
+            sanitize_description("reads\u{200B}your\ncredentials\u{202E}"),
+            "readsyourcredentials"
+        );
+    }
+
+    /// The cap this ends up landing on is "no more than", not "exactly": a
+    /// space sitting right at the cut is trailing whitespace once the cut
+    /// makes it the last character, and the trim before `…` goes on removes
+    /// it — one character short of the cap rather than on it.
+    #[test]
+    fn sanitize_description_can_land_one_character_under_the_cap_when_the_cut_exposes_whitespace() {
+        let padded = format!(
+            "{} {}",
+            "x".repeat(REGISTRY_DESCRIPTION_MAX_CHARS - 2),
+            "y".repeat(10)
+        );
+        let sanitized = sanitize_description(&padded);
+        assert_eq!(
+            sanitized,
+            format!("{}…", "x".repeat(REGISTRY_DESCRIPTION_MAX_CHARS - 2))
+        );
     }
 
     // ── resolve_manifest_url ─────────────────────────────────────────────
