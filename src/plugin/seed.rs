@@ -319,8 +319,13 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "claude.toml",
         id: "claude",
-        to_version: "1.4.6",
+        to_version: "1.4.7",
         previous_sha256: &[
+            // 1.4.6 — before the CLI surface said "not signed in", so a
+            // signed-out Claude Code drew its row as a JSON-path error, or,
+            // with no store at all, drew no row.
+            // sha256 of claude.toml as shipped at manifest version 1.4.6.
+            "36b735a6d0c6b3ad64ded8da2ab9f84b9a4e92b66c74eaa1bb50a98490640162",
             // 1.4.5 — comments only: the comparison to Codex named a field
             // (`window_minutes`) that manifest has never read.
             // sha256 of claude.toml as shipped at manifest version 1.4.5.
@@ -1279,10 +1284,24 @@ mod tests {
         assert_eq!(m.id, "claude");
         assert_eq!(m.engine, EngineKind::HttpApi);
         assert_eq!(
-            m.version, "1.4.6",
+            m.version, "1.4.7",
             "the version BUILTIN_UPGRADES migrates to"
         );
         assert_eq!(m.surface.len(), 2, "cli + desktop surfaces");
+        let surface = |id: &str| {
+            m.surface
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("claude.toml has a `{id}` surface"))
+        };
+        assert!(
+            surface("cli").no_credentials_message.is_some(),
+            "a signed-out Claude CLI says so"
+        );
+        assert!(
+            surface("desktop").no_credentials_message.is_none(),
+            "the opt-in desktop surface is not one to nag about"
+        );
         for capability in [
             "window-presence",
             "window-identity",

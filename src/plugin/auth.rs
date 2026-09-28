@@ -92,7 +92,43 @@ impl ResolveEmpty {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
     PresentErr(String),
+    /// A credential store that exists and is a JSON object, but holds no token
+    /// at `token_json_path` — measured on a machine whose Claude Code reported
+    /// itself signed out (`claude auth status`: `loggedIn: false`) while its
+    /// Keychain item was still there. Still a Present-err as far as the chain goes: it stops
+    /// there, and the message names the store. Split out only so a surface
+    /// that sets `no_credentials_message` can say "not signed in" here too,
+    /// by type rather than by matching this message's text — see
+    /// `plugin::engine_http::fetch_surface`. A store that is not a JSON object
+    /// stays [`ResolveError::PresentErr`]: that is damage, not a sign-out.
+    NoToken(String),
     Empty(ResolveEmpty),
+}
+
+/// A step's failure, as [`run_step`] hands it to [`resolve_token`]. Only
+/// the steps that read a JSON blob through [`token_from_blob`] can produce
+/// [`StepError::NoToken`]; every other step's `String` error converts into
+/// [`StepError::Broken`] through `From`, so `?` keeps working unchanged
+/// inside them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StepError {
+    Broken(String),
+    NoToken(String),
+}
+
+impl StepError {
+    #[cfg(test)]
+    fn message(&self) -> &str {
+        match self {
+            StepError::Broken(m) | StepError::NoToken(m) => m,
+        }
+    }
+}
+
+impl From<String> for StepError {
+    fn from(message: String) -> Self {
+        StepError::Broken(message)
+    }
 }
 
 /// Walk a surface's `[[surface.auth]]` chain and return the first token
@@ -121,7 +157,8 @@ pub fn resolve_token(
         match run_step(step, &surface.allowed_hosts, &mut lapsed_expiry, provider) {
             Ok(Some(token)) => return Ok((token, step.expiry_json_path.is_some())),
             Ok(None) => continue,
-            Err(e) => return Err(ResolveError::PresentErr(e)),
+            Err(StepError::Broken(e)) => return Err(ResolveError::PresentErr(e)),
+            Err(StepError::NoToken(e)) => return Err(ResolveError::NoToken(e)),
         }
     }
     Err(ResolveError::Empty(match lapsed_expiry {
@@ -153,16 +190,16 @@ fn run_step(
     allowed_hosts: &[String],
     lapsed_expiry: &mut Option<u64>,
     provider: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, StepError> {
     match step.kind {
         AuthType::CredentialsFile => credentials_file_step(step, lapsed_expiry),
         AuthType::Keychain => keychain_step(step, lapsed_expiry),
-        AuthType::Env => env_step(step),
-        AuthType::ElectronSafeStorage => electron_safe_storage_step(step),
+        AuthType::Env => Ok(env_step(step)?),
+        AuthType::ElectronSafeStorage => Ok(electron_safe_storage_step(step)?),
         AuthType::WinCredential => win_credential_step(step, lapsed_expiry),
-        AuthType::CredentialsMap => credentials_map_step(step, lapsed_expiry),
-        AuthType::RejectWhen => reject_when_step(step),
-        AuthType::OauthRefresh => oauth_refresh_step(step, allowed_hosts, provider),
+        AuthType::CredentialsMap => Ok(credentials_map_step(step, lapsed_expiry)?),
+        AuthType::RejectWhen => Ok(reject_when_step(step)?),
+        AuthType::OauthRefresh => Ok(oauth_refresh_step(step, allowed_hosts, provider)?),
     }
 }
 
@@ -264,7 +301,7 @@ fn resolve_credentials_file_path(step: &AuthStep, path: &str) -> std::path::Path
 fn credentials_file_step(
     step: &AuthStep,
     lapsed_expiry: &mut Option<u64>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, StepError> {
     let path = require_str("credentials-file", "path", step.path.as_deref())?;
     let token_json_path = require_str(
         "credentials-file",
@@ -418,7 +455,7 @@ fn resolve_keychain_service(step: &AuthStep, base: &str) -> String {
 fn keychain_step(
     step: &AuthStep,
     lapsed_expiry: &mut Option<u64>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, StepError> {
     #[cfg(target_os = "macos")]
     {
         let base = require_str("keychain", "service", step.service.as_deref())?;
@@ -542,11 +579,19 @@ fn token_from_blob(
     now: i64,
     context: &str,
     lapsed_expiry: &mut Option<u64>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, StepError> {
     let Some(token) = extract_token(json, token_json_path) else {
-        return Err(format!(
-            "not JSON, or no token at `{token_json_path}` in {context}"
-        ));
+        // Only an object is a store its CLI emptied. Anything else — not
+        // JSON at all, or JSON that is `null`, an array, a bare string or
+        // number — is damage, and must never read as a sign-out.
+        return Err(match serde_json::from_str::<Value>(json) {
+            Ok(Value::Object(_)) => {
+                StepError::NoToken(format!("no token at `{token_json_path}` in {context}"))
+            }
+            _ => StepError::Broken(format!(
+                "not a JSON object, or no token at `{token_json_path}` in {context}"
+            )),
+        });
     };
     if let Some(expiry_path) = expiry_json_path {
         if let Some(expires_at) = stale_expiry(json, expiry_path, now) {
@@ -964,7 +1009,7 @@ fn electron_decrypt(
 fn win_credential_step(
     step: &AuthStep,
     lapsed_expiry: &mut Option<u64>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, StepError> {
     let targets = require_vec("win-credential", "targets", step.targets.as_deref())?;
     let token_json_path = require_str(
         "win-credential",
@@ -995,7 +1040,17 @@ fn win_credential_step(
             ) {
                 Ok(Some(token)) => return Ok(Some(token)),
                 Ok(None) => {} // lapsed — `token_from_blob` already recorded it
-                Err(e) => last_err = Some(e),
+                // A damaged target outranks an emptied one, whichever came
+                // last: otherwise a later `NoToken` would let a surface's
+                // "not signed in" sentence cover a store that is broken.
+                Err(e) => {
+                    if !matches!(
+                        (&last_err, &e),
+                        (Some(StepError::Broken(_)), StepError::NoToken(_))
+                    ) {
+                        last_err = Some(e);
+                    }
+                }
             }
         }
     }
@@ -1009,7 +1064,7 @@ fn win_credential_step(
 fn win_credential_step(
     _step: &AuthStep,
     _lapsed_expiry: &mut Option<u64>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, StepError> {
     Ok(None)
 }
 
@@ -7005,12 +7060,80 @@ mod tests {
         )
         .expect_err("no token at the path is Present-err, not a lapsed Absent");
         assert!(
-            err.contains("no token at `claudeAiOauth.accessToken`"),
-            "{err}"
+            err.message()
+                .contains("no token at `claudeAiOauth.accessToken`"),
+            "{err:?}"
+        );
+        assert!(
+            matches!(err, StepError::NoToken(_)),
+            "a blob that parses but holds no token is the emptied-store case: {err:?}"
         );
         assert_eq!(
             lapsed_expiry, None,
             "a token that was never found cannot also be the one that lapsed"
+        );
+    }
+
+    #[test]
+    fn token_from_blob_calls_a_blob_that_does_not_parse_broken_not_emptied() {
+        // Damage is not a sign-out: a surface's `no_credentials_message`
+        // must never paper over a store that is not even JSON.
+        let err = token_from_blob(
+            "{not json",
+            "claudeAiOauth.accessToken",
+            None,
+            0,
+            "Keychain item 'x'",
+            &mut None,
+        )
+        .expect_err("garbage is an error");
+        assert!(matches!(err, StepError::Broken(_)), "{err:?}");
+        assert!(err.message().contains("not a JSON object"), "{err:?}");
+
+        // Valid JSON that is not an object is damage too.
+        for blob in ["null", "[]", "\"x\"", "123"] {
+            let err = token_from_blob(
+                blob,
+                "claudeAiOauth.accessToken",
+                None,
+                0,
+                "Keychain item 'x'",
+                &mut None,
+            )
+            .expect_err("no token in a non-object");
+            assert!(matches!(err, StepError::Broken(_)), "{blob}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_token_reports_an_emptied_credentials_file_as_no_token() {
+        // The chain-level shape `engine_http` matches on: a credentials file
+        // that exists and parses, with nothing at `token_json_path`.
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-no-token-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("creds.json");
+        std::fs::write(&file, r#"{"mcpOAuth":{}}"#).unwrap();
+        let surface: SurfaceConfig = toml::from_str(&format!(
+            r#"
+            id = "cli"
+            label = "CLI"
+            [[auth]]
+            type = "credentials-file"
+            path = '{}'
+            token_json_path = "claudeAiOauth.accessToken"
+            "#,
+            file.display()
+        ))
+        .unwrap();
+        let resolved = resolve_token(&surface, "test provider");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(resolved, Err(ResolveError::NoToken(_))),
+            "{resolved:?}"
         );
     }
 

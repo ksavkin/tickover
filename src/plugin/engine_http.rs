@@ -139,6 +139,16 @@ fn fetch_surface(
             reading.fail(e);
             return reading;
         }
+        // A store the CLI emptied on sign-out: to the person looking at the
+        // row that is "not signed in", so a surface that has a sentence for
+        // that state says it here too. Without one, the store's own error
+        // stands, exactly as before — never the hidden `NO_CREDENTIALS` row,
+        // since this store does exist. (A manifest cannot set the message to
+        // that sentinel; `manifest.rs` refuses it.)
+        Err(auth::ResolveError::NoToken(e)) => {
+            reading.fail(surface.no_credentials_message.clone().unwrap_or(e));
+            return reading;
+        }
         Err(auth::ResolveError::Empty(empty)) => {
             // A chain that ended `Lapsed` is a token this app cannot renew
             // on its own — unless the manifest names a ping that can, as a
@@ -2413,6 +2423,85 @@ mod tests {
         );
         let m = PluginManifest::from_str(&toml).expect("valid test manifest");
         m.surface.into_iter().next().expect("one surface")
+    }
+
+    /// A manifest whose one surface reads `path` — a credentials file that
+    /// the test leaves emptied of its token — optionally with a
+    /// `no_credentials_message`.
+    fn signed_out_manifest(path: &std::path::Path, message: Option<&str>) -> PluginManifest {
+        let message_line = message
+            .map(|m| format!("no_credentials_message = \"{m}\""))
+            .unwrap_or_default();
+        let toml = format!(
+            r#"
+            id         = "claude"
+            name       = "Claude"
+            menu_label = "Cl"
+            order      = 20
+            engine     = "http-api"
+
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode    = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "five_hour.utilization"
+            resets_at_path    = "five_hour.resets_at"
+            resets_at_format  = "iso8601"
+
+            [http]
+            [[http.request]]
+            url = "https://api.anthropic.com/api/oauth/usage"
+
+            [[surface]]
+            id     = "cli"
+            label  = "CLI"
+            opt_in = false
+            allowed_hosts = ["api.anthropic.com"]
+            {message_line}
+            [[surface.auth]]
+            type            = "credentials-file"
+            path            = '{path}'
+            token_json_path = "claudeAiOauth.accessToken"
+        "#,
+            path = path.to_string_lossy(),
+        );
+        PluginManifest::from_str(&toml).expect("valid test manifest")
+    }
+
+    #[test]
+    fn a_store_emptied_by_a_sign_out_reads_as_the_surfaces_not_signed_in_message() {
+        // What Claude Code leaves after a logout: the store is still there and
+        // still JSON, with no OAuth record in it. No request is made — the
+        // chain stops before the network.
+        let dir = temp_dir("signed-out-store");
+        let file = dir.join(".credentials.json");
+        std::fs::write(&file, r#"{"mcpOAuth":{}}"#).unwrap();
+
+        let m = signed_out_manifest(&file, Some("Not signed in — run: claude auth login"));
+        let reading = fetch_surface(&m, &m.surface[0], &BTreeMap::new());
+        assert_eq!(
+            reading.error.as_deref(),
+            Some("Not signed in — run: claude auth login")
+        );
+
+        // Without a sentence of its own the store's error stands, as before —
+        // and it is never the hidden-row sentinel, since the store exists.
+        let m = signed_out_manifest(&file, None);
+        let reading = fetch_surface(&m, &m.surface[0], &BTreeMap::new());
+        let error = reading.error.expect("an emptied store is still an error");
+        assert!(error.contains("no token at"), "{error}");
+        assert_ne!(error, auth::NO_CREDENTIALS);
+
+        // A damaged store is not a sign-out, message or no message.
+        std::fs::write(&file, "{not json").unwrap();
+        let m = signed_out_manifest(&file, Some("Not signed in — run: claude auth login"));
+        let reading = fetch_surface(&m, &m.surface[0], &BTreeMap::new());
+        let error = reading.error.expect("a damaged store is an error");
+        assert!(error.contains("not a JSON object"), "{error}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

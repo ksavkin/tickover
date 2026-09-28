@@ -64,11 +64,13 @@ the README and in
 - **A notice above the rows** appears when the provider says the account is
   blocked. A blocked account may report no window at all, and the bars alone
   would then show nothing wrong.
-- **Only Codex announces a missing login** ("Not signed in — run: codex
-  login"). Whether a row says so is a manifest field
-  (`no_credentials_message`), and Codex is the only shipped manifest that
-  sets one. The other four hide their row entirely — right for a tool you
-  never installed, a rough edge for one you did.
+- **Codex and Claude announce a missing login** ("Not signed in — run:
+  codex login", "Not signed in — run: claude auth login") — also when the
+  CLI's credential store is still there but emptied by a sign-out. Whether a
+  row says so is a manifest field (`no_credentials_message`), and these are
+  the two shipped manifests that set one. The other three hide their row
+  entirely — right for a tool you never installed, a rough edge for one you
+  did.
 - **Signing in to Codex with an API key** rather than a ChatGPT account gets
   a sentence of its own: an API key has no subscription window to report.
 - **A row that disappears because its credential went away** (signed out,

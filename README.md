@@ -232,7 +232,7 @@ Tests run under a substituted `HOME` — the invocation and the reason are in
   Windows: none), and no signing key is pinned for the
   plugin registry — *Check updates* is transport integrity, not provenance.
 - **A provider you are not signed into is hidden, not announced** — except
-  Codex, the one shipped manifest that sets a message for it.
+  Codex and Claude's CLI, the two shipped manifests that set a message for it.
 - **The panel is dark only**; the tray pill follows the system theme. No
   notifications, no cost accounting, no Linux.
 
