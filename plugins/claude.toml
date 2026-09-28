@@ -18,7 +18,7 @@ order        = 20
 # the CLI renames under it — see docs/PLUGIN-ARCHITECTURE.md, "Reader
 # capabilities".
 requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry", "reading-balances", "balance-conditional", "credentials-file-path-env", "keychain-service-env"]
-version      = "1.4.6"
+version      = "1.4.7"
 engine       = "http-api"
 # Re-fetched every 60 s.
 refresh_secs = 60
@@ -183,6 +183,14 @@ label         = "CLI"
 opt_in        = false
 in_menu_bar   = true
 allowed_hosts = ["api.anthropic.com"]
+# Shown instead of hiding the row when no credentials are found at all, and
+# instead of the store's own error when the Keychain item or credentials file
+# is still there, still JSON, but holds no token at any of the paths below —
+# the state measured on a machine where `claude auth status` reported
+# `loggedIn: false` with the Keychain item still present. Either way the fix
+# is the same command, so the row says it rather than going blank or quoting
+# a JSON path. Same choice Codex makes.
+no_credentials_message = "Not signed in — run: claude auth login"
 
 # Plaintext credentials file first, then the macOS Keychain item the CLI
 # also writes there. On Windows, `%USERPROFILE%\.claude\.credentials.json`

@@ -830,7 +830,7 @@ declare zero, one, or several surfaces.
 | `opt_in` | bool | `false` | if `true`, the surface is off unless the user explicitly enables it (for a credential lookup that needs a scary OS prompt) |
 | `in_menu_bar` | bool | `true` | whether this surface's readings show in the menu-bar pill/title; `false` for popup-only surfaces (e.g. the Claude desktop account) |
 | `allowed_hosts` | array of strings | empty | hosts this surface's requests are allowed to reach — see [Security](#security). Required, and refused when empty, on any surface whose auth chain has a step other than `reject-when` — regardless of `engine`, since a credential chain can exist ahead of an engine that reads it — an empty list would let its token be sent anywhere |
-| `no_credentials_message` | string | — (optional) | what to show when the whole auth chain came up empty. Unset, that state hides the provider's row entirely (right for a provider that may simply not be installed); set, the row stays and says this instead (Codex: `"Not signed in — run: codex login"`) |
+| `no_credentials_message` | string | — (optional) | what to show when the whole auth chain came up empty, or when a `credentials-file`/`keychain`/`win-credential` step found its store but that store — still valid JSON — holds no token at `token_json_path` (what a CLI leaves after signing out). Unset, the first state hides the provider's row entirely (right for a provider that may simply not be installed) and the second shows the store's own error; set, the row stays and says this instead in both (Codex: `"Not signed in — run: codex login"`, Claude's CLI surface: `"Not signed in — run: claude auth login"`). A store that does not parse is damage, not a sign-out, and keeps its own error either way |
 | `[[surface.auth]]` | array of tables | empty | ordered credential lookup chain — see [Auth chain](#auth-chain-semantics) |
 
 A manifest may declare at most 8 `[[surface]]` entries.
@@ -2149,7 +2149,7 @@ order        = 20
 # the CLI renames under it — see docs/PLUGIN-ARCHITECTURE.md, "Reader
 # capabilities".
 requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry", "reading-balances", "balance-conditional", "credentials-file-path-env", "keychain-service-env"]
-version      = "1.4.6"
+version      = "1.4.7"
 engine       = "http-api"
 # Re-fetched every 60 s.
 refresh_secs = 60
@@ -2314,6 +2314,14 @@ label         = "CLI"
 opt_in        = false
 in_menu_bar   = true
 allowed_hosts = ["api.anthropic.com"]
+# Shown instead of hiding the row when no credentials are found at all, and
+# instead of the store's own error when the Keychain item or credentials file
+# is still there, still JSON, but holds no token at any of the paths below —
+# the state measured on a machine where `claude auth status` reported
+# `loggedIn: false` with the Keychain item still present. Either way the fix
+# is the same command, so the row says it rather than going blank or quoting
+# a JSON path. Same choice Codex makes.
+no_credentials_message = "Not signed in — run: claude auth login"
 
 # Plaintext credentials file first, then the macOS Keychain item the CLI
 # also writes there. On Windows, `%USERPROFILE%\.claude\.credentials.json`
