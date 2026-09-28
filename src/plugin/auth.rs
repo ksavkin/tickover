@@ -92,14 +92,14 @@ impl ResolveEmpty {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
     PresentErr(String),
-    /// A credential store that exists and parses as JSON, but holds no token
+    /// A credential store that exists and is a JSON object, but holds no token
     /// at `token_json_path` — measured on a machine whose Claude Code reported
     /// itself signed out (`claude auth status`: `loggedIn: false`) while its
     /// Keychain item was still there. Still a Present-err as far as the chain goes: it stops
     /// there, and the message names the store. Split out only so a surface
     /// that sets `no_credentials_message` can say "not signed in" here too,
     /// by type rather than by matching this message's text — see
-    /// `plugin::engine_http::fetch_surface`. A store that does not even parse
+    /// `plugin::engine_http::fetch_surface`. A store that is not a JSON object
     /// stays [`ResolveError::PresentErr`]: that is damage, not a sign-out.
     NoToken(String),
     Empty(ResolveEmpty),
@@ -581,13 +581,16 @@ fn token_from_blob(
     lapsed_expiry: &mut Option<u64>,
 ) -> Result<Option<String>, StepError> {
     let Some(token) = extract_token(json, token_json_path) else {
-        let message = format!("not JSON, or no token at `{token_json_path}` in {context}");
-        // The same sentence either way; only a blob that parses is a store
-        // its CLI emptied rather than one that is damaged.
-        return Err(if serde_json::from_str::<Value>(json).is_ok() {
-            StepError::NoToken(message)
-        } else {
-            StepError::Broken(message)
+        // Only an object is a store its CLI emptied. Anything else — not
+        // JSON at all, or JSON that is `null`, an array, a bare string or
+        // number — is damage, and must never read as a sign-out.
+        return Err(match serde_json::from_str::<Value>(json) {
+            Ok(Value::Object(_)) => {
+                StepError::NoToken(format!("no token at `{token_json_path}` in {context}"))
+            }
+            _ => StepError::Broken(format!(
+                "not a JSON object, or no token at `{token_json_path}` in {context}"
+            )),
         });
     };
     if let Some(expiry_path) = expiry_json_path {
@@ -1037,7 +1040,17 @@ fn win_credential_step(
             ) {
                 Ok(Some(token)) => return Ok(Some(token)),
                 Ok(None) => {} // lapsed — `token_from_blob` already recorded it
-                Err(e) => last_err = Some(e),
+                // A damaged target outranks an emptied one, whichever came
+                // last: otherwise a later `NoToken` would let a surface's
+                // "not signed in" sentence cover a store that is broken.
+                Err(e) => {
+                    if !matches!(
+                        (&last_err, &e),
+                        (Some(StepError::Broken(_)), StepError::NoToken(_))
+                    ) {
+                        last_err = Some(e);
+                    }
+                }
             }
         }
     }
@@ -7075,7 +7088,21 @@ mod tests {
         )
         .expect_err("garbage is an error");
         assert!(matches!(err, StepError::Broken(_)), "{err:?}");
-        assert!(err.message().contains("not JSON"), "{err:?}");
+        assert!(err.message().contains("not a JSON object"), "{err:?}");
+
+        // Valid JSON that is not an object is damage too.
+        for blob in ["null", "[]", "\"x\"", "123"] {
+            let err = token_from_blob(
+                blob,
+                "claudeAiOauth.accessToken",
+                None,
+                0,
+                "Keychain item 'x'",
+                &mut None,
+            )
+            .expect_err("no token in a non-object");
+            assert!(matches!(err, StepError::Broken(_)), "{blob}: {err:?}");
+        }
     }
 
     #[test]
@@ -7096,7 +7123,7 @@ mod tests {
             label = "CLI"
             [[auth]]
             type = "credentials-file"
-            path = "{}"
+            path = '{}'
             token_json_path = "claudeAiOauth.accessToken"
             "#,
             file.display()

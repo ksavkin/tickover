@@ -2500,7 +2500,7 @@ mod tests {
         let m = signed_out_manifest(&file, Some("Not signed in — run: claude auth login"));
         let reading = fetch_surface(&m, &m.surface[0], &BTreeMap::new());
         let error = reading.error.expect("a damaged store is an error");
-        assert!(error.contains("not JSON"), "{error}");
+        assert!(error.contains("not a JSON object"), "{error}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

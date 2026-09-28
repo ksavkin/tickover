@@ -1288,12 +1288,18 @@ mod tests {
             "the version BUILTIN_UPGRADES migrates to"
         );
         assert_eq!(m.surface.len(), 2, "cli + desktop surfaces");
+        let surface = |id: &str| {
+            m.surface
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("claude.toml has a `{id}` surface"))
+        };
         assert!(
-            m.surface[0].no_credentials_message.is_some(),
+            surface("cli").no_credentials_message.is_some(),
             "a signed-out Claude CLI says so"
         );
         assert!(
-            m.surface[1].no_credentials_message.is_none(),
+            surface("desktop").no_credentials_message.is_none(),
             "the opt-in desktop surface is not one to nag about"
         );
         for capability in [
