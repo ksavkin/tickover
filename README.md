@@ -32,10 +32,6 @@ fix is an edit, not a release.
 
 ## Download
 
-This repository is currently private, so the link below resolves only for
-an account it has been shared with — there is no public download yet; see
-[`docs/RELEASING.md`](docs/RELEASING.md) for what changes once it is public.
-
 [**Latest release**](https://github.com/ksavkin/tickover/releases/latest):
 
 - `Tickover-vX.Y.Z-macos-universal.zip` — `Tickover.app`, one universal
