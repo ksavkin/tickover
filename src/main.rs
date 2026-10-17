@@ -2249,6 +2249,12 @@ fn run_slow_timer(
                         cache: &ctx.projection_cache,
                     },
                 );
+                // The renderer announces a change once per frame it draws, so
+                // a model written while that announcement was lost (see
+                // `present_popover`) leaves the frame behind for good.
+                // Requesting one every tick the panel is on screen bounds any
+                // such stall to a second.
+                app.window().request_redraw();
             }
             // Cheap no-op unless data, theme, or the toggle actually changed.
             sync_tray_indicator_from(&ctx.tray, app.get_menu_bar_text(), &current, &ctx.tray_key);
@@ -8272,6 +8278,13 @@ fn present_popover(
     // placement lands on a `Resized` replay like before.
     let moved = position_popover(app, anchor, pending, shown);
     let _ = app.window().show();
+    // Showing discards the backend's record of a pending repaint, and the
+    // model refresh that preceded it has already spent the one change
+    // notification the renderer sends per frame it draws. Measured: a window
+    // re-shown after `hide()` then stops repainting — the model keeps
+    // advancing, the frame on screen does not — until something asks for a
+    // frame. Ask here, so the first frame is the refreshed one.
+    app.window().request_redraw();
     // "Leave a parked window parked" is only a courtesy while the parking
     // spot is reachable — a dock-mode window last left on a monitor that has
     // since gone away (or under a resolution change) is a window nobody can
