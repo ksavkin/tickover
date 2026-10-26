@@ -74,6 +74,16 @@ single-instance lock is touched.
 | `--report` (alias `--html`) | writes a self-contained HTML report — the same figures, plus per-model and per-day detail — and opens it in the default browser; `--report=PATH` names the file, otherwise it lands at `<config>/tickover/reports/usage-<timestamp>.html` (see the file table above) |
 | `--help` / `-h` | usage |
 
+The cost line is the one figure that can be incomplete, and it says so rather
+than quietly leaving a model out: a mix containing a model the bundled
+price table has no row for prints `est. cost 18.00 USD (list price, opt-in,
+partial — unpriced models excluded)`, the HTML report marks its headline with
+a `*` and the same caption, and `--json` carries the fact as its own field,
+`est_cost_usd_missing_models` — `true` when a model is missing a price, and
+`null` exactly when `est_cost_usd` is `null` too. A script can therefore tell
+an estimate that covers everything from one that does not, without parsing
+prose.
+
 Both the CLI and the panel's Activity card read the same on-disk store and
 can show the same figures over three ranges — 24 hours, 7 days or 30 days
 in the panel; all-time, today and this week on the command line. Neither

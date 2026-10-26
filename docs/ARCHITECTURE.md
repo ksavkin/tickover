@@ -234,8 +234,8 @@ by `src/menubar.rs`.
 
 ## Numbers
 
-About 75,000 lines of Rust (roughly half of it tests), three Slint files,
-some 1,150 test functions, a release binary of about 11 MB on Apple silicon
+About 78,000 lines of Rust (roughly half of it tests), three Slint files,
+some 1,200 test functions, a release binary of about 10.6 MB on Apple silicon
 (bundling SQLite for Antigravity's history pushed this up from the roughly
 8 MB before it; the macOS binary is universal, so roughly twice that on
 disk). CI builds and tests on macOS and Windows,

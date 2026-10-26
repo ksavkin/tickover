@@ -199,7 +199,7 @@ reporting, nothing on a timer against a host this project controls.
 
 ## Engineering notes
 
-About 75,000 lines of Rust, roughly half of it tests — some 1,150 test
+About 78,000 lines of Rust, roughly half of it tests — some 1,200 test
 functions — one tree for both desktops.
 Six things worth a look:
 

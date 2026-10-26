@@ -12,7 +12,7 @@ Native menu-bar (macOS) / system-tray (Windows) indicator of AI-assistant usage 
   a quota-only binary; `cargo test --no-default-features` (under the same
   substituted `HOME` as below) skips `tests/history_e2e.rs`, which is gated
   `#![cfg(feature = "history")]` and does not run in that configuration.
-- **`[profile.release]` deliberately keeps unwinding** (no `panic = "abort"`, see Cargo.toml's own comment there): `main.rs`'s `FetchGuard`/`RegistryGuard` turn a panic on a background fetch/install thread into an empty or failed result sent on `drop`, which `"abort"` would skip by ending the process at the panic site instead. The cost is a larger stripped binary — about 8.5 MB on macOS arm64 instead of about 6.8 MB.
+- **`[profile.release]` deliberately keeps unwinding** (no `panic = "abort"`, see Cargo.toml's own comment there): `main.rs`'s `FetchGuard`/`RegistryGuard` turn a panic on a background fetch/install thread into an empty or failed result sent on `drop`, which `"abort"` would skip by ending the process at the panic site instead. The cost is a larger stripped binary: about 8.5 MB on macOS arm64 against about 6.8 MB, measured when the choice was made — the binary has grown to about 10.6 MB since, and the comparison has not been taken again on it.
 - Test: **only under a substituted `HOME`** — otherwise the suite reads and writes the real one:
   ```bash
   REAL_HOME="$HOME"; FH=$(mktemp -d)
