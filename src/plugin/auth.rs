@@ -100,16 +100,18 @@ pub enum ResolveError {
     /// that sets `no_credentials_message` can say "not signed in" here too,
     /// by type rather than by matching this message's text — see
     /// `plugin::engine_http::fetch_surface`. A store that is not a JSON object
-    /// stays [`ResolveError::PresentErr`]: that is damage, not a sign-out.
+    /// stays [`ResolveError::PresentErr`]: that is damage, not a sign-out. So
+    /// does a `credentials-map` with more than one matching entry: its tokens
+    /// are there, only which one to use is unknown.
     NoToken(String),
     Empty(ResolveEmpty),
 }
 
 /// A step's failure, as [`run_step`] hands it to [`resolve_token`]. Only
-/// the steps that read a JSON blob through [`token_from_blob`] can produce
-/// [`StepError::NoToken`]; every other step's `String` error converts into
-/// [`StepError::Broken`] through `From`, so `?` keeps working unchanged
-/// inside them.
+/// the steps that read a JSON blob through [`token_from_blob`], and
+/// [`credentials_map_step`], can produce [`StepError::NoToken`]; every other
+/// step's `String` error converts into [`StepError::Broken`] through `From`,
+/// so `?` keeps working unchanged inside them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StepError {
     Broken(String),
@@ -197,7 +199,7 @@ fn run_step(
         AuthType::Env => Ok(env_step(step)?),
         AuthType::ElectronSafeStorage => Ok(electron_safe_storage_step(step)?),
         AuthType::WinCredential => win_credential_step(step, lapsed_expiry),
-        AuthType::CredentialsMap => Ok(credentials_map_step(step, lapsed_expiry)?),
+        AuthType::CredentialsMap => credentials_map_step(step, lapsed_expiry),
         AuthType::RejectWhen => Ok(reject_when_step(step)?),
         AuthType::OauthRefresh => Ok(oauth_refresh_step(step, allowed_hosts, provider)?),
     }
@@ -376,7 +378,7 @@ fn credentials_file_step(
 fn credentials_map_step(
     step: &AuthStep,
     lapsed_expiry: &mut Option<u64>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, StepError> {
     let path = require_str("credentials-map", "path", step.path.as_deref())?;
     let key_prefix = require_str("credentials-map", "key_prefix", step.key_prefix.as_deref())?;
     let token_json_path = require_str(
@@ -402,23 +404,24 @@ fn credentials_map_step(
     // shadowed by whichever entry the map happens to iterate first.
     let mut matches = object.iter().filter(|(key, _)| key.starts_with(key_prefix));
     let Some((_, entry)) = matches.next() else {
-        return Err(format!(
+        return Err(StepError::NoToken(format!(
             "no entry with a key starting with `{key_prefix}` in {}",
             file.display()
-        ));
+        )));
     };
     if matches.next().is_some() {
         return Err(format!(
             "more than one entry in {} has a key starting with `{key_prefix}` — cannot tell \
              which account's token to use",
             file.display()
-        ));
+        )
+        .into());
     }
     let Some(token) = extract_token_at(entry, token_json_path) else {
-        return Err(format!(
+        return Err(StepError::NoToken(format!(
             "no token at `{token_json_path}` in the entry matching `{key_prefix}` in {}",
             file.display()
-        ));
+        )));
     };
     if let Some(expiry_path) = step.expiry_json_path.as_deref() {
         if let Some(expires_at) = stale_expiry_at(entry, expiry_path, now_unix()) {
@@ -8290,13 +8293,25 @@ mod tests {
     }
 
     #[test]
-    fn credentials_map_step_present_err_when_no_entry_matches_the_prefix() {
+    fn credentials_map_step_no_token_when_no_entry_matches_the_prefix() {
         let dir = temp_dir("cm-no-match");
         let step =
             credentials_map_step_for(&dir, r#"{"https://other.example::abc":{"key":"tok"}}"#);
         let err = credentials_map_step(&step, &mut None)
             .expect_err("a store that exists but names no matching entry must not be Absent");
-        assert!(err.contains("https://auth.x.ai::"), "{err}");
+        assert!(matches!(err, StepError::NoToken(_)), "{err:?}");
+        assert!(err.message().contains("https://auth.x.ai::"), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `{}` is what a signed-out CLI leaves behind, the same store emptied
+    /// that the no-match test above reaches through a stranger's entry.
+    #[test]
+    fn credentials_map_step_no_token_when_the_store_is_an_empty_object() {
+        let dir = temp_dir("cm-empty-object");
+        let step = credentials_map_step_for(&dir, "{}");
+        let err = credentials_map_step(&step, &mut None).expect_err("{} holds no token");
+        assert!(matches!(err, StepError::NoToken(_)), "{err:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -8314,7 +8329,8 @@ mod tests {
         );
         let err = credentials_map_step(&step, &mut None)
             .expect_err("ambiguous match must be a Present-err");
-        assert!(err.contains("more than one"), "{err}");
+        assert!(matches!(err, StepError::Broken(_)), "{err:?}");
+        assert!(err.message().contains("more than one"), "{err:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -8322,7 +8338,8 @@ mod tests {
     fn credentials_map_step_present_err_when_root_is_not_an_object() {
         let dir = temp_dir("cm-not-object");
         let step = credentials_map_step_for(&dir, r#"["not", "an", "object"]"#);
-        assert!(credentials_map_step(&step, &mut None).is_err());
+        let err = credentials_map_step(&step, &mut None).expect_err("an array is damage");
+        assert!(matches!(err, StepError::Broken(_)), "{err:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -8330,20 +8347,22 @@ mod tests {
     fn credentials_map_step_present_err_when_json_broken() {
         let dir = temp_dir("cm-broken");
         let step = credentials_map_step_for(&dir, "not json");
-        assert!(credentials_map_step(&step, &mut None).is_err());
+        let err = credentials_map_step(&step, &mut None).expect_err("bad JSON is damage");
+        assert!(matches!(err, StepError::Broken(_)), "{err:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn credentials_map_step_present_err_when_matched_entry_has_no_token() {
+    fn credentials_map_step_no_token_when_matched_entry_has_no_token() {
         let dir = temp_dir("cm-no-token");
         let step = credentials_map_step_for(
             &dir,
             r#"{"https://auth.x.ai::11111111-1111-1111-1111-111111111111":{"other":"x"}}"#,
         );
         let err = credentials_map_step(&step, &mut None)
-            .expect_err("a matched entry without the token field is Present-err");
-        assert!(err.contains('`'), "{err}"); // names the token_json_path
+            .expect_err("a matched entry without the token field is not Absent");
+        assert!(matches!(err, StepError::NoToken(_)), "{err:?}");
+        assert!(err.message().contains('`'), "{err:?}"); // names the token_json_path
         std::fs::remove_dir_all(&dir).ok();
     }
 
