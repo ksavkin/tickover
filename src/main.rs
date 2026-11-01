@@ -7071,7 +7071,8 @@ fn open_history_report(ctx: &Ctx) {
         .filter(|m| plugin_enabled(m))
         .map(|m| m.id.clone())
         .collect();
-    let stats = tickover::history::query::compute(store, 30, &enabled);
+    let stats =
+        tickover::history::query::compute(store, tickover::history::query::ALL_DAYS, &enabled);
     let now = now_unix();
     // The panel's live readings become the report's RIGHT NOW cards — same
     // primary window, same projection math the quota blocks already drew,
@@ -7125,13 +7126,9 @@ fn open_history_report(ctx: &Ctx) {
         .iter()
         .filter_map(|m| m.history.as_ref().map(|h| h.root.clone()))
         .collect();
-    match tickover::history::report::write(
-        &stats,
-        None,
-        config::history_cost_estimate(),
-        &quota,
-        &sources,
-    ) {
+    let cost_on = config::history_cost_estimate();
+    let data = tickover::history::report_data::build(store, &stats, &enabled, cost_on);
+    match tickover::history::report::write(&stats, None, cost_on, &quota, &sources, &data) {
         Ok(path) => stats_cli::open_in_browser(&path),
         Err(e) => diag::line(format!("history: report write failed: {e}")),
     }

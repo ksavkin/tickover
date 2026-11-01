@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use tickover::history::store::HistoryStore;
-use tickover::history::{pricing, query};
+use tickover::history::{pricing, query, report, report_data};
 use tickover::plugin::manifest::PluginManifest;
 
 /// What a well-formed `stats` invocation asks for, `--report`/`--json`'s
@@ -22,7 +22,7 @@ use tickover::plugin::manifest::PluginManifest;
 /// machine-readable output alongside an artifact it already opened.
 #[derive(Debug, PartialEq, Eq)]
 enum Output {
-    Report(Option<PathBuf>),
+    Report { path: Option<PathBuf>, mask: bool },
     Json,
     Text,
 }
@@ -43,10 +43,12 @@ enum ParsedArgs {
 fn parse_args(args: impl IntoIterator<Item = String>) -> ParsedArgs {
     let mut json = false;
     let mut report: Option<Option<PathBuf>> = None;
+    let mut mask = false;
     for arg in args {
         match arg.as_str() {
             "--json" => json = true,
             "--report" | "--html" => report = Some(None),
+            "--mask" => mask = true,
             _ if arg.starts_with("--report=") || arg.starts_with("--html=") => {
                 report = arg.split_once('=').map(|(_, p)| Some(PathBuf::from(p)));
             }
@@ -55,7 +57,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> ParsedArgs {
         }
     }
     ParsedArgs::Run(match report {
-        Some(path) => Output::Report(path),
+        Some(path) => Output::Report { path, mask },
+        // Only the report ever leaves this machine as a file, so `--mask`
+        // anywhere else would promise something it does not do.
+        None if mask => return ParsedArgs::Unknown("--mask without --report".to_string()),
         None if json => Output::Json,
         None => Output::Text,
     })
@@ -84,11 +89,13 @@ pub fn maybe_run(load_manifests: impl FnOnce() -> Vec<PluginManifest>) -> Option
 fn usage() -> &'static str {
     "tickover stats — local token-usage history\n\
      \n\
-     USAGE: tickover stats [--json] [--report[=PATH]]\n\
+     USAGE: tickover stats [--json] [--report[=PATH] [--mask]]\n\
      \n\
        --json           machine-readable output\n\
        --report[=PATH]  write a self-contained HTML report and open it\n\
-                      (default: <config>/tickover/reports/usage-<ts>.html)\n"
+                      (default: <config>/tickover/reports/usage-<ts>.html)\n\
+       --mask           write project-1, project-2 into the report instead\n\
+                      of project names, to share it\n"
 }
 
 fn run(output: Output, manifests: Vec<PluginManifest>) -> i32 {
@@ -164,17 +171,24 @@ fn run(output: Output, manifests: Vec<PluginManifest>) -> i32 {
     // figure — `enabled_manifests` was already filtered to enabled above.
     let enabled: std::collections::HashSet<String> =
         enabled_manifests.iter().map(|m| m.id.clone()).collect();
-    let stats = query::compute(&store, 30, &enabled);
+    let days = match output {
+        Output::Report { .. } => query::ALL_DAYS,
+        _ => 30,
+    };
+    let mut stats = query::compute(&store, days, &enabled);
     let cost_on = crate::config::history_cost_estimate();
 
     match output {
-        Output::Report(path) => {
+        Output::Report { path, mask } => {
+            let mut data = report_data::build(&store, &stats, &enabled, cost_on);
+            if mask {
+                report_data::mask_projects(&mut stats, &mut data);
+            }
             let sources: Vec<String> = enabled_manifests
                 .iter()
                 .filter_map(|m| m.history.as_ref().map(|h| h.root.clone()))
                 .collect();
-            let path = match tickover::history::report::write(&stats, path, cost_on, &[], &sources)
-            {
+            let path = match report::write(&stats, path, cost_on, &[], &sources, &data) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("tickover stats: report failed: {e}");
@@ -401,8 +415,31 @@ mod tests {
     fn report_alone_with_no_value_uses_the_default_path() {
         assert_eq!(
             parse_args(words(&["--report"])),
-            ParsedArgs::Run(Output::Report(None))
+            ParsedArgs::Run(Output::Report {
+                path: None,
+                mask: false
+            })
         );
+    }
+
+    #[test]
+    fn mask_goes_with_a_report_in_either_order() {
+        for args in [&["--report", "--mask"], &["--mask", "--report"]] {
+            assert_eq!(
+                parse_args(words(args)),
+                ParsedArgs::Run(Output::Report {
+                    path: None,
+                    mask: true
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn mask_without_a_report_is_refused() {
+        for args in [&["--mask"][..], &["--mask", "--json"][..]] {
+            assert!(matches!(parse_args(words(args)), ParsedArgs::Unknown(_)));
+        }
     }
 
     /// `--html` is a bare alias for `--report`, not a distinct output mode —
@@ -411,7 +448,10 @@ mod tests {
     fn html_is_an_alias_for_report() {
         assert_eq!(
             parse_args(words(&["--html"])),
-            ParsedArgs::Run(Output::Report(None))
+            ParsedArgs::Run(Output::Report {
+                path: None,
+                mask: false
+            })
         );
     }
 
@@ -419,11 +459,17 @@ mod tests {
     fn report_with_a_value_names_the_path() {
         assert_eq!(
             parse_args(words(&["--report=out.html"])),
-            ParsedArgs::Run(Output::Report(Some(PathBuf::from("out.html"))))
+            ParsedArgs::Run(Output::Report {
+                path: Some(PathBuf::from("out.html")),
+                mask: false
+            })
         );
         assert_eq!(
             parse_args(words(&["--html=out.html"])),
-            ParsedArgs::Run(Output::Report(Some(PathBuf::from("out.html"))))
+            ParsedArgs::Run(Output::Report {
+                path: Some(PathBuf::from("out.html")),
+                mask: false
+            })
         );
     }
 
@@ -435,7 +481,10 @@ mod tests {
     fn report_with_an_empty_value_names_an_empty_path_rather_than_the_default() {
         assert_eq!(
             parse_args(words(&["--report="])),
-            ParsedArgs::Run(Output::Report(Some(PathBuf::from(""))))
+            ParsedArgs::Run(Output::Report {
+                path: Some(PathBuf::from("")),
+                mask: false
+            })
         );
     }
 
@@ -469,15 +518,24 @@ mod tests {
     fn report_wins_over_json_in_either_order() {
         assert_eq!(
             parse_args(words(&["--report", "--json"])),
-            ParsedArgs::Run(Output::Report(None))
+            ParsedArgs::Run(Output::Report {
+                path: None,
+                mask: false
+            })
         );
         assert_eq!(
             parse_args(words(&["--json", "--report"])),
-            ParsedArgs::Run(Output::Report(None))
+            ParsedArgs::Run(Output::Report {
+                path: None,
+                mask: false
+            })
         );
         assert_eq!(
             parse_args(words(&["--json", "--report=out.html"])),
-            ParsedArgs::Run(Output::Report(Some(PathBuf::from("out.html"))))
+            ParsedArgs::Run(Output::Report {
+                path: Some(PathBuf::from("out.html")),
+                mask: false
+            })
         );
     }
 

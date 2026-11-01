@@ -15,6 +15,7 @@ pub mod formats;
 pub mod pricing;
 pub mod query;
 pub mod report;
+pub mod report_data;
 pub mod scanner;
 pub mod store;
 

@@ -113,6 +113,11 @@ pub struct Stats {
     pub skipped_unparsed: u64,
 }
 
+/// A `days` for [`compute`] wide enough that nothing is cut off: the report
+/// states a first date and a busiest day for all of history, which `daily`
+/// can only answer if it reaches that far.
+pub const ALL_DAYS: u32 = 365_000;
+
 /// Compute everything [`Stats`] exposes over the store's live buckets.
 /// `days` bounds `daily`/`heatmap` lookback; all-time groupings ignore it.
 /// `enabled` is the providers the user hasn't disabled — a disabled
@@ -258,7 +263,7 @@ pub fn compute(
 }
 
 /// `"YYYY-MM-DDTHH"` (UTC) → the hour as a `DateTime<Utc>`.
-fn parse_bucket_hour(hour: &str) -> Option<DateTime<Utc>> {
+pub fn parse_bucket_hour(hour: &str) -> Option<DateTime<Utc>> {
     let date = NaiveDate::parse_from_str(hour.get(..10)?, "%Y-%m-%d").ok()?;
     let h: u32 = hour.get(11..)?.parse().ok()?;
     Some(Utc.from_utc_datetime(&date.and_hms_opt(h, 0, 0)?))

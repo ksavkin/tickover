@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use tickover::history::{query, report, scan_tick, store::HistoryStore};
+use tickover::history::{query, report, report_data, scan_tick, store::HistoryStore};
 use tickover::plugin::manifest::PluginManifest;
 
 const SENTINEL: &str = "SENTINEL-PROMPT-9f3ac7b2";
@@ -261,7 +261,8 @@ fn nothing_but_usage_metadata_leaves_the_extractor() {
     }
 
     let report_path = store_dir.join("report.html");
-    let written = report::write(&st, Some(report_path.clone()), false, &[], &[]).unwrap();
+    let data = report_data::build(&store, &st, &all_enabled(&manifests), false);
+    let written = report::write(&st, Some(report_path.clone()), false, &[], &[], &data).unwrap();
     let html = fs::read_to_string(&written).unwrap();
     // The report's own positive control: its "TOKENS" card always renders
     // `st.total.sum()` abbreviated to one decimal place (6500 + 9800 here),

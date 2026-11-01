@@ -156,7 +156,7 @@ Grok's unified log, Antigravity's conversation database. Tickover turns
 that into the panel's Activity card (today, this week, this month, a
 cache-hit rate, your top projects) and into `tickover stats` on the command
 line, which adds `--json` for scripts and `--report` for a self-contained
-HTML page. Nothing but a timestamp, a project name, a model name and token
+HTML page with a period picker. Nothing but a timestamp, a project name, a model name and token
 counts is ever kept from what it reads — never a prompt or a response; see
 [`docs/PROVIDERS.md`](docs/PROVIDERS.md#local-usage-history) for the
 per-provider table and [`SECURITY.md`](SECURITY.md) for what that guarantee

@@ -71,7 +71,8 @@ single-instance lock is touched.
 |---|---|
 | (none) | plain-text totals: all-time and today's/this week's tokens by class, the cache-hit rate, a streak of active days, a breakdown by provider, and the top projects by volume |
 | `--json` | the same figures as one JSON object on stdout, for scripting |
-| `--report` (alias `--html`) | writes a self-contained HTML report — the same figures, plus per-model and per-day detail — and opens it in the default browser; `--report=PATH` names the file, otherwise it lands at `<config>/tickover/reports/usage-<timestamp>.html` (see the file table above) |
+| `--report` (alias `--html`) | writes a self-contained HTML report — the same figures, plus per-model and per-day detail — and opens it in the default browser; `--report=PATH` names the file, otherwise it lands at `<config>/tickover/reports/usage-<timestamp>.html` (see the file table above). The page has a period picker: presets or any two dates, in whole local hours of the machine that wrote the report. It needs no server; the data is inside the file |
+| `--mask` | with `--report` only: writes `project-1`, `project-2` into the file instead of project names, for a report you mean to share. The **Mask projects** box on the page hides names on screen only, and every project name is in the file itself |
 | `--help` / `-h` | usage |
 
 The cost line is the one figure that can be incomplete, and it says so rather
