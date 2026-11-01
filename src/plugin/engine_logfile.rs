@@ -1380,6 +1380,9 @@ mod tests {
 
     use crate::plugin::manifest::{PeriodConfig, PeriodUnit, SourceConfig};
 
+    /// A path `Path::is_absolute` accepts on the platform running the tests.
+    const ABSOLUTE_ROOT: &str = if cfg!(windows) { r"C:\tmp\x" } else { "/tmp/x" };
+
     /// Guards every test below that calls `std::env::set_var`/`remove_var`:
     /// real process environment is process-wide state `cargo test`'s default
     /// parallelism does not otherwise serialize, and each test's own
@@ -3195,7 +3198,7 @@ mod tests {
     fn resolve_root_joins_root_env_join_onto_the_env_override() {
         let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let env_name = "TICKOVER_TEST_ENGINE_LOGFILE_ROOT_JOIN";
-        std::env::set_var(env_name, "/tmp/x");
+        std::env::set_var(env_name, ABSOLUTE_ROOT);
         let lf = LogFileConfig {
             root_env: Some(env_name.to_string()),
             root_env_join: Some("sessions".to_string()),
@@ -3212,7 +3215,7 @@ mod tests {
         };
         assert_eq!(
             resolve_root(&lf, &no_options()),
-            PathBuf::from("/tmp/x/sessions")
+            PathBuf::from(ABSOLUTE_ROOT).join("sessions")
         );
         std::env::remove_var(env_name);
     }
@@ -3221,7 +3224,7 @@ mod tests {
     fn resolve_root_substitutes_option_placeholders_in_root_env_join() {
         let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let env_name = "TICKOVER_TEST_ENGINE_LOGFILE_ROOT_OPTION_JOIN";
-        std::env::set_var(env_name, "/tmp/x");
+        std::env::set_var(env_name, ABSOLUTE_ROOT);
         let lf = LogFileConfig {
             root_env: Some(env_name.to_string()),
             root_env_join: Some("{option.subdir}".to_string()),
@@ -3238,10 +3241,16 @@ mod tests {
         };
         let mut opts = BTreeMap::new();
         opts.insert("subdir".to_string(), true);
-        assert_eq!(resolve_root(&lf, &opts), PathBuf::from("/tmp/x/true"));
+        assert_eq!(
+            resolve_root(&lf, &opts),
+            PathBuf::from(ABSOLUTE_ROOT).join("true")
+        );
 
         opts.insert("subdir".to_string(), false);
-        assert_eq!(resolve_root(&lf, &opts), PathBuf::from("/tmp/x/false"));
+        assert_eq!(
+            resolve_root(&lf, &opts),
+            PathBuf::from(ABSOLUTE_ROOT).join("false")
+        );
         std::env::remove_var(env_name);
     }
 
@@ -3330,8 +3339,11 @@ mod tests {
         }
 
         // An absolute value is still honoured exactly as before.
-        std::env::set_var(env_name, "/tmp/x");
-        assert_eq!(resolve_root(&lf, &no_options()), PathBuf::from("/tmp/x"));
+        std::env::set_var(env_name, ABSOLUTE_ROOT);
+        assert_eq!(
+            resolve_root(&lf, &no_options()),
+            PathBuf::from(ABSOLUTE_ROOT)
+        );
         std::env::remove_var(env_name);
     }
 

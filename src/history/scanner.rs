@@ -1329,7 +1329,7 @@ format = "{format}"
 root   = "{root_display}"
 glob   = "{glob}"
 "#,
-            root_display = root.display()
+            root_display = root.display().to_string().replace('\\', "\\\\")
         );
         PluginManifest::from_str(&text).unwrap_or_else(|e| panic!("fixture manifest: {e}"))
     }

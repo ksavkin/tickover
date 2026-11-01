@@ -2342,7 +2342,7 @@ mod tests {
         pass(&mut store, "/f", (0, 100), true, &[("h1", 1)]);
         let pad = |dir: &Path, bytes: u64| {
             let path = dir.join("days.jsonl");
-            let f = fs::OpenOptions::new().append(true).open(path).unwrap();
+            let f = fs::OpenOptions::new().write(true).open(path).unwrap();
             let len = f.metadata().unwrap().len();
             f.set_len(len + bytes).unwrap();
         };
