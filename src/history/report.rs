@@ -791,7 +791,7 @@ fn context_efficiency(h: &mut String, st: &Stats) {
         h,
         r#"<div id="sec-context" style="display: flex; flex-direction: column; gap: 14px;">
 <div class="row"><h2 class="sec">CONTEXT EFFICIENCY</h2>
-<span class="secnote">cache read ÷ (cache read + input)</span></div>
+<span class="secnote">cache read ÷ (cache read + cache write + input)</span></div>
 <div class="card" style="padding: 24px; display: grid; grid-template-columns: 300px minmax(0,1fr); gap: 40px; align-items: center;">
 <div style="display: flex; flex-direction: column; gap: 8px;">
 <div class="mono" data-k="ctx-pct" style="font-size: 64px; font-weight: 600; letter-spacing: -0.04em; line-height: 1; color: var(--ok);">{pct:.0}%</div>

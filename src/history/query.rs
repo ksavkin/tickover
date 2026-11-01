@@ -46,10 +46,13 @@ impl Totals {
     pub fn active(&self) -> u64 {
         self.input + self.output + self.cache_write + self.thinking
     }
-    /// Cache-hit ratio over read-or-fresh input, `None` when there is no
-    /// input traffic at all (a 0/0 ratio is meaningless, not 0%).
+    /// Cache-hit ratio over all input, `None` when there is no input traffic
+    /// at all (a 0/0 ratio is meaningless, not 0%). Cache writes count as
+    /// input: that context was sent and not served from the cache, and leaving
+    /// it out reads as 100% on a provider that logs nearly all of its fresh
+    /// context as writes.
     pub fn cache_hit_pct(&self) -> Option<f64> {
-        let denom = self.cache_read + self.input;
+        let denom = self.cache_read + self.input + self.cache_write;
         (denom > 0).then(|| self.cache_read as f64 * 100.0 / denom as f64)
     }
 }
@@ -967,9 +970,20 @@ mod tests {
         assert_eq!(st.total.input, 100);
         assert_eq!(st.providers, vec!["claude".to_string()]);
         assert_eq!(st.by_provider["claude"].cache_read, 200);
-        // cache-hit = read / (read + fresh) = 200/300
+        // cache-hit = read / (read + written + fresh) = 200/300
         assert!((st.by_provider["claude"].cache_hit_pct().unwrap() - 66.66).abs() < 0.1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cache_write_counts_against_the_hit_rate() {
+        let t = Totals {
+            cache_read: 980,
+            cache_write: 19,
+            input: 1,
+            ..Totals::default()
+        };
+        assert_eq!(t.cache_hit_pct(), Some(98.0));
     }
 
     #[test]

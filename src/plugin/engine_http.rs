@@ -1718,8 +1718,26 @@ fn read_amount(value: &Value, cfg: &AmountConfig) -> Option<crate::model::Balanc
         AmountKind::Text => {
             let s = json_path_get(value, path_of(&cfg.path)?)?.as_str()?;
             let s = crate::plugin::sanitize_provider_text(s);
-            (!s.is_empty()).then_some(crate::model::BalanceAmount::Text(s))
+            (!s.is_empty()).then(|| crate::model::BalanceAmount::Text(trim_fixed_scale(s)))
         }
+    }
+}
+
+/// Drop the trailing zeros of a plain decimal string. Codex states a credit
+/// balance at a fixed scale, `"62500.0000000000"`, and those digits say nothing
+/// to the reader. Anything that is not just a number keeps its exact text: a
+/// string like `"$5.00"` has a format of its own.
+fn trim_fixed_scale(s: String) -> String {
+    let Some((whole, fraction)) = s.split_once('.') else {
+        return s;
+    };
+    let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    if !digits(whole.strip_prefix('-').unwrap_or(whole)) || !digits(fraction) {
+        return s;
+    }
+    match fraction.trim_end_matches('0') {
+        "" => whole.to_string(),
+        kept => format!("{whole}.{kept}"),
     }
 }
 
@@ -3417,6 +3435,24 @@ mod tests {
     }
 
     #[test]
+    fn a_fixed_scale_balance_loses_its_trailing_zeros_and_nothing_else() {
+        for (sent, drawn) in [
+            ("62500.0000000000", "62500"),
+            ("62500.5000000000", "62500.5"),
+            ("-12.50", "-12.5"),
+            ("0.000", "0"),
+            ("100", "100"),
+            ("$5.00", "$5.00"),
+            ("5.00 left", "5.00 left"),
+            ("1.2.0", "1.2.0"),
+            (".50", ".50"),
+            ("5.", "5."),
+        ] {
+            assert_eq!(trim_fixed_scale(sent.to_string()), drawn, "{sent}");
+        }
+    }
+
+    #[test]
     fn provider_text_reaches_the_row_sanitised() {
         let m = balance_manifest(
             "label = \"Credits\"\n[balances.remaining]\nkind = \"text\"\npath = \"credits.balance\"",
@@ -3669,6 +3705,16 @@ mod tests {
             parse_usage(&json!({ "five_hour": { "utilization": 2.0 } }), &claude).unwrap_err(),
             "no \"WK\" window in the response"
         );
+
+        // The 5-hour window is the one half that may go missing: a live
+        // account answers with it null, and the weekly row has to survive.
+        let no_session = json!({
+            "five_hour": null,
+            "seven_day": { "utilization": 9.0, "resets_at": "2026-11-05T05:00:00Z" }
+        });
+        let windows = parse_usage(&no_session, &claude).expect("no 5-hour window is a state");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "WK");
     }
 
     #[test]

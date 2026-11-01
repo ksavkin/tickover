@@ -366,8 +366,12 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "claude.toml",
         id: "claude",
-        to_version: "1.5.1",
+        to_version: "1.5.2",
         previous_sha256: &[
+            // 1.5.1 — before the 5-hour window stopped being `required`, so an
+            // account reporting none drew an error in place of its weekly row.
+            // sha256 of claude.toml as shipped at manifest version 1.5.1.
+            "58198728e7888a962ea05537004258734259a05bf64a3ec46020530e7086328f",
             // 1.5.0 — before the CLI surface said "not signed in", so a
             // signed-out Claude Code drew its row as a JSON-path error, or,
             // with no store at all, drew no row.
@@ -1351,7 +1355,7 @@ mod tests {
         assert_eq!(m.id, "claude");
         assert_eq!(m.engine, EngineKind::HttpApi);
         assert_eq!(
-            m.version, "1.5.1",
+            m.version, "1.5.2",
             "the version BUILTIN_UPGRADES migrates to"
         );
         assert_eq!(m.surface.len(), 2, "cli + desktop surfaces");

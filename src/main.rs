@@ -7057,6 +7057,17 @@ fn report_row_id(plugins: &[PluginManifest], r: &ProviderReading) -> String {
         .unwrap_or_else(|| r.id.clone())
 }
 
+/// The window a provider's RIGHT NOW card is about: the 5-hour one, or the
+/// weekly one while no 5-hour figure is reported, so a provider between
+/// sessions keeps its card instead of dropping out of the report.
+#[cfg(feature = "history")]
+fn report_window(r: &ProviderReading) -> Option<&Window> {
+    [r.primary_window(), r.secondary_window()]
+        .into_iter()
+        .flatten()
+        .find(|w| w.used_percent.is_some())
+}
+
 /// "Full report ↗": render the HTML report from the in-memory snapshot and
 /// hand it to the browser. Runs on the callback — `compute` is a single
 /// pass over buckets the store already holds, so no worker is worth the
@@ -7082,7 +7093,7 @@ fn open_history_report(ctx: &Ctx) {
     let quota: Vec<tickover::history::report::QuotaNow> = readings(&plugins, &ctx.cache.borrow())
         .iter()
         .filter_map(|r| {
-            let w = r.primary_window()?;
+            let w = report_window(r)?;
             let used = w.used_percent?;
             let id = report_row_id(&plugins, r);
             let proj = quota_projection(&ctx.history, &ctx.projection_cache, &id, w, used, now);
@@ -14925,6 +14936,24 @@ mod title_tests {
         // test ever running.
         assert_eq!(tickover::plugin::window_key(&m.windows[0], 0), "w0:");
         assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", seen), &NO_PROJ).is_empty());
+    }
+
+    #[cfg(feature = "history")]
+    #[test]
+    fn a_report_card_falls_back_to_the_weekly_window() {
+        let weekly = win("WK", Role::Secondary, 82.0, 3 * 86400, 10_080);
+        let both = reading_with(
+            vec![weekly.clone(), win("5H", Role::Primary, 7.0, 3600, 300)],
+            None,
+        );
+        assert_eq!(report_window(&both).unwrap().label, "5H");
+        let only_weekly = reading_with(vec![weekly.clone()], None);
+        assert_eq!(report_window(&only_weekly).unwrap().label, "WK");
+        let mut no_figure = win("5H", Role::Primary, 7.0, 3600, 300);
+        no_figure.used_percent = None;
+        let empty_primary = reading_with(vec![no_figure, weekly], None);
+        assert_eq!(report_window(&empty_primary).unwrap().label, "WK");
+        assert!(report_window(&reading_with(Vec::new(), None)).is_none());
     }
 
     /// A reading we could not take is not evidence that a window is empty. The

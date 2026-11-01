@@ -221,10 +221,19 @@ fn quota_only(manifests: &[PluginManifest]) -> Vec<String> {
 }
 
 /// Open `path` in the default browser — plain `open`/`start`/`xdg-open`.
-/// The CLI exits right after, so no child reaping is needed.
+///
+/// macOS names the system `open` in full: a terminal may put its own first on
+/// `PATH`, and cmux's sends an HTML file to its in-app browser, so a tray
+/// started from one would answer the report button by doing nothing visible.
+///
+/// The tray outlives the child, so a thread reaps it, and that is also where a
+/// failure gets said. The CLI exits right after, which ends the thread and
+/// loses nothing.
 pub(crate) fn open_in_browser(path: &std::path::Path) {
     #[cfg(target_os = "macos")]
-    let cmd = std::process::Command::new("open").arg(path).spawn();
+    let cmd = std::process::Command::new("/usr/bin/open")
+        .arg(path)
+        .spawn();
     #[cfg(target_os = "windows")]
     let cmd = std::process::Command::new("cmd")
         .args(["/c", "start", ""])
@@ -232,7 +241,16 @@ pub(crate) fn open_in_browser(path: &std::path::Path) {
         .spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     let cmd = std::process::Command::new("xdg-open").arg(path).spawn();
-    let _ = cmd;
+    match cmd {
+        Ok(mut child) => {
+            std::thread::spawn(move || match child.wait() {
+                Ok(status) if status.success() => {}
+                Ok(status) => crate::diag::line(format!("report: browser open: {status}")),
+                Err(e) => crate::diag::line(format!("report: browser open: {e}")),
+            });
+        }
+        Err(e) => crate::diag::line(format!("report: browser open: {e}")),
+    }
 }
 
 pub(crate) fn fmt_tokens(n: u64) -> String {

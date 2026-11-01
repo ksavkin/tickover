@@ -355,8 +355,9 @@ saying "no usage reported yet", which is true.
 
 So mark a window `required` only where the provider genuinely always sends it,
 and expect no safety net where you don't. Neither of Codex's windows is
-marked. Both of Claude's are — Anthropic sends both for every account, so a
-response with half of them has changed shape.
+marked. Claude's weekly window is: a response without it has changed shape. Its
+5-hour window is not, because a live account has been measured answering with
+`five_hour` null beside a filled-in weekly window.
 
 #### The seen-window registry: a row that doesn't blink out
 
@@ -2193,7 +2194,7 @@ order        = 20
 # the CLI renames under it — see docs/PLUGIN-ARCHITECTURE.md, "Reader
 # capabilities".
 requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry", "reading-balances", "balance-conditional", "credentials-file-path-env", "keychain-service-env", "reading-history"]
-version      = "1.5.1"
+version      = "1.5.2"
 engine       = "http-api"
 # Re-fetched every 60 s.
 refresh_secs = 60
@@ -2201,16 +2202,18 @@ refresh_secs = 60
 # Claude reports no window lengths of its own, so the nominal periods (5h =
 # 300 min, weekly = 10080 min) are assumed here. This is the mirror image of
 # Codex, whose windows carry their own `limit_window_seconds`.
-# Both windows are `required`: Anthropic reports both for every account, so a
-# response missing one has changed shape under us. That is worth saying out
-# loud — the alternative is a panel drawing whichever half still parsed, where
-# a missing row is indistinguishable from a quota nothing has been spent
+# Only the weekly window is `required`. A live account has been measured with
+# `five_hour` null, `seven_day` filled in and no session element in `limits[]`,
+# so a missing 5-hour window is a state of the account. Refusing it would hide
+# the weekly figure that did arrive and stop the auto-ping along with it. A
+# response with no weekly window has changed shape under us, and that is worth
+# saying out loud — the alternative is a panel drawing whatever still parsed,
+# where a missing row is indistinguishable from a quota nothing has been spent
 # against.
 [[windows]]
 id       = "claude-5h"
 label    = "5H"
 role     = "primary"
-required = true
 [windows.period]
 mode    = "assumed"
 assumed = 300

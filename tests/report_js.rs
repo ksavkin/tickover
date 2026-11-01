@@ -203,6 +203,7 @@ fn expected(st: &Stats) -> Value {
         "cost": cost(&st.models),
         "saved": rounded(saved),
         "saved_partial": saved_partial,
+        "hit": st.total.cache_hit_pct().map(rounded),
     })
 }
 
@@ -240,6 +241,7 @@ fn normalized(a: &Value) -> Value {
         "weeks": a["weeks"],
         "cost": round_cost(a),
         "saved": rounded(a["saved"].as_f64().unwrap()),
+        "hit": a["hit"].as_f64().map(rounded),
         "saved_partial": a["saved_partial"],
     })
 }
@@ -273,7 +275,11 @@ fn assert_period(lines: &[DayLine], from: Option<NaiveDate>, to: Option<NaiveDat
     let answer = run_node(
         &whole_dir,
         &data,
-        &format!("r.aggregate(data, {}, {})", quote(from), quote(to)),
+        &format!(
+            "(a => Object.assign(a, {{hit: r.cacheHit(a.total)}}))(r.aggregate(data, {}, {}))",
+            quote(from),
+            quote(to)
+        ),
     );
     assert_eq!(normalized(&answer), expected(&stats(&part)), "{tag}");
     let _ = std::fs::remove_dir_all(&whole_dir);

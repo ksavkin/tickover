@@ -179,7 +179,7 @@
     return day.slice(8, 10) + " " + MONTHS[+day.slice(5, 7) - 1] + " " + day.slice(0, 4);
   }
 
-  var api = { aggregate: aggregate, fmtTokens: fmtTokens, fmtInt: fmtInt, fmtUsd: fmtUsd, fmtHeadlineUsd: fmtHeadlineUsd, fmtSpan: fmtSpan, fmtDay: fmtDay, fmtActiveDays: fmtActiveDays };
+  var api = { aggregate: aggregate, cacheHit: cacheHit, fmtTokens: fmtTokens, fmtInt: fmtInt, fmtUsd: fmtUsd, fmtHeadlineUsd: fmtHeadlineUsd, fmtSpan: fmtSpan, fmtDay: fmtDay, fmtActiveDays: fmtActiveDays };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;
     return;
@@ -238,7 +238,7 @@
     return whole > 0 ? (part * 100) / whole : 0;
   }
   function cacheHit(t) {
-    var denom = t.cache_read + t.input;
+    var denom = t.cache_read + t.input + t.cache_write;
     return denom > 0 ? (t.cache_read * 100) / denom : null;
   }
   function usd(cost, partial) {
