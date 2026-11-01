@@ -189,7 +189,7 @@ created `0600` on macOS (Windows has no code-level equivalent for either),
 beside a third file in the same directory, `lock`, which carries no data of
 its own and exists only for the flock below:
 
-- `days.jsonl` — append-only bucket lines: hour, provider, project,
+- `days.jsonl` — bucket lines, appended between compactions: hour, provider, project,
   model, session, the five token classes, message count, the source
   file's generation, the source range `[lo, hi)` the bucket was
   aggregated from (bytes for JSONL, row indices for SQLite), a `full`
@@ -331,12 +331,18 @@ Several edges are accepted rather than chased:
   file it stopped walking — the entry sits in `state.json`,
   unreachable, until the file itself is actually deleted. The cost is
   one stale cursor per abandoned path, not a miscount.
-- **A provider whose log only ever grows is not size-bounded.**
-  Compaction rewrites `days.jsonl` past a size threshold, but only
-  lines a *later, sealed* generation has actually superseded ever
-  leave. A provider that never rewrites its own log — new hours,
-  sessions or models, never a stale generation — has nothing to drop,
-  and the file keeps growing past the threshold on every future check.
+- **`days.jsonl` grows with activity, without a ceiling.** A scanner pass
+  writes one line per bucket, so a session polled every few minutes
+  leaves many lines for one hour. Compaction folds a settled file into
+  one line per bucket, all sharing one prefix-chain step `(b, 0, H)`:
+  sharing it is what makes the next seal keep them, since steps that
+  overlap are read as stale. It runs from 4 MiB, and again each time the
+  file has grown half past the size the last check left. A file is left
+  alone mid-rescan, unsealed, with a range past its committed cursor,
+  with activity on a line that has no range, or while it is a tracked
+  row-coordinate source. What remains is one line per hour, session,
+  model and file. Nothing removes those: each is the only record of its
+  usage, often from a transcript the provider has since deleted.
 - **A recreated file's stale sealed generation is retained forever,
   until re-sealed past.** Delete-and-recreate, a `SCHEMA_VERSION`
   rebuild, or a downgrade can hand a file a fresh life at a generation

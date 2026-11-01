@@ -64,20 +64,16 @@ fn default_digest_len() -> u64 {
 /// Codex rollouts both start with a header line naming their own ids).
 pub(crate) const PREFIX_BYTES: usize = 4096;
 
-/// [`HistoryStore::commit`] rewrites `days.jsonl` once it passes this size
-/// — but only the lines [`HistoryStore::compute_droppable_indices`] finds
-/// genuinely dead actually leave, and being rewritten is not by itself
-/// enough to make a file's older generations droppable: it takes a *later*
-/// generation actually reaching a `full` seal to supersede an earlier one
-/// (see [`HistoryStore::generation_maps`]). A provider whose file keeps
-/// getting rewritten before any generation ever completes a pass — every
-/// attempt truncated, none reaching the end of the source — leaves every
-/// generation's lines live-or-unsealed forever, the same as a provider
-/// whose log only ever grows with new hours, sessions or models and never
-/// produces a stale generation to drop in the first place: either way,
-/// every line stays, compaction finds nothing to remove, and the file
-/// keeps growing past this size on every future check.
-const DAYS_COMPACT_BYTES: u64 = 16 * 1024 * 1024;
+/// [`HistoryStore::commit`] considers rewriting `days.jsonl` from this size
+/// up, and again each time it has grown half as much as the last rewrite
+/// left it ([`ScannerState::compacted_size`]). A scanner pass writes one line
+/// per bucket, so a session polled every few minutes spends most of the file
+/// on lines that differ only in their byte range;
+/// [`HistoryStore::checkpointed_days`] folds those together. What is left
+/// grows with real activity (one line per hour, session, model and file), not
+/// with the number of passes, and nothing here caps that: every line is the
+/// only record of usage, often from a transcript the provider has deleted.
+const DAYS_COMPACT_BYTES: u64 = 4 * 1024 * 1024;
 
 /// How many `state.corrupt-*.json` snapshots [`HistoryStore::open`] keeps —
 /// enough to look back past more than one incident without letting a
@@ -335,6 +331,12 @@ pub struct ScannerState {
     /// the more accurate source once one exists.
     #[serde(default)]
     pub pruned_generations: BTreeMap<String, u32>,
+    /// `days.jsonl`'s size after the last compaction check that ran, whether
+    /// or not it found anything to do — the second half of the trigger in
+    /// [`HistoryStore::maybe_compact_days`]. Without it, a file past
+    /// [`DAYS_COMPACT_BYTES`] would pay for that search on every commit.
+    #[serde(default)]
+    pub compacted_size: u64,
 }
 
 /// One aggregate line in `days.jsonl`. This is the *only* thing history
@@ -496,6 +498,18 @@ impl DayLine {
     /// both alike without knowing tombstones exist.
     pub fn has_activity(&self) -> bool {
         self.sum() > 0 || self.messages > 0
+    }
+
+    /// Fold `other`'s counters into this line. Only ever called with lines of
+    /// one [`BucketKey`], so attribution needs no merging.
+    fn absorb(&mut self, other: &DayLine) {
+        self.v = self.v.max(other.v);
+        self.input += other.input;
+        self.output += other.output;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+        self.thinking += other.thinking;
+        self.messages = self.messages.saturating_add(other.messages);
     }
 }
 
@@ -1169,9 +1183,9 @@ impl HistoryStore {
     /// Persist `state.json` atomically (tmp + rename) — but only when
     /// [`Self::state_dirty`] says `state` actually differs from what's on
     /// disk, and never when [`Self::foreign_newer_state`] is set — then
-    /// compact `days.jsonl` if it has grown past [`DAYS_COMPACT_BYTES`]
-    /// (that trigger is unconditional; a `days.jsonl`-only pass with an
-    /// untouched `state` still needs to compact) — *unless*
+    /// compact `days.jsonl` if [`Self::maybe_compact_days`]'s size trigger
+    /// says so (that trigger is unconditional; a `days.jsonl`-only pass with
+    /// an untouched `state` still needs to compact) — *unless*
     /// `foreign_newer_state` is set, in which case compaction is skipped
     /// too: `open` already dropped every line a newer schema wrote from
     /// this run's in-memory `days` (any `v` greater than
@@ -1190,25 +1204,37 @@ impl HistoryStore {
     /// over the target, so a reader never sees a half-written state.
     /// `days.jsonl` needs none of this — it only ever appends new lines.
     pub fn commit(&mut self) -> io::Result<()> {
-        if self.state_dirty && !self.foreign_newer_state {
-            self.state.version = SCHEMA_VERSION;
-            let tmp = self.dir.join("state.json.tmp");
-            let target = Self::state_path(&self.dir);
-            {
-                let f = create_private(&tmp)?;
-                let mut w = io::BufWriter::new(f);
-                serde_json::to_writer(&mut w, &self.state).map_err(io::Error::other)?;
-                w.write_all(b"\n")?;
-                w.flush()?;
-                w.get_ref().sync_data().ok();
-            }
-            fs::rename(&tmp, &target)?;
-            self.state_dirty = false;
-        }
+        self.write_state()?;
         if self.foreign_newer_state {
             return Ok(());
         }
-        self.maybe_compact_days()
+        self.maybe_compact_days()?;
+        // A second write, after the compaction, only when it recorded a new
+        // `compacted_size`. The cursors a checkpoint trusted were already on
+        // disk from the write above; a crash between the two costs one
+        // repeated check.
+        self.write_state()
+    }
+
+    /// The `state.json` half of [`Self::commit`].
+    fn write_state(&mut self) -> io::Result<()> {
+        if !self.state_dirty || self.foreign_newer_state {
+            return Ok(());
+        }
+        self.state.version = SCHEMA_VERSION;
+        let tmp = self.dir.join("state.json.tmp");
+        let target = Self::state_path(&self.dir);
+        {
+            let f = create_private(&tmp)?;
+            let mut w = io::BufWriter::new(f);
+            serde_json::to_writer(&mut w, &self.state).map_err(io::Error::other)?;
+            w.write_all(b"\n")?;
+            w.flush()?;
+            w.get_ref().sync_data().ok();
+        }
+        fs::rename(&tmp, &target)?;
+        self.state_dirty = false;
+        Ok(())
     }
 
     /// Day lines that still count: a line is stale only when its file is
@@ -1471,46 +1497,66 @@ impl HistoryStore {
             .collect()
     }
 
-    /// Rewrite `days.jsonl` dropping genuinely dead lines
-    /// ([`Self::compute_droppable_indices`]), when it is big enough for the
-    /// dropped share to be worth one rewrite. Not the same set
-    /// [`Self::live_days`] shows: a line mid-rescan and not yet sealed is
-    /// hidden from the live figure but kept on disk, because the seal that
-    /// will complete it still needs it.
+    /// Compact `days.jsonl` once it has reached [`DAYS_COMPACT_BYTES`] and
+    /// grown half again past the size the last check left it at — a file that
+    /// sits just over the threshold must not be rewritten on every commit
+    /// that turns up one dead line.
     fn maybe_compact_days(&mut self) -> io::Result<()> {
         let path = Self::days_path(&self.dir);
         let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        if size < DAYS_COMPACT_BYTES {
+        if size < DAYS_COMPACT_BYTES.max(self.state.compacted_size.saturating_mul(3) / 2) {
             return Ok(());
         }
+        self.compact_days()
+    }
+
+    /// Rewrite `days.jsonl` dropping genuinely dead lines
+    /// ([`Self::compute_droppable_indices`]) and folding pass-by-pass lines
+    /// together ([`Self::checkpointed_days`]). Not the same set
+    /// [`Self::live_days`] shows: a line mid-rescan and not yet sealed is
+    /// hidden from the live figure but kept on disk, because the seal that
+    /// will complete it still needs it.
+    ///
+    /// Runs under [`lock_store`], on a store `open` read fresh: the rewrite
+    /// comes from this process's memory, so a stale one would lose lines.
+    fn compact_days(&mut self) -> io::Result<()> {
+        let path = Self::days_path(&self.dir);
         let droppable = self.compute_droppable_indices();
-        if droppable.is_empty() {
+        let Some(keep) = self.checkpointed_days(&droppable) else {
+            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            self.record_compacted_size(size);
             return Ok(());
-        }
-        let keep: Vec<DayLine> = self
-            .days
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !droppable.contains(i))
-            .map(|(_, d)| d.clone())
-            .collect();
+        };
         let tmp = self.dir.join("days.jsonl.tmp");
+        let mut seen_lines = std::collections::HashSet::with_capacity(keep.len());
+        let written;
         {
             let mut f = create_private(&tmp)?;
             let mut buf = Vec::new();
             for d in &keep {
-                serde_json::to_writer(&mut buf, d).map_err(io::Error::other)?;
+                let line = serde_json::to_string(d).map_err(io::Error::other)?;
+                buf.extend_from_slice(line.as_bytes());
                 buf.push(b'\n');
+                seen_lines.insert(line);
             }
             f.write_all(&buf)?;
-            f.sync_data().ok();
+            // Not `.ok()`: this rewrite replaces lines that may be the only
+            // record of a deleted transcript, so it must not take the place
+            // of the old file before its bytes are known to be on disk.
+            f.sync_data()?;
+            written = buf.len() as u64;
         }
         fs::rename(&tmp, &path)?;
+        #[cfg(unix)]
+        if let Ok(d) = fs::File::open(&self.dir) {
+            d.sync_all().ok();
+        }
         // Reindex in place — compaction changes every index, so both
         // maps must be rebuilt, not just `by_key`: a stale `by_file`
         // index either points past the shortened `days` (panic) or at
         // an unrelated line (a seal then kills coverage it never read).
         self.days = keep;
+        self.seen_lines = seen_lines;
         self.dead.clear();
         self.by_key.clear();
         self.by_file.clear();
@@ -1526,7 +1572,149 @@ impl HistoryStore {
         // that the array has been rewritten shorter, and so is anything
         // `live_days` had cached before this call.
         self.invalidate_live_cache();
+        self.record_compacted_size(written);
         Ok(())
+    }
+
+    fn record_compacted_size(&mut self, size: u64) {
+        self.state.compacted_size = size;
+        self.mark_state_dirty();
+    }
+
+    /// The lines a compaction should write: everything outside `droppable`,
+    /// with each file [`Self::checkpoint_of`] accepts reduced to its
+    /// checkpoint. `None` when that would change nothing.
+    fn checkpointed_days(
+        &self,
+        droppable: &std::collections::HashSet<usize>,
+    ) -> Option<Vec<DayLine>> {
+        let maps = self.generation_maps();
+        let mut by_file: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, d) in self.days.iter().enumerate() {
+            if !droppable.contains(&i) {
+                by_file.entry(d.file.as_str()).or_default().push(i);
+            }
+        }
+        let mut replaced: HashMap<usize, DayLine> = HashMap::new();
+        let mut absorbed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (file, idxs) in &by_file {
+            let Some(lines) = self.checkpoint_of(file, idxs, &maps) else {
+                continue;
+            };
+            for &i in idxs {
+                absorbed.insert(i);
+            }
+            for (i, line) in lines {
+                absorbed.remove(&i);
+                replaced.insert(i, line);
+            }
+        }
+        if droppable.is_empty() && absorbed.is_empty() {
+            return None;
+        }
+        Some(
+            self.days
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !droppable.contains(i) && !absorbed.contains(i))
+                .map(|(i, d)| replaced.remove(&i).unwrap_or_else(|| d.clone()))
+                .collect(),
+        )
+    }
+
+    /// One file's lines folded into one line per bucket, each paired with the
+    /// index of the line it takes the place of (the bucket's first, so a
+    /// session's first project stays first) — or `None` when the file must be
+    /// left alone, or folding it would save nothing.
+    ///
+    /// Every line of a checkpoint carries the same `(b, 0, H)`, and that is
+    /// the point: to [`Self::fold_line`] they are then one step of the prefix
+    /// chain, whose seal keeps them all and whose successor starts at `H`.
+    /// Giving each bucket its own merged range instead would leave steps that
+    /// overlap, and the next seal kills the older of two overlapping steps.
+    ///
+    /// Each refusal below is a way `[0, H)` could claim more than is settled:
+    ///
+    /// * more than one generation, or not the one the live figure reads: a
+    ///   rescan is under way and its seal still needs the old lines;
+    /// * the freshest step is not a seal reaching `H`: the pass that would
+    ///   vouch for the whole range never finished;
+    /// * activity without a range: a line from before ranges existed, which
+    ///   the seal logic treats differently and this must not relabel;
+    /// * `H` past the committed cursor: a pass wrote these lines and died
+    ///   before `commit`. Its retry starts below `H`, and would overlap every
+    ///   checkpoint line of its buckets instead of the one pass's bytes;
+    /// * row coordinates (`aux["max_idx"]`, Antigravity): `lo`/`hi` count rows
+    ///   while `cursor` is `0` or the file's size, so the cursor test above
+    ///   would pass without meaning anything.
+    ///
+    /// A file no longer tracked has no pass to retry, so the last two do not
+    /// apply to it. [`DayLine::full`] on the merged lines is not a new claim:
+    /// the freshest step already sealed the generation.
+    fn checkpoint_of(
+        &self,
+        file: &str,
+        idxs: &[usize],
+        maps: &GenerationMaps<'_>,
+    ) -> Option<Vec<(usize, DayLine)>> {
+        if idxs.len() < 2 {
+            return None;
+        }
+        let gen = self.days[idxs[0]].gen;
+        if idxs.iter().any(|&i| self.days[i].gen != gen)
+            || Self::target_gen(maps, file).is_some_and(|target| target != gen)
+        {
+            return None;
+        }
+        let h = idxs.iter().map(|&i| self.days[i].hi).max()?;
+        // Same freshness `fold_line` orders candidate steps by.
+        let freshest = *idxs.iter().max_by_key(|&&i| (self.days[i].b, i))?;
+        if !self.days[freshest].full || self.days[freshest].hi != h {
+            return None;
+        }
+        if idxs.iter().any(|&i| {
+            let d = &self.days[i];
+            d.has_activity() && d.hi <= d.lo
+        }) {
+            return None;
+        }
+        if let Some(st) = self.state.files.get(file) {
+            if st.gen != gen || h > st.cursor || st.aux.contains_key("max_idx") {
+                return None;
+            }
+        }
+        let mut buckets: HashMap<BucketKey, usize> = HashMap::new();
+        let mut lines: Vec<(usize, DayLine)> = Vec::new();
+        for &i in idxs {
+            let d = &self.days[i];
+            if !d.has_activity() {
+                continue;
+            }
+            match buckets.entry(bucket_key(d)) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    lines[*e.get()].1.absorb(d);
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(lines.len());
+                    lines.push((i, d.clone()));
+                }
+            }
+        }
+        if lines.is_empty() {
+            // Nothing but coverage: the seal alone has to survive a reload.
+            return Some(vec![(freshest, self.days[freshest].clone())]);
+        }
+        if lines.len() == idxs.len() {
+            return None;
+        }
+        let b = self.days[freshest].b;
+        for (_, line) in &mut lines {
+            line.b = b;
+            line.lo = 0;
+            line.hi = h;
+            line.full = true;
+        }
+        Some(lines)
     }
 
     /// Drop state for a path once its file is confirmed gone or replaced
@@ -1745,6 +1933,449 @@ mod tests {
             thinking: 0,
             messages: 1,
         }
+    }
+
+    /// One scanner pass: a line per `(hour, input)` over one shared range,
+    /// the way `scan_root` emits them.
+    fn pass(
+        store: &mut HistoryStore,
+        file: &str,
+        range: (u64, u64),
+        full: bool,
+        buckets: &[(&str, u64)],
+    ) {
+        let lines: Vec<DayLine> = buckets
+            .iter()
+            .map(|&(hour, input)| {
+                let mut d = day(file, 0, input);
+                d.hour = hour.to_string();
+                d.lo = range.0;
+                d.hi = range.1;
+                d.full = full;
+                d
+            })
+            .collect();
+        store.append_days(&lines).unwrap();
+    }
+
+    fn tombstone(store: &mut HistoryStore, file: &str, lo: u64, hi: u64) {
+        let mut d = day(file, 0, 0);
+        d.messages = 0;
+        d.project = String::new();
+        d.model = String::new();
+        d.session = String::new();
+        d.lo = lo;
+        d.hi = hi;
+        d.full = true;
+        store.append_days(&[d]).unwrap();
+    }
+
+    fn track(store: &mut HistoryStore, file: &str, cursor: u64) {
+        let mut st = FileState::fresh("d".into(), cursor, 1);
+        st.cursor = cursor;
+        store.state.files.insert(file.to_string(), st);
+    }
+
+    /// Live input per hour, sorted — what a checkpoint must leave unchanged.
+    fn live_by_hour(store: &HistoryStore) -> BTreeMap<String, u64> {
+        let mut out = BTreeMap::new();
+        for d in store.live_days() {
+            if d.has_activity() {
+                *out.entry(d.hour.clone()).or_default() += d.input;
+            }
+        }
+        out
+    }
+
+    fn line_count(dir: &Path) -> usize {
+        fs::read_to_string(dir.join("days.jsonl"))
+            .unwrap()
+            .lines()
+            .count()
+    }
+
+    #[test]
+    fn a_checkpoint_folds_passes_into_one_line_per_bucket_and_keeps_every_token() {
+        let dir = tmpdir("checkpoint-folds");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        track(&mut store, "/f", 300);
+        pass(&mut store, "/f", (0, 100), true, &[("h1", 1), ("h2", 2)]);
+        pass(&mut store, "/f", (100, 200), true, &[("h2", 4)]);
+        pass(&mut store, "/f", (200, 300), true, &[("h2", 8)]);
+        let before = live_by_hour(&store);
+        assert_eq!(line_count(&dir), 4);
+
+        store.compact_days().unwrap();
+
+        assert_eq!(line_count(&dir), 2);
+        assert_eq!(live_by_hour(&store), before);
+        assert_eq!(store.seen_lines.len(), 2, "seen_lines must shrink with it");
+        let reopened = HistoryStore::open(&dir).unwrap();
+        assert_eq!(live_by_hour(&reopened), before, "and survive a reload");
+        assert!(reopened
+            .days
+            .iter()
+            .all(|d| d.full && d.lo == 0 && d.hi == 300));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_seal_after_a_checkpoint_keeps_the_whole_checkpoint() {
+        let dir = tmpdir("checkpoint-next-seal");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        track(&mut store, "/f", 200);
+        pass(&mut store, "/f", (0, 100), true, &[("h1", 1)]);
+        pass(&mut store, "/f", (100, 200), true, &[("h1", 2), ("h2", 4)]);
+        store.compact_days().unwrap();
+
+        // A bucket the next pass touches and one it does not: only a shared
+        // step keeps both alive under this seal.
+        pass(&mut store, "/f", (200, 300), true, &[("h1", 8)]);
+        let want = BTreeMap::from([("h1".to_string(), 11), ("h2".to_string(), 4)]);
+        assert_eq!(live_by_hour(&store), want);
+        let reopened = HistoryStore::open(&dir).unwrap();
+        assert_eq!(live_by_hour(&reopened), want);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_truncated_pass_after_a_checkpoint_leaves_it_alone() {
+        let dir = tmpdir("checkpoint-truncated");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        track(&mut store, "/f", 200);
+        pass(&mut store, "/f", (0, 100), true, &[("h1", 1)]);
+        pass(&mut store, "/f", (100, 200), true, &[("h1", 2)]);
+        store.compact_days().unwrap();
+        pass(&mut store, "/f", (200, 250), false, &[("h1", 4)]);
+        let want = BTreeMap::from([("h1".to_string(), 7)]);
+        assert_eq!(live_by_hour(&store), want);
+        let reopened = HistoryStore::open(&dir).unwrap();
+        assert_eq!(live_by_hour(&reopened), want);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_checkpoint_folds_the_first_one_in() {
+        let dir = tmpdir("checkpoint-twice");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        track(&mut store, "/f", 300);
+        pass(&mut store, "/f", (0, 100), true, &[("h1", 1), ("h2", 2)]);
+        pass(&mut store, "/f", (100, 200), true, &[("h1", 4)]);
+        store.compact_days().unwrap();
+        pass(&mut store, "/f", (200, 300), true, &[("h1", 8)]);
+        let before = live_by_hour(&store);
+        store.compact_days().unwrap();
+        assert_eq!(line_count(&dir), 2);
+        assert_eq!(live_by_hour(&store), before);
+        assert_eq!(live_by_hour(&HistoryStore::open(&dir).unwrap()), before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_checkpoint_refuses_a_pass_the_cursor_has_not_committed() {
+        // The crash window: lines on disk past the committed cursor. The
+        // retry starts at the cursor and overlaps them; a checkpoint would
+        // have stretched that overlap over the whole file.
+        let dir = tmpdir("checkpoint-crash");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        track(&mut store, "/f", 100);
+        pass(&mut store, "/f", (0, 100), true, &[("h1", 1)]);
+        pass(&mut store, "/f", (100, 200), true, &[("h1", 2)]);
+        store.compact_days().unwrap();
+        assert_eq!(line_count(&dir), 2, "the file must be left alone");
+
+        pass(&mut store, "/f", (100, 200), true, &[("h1", 4)]);
+        assert_eq!(
+            live_by_hour(&store),
+            BTreeMap::from([("h1".to_string(), 5)])
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_checkpoint_refuses_a_chain_no_seal_vouches_for() {
+        let dir = tmpdir("checkpoint-unsealed");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        track(&mut store, "/open", 200);
+        pass(&mut store, "/open", (0, 100), true, &[("h1", 1)]);
+        pass(&mut store, "/open", (100, 200), false, &[("h1", 2)]);
+        // `fold_line` kills any line past a seal's `lo`, so a freshest seal
+        // short of `H` takes editing memory to reach; refused all the same.
+        track(&mut store, "/short", 300);
+        pass(&mut store, "/short", (0, 100), true, &[("h1", 4)]);
+        pass(&mut store, "/short", (100, 200), true, &[("h1", 8)]);
+        let first = store.days.iter().position(|d| d.file == "/short").unwrap();
+        store.days[first].hi = 300;
+        store.compact_days().unwrap();
+        assert_eq!(line_count(&dir), 4);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_checkpoint_refuses_row_coordinates_until_the_file_is_gone() {
+        let dir = tmpdir("checkpoint-rows");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        track(&mut store, "/db", 1_000_000);
+        store
+            .state
+            .files
+            .get_mut("/db")
+            .unwrap()
+            .aux
+            .insert("max_idx".to_string(), serde_json::json!(7));
+        pass(&mut store, "/db", (0, 5), true, &[("h1", 1)]);
+        pass(&mut store, "/db", (5, 7), true, &[("h1", 2)]);
+        store.compact_days().unwrap();
+        assert_eq!(line_count(&dir), 2);
+
+        store.state.files.remove("/db");
+        store.state.pruned_generations.insert("/db".to_string(), 0);
+        store.compact_days().unwrap();
+        assert_eq!(line_count(&dir), 1);
+        assert_eq!(
+            live_by_hour(&store),
+            BTreeMap::from([("h1".to_string(), 3)])
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_checkpoint_refuses_activity_with_no_range() {
+        // A seal kills a rangeless line behind it, so only one that sorts
+        // older than the seal yet sits after it survives to reach this check:
+        // legacy lines all carry `b = 0`.
+        let dir = tmpdir("checkpoint-legacy");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        track(&mut store, "/f", 200);
+        pass(&mut store, "/f", (0, 100), true, &[("h1", 1)]);
+        pass(&mut store, "/f", (100, 200), true, &[("h1", 2)]);
+        store.append_days(&[day("/f", 0, 4)]).unwrap();
+        store.days[2].b = 0;
+        store.compact_days().unwrap();
+        assert_eq!(line_count(&dir), 3, "the file must be left alone");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_checkpoint_refuses_a_file_held_at_an_older_generation() {
+        // A rewrite bumped the generation and its rescan has not sealed: the
+        // figure still reads the old one, and that rescan needs it intact.
+        let dir = tmpdir("checkpoint-rewrite");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        track(&mut store, "/f", 200);
+        pass(&mut store, "/f", (0, 100), true, &[("h1", 1)]);
+        pass(&mut store, "/f", (100, 200), true, &[("h1", 2)]);
+        store.state.files.get_mut("/f").unwrap().gen = 1;
+        let before = live_by_hour(&store);
+        store.compact_days().unwrap();
+        assert_eq!(line_count(&dir), 2);
+        assert_eq!(live_by_hour(&store), before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tombstones_fold_away_and_an_idle_file_keeps_its_seal() {
+        let dir = tmpdir("checkpoint-tombstones");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        track(&mut store, "/busy", 300);
+        pass(&mut store, "/busy", (0, 100), true, &[("h1", 1)]);
+        tombstone(&mut store, "/busy", 100, 200);
+        tombstone(&mut store, "/busy", 300, 300);
+        track(&mut store, "/idle", 300);
+        tombstone(&mut store, "/idle", 0, 100);
+        tombstone(&mut store, "/idle", 100, 300);
+        let before = live_by_hour(&store);
+
+        store.compact_days().unwrap();
+
+        assert_eq!(line_count(&dir), 2);
+        assert_eq!(live_by_hour(&store), before);
+        let reopened = HistoryStore::open(&dir).unwrap();
+        let idle: Vec<_> = reopened.days.iter().filter(|d| d.file == "/idle").collect();
+        assert_eq!(idle.len(), 1);
+        assert!(idle[0].full, "the seal has to survive the reload");
+        assert_eq!((idle[0].lo, idle[0].hi), (100, 300), "and stay as written");
+        let busy: Vec<_> = reopened.days.iter().filter(|d| d.file == "/busy").collect();
+        assert_eq!(busy.len(), 1);
+        assert_eq!((busy[0].lo, busy[0].hi), (0, 300));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_checkpoint_keeps_two_files_of_one_bucket_apart() {
+        let dir = tmpdir("checkpoint-two-files");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        for f in ["/a", "/b"] {
+            track(&mut store, f, 200);
+            pass(&mut store, f, (0, 100), true, &[("h1", 1)]);
+            pass(&mut store, f, (100, 200), true, &[("h1", 2)]);
+        }
+        store.compact_days().unwrap();
+        assert_eq!(line_count(&dir), 2);
+        assert_eq!(
+            live_by_hour(&store),
+            BTreeMap::from([("h1".to_string(), 6)])
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_checkpoint_cannot_change_what_counts_as_sealed() {
+        // Compared on a deleted file too: `generation_maps` rebuilds these
+        // from the very lines a checkpoint rewrites.
+        let dir = tmpdir("checkpoint-maps");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        track(&mut store, "/live", 200);
+        pass(&mut store, "/live", (0, 100), true, &[("h1", 1)]);
+        pass(&mut store, "/live", (100, 200), true, &[("h2", 2)]);
+        pass(&mut store, "/gone", (0, 100), true, &[("h1", 4)]);
+        pass(&mut store, "/gone", (100, 200), true, &[("h1", 8)]);
+        store
+            .state
+            .pruned_generations
+            .insert("/gone".to_string(), 0);
+        let owned = |s: &HistoryStore| {
+            let (current, last_live, sealed) = s.generation_maps();
+            let own = |m: HashMap<&str, u32>| -> BTreeMap<String, u32> {
+                m.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+            };
+            (own(current), own(last_live), own(sealed))
+        };
+        let before = owned(&store);
+        store.compact_days().unwrap();
+        assert_eq!(line_count(&dir), 3);
+        assert_eq!(owned(&store), before);
+        store.commit().unwrap();
+        assert_eq!(owned(&HistoryStore::open(&dir).unwrap()), before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Random honest histories, checkpointed at random moments, against the
+    /// same history never checkpointed: the two must read the same at every
+    /// step and after a reload. Passes resume at the cursor, sometimes stop
+    /// short, sometimes write and crash before their cursor moves, and
+    /// sometimes find nothing to emit.
+    #[test]
+    fn checkpoints_at_random_moments_never_change_the_live_figure() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self, n: u64) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0 % n
+            }
+        }
+        for seed in 1..=40u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let plain_dir = tmpdir(&format!("checkpoint-sim-plain-{seed}"));
+            let folded_dir = tmpdir(&format!("checkpoint-sim-folded-{seed}"));
+            let mut plain = HistoryStore::open(&plain_dir).unwrap();
+            let mut folded = HistoryStore::open(&folded_dir).unwrap();
+            let mut cursors = [0u64; 3];
+            let files = ["/a", "/b", "/c"];
+            for f in files {
+                track(&mut plain, f, 0);
+                track(&mut folded, f, 0);
+            }
+            let mut folded_any = false;
+            for step in 0..60u64 {
+                let which = rng.next(3) as usize;
+                let lo = cursors[which];
+                let hi = lo + 1 + rng.next(50);
+                let complete = rng.next(4) > 0;
+                let crashes = rng.next(6) == 0;
+                let empty = rng.next(5) == 0;
+                let hours = ["h1", "h2", "h3", "h4"];
+                let buckets = [
+                    (hours[rng.next(4) as usize], 1 + rng.next(9)),
+                    (hours[rng.next(4) as usize], 1 + rng.next(9)),
+                ];
+                for store in [&mut plain, &mut folded] {
+                    if empty && complete {
+                        tombstone(store, files[which], lo, hi);
+                    } else if buckets[0].0 == buckets[1].0 {
+                        let merged = [(buckets[0].0, buckets[0].1 + buckets[1].1)];
+                        pass(store, files[which], (lo, hi), complete, &merged);
+                    } else {
+                        pass(store, files[which], (lo, hi), complete, &buckets);
+                    }
+                }
+                if !crashes {
+                    cursors[which] = hi;
+                    for store in [&mut plain, &mut folded] {
+                        store.state.files.get_mut(files[which]).unwrap().cursor = hi;
+                    }
+                }
+                if rng.next(5) == 0 {
+                    let lines = folded.days.len();
+                    folded.compact_days().unwrap();
+                    folded_any |= folded.days.len() < lines;
+                }
+                assert_eq!(
+                    live_by_hour(&folded),
+                    live_by_hour(&plain),
+                    "seed {seed} step {step}"
+                );
+                if rng.next(7) == 0 {
+                    plain.commit().unwrap();
+                    folded.commit().unwrap();
+                    plain = HistoryStore::open(&plain_dir).unwrap();
+                    folded = HistoryStore::open(&folded_dir).unwrap();
+                    assert_eq!(
+                        live_by_hour(&folded),
+                        live_by_hour(&plain),
+                        "seed {seed} step {step}, after reload"
+                    );
+                }
+            }
+            assert!(folded_any, "seed {seed} never exercised a checkpoint");
+            let _ = fs::remove_dir_all(&plain_dir);
+            let _ = fs::remove_dir_all(&folded_dir);
+        }
+    }
+
+    #[test]
+    fn the_size_trigger_waits_for_half_again_the_last_compaction() {
+        let dir = tmpdir("compact-trigger");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        pass(&mut store, "/f", (0, 100), true, &[("h1", 1)]);
+        let pad = |dir: &Path, bytes: u64| {
+            let path = dir.join("days.jsonl");
+            let f = fs::OpenOptions::new().append(true).open(path).unwrap();
+            let len = f.metadata().unwrap().len();
+            f.set_len(len + bytes).unwrap();
+        };
+        let size = |dir: &Path| fs::metadata(dir.join("days.jsonl")).unwrap().len();
+
+        pad(&dir, DAYS_COMPACT_BYTES);
+        store.state.compacted_size = 8 * 1024 * 1024;
+        store.maybe_compact_days().unwrap();
+        assert_eq!(
+            store.state.compacted_size,
+            8 * 1024 * 1024,
+            "under 12 MiB nothing runs, however far past the threshold"
+        );
+
+        pad(&dir, 8 * 1024 * 1024 + 1);
+        store.maybe_compact_days().unwrap();
+        assert!(store.state.compacted_size >= size(&dir));
+        assert!(store.state_dirty, "the new size has to reach state.json");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compacted_size_survives_a_commit_and_an_old_state_file_reads_as_zero() {
+        let dir = tmpdir("compacted-size");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        pass(&mut store, "/f", (0, 100), true, &[("h1", 1)]);
+        store.record_compacted_size(123);
+        store.commit().unwrap();
+        assert!(!store.state_dirty);
+        assert_eq!(HistoryStore::open(&dir).unwrap().state.compacted_size, 123);
+        let old: ScannerState = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.compacted_size, 0);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
