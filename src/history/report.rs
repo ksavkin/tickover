@@ -20,7 +20,7 @@
 
 use std::fmt::Write as _;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{Datelike, Local};
 
@@ -157,9 +157,59 @@ fn fmt_usd_for_models(models: &[(String, Totals)]) -> String {
     }
 }
 
+/// How many reports [`write()`] keeps in its own folder. Each one carries the
+/// whole history, about 1 MB, and every press of the panel's button writes
+/// a new one, so without a limit the folder only ever grows.
+pub const KEEP_REPORTS: usize = 5;
+
+/// Whether `name` is one [`write()`] would have chosen itself:
+/// `usage-YYYYMMDD-HHMMSS.html`, nothing more and nothing less.
+fn is_own_report_name(name: &str) -> bool {
+    let Some(stamp) = name
+        .strip_prefix("usage-")
+        .and_then(|s| s.strip_suffix(".html"))
+    else {
+        return false;
+    };
+    let b = stamp.as_bytes();
+    b.len() == 15
+        && b[8] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 8 || c.is_ascii_digit())
+}
+
+/// Delete all but the newest `keep` reports in `dir`, never `current`.
+/// Only names shaped the way [`write()`] chooses them count — the name is
+/// the only mark of ownership, so a file given such a name by hand counts
+/// too; anything named otherwise is never touched, and neither is a
+/// symlink, whatever it is called. The timestamp in the name orders
+/// them. Best effort: a file that cannot be removed stays, and the next
+/// report tries again. Returns how many were removed.
+pub fn prune_reports(dir: &Path, keep: usize, current: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut own: Vec<(String, PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let is_file = e.file_type().ok()?.is_file();
+            (is_file && is_own_report_name(&name)).then(|| (name, e.path()))
+        })
+        .collect();
+    own.sort_by(|a, b| b.0.cmp(&a.0));
+    own.into_iter()
+        .skip(keep)
+        .filter(|(_, p)| p != current)
+        .filter(|(_, p)| std::fs::remove_file(p).is_ok())
+        .count()
+}
+
 /// Write the report. `path: None` → `<config>/tickover/reports/
-/// usage-<yyyymmdd-hhmmss>.html`; the file is created `0600`. Returns the
-/// path actually written.
+/// usage-<yyyymmdd-hhmmss>.html`, after which all but the newest
+/// [`KEEP_REPORTS`] of those are deleted ([`prune_reports`]); the file is
+/// created `0600`. Returns the path actually written.
 pub fn write(
     st: &Stats,
     path: Option<PathBuf>,
@@ -168,6 +218,7 @@ pub fn write(
     sources: &[String],
     data: &ReportData,
 ) -> io::Result<PathBuf> {
+    let own_folder = path.is_none();
     let path = match path {
         Some(p) => p,
         None => {
@@ -203,6 +254,11 @@ pub fn write(
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    if own_folder {
+        if let Some(dir) = path.parent() {
+            prune_reports(dir, KEEP_REPORTS, &path);
+        }
     }
     Ok(path)
 }
@@ -1339,6 +1395,79 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn only_names_the_report_writer_chooses_count_as_its_own() {
+        assert!(is_own_report_name("usage-20261111-170716.html"));
+        for name in [
+            "usage-20261111-170716.htm",
+            "usage-20261111170716.html",
+            "usage-2026111-170716.html",
+            "usage-20261111-17071a.html",
+            "usage-20261111-170716.html.bak",
+            "my-usage-20261111-170716.html",
+            "usage-20261111-170716-2.html",
+            "usage-.html",
+        ] {
+            assert!(!is_own_report_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_reports_and_nothing_else_is_touched() {
+        let dir = tmpdir("prune");
+        let own: Vec<String> = (1..=8)
+            .map(|d| format!("usage-202611{d:02}-120000.html"))
+            .collect();
+        for n in &own {
+            fs::write(dir.join(n), "x").unwrap();
+        }
+        fs::write(dir.join("mine.html"), "x").unwrap();
+        fs::write(dir.join("usage-latest.html"), "x").unwrap();
+        // The oldest name, passed as the report just written, survives
+        // even though it falls outside the newest `keep`.
+        let current = dir.join(&own[0]);
+
+        let removed = prune_reports(&dir, 3, &current);
+
+        assert_eq!(removed, 4);
+        let mut left: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "mine.html".to_string(),
+                own[0].clone(),
+                own[5].clone(),
+                own[6].clone(),
+                own[7].clone(),
+                "usage-latest.html".to_string(),
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pruning_never_follows_or_removes_a_symlink() {
+        let dir = tmpdir("prune-link");
+        let outside = tmpdir("prune-link-target");
+        let target = outside.join("keep-me.html");
+        fs::write(&target, "x").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("usage-20200101-000000.html")).unwrap();
+        for d in 1..=3 {
+            fs::write(dir.join(format!("usage-202611{d:02}-120000.html")), "x").unwrap();
+        }
+
+        assert_eq!(prune_reports(&dir, 1, &dir.join("none")), 2);
+        assert!(target.exists());
+        assert!(fs::symlink_metadata(dir.join("usage-20200101-000000.html")).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     /// One session's bucket for a given model — round numbers throughout
