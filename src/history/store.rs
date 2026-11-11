@@ -366,12 +366,15 @@ pub struct ScannerState {
 /// the store to the snapshot. That is safe only for what a rescan re-derives
 /// by itself: a file that kept growing is read again from the snapshot's
 /// cursor, and the re-parsed byte ranges supersede the lines they repeat,
-/// as after a failed commit. It is not safe for a change the rescan cannot
-/// see again — a file deleted or rewritten under a new generation, a
-/// pruned generation recorded, a compaction that leaned on a cursor — so
-/// every one of those folds instead of landing here
-/// ([`HistoryStore::write_state`]), and a fold also comes at least every
-/// [`FOLD_EVERY`], which bounds how far a rewind can reach. The global
+/// as after a failed commit; a file rewritten in the meantime is found
+/// rewritten again and gets a generation above every one its lines carry
+/// ([`HistoryStore::rewrite_file`]), so the lines of the lost generations
+/// go stale instead of sharing a number with the new ones. It is not safe
+/// for a change the rescan cannot see again — a file deleted, a pruned
+/// generation recorded, a compaction that leaned on a cursor — so every one
+/// of those folds instead of landing here ([`HistoryStore::write_state`]),
+/// and a fold also comes at least every [`FOLD_EVERY`], which bounds how
+/// far a rewind can reach. The global
 /// dedup ring is the one thing that rewinds with it and is not folded on
 /// change, since it changes on nearly every pass: the narrow cross-file
 /// gap the module notes for a failed commit therefore spans up to that
@@ -415,10 +418,6 @@ const FOLD_EVERY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 /// which entries changed. 256 bits of blake2b, so an entry that changed is
 /// never mistaken for one that did not.
 type EntryDigest = [u8; 32];
-
-/// What the snapshot holds for one path: its digest, and its generation —
-/// a generation that moved is a fold, never a hot entry.
-type SnapshotEntry = (EntryDigest, u32);
 
 fn entry_digest(st: &FileState) -> EntryDigest {
     use blake2::Digest as _;
@@ -732,10 +731,10 @@ pub struct HistoryStore {
     /// carries a timeout, so one unresponsive network volume still blocks
     /// whichever tick's turn it is to run the (now singular) sweep.
     missing_files_pruned: bool,
-    /// [`entry_digest`] and generation of every entry as the snapshot in
-    /// `state.json` holds it — what [`Self::write_state`] compares the live
-    /// entries against. Empty for a read-only store, which never writes.
-    snapshot_digests: HashMap<String, SnapshotEntry>,
+    /// [`entry_digest`] of every entry as the snapshot in `state.json` holds
+    /// it — what [`Self::write_state`] compares the live entries against.
+    /// Empty for a read-only store, which never writes.
+    snapshot_digests: HashMap<String, EntryDigest>,
     /// The snapshot's own [`ScannerState::pruned_generations`], for the same
     /// comparison.
     snapshot_pruned: BTreeMap<String, u32>,
@@ -841,7 +840,7 @@ impl HistoryStore {
                         (
                             s.files
                                 .iter()
-                                .map(|(p, st)| (p.clone(), (entry_digest(st), st.gen)))
+                                .map(|(p, st)| (p.clone(), entry_digest(st)))
                                 .collect(),
                             s.pruned_generations.clone(),
                         )
@@ -1355,12 +1354,60 @@ impl HistoryStore {
         self.invalidate_live_cache();
         self.mark_state_dirty();
         let key = path.to_string_lossy().into_owned();
-        self.state.pruned_generations.remove(&key);
-        self.state.files.entry(key).or_insert_with(|| {
-            let mut st = FileState::fresh(digest, size, mtime);
-            st.provider = provider.to_string();
-            st
-        });
+        let was_pruned = self.state.pruned_generations.remove(&key).is_some();
+        // A path with lines but no entry and no pruned record lost its entry
+        // with a hot file (see [`HotState`]): starting it at generation 0
+        // again would reuse a number those lines carry, exactly what
+        // [`Self::rewrite_file`] avoids for a tracked file. A pruned path
+        // keeps its own rules, set out above.
+        if self.state.files.contains_key(&key) {
+            return;
+        }
+        let floor = if was_pruned {
+            None
+        } else {
+            self.generation_floor(&key)
+        };
+        let mut st = FileState::fresh(digest, size, mtime);
+        st.provider = provider.to_string();
+        if let Some(floor) = floor {
+            st.gen = floor.saturating_add(1);
+        }
+        self.state.files.insert(key, st);
+    }
+
+    /// The highest generation `days.jsonl` holds lines of for `key`, dead
+    /// ones included: `by_file` keeps a generation's key after a seal kills
+    /// its lines, and loses it only when a compaction drops them for good,
+    /// when no line is left to share the number.
+    fn generation_floor(&self, key: &str) -> Option<u32> {
+        self.by_file
+            .keys()
+            .filter(|(f, _)| f == key)
+            .map(|&(_, g)| g)
+            .max()
+    }
+
+    /// Start a new generation for a tracked file the scanner found rewritten
+    /// ([`FileState::reset`]), numbered above every generation `days.jsonl`
+    /// holds lines of for the path, not merely one above the tracked one.
+    /// The two differ only after the store rewound to an older snapshot (a
+    /// hot file lost, see [`HotState`]): the generations of the lost passes
+    /// still have lines, and reusing one of those numbers would put the new
+    /// generation's lines beside old ones a seal does not always reach — a
+    /// line of the old content inside a span the new content left empty.
+    /// One above all of them, the old lines are simply an older generation.
+    /// Every scan pass of an SQLite store can land here, since a write moves
+    /// its header, so this costs a walk of the generation index rather than
+    /// a fold of the whole state.
+    pub fn rewrite_file(&mut self, path: &Path, digest: String, size: u64, mtime: i64) {
+        let floor = self.generation_floor(&path.to_string_lossy());
+        if let Some(st) = self.file_state_mut(path) {
+            st.reset(digest, size, mtime);
+            if let Some(floor) = floor {
+                st.gen = st.gen.max(floor.saturating_add(1));
+            }
+        }
     }
 
     /// Append finished buckets to `days.jsonl` — the only write the log
@@ -1480,8 +1527,8 @@ impl HistoryStore {
     /// The state half of [`Self::commit`]: `state-hot.json` with the entries
     /// that changed since the snapshot, or the whole snapshot when the change
     /// is one a lost hot file must not be able to take back (see
-    /// [`HotState`]): an entry gone, an entry under a new generation, a
-    /// pruned generation added or cleared. Also a fold when the snapshot
+    /// [`HotState`]): an entry gone, an entry new since the snapshot and
+    /// already past generation 0, a pruned generation added or cleared. Also a fold when the snapshot
     /// predates this build's ids ([`ScannerState::fold_id`] `0`), is older
     /// than [`FOLD_EVERY`], or the hot file would pass [`HOT_FOLD_BYTES`].
     ///
@@ -1510,12 +1557,13 @@ impl HistoryStore {
         let mut files: BTreeMap<&str, &FileState> = BTreeMap::new();
         for (p, st) in &s.files {
             match self.snapshot_digests.get(p.as_str()) {
-                Some((_, gen)) if *gen != st.gen => return self.fold(),
                 // New since the snapshot, and already rewritten under a
-                // later generation: the snapshot would rescan it as
-                // generation 0, beside lines it cannot supersede.
+                // later generation: without the hot file it would be
+                // tracked afresh at generation 0, a number its own lines
+                // already carry ([`Self::rewrite_file`] only guards a file
+                // it still tracks).
                 None if st.gen != 0 => return self.fold(),
-                Some((digest, _)) if *digest == entry_digest(st) => {}
+                Some(digest) if *digest == entry_digest(st) => {}
                 _ => {
                     files.insert(p.as_str(), st);
                 }
@@ -1586,7 +1634,7 @@ impl HistoryStore {
             .state
             .files
             .iter()
-            .map(|(p, st)| (p.clone(), (entry_digest(st), st.gen)))
+            .map(|(p, st)| (p.clone(), entry_digest(st)))
             .collect();
         self.snapshot_pruned = self.state.pruned_generations.clone();
         self.state_dirty = false;
@@ -2435,12 +2483,9 @@ mod tests {
         // would come back wrong: a deleted file's lines with nothing to
         // supersede them, a generation reused, a pruned record forgotten.
         type Change = fn(&mut ScannerState);
-        let changes: [(&str, Change); 4] = [
+        let changes: [(&str, Change); 3] = [
             ("entry gone", |s| {
                 s.files.remove("/b");
-            }),
-            ("new generation", |s| {
-                s.files.get_mut("/b").unwrap().reset("d2".into(), 1, 2)
             }),
             ("pruned added", |s| {
                 s.pruned_generations.insert("/x".into(), 1);
@@ -2588,6 +2633,101 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// One scanner pass of `file` at generation `gen`: a line per bucket.
+    fn pass_at(
+        store: &mut HistoryStore,
+        file: &str,
+        gen: u32,
+        range: (u64, u64),
+        full: bool,
+        buckets: &[(&str, u64)],
+    ) {
+        let lines: Vec<DayLine> = buckets
+            .iter()
+            .map(|&(hour, input)| {
+                let mut d = day(file, gen, input);
+                d.hour = hour.to_string();
+                d.lo = range.0;
+                d.hi = range.1;
+                d.full = full;
+                d
+            })
+            .collect();
+        store.append_days(&lines).unwrap();
+    }
+
+    #[test]
+    fn a_rewritten_file_never_reuses_a_generation_its_lines_already_carry() {
+        // A file rewritten while only the hot file knew it, the hot file
+        // lost, and the file rewritten again: the new content has no
+        // records in its first ten bytes. Had the rescan reused generation
+        // 1, the completing pass's seal would keep the lost pass's [0, 10)
+        // line as its own prefix and count old content beside new.
+        let dir = tmpdir("hot-gen-floor");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store.state_mut().files.insert("/a".into(), entry(0, &[]));
+        pass_at(&mut store, "/a", 0, (0, 10), true, &[("h1", 4)]);
+        store.file_state_mut(Path::new("/a")).unwrap().cursor = 10;
+        store.commit().unwrap();
+
+        store.rewrite_file(Path::new("/a"), "v1".into(), 20, 2);
+        let gen = store.file_state(Path::new("/a")).unwrap().gen;
+        assert_eq!(gen, 1);
+        pass_at(&mut store, "/a", gen, (0, 10), false, &[("h1", 5)]);
+        pass_at(&mut store, "/a", gen, (10, 20), true, &[("h2", 7)]);
+        store.file_state_mut(Path::new("/a")).unwrap().cursor = 20;
+        store.commit().unwrap();
+        assert!(
+            dir.join("state-hot.json").exists(),
+            "a new generation goes hot"
+        );
+
+        fs::remove_file(dir.join("state-hot.json")).unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(store.file_state(Path::new("/a")).unwrap().gen, 0);
+        store.rewrite_file(Path::new("/a"), "v2".into(), 20, 3);
+        let gen = store.file_state(Path::new("/a")).unwrap().gen;
+        assert_eq!(gen, 2, "above every generation the log holds");
+        pass_at(&mut store, "/a", gen, (10, 20), true, &[("h3", 3)]);
+        assert_eq!(
+            live_by_hour(&store),
+            BTreeMap::from([("h3".to_string(), 3)])
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_whose_entry_was_lost_with_the_hot_file_starts_above_its_old_lines() {
+        // New since the snapshot, so only the hot file tracked it; lost
+        // with it, the file is found again as untracked while its
+        // generation-0 lines are still in the log.
+        let dir = tmpdir("hot-new-lost");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store.state_mut().files.insert("/a".into(), entry(1, &[]));
+        store.commit().unwrap();
+        store.begin_file(Path::new("/new"), "p", "v0".into(), 20, 1);
+        assert_eq!(store.file_state(Path::new("/new")).unwrap().gen, 0);
+        pass_at(&mut store, "/new", 0, (0, 10), false, &[("h1", 5)]);
+        pass_at(&mut store, "/new", 0, (10, 20), true, &[("h2", 7)]);
+        store.file_state_mut(Path::new("/new")).unwrap().cursor = 20;
+        store.commit().unwrap();
+        assert_eq!(hot_files(&dir), vec!["/new".to_string()]);
+
+        fs::remove_file(dir.join("state-hot.json")).unwrap();
+        let mut store = HistoryStore::open(&dir).unwrap();
+        assert!(store.file_state(Path::new("/new")).is_none());
+        // Rewritten meanwhile: nothing in its first ten bytes now.
+        store.begin_file(Path::new("/new"), "p", "v1".into(), 20, 2);
+        let gen = store.file_state(Path::new("/new")).unwrap().gen;
+        assert_eq!(gen, 1);
+        pass_at(&mut store, "/new", gen, (10, 20), true, &[("h3", 3)]);
+        assert_eq!(
+            live_by_hour(&store),
+            BTreeMap::from([("h3".to_string(), 3)])
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_hot_file_missing_a_field_is_ignored_not_applied_as_empty() {
         let dir = tmpdir("hot-partial");
@@ -2614,28 +2754,25 @@ mod tests {
         let dir = tmpdir("hot-stale");
         let mut store = HistoryStore::open(&dir).unwrap();
         store.state_mut().files.insert("/a".into(), entry(1, &[]));
+        store.state_mut().files.insert("/b".into(), entry(1, &[]));
         store.commit().unwrap();
         store.state_mut().files.get_mut("/a").unwrap().cursor = 2;
         store.commit().unwrap();
         let stale = fs::read(dir.join("state-hot.json")).unwrap();
         // A fold that stopped before removing the hot file it retired.
-        store
-            .state_mut()
-            .files
-            .get_mut("/a")
-            .unwrap()
-            .reset("d2".into(), 1, 2);
+        store.state_mut().files.remove("/b");
+        store.state_mut().files.get_mut("/a").unwrap().cursor = 3;
         store.commit().unwrap();
         fs::write(dir.join("state-hot.json"), &stale).unwrap();
 
         let ro = HistoryStore::open_read_only(&dir).unwrap();
-        assert_eq!(ro.file_state(Path::new("/a")).unwrap().gen, 1);
+        assert_eq!(ro.file_state(Path::new("/a")).unwrap().cursor, 3);
         assert!(
             dir.join("state-hot.json").exists(),
             "a read-only open leaves it"
         );
         let locked = HistoryStore::open(&dir).unwrap();
-        assert_eq!(locked.file_state(Path::new("/a")).unwrap().gen, 1);
+        assert_eq!(locked.file_state(Path::new("/a")).unwrap().cursor, 3);
         assert!(!dir.join("state-hot.json").exists());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2801,42 +2938,116 @@ mod tests {
                 self.0 % n
             }
         }
+        /// What one file holds: `(lo, hi, record)` per span, so a rescan
+        /// from any cursor re-derives exactly those bytes. A span without a
+        /// record is bytes the scanner reads past without emitting a line.
+        type Content<'a> = Vec<(u64, u64, Option<(&'a str, u64)>)>;
+        fn truth(contents: &[Content]) -> BTreeMap<String, u64> {
+            let mut out = BTreeMap::new();
+            for c in contents {
+                for &(_, _, rec) in c {
+                    if let Some((hour, input)) = rec {
+                        *out.entry(hour.to_string()).or_default() += input;
+                    }
+                }
+            }
+            out
+        }
+        /// The scanner's pass over `[from, to)` of `content`: one line per
+        /// hour, or, for a pass that reached the end with nothing to emit,
+        /// a tombstone. `to` short of the end is a pass cut off by its time
+        /// budget: no seal, and nothing at all when it found no record.
+        fn read_to(store: &mut HistoryStore, f: &str, content: &Content, from: u64, to: u64) {
+            let end = content.last().map_or(0, |s| s.1);
+            let full = to >= end;
+            let gen = store.file_state(Path::new(f)).unwrap().gen;
+            let mut buckets: BTreeMap<&str, u64> = BTreeMap::new();
+            for &(slo, shi, rec) in content {
+                if let (true, Some((hour, input))) = (slo >= from && shi <= to, rec) {
+                    *buckets.entry(hour).or_default() += input;
+                }
+            }
+            if buckets.is_empty() && !full {
+                store.file_state_mut(Path::new(f)).unwrap().cursor = to;
+                return;
+            }
+            if buckets.is_empty() {
+                let mut d = day(f, gen, 0);
+                d.messages = 0;
+                (d.project, d.model, d.session) = (String::new(), String::new(), String::new());
+                (d.lo, d.hi, d.full) = (from, end, true);
+                store.append_days(&[d]).unwrap();
+            } else {
+                let buckets: Vec<(&str, u64)> = buckets.into_iter().collect();
+                pass_at(store, f, gen, (from, to.min(end)), full, &buckets);
+            }
+            store.file_state_mut(Path::new(f)).unwrap().cursor = to.min(end);
+        }
+        fn read(store: &mut HistoryStore, f: &str, content: &Content, from: u64) {
+            read_to(store, f, content, from, u64::MAX);
+        }
+        /// A whole-file rescan the way a large one runs: its first span in
+        /// one pass, the rest in the next.
+        fn rescan(store: &mut HistoryStore, f: &str, content: &Content) {
+            let split = content.first().map_or(0, |s| s.1);
+            read_to(store, f, content, 0, split);
+            read(store, f, content, split);
+        }
         let files = ["/a", "/b", "/c"];
         let hours = ["h1", "h2", "h3", "h4"];
-        let mut lost_any = false;
-        let mut compacted_any = false;
+        let (mut lost_any, mut compacted_any, mut rewritten_any) = (false, false, false);
         for seed in 1..=8u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let keep_dir = tmpdir(&format!("hot-sim-keep-{seed}"));
             let lose_dir = tmpdir(&format!("hot-sim-lose-{seed}"));
             let mut keep = HistoryStore::open(&keep_dir).unwrap();
             let mut lose = HistoryStore::open(&lose_dir).unwrap();
-            // What each file holds: `(lo, hi, hour, input)` per pass, so a
-            // rescan from any cursor can re-derive exactly those bytes.
-            let mut content: Vec<Vec<(u64, u64, &str, u64)>> = vec![Vec::new(); 3];
-            let mut truth: BTreeMap<String, u64> = BTreeMap::new();
+            let mut content: Vec<Content> = vec![Vec::new(); 3];
+            // Each file's prefix digest: a rewrite changes it, which is how
+            // the scanner tells a rewrite from an append.
+            let mut version = [0u32; 3];
             for store in [&mut keep, &mut lose] {
                 store.compact_threshold = 1;
                 for f in files {
                     store.state_mut().files.insert(f.to_string(), entry(0, &[]));
+                    store.file_state_mut(Path::new(f)).unwrap().digest = "v0".into();
                 }
             }
             for step in 0..80u64 {
                 let which = rng.next(3) as usize;
-                let lo = content[which].last().map_or(0, |s| s.1);
-                let hi = lo + 1 + rng.next(40);
-                let hour = hours[rng.next(4) as usize];
-                let input = 1 + rng.next(9);
-                content[which].push((lo, hi, hour, input));
-                *truth.entry(hour.to_string()).or_default() += input;
-                for store in [&mut keep, &mut lose] {
-                    pass(store, files[which], (lo, hi), true, &[(hour, input)]);
-                    store
-                        .state_mut()
-                        .files
-                        .get_mut(files[which])
-                        .unwrap()
-                        .cursor = hi;
+                let f = files[which];
+                if rng.next(8) == 0 {
+                    // Rewritten: new content from byte 0, the first span of
+                    // it often carrying no record at all.
+                    version[which] += 1;
+                    let gap = 1 + rng.next(20);
+                    let hi = gap + 1 + rng.next(40);
+                    let first =
+                        (rng.next(2) == 0).then(|| (hours[rng.next(4) as usize], 1 + rng.next(9)));
+                    content[which] = vec![
+                        (0, gap, first),
+                        (
+                            gap,
+                            hi,
+                            Some((hours[rng.next(4) as usize], 1 + rng.next(9))),
+                        ),
+                    ];
+                    rewritten_any = true;
+                    for store in [&mut keep, &mut lose] {
+                        store.rewrite_file(Path::new(f), format!("v{}", version[which]), hi, 2);
+                        rescan(store, f, &content[which]);
+                    }
+                } else {
+                    let lo = content[which].last().map_or(0, |s| s.1);
+                    let hi = lo + 1 + rng.next(40);
+                    content[which].push((
+                        lo,
+                        hi,
+                        Some((hours[rng.next(4) as usize], 1 + rng.next(9))),
+                    ));
+                    for store in [&mut keep, &mut lose] {
+                        read(store, f, &content[which], lo);
+                    }
                 }
                 if rng.next(3) == 0 {
                     keep.commit().unwrap();
@@ -2855,33 +3066,68 @@ mod tests {
                     }
                     lose = HistoryStore::open(&lose_dir).unwrap();
                     lose.compact_threshold = 1;
-                    // The scanner's next pass: each file read again from
-                    // wherever its cursor now stands, to the end.
+                    if rng.next(2) == 0 {
+                        // Rewritten again before anything read it: new
+                        // content whose first span carries no record, where
+                        // a lost generation's line may still sit.
+                        // Preferably a file the lost hot file had seen
+                        // rewritten, with a gap at least as wide as any
+                        // first span before it — the case a reused
+                        // generation gets wrong.
+                        let n = (0..3)
+                            .find(|&n| {
+                                let g = |s: &HistoryStore| {
+                                    s.file_state(Path::new(files[n])).unwrap().gen
+                                };
+                                g(&lose) != g(&keep)
+                            })
+                            .unwrap_or(rng.next(3) as usize);
+                        version[n] += 1;
+                        let gap = 21;
+                        let hi = gap + 1 + rng.next(40);
+                        content[n] = vec![
+                            (0, gap, None),
+                            (
+                                gap,
+                                hi,
+                                Some((hours[rng.next(4) as usize], 1 + rng.next(9))),
+                            ),
+                        ];
+                        for store in [&mut keep, &mut lose] {
+                            store.rewrite_file(
+                                Path::new(files[n]),
+                                format!("v{}", version[n]),
+                                hi,
+                                2,
+                            );
+                            rescan(store, files[n], &content[n]);
+                        }
+                    }
+                    // The scanner's next pass over each file: rewritten
+                    // since the state it now holds, read whole under a new
+                    // generation; grown, read from its cursor.
                     for (n, f) in files.iter().enumerate() {
+                        let digest = format!("v{}", version[n]);
                         let end = content[n].last().map_or(0, |s| s.1);
-                        let from = lose.file_state(Path::new(f)).unwrap().cursor;
-                        if from >= end {
-                            continue;
+                        let st = lose.file_state(Path::new(f)).unwrap();
+                        if st.digest != digest {
+                            lose.rewrite_file(Path::new(f), digest, end, 2);
+                            rescan(&mut lose, f, &content[n]);
+                        } else if st.cursor < end {
+                            let from = st.cursor;
+                            read(&mut lose, f, &content[n], from);
                         }
-                        let mut buckets: BTreeMap<&str, u64> = BTreeMap::new();
-                        for &(slo, _, hour, input) in &content[n] {
-                            if slo >= from {
-                                *buckets.entry(hour).or_default() += input;
-                            }
-                        }
-                        let buckets: Vec<(&str, u64)> = buckets.into_iter().collect();
-                        pass(&mut lose, f, (from, end), true, &buckets);
-                        lose.state_mut().files.get_mut(*f).unwrap().cursor = end;
                     }
                 }
-                assert_eq!(live_by_hour(&keep), truth, "seed {seed} step {step}, kept");
-                assert_eq!(live_by_hour(&lose), truth, "seed {seed} step {step}, lost");
+                let want = truth(&content);
+                assert_eq!(live_by_hour(&keep), want, "seed {seed} step {step}, kept");
+                assert_eq!(live_by_hour(&lose), want, "seed {seed} step {step}, lost");
             }
             let _ = fs::remove_dir_all(&keep_dir);
             let _ = fs::remove_dir_all(&lose_dir);
         }
         assert!(
-            lost_any && compacted_any,
+            lost_any && compacted_any && rewritten_any,
             "the simulation never exercised its point"
         );
     }
@@ -5022,15 +5268,10 @@ mod tests {
             .reset("d2".into(), 2, 2);
         store.commit().unwrap();
 
-        // A new generation is a fold: it goes into the snapshot itself.
-        let after_bytes = fs::read(&path).unwrap();
-        assert_ne!(
-            before_bytes, after_bytes,
-            "the bumped generation must have reached disk"
-        );
-        // The rewrite through `BufWriter` must round-trip exactly like the
-        // unbuffered write it replaced — `open` reading the new bytes back
-        // and finding gen 1 is the proof.
+        // The change lands in the hot file, leaving the snapshot as it was;
+        // `open` reading the pair back and finding gen 1 is the proof.
+        assert_eq!(fs::read(&path).unwrap(), before_bytes);
+        assert!(dir.join("state-hot.json").exists());
         let reopened = HistoryStore::open(&dir).unwrap();
         assert_eq!(reopened.file_state(Path::new("/f")).unwrap().gen, 1);
         let _ = fs::remove_dir_all(&dir);

@@ -205,9 +205,7 @@ pub fn scan_root(
                     // (resume_from > 0) would skip every re-derived record
                     // as a "ring-evicted repeat".
                     store.release_owned(&key);
-                    if let Some(st) = store.file_state_mut(&sig.path) {
-                        st.reset(fresh_digest, sig.size, sig.mtime);
-                    }
+                    store.rewrite_file(&sig.path, fresh_digest, sig.size, sig.mtime);
                 } else if let Some(st) = store.file_state_mut(&sig.path) {
                     st.size = sig.size;
                     st.mtime = sig.mtime;

@@ -282,19 +282,25 @@ its own and exists only for the flock below:
   batch counter, tagged with the `fold_id` of the `state.json` it
   extends. Most commits write only this (about 1.5 MB on a store whose
   `state.json` is 13 MB, nearly all of it the global ring); `state.json`
-  itself is rewritten only on a *fold*: when an entry leaves the map,
-  moves to a new generation or a pruned generation is recorded, before
-  every `days.jsonl` compaction, when the hot file would pass 4 MB, and
-  at least once an hour. A hot file that is missing, does not parse or
-  carries another `fold_id` is ignored, never quarantined (the next
-  locked open removes it), and the store
-  rewinds to `state.json`: for files that only grew since, the next scan
-  reads them again from the older cursor and its byte ranges supersede
-  the lines they repeat; what a rescan could not see again (a deleted
-  file, a new generation, a pruned one) folds. The global dedup ring is
-  the exception: it changes on nearly every pass, so it rewinds with the
-  hot file, and the narrow cross-file gap a failed commit already leaves
-  can span up to that hour instead of one pass. A fold removes the hot
+  itself is rewritten only on a *fold*: when an entry leaves the map, a
+  pruned generation is recorded or cleared, an entry new since the last
+  fold reaches a second generation, before every `days.jsonl`
+  compaction, when the hot file would pass 4 MB, and at least once an
+  hour. A hot file that is missing, does not parse or carries another
+  `fold_id` is ignored, never quarantined (the next locked open removes
+  it), and the store rewinds to `state.json`: for files that only grew
+  since, the next scan reads them again from the older cursor and its
+  byte ranges supersede the lines they repeat; a file rewritten since is
+  found rewritten again, and its new generation is numbered above every
+  generation `days.jsonl` holds for it, so the lines of the lost ones go
+  stale rather than share a number with the new ones — the same for a
+  file whose entry only the lost hot file held (a generation is
+  not a fold: an SQLite store moves its header on every write, so its
+  file reads as rewritten on nearly every pass). What a rescan could not
+  see again folds. The global dedup ring is the exception: it changes on
+  nearly every pass, so it rewinds with the hot file, and the narrow
+  cross-file gap a failed commit already leaves can span up to that hour
+  instead of one pass. A fold removes the hot
   file it retires. `state.json` keeps its shape and version, so an
   older build reads it as before; it drops `fold_id` when it rewrites the
   file, which retires the hot file with it.
