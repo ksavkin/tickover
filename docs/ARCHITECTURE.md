@@ -30,8 +30,9 @@ is untouched. And **the app never prints a figure the provider did not
 state** — no scraped numbers, no percentage computed from something else —
 beyond the exceptions licensed in [`../CONTRIBUTING.md`](../CONTRIBUTING.md):
 one unit change (a stated *remaining* fraction into the used percent), one
-opt-in estimate (a dollar cost from locally counted tokens against a bundled
-list-price table, off by default and never presented as a bill), and the
+estimate (an API-equivalent dollar cost from locally counted tokens against
+a bundled list-price snapshot, switchable off and never presented as a
+bill), and the
 window's own pace — the hatched projection and its captions — drawn from the
 stated used percent and the window's clock, hatched and prefixed with `~`, and
 never allowed to stand in for the figure the provider reported. Both rules are

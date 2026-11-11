@@ -14,7 +14,7 @@ Corrections welcome.
 | Providers shipped | 5 | 68+ | 13 | 4 | 7 |
 | Where a quota comes from | the provider's usage API, with the login your CLI holds; host pinned per manifest | provider configs, local logs, browser cookies (opt-in) | probes the CLIs; APIs; browser cookies for one | local log files (Claude, Codex); Google's endpoint (Antigravity) | first-party endpoints with existing credentials |
 | Adding a provider | a TOML file, no rebuild | ? | a Swift probe | ? | ? |
-| Cost / token accounting | off by default; opt-in list-price estimate, not a bill | spend charts, dashboards | ? | cost reports, burn rate | ? |
+| Cost / token accounting | API-equivalent at list prices, on by default, not a bill | spend charts, dashboards | ? | cost reports, burn rate | ? |
 | Notifications | none | incident badges | system notifications | service-status alerts | ? |
 | Install | zip from Releases, or build from source | Homebrew, releases, AUR | Homebrew, signed DMG | Homebrew, `uvx`, Windows binary | signed DMG |
 | Signed release | not yet | ? | yes | yes (SignPath) | yes |

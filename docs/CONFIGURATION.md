@@ -97,8 +97,8 @@ that drops it.
 
 Every cost the app shows is an *API-equivalent*: what the same tokens would
 cost at the providers' published API list prices — not a bill, and on a
-subscription not what you paid. It is off by default; set
-`"history_cost_estimate_opt_in": true` in `config.json` to show it
+subscription not what you paid. It is on by default; set
+`"history_cost_estimate_opt_in": false` in `config.json` to hide it
 everywhere.
 
 Prices come from a snapshot built into the app (`assets/prices.json`,

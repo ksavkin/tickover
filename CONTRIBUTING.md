@@ -23,10 +23,11 @@ Two rules decide most questions before they are asked:
   computed from something else is out, and so is a number scraped from a web
   page. Two conversions are licensed: complementing a stated *remaining*
   fraction into the consumed percent a window holds — a change of units,
-  reversible, information-preserving — and, opt-in and off by default, an
-  estimated dollar cost computed from locally counted tokens against a
-  bundled list-price table (`src/history/pricing.rs`), always labelled
-  "estimated" and never presented as a bill. Statements about a window's
+  reversible, information-preserving — and an API-equivalent dollar cost
+  computed from locally counted tokens against a bundled list-price snapshot
+  (`assets/prices.json`, read by `src/history/pricing.rs`), on unless
+  switched off, always labelled as what the tokens would cost at API prices
+  and never presented as a bill. Statements about a window's
   *future* are licensed on a narrower condition: the hatched projection band
   and its `~63%`, the `caps ~18:40` it becomes, the `pace +22 pp` tooltip and
   the `burn 41.2K/h` beside them come from figures the provider did state (the
