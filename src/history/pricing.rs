@@ -380,7 +380,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{id} is not in assets/prices.json any more"))
     }
 
-    /// Every model id a real history carried on 2026-11-05, and the
+    /// Every model id a real history carried by 2026-11-11, and the
     /// snapshot row it must resolve to — or `None`, for ids no source
     /// publishes a price for. Several of the hits (`gpt-5.6-*`, `gpt-5.5`,
     /// `claude-opus-4-8`) once priced at a shorter id's row instead.
@@ -392,6 +392,7 @@ mod tests {
             ("claude-opus-4-8", Some("claude-opus-4-8")),
             ("claude-fable-5", Some("claude-fable-5")),
             ("claude-fable-5-1", Some("claude-fable-5-1")),
+            ("claude-fable-5-2", Some("claude-fable-5-2")),
             ("claude-sonnet-5", Some("claude-sonnet-5")),
             ("claude-sonnet-5-5", Some("claude-sonnet-5-5")),
             ("claude-haiku-5-5", Some("claude-haiku-5-5")),
