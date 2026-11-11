@@ -320,7 +320,7 @@ mod tests {
         let mut store = HistoryStore::open(&dir).unwrap();
         store
             .append_days(&[
-                line("raw-session-a", "big</script>", "claude-sonnet-4", 900, 1),
+                line("raw-session-a", "big</script>", "claude-sonnet-4-6", 900, 1),
                 line("raw-session-b", "small", "mystery-model-x", 100, 1),
                 line("raw-tombstone", "", "", 0, 0),
             ])

@@ -236,7 +236,7 @@ fn render(
         habits_and_sessions(h, st, cost_on);
         wrapped(h, st, cost_on);
     });
-    footer(&mut h, sources);
+    footer(&mut h, sources, &pricing_line(st, cost_on));
     templates(&mut h);
     h.push_str("</div></div>\n<script type=\"application/json\" id=\"report-data\">");
     h.push_str(&embedded);
@@ -559,11 +559,11 @@ fn headline(h: &mut String, st: &Stats, cost_on: bool) {
             })
             .unwrap_or_else(|| "—".into()),
             if partial {
-                "at list price, partial — unpriced models excluded".to_string()
+                "API-equivalent, partial — unpriced models excluded".to_string()
             } else if v.is_none() {
                 "no list price for these models".to_string()
             } else {
-                "at list price".to_string()
+                "API-equivalent, not your bill".to_string()
             },
         )
     } else {
@@ -638,7 +638,7 @@ fn coverage(h: &mut String, st: &Stats) {
     }
     h.push_str(
         r#"<span class="spacer"></span>
-<span style="font-size: 12px; color: var(--meta);">Token counts are exact as logged; costs are estimates at public list prices, not your invoice.</span>
+<span style="font-size: 12px; color: var(--meta);">Token counts are exact as logged; costs are API-equivalents at public list prices, not your invoice.</span>
 </div>
 "#,
     );
@@ -1296,7 +1296,38 @@ fn wrapped(h: &mut String, st: &Stats, cost_on: bool) {
     );
 }
 
-fn footer(h: &mut String, sources: &[String]) {
+/// The price line under every cost: which snapshot priced it, and which
+/// models it could not — across the whole embedded history, not the
+/// picked period, so it never changes under the period picker.
+fn pricing_line(st: &Stats, cost_on: bool) -> String {
+    if !cost_on {
+        return String::new();
+    }
+    let missing = pricing::unpriced(&st.models);
+    let mut line = format!(" Costs: {}.", esc(&pricing::sources_note()));
+    if !missing.is_empty() {
+        let total = st.total.sum().max(1) as f64;
+        let share: u64 = st
+            .models
+            .iter()
+            .filter(|(m, _)| missing.contains(m))
+            .map(|(_, t)| t.sum())
+            .sum();
+        let names = missing
+            .iter()
+            .map(|m| format!(r#"<span class="mono">{}</span>"#, esc(m)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(
+            line,
+            " No list price, left out of every cost ({:.1}% of tokens): {names}.",
+            share as f64 * 100.0 / total
+        );
+    }
+    line
+}
+
+fn footer(h: &mut String, sources: &[String], prices: &str) {
     let srcs = if sources.is_empty() {
         "local history files".to_string()
     } else {
@@ -1310,7 +1341,7 @@ fn footer(h: &mut String, sources: &[String]) {
         h,
         r#"<div style="padding: 8px 0 44px; display: flex; gap: 40px; border-top: 1px solid var(--track);">
 <div style="max-width: 560px; font-size: 12px; color: var(--meta); line-height: 1.7; padding-top: 14px;">
-Generated {now} by tickover {ver}. Read from {srcs}. Duplicate message ids removed; Codex cumulative counters differenced. Claude sub-agent turns count once, from their own transcript file.
+Generated {now} by tickover {ver}. Read from {srcs}. Duplicate message ids removed; Codex cumulative counters differenced. Claude sub-agent turns count once, from their own transcript file.{prices}
 </div>
 <span class="spacer"></span>
 <div class="mono" style="font-size: 11px; color: var(--meta); text-align: right; line-height: 1.8; padding-top: 14px;">file mode 0600<br>no network calls<br>no external assets</div>
@@ -1394,7 +1425,7 @@ mod tests {
         let mut store = HistoryStore::open(&dir).unwrap();
         let hour = chrono::Utc::now().format("%Y-%m-%dT%H").to_string();
         store
-            .append_days(&[day(&hour, "claude-sonnet-4", 500_000)])
+            .append_days(&[day(&hour, "claude-sonnet-4-6", 500_000)])
             .unwrap();
         store.commit().unwrap();
         let store = HistoryStore::open(&dir).unwrap();
@@ -1435,14 +1466,14 @@ mod tests {
     #[test]
     fn a_report_with_cost_on_marks_every_partial_sum() {
         // One session, one provider, two models: one this table prices
-        // ("claude-sonnet-4"), one it does not ("mystery-model-x", which
+        // ("claude-sonnet-4-6"), one it does not ("mystery-model-x", which
         // also reads from cache so the cache-savings row mixes too).
         let dir = tmpdir("report-partial-cost");
         let mut store = HistoryStore::open(&dir).unwrap();
         let hour = chrono::Utc::now().format("%Y-%m-%dT%H").to_string();
         store
             .append_days(&[
-                day(&hour, "claude-sonnet-4", 0),
+                day(&hour, "claude-sonnet-4-6", 0),
                 day(&hour, "mystery-model-x", 500_000),
             ])
             .unwrap();
@@ -1454,11 +1485,11 @@ mod tests {
 
         let html = render_for(&store, &st, &enabled);
 
-        // Headline EST. COST: only "claude-sonnet-4" prices (3.0 + 15.0
+        // Headline EST. COST: only "claude-sonnet-4-6" prices (3.0 + 15.0
         // per 1M at its own rate = $18), and the caption says so.
         assert!(html.contains("$18*"), "headline must mark the partial sum");
         assert!(
-            html.contains("at list price, partial — unpriced models excluded"),
+            html.contains("API-equivalent, partial — unpriced models excluded"),
             "headline caption must name the exclusion"
         );
         // Per-provider row and session row sum the same two models —
@@ -1483,7 +1514,7 @@ mod tests {
         let mut store = HistoryStore::open(&dir).unwrap();
         let hour = chrono::Utc::now().format("%Y-%m-%dT%H").to_string();
         store
-            .append_days(&[day(&hour, "claude-sonnet-4", 0)])
+            .append_days(&[day(&hour, "claude-sonnet-4-6", 0)])
             .unwrap();
         store.commit().unwrap();
         let store = HistoryStore::open(&dir).unwrap();
