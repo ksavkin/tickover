@@ -703,8 +703,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     spawn_history_scan(&ctx);
     #[cfg(feature = "history")]
     {
+        // Read-only: this open does not hold the store lock, and the scan
+        // thread spawned just above may be committing at this moment.
         *ctx.history.borrow_mut() = tickover::history::default_dir()
-            .and_then(|d| tickover::history::store::HistoryStore::open(&d).ok());
+            .and_then(|d| tickover::history::store::HistoryStore::open_read_only(&d).ok());
         sync_activity(&app, &ctx);
     }
 

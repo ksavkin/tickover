@@ -277,6 +277,27 @@ its own and exists only for the flock below:
   quarantined to `state.corrupt-<epoch>.json`, keeping only the most
   recent handful so repeated incidents don't accumulate one file per
   run forever.
+- `state-hot.json` — what changed since `state.json` was last written
+  whole: the entries that differ from it, the global dedup ring and the
+  batch counter, tagged with the `fold_id` of the `state.json` it
+  extends. Most commits write only this (about 1.5 MB on a store whose
+  `state.json` is 13 MB, nearly all of it the global ring); `state.json`
+  itself is rewritten only on a *fold*: when an entry leaves the map,
+  moves to a new generation or a pruned generation is recorded, before
+  every `days.jsonl` compaction, when the hot file would pass 4 MB, and
+  at least once an hour. A hot file that is missing, does not parse or
+  carries another `fold_id` is ignored, never quarantined (the next
+  locked open removes it), and the store
+  rewinds to `state.json`: for files that only grew since, the next scan
+  reads them again from the older cursor and its byte ranges supersede
+  the lines they repeat; what a rescan could not see again (a deleted
+  file, a new generation, a pruned one) folds. The global dedup ring is
+  the exception: it changes on nearly every pass, so it rewinds with the
+  hot file, and the narrow cross-file gap a failed commit already leaves
+  can span up to that hour instead of one pass. A fold removes the hot
+  file it retires. `state.json` keeps its shape and version, so an
+  older build reads it as before; it drops `fold_id` when it rewrites the
+  file, which retires the hot file with it.
 
 The whole open→scan→commit sequence runs under a `flock` on a `lock`
 file in the same directory, so the tray app and `tickover stats` can

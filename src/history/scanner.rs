@@ -1380,6 +1380,10 @@ glob   = "{glob}"
             after_meta.modified().unwrap(),
             "an unchanged tick must not touch the file at all, not just leave it byte-identical"
         );
+        assert!(
+            !dir.join("state-hot.json").exists(),
+            "nor write the hot file in its place"
+        );
 
         // A real change must still reach disk on the very next commit.
         let mut f = fs::OpenOptions::new()
@@ -1394,10 +1398,19 @@ glob   = "{glob}"
         });
         assert_eq!(scans[0].outcome.files_scanned, 1);
         store.commit().unwrap();
-        let changed_bytes = fs::read(&path).unwrap();
-        assert_ne!(
-            before_bytes, changed_bytes,
+        // The change goes to the hot file, not the snapshot; what a fresh
+        // open reads back is what counts.
+        let file = root.join("t.jsonl");
+        let reopened = HistoryStore::open(&dir).unwrap();
+        assert_eq!(
+            reopened.file_state(&file).unwrap().cursor,
+            store.file_state(&file).unwrap().cursor,
             "the changed cursor must reach disk"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before_bytes);
+        assert!(
+            dir.join("state-hot.json").exists(),
+            "by way of the hot file"
         );
 
         let _ = fs::remove_dir_all(&root);

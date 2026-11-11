@@ -5,8 +5,10 @@
 //! the provider's own directories are never written to:
 //!
 //! * `state.json` — [`ScannerState`]: a map of scanned file → [`FileState`]
-//!   (size, mtime, cursor, prefix digest, generation, dedup ring). Rewritten
-//!   atomically (tmp + rename) like `config.rs` does; an older or unreadable
+//!   (size, mtime, cursor, prefix digest, generation, dedup ring), with
+//!   `state-hot.json` ([`HotState`]) holding what changed since it was last
+//!   written whole. Both rewritten atomically (tmp + rename) like
+//!   `config.rs` does; an older or unreadable
 //!   file is quarantined aside and rebuilt from a full rescan rather than
 //!   trusted, while a *newer* one — a downgrade — is left in place and this
 //!   run starts empty instead. Known narrow gap: a crash between an append
@@ -129,7 +131,12 @@ pub struct FileState {
     /// a usage row (entries persisted before this field existed) still
     /// dedups outright — a repeat of unknown growth can't be priced.
     #[serde(default)]
-    pub recent_usage: std::collections::HashMap<String, [u64; 5]>,
+    ///
+    /// A `BTreeMap`, not a `HashMap`: the entry is hashed in its serialized
+    /// form to tell whether it changed since the snapshot (see
+    /// [`HistoryStore::write_state`]), and a hash map writes its keys in a
+    /// different order every time it is rebuilt.
+    pub recent_usage: BTreeMap<String, [u64; 5]>,
     /// Membership mirror of `recent_ids` — checked per record, so O(1).
     /// Rebuilt from `recent_ids` at store open.
     #[serde(skip)]
@@ -190,7 +197,7 @@ impl FileState {
             digest,
             gen: 0,
             recent_ids: VecDeque::new(),
-            recent_usage: std::collections::HashMap::new(),
+            recent_usage: BTreeMap::new(),
             recent_set: std::collections::HashSet::new(),
             skipped_unparsed: 0,
             provider: String::new(),
@@ -337,6 +344,122 @@ pub struct ScannerState {
     /// [`DAYS_COMPACT_BYTES`] would pay for that search on every commit.
     #[serde(default)]
     pub compacted_size: u64,
+    /// Which snapshot this is: a fresh non-zero number every time
+    /// `state.json` is rewritten whole, and the key `state-hot.json` has to
+    /// match before it is applied on top (see [`HotState::base`]). An older
+    /// build drops the field when it rewrites the file, so the hot file
+    /// stops matching exactly when the snapshot under it changed hands.
+    #[serde(default)]
+    pub fold_id: u64,
+}
+
+/// `state-hot.json`: what changed since the snapshot in `state.json`.
+///
+/// `state.json` holds the whole [`ScannerState`] and costs megabytes to
+/// write, mostly dedup rings of files that have not changed in weeks, so it
+/// is rewritten only on a *fold* ([`HistoryStore::fold`]). Every other
+/// commit writes just this: the entries that differ from the snapshot and
+/// the small fields that move on every pass. `state.json` keeps the shape
+/// and version every earlier build reads.
+///
+/// Losing this file, or finding it does not belong to the snapshot, rewinds
+/// the store to the snapshot. That is safe only for what a rescan re-derives
+/// by itself: a file that kept growing is read again from the snapshot's
+/// cursor, and the re-parsed byte ranges supersede the lines they repeat,
+/// as after a failed commit. It is not safe for a change the rescan cannot
+/// see again — a file deleted or rewritten under a new generation, a
+/// pruned generation recorded, a compaction that leaned on a cursor — so
+/// every one of those folds instead of landing here
+/// ([`HistoryStore::write_state`]), and a fold also comes at least every
+/// [`FOLD_EVERY`], which bounds how far a rewind can reach. The global
+/// dedup ring is the one thing that rewinds with it and is not folded on
+/// change, since it changes on nearly every pass: the narrow cross-file
+/// gap the module notes for a failed commit therefore spans up to that
+/// bound instead of one pass.
+///
+/// Every field is required: a hot file missing one was not written by
+/// [`HistoryStore::write_state`], and is ignored like any other that does
+/// not parse, rather than applied with the gap read as empty.
+#[derive(Debug, Deserialize)]
+struct HotState {
+    /// The [`ScannerState::fold_id`] of the snapshot this extends. Applied
+    /// only on an exact match, and never on `0`.
+    base: u64,
+    next_batch: u64,
+    compacted_size: u64,
+    global_ids: VecDeque<GlobalKey>,
+    /// Entries that differ from the snapshot's, or that it does not have.
+    files: BTreeMap<String, FileState>,
+}
+
+/// [`HotState`] as written, borrowing from the live state instead of
+/// copying it.
+#[derive(Serialize)]
+struct HotStateRef<'a> {
+    base: u64,
+    next_batch: u64,
+    compacted_size: u64,
+    global_ids: &'a VecDeque<GlobalKey>,
+    files: BTreeMap<&'a str, &'a FileState>,
+}
+
+/// A hot file past this many bytes is folded into the snapshot instead of
+/// written: it would cost as much as the snapshot does.
+const HOT_FOLD_BYTES: usize = 4 * 1024 * 1024;
+
+/// The longest a snapshot goes unfolded while commits keep landing in the
+/// hot file: how far back a lost hot file can rewind the store.
+const FOLD_EVERY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// A digest of one entry's serialized form: what tells [`HotState::files`]
+/// which entries changed. 256 bits of blake2b, so an entry that changed is
+/// never mistaken for one that did not.
+type EntryDigest = [u8; 32];
+
+/// What the snapshot holds for one path: its digest, and its generation —
+/// a generation that moved is a fold, never a hot entry.
+type SnapshotEntry = (EntryDigest, u32);
+
+fn entry_digest(st: &FileState) -> EntryDigest {
+    use blake2::Digest as _;
+    struct Sink(blake2::Blake2b512);
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.update(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = Sink(blake2::Blake2b512::new());
+    // Serializing into a hasher cannot fail: every field is plain data.
+    let _ = serde_json::to_writer(&mut sink, st);
+    let full = sink.0.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&full[..32]);
+    out
+}
+
+/// A fresh, non-zero snapshot id different from `old`.
+fn new_fold_id(old: u64) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut salt = 0u64;
+    loop {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(nanos);
+        h.write_u32(std::process::id());
+        h.write_u64(salt);
+        let id = h.finish();
+        if id != 0 && id != old {
+            return id;
+        }
+        salt += 1;
+    }
 }
 
 /// One aggregate line in `days.jsonl`. This is the *only* thing history
@@ -609,6 +732,19 @@ pub struct HistoryStore {
     /// carries a timeout, so one unresponsive network volume still blocks
     /// whichever tick's turn it is to run the (now singular) sweep.
     missing_files_pruned: bool,
+    /// [`entry_digest`] and generation of every entry as the snapshot in
+    /// `state.json` holds it — what [`Self::write_state`] compares the live
+    /// entries against. Empty for a read-only store, which never writes.
+    snapshot_digests: HashMap<String, SnapshotEntry>,
+    /// The snapshot's own [`ScannerState::pruned_generations`], for the same
+    /// comparison.
+    snapshot_pruned: BTreeMap<String, u32>,
+    /// Opened by [`Self::open_read_only`]: nothing here is ever written,
+    /// renamed or deleted, whatever is called on it.
+    read_only: bool,
+    /// [`DAYS_COMPACT_BYTES`], lowered by tests that need a compaction on
+    /// every few commits.
+    compact_threshold: u64,
 }
 
 impl HistoryStore {
@@ -619,57 +755,152 @@ impl HistoryStore {
         dir.join("days.jsonl")
     }
 
+    pub fn hot_path(dir: &Path) -> PathBuf {
+        dir.join("state-hot.json")
+    }
+
     /// Open (or create) the store under `dir`. A missing directory is made;
     /// an unreadable or *older*-schema `state.json` is moved aside to
     /// `state.corrupt-<secs>.json` and rebuilt empty — the next scan
     /// repopulates it from scratch. A *newer*-schema file is a downgrade,
     /// not corruption: it is left exactly where it is (see
     /// [`Self::foreign_newer_state`]) and this run starts empty instead.
+    /// `state-hot.json` is applied on top of the snapshot when it belongs to
+    /// it, and otherwise ignored, never quarantined (see [`HotState`]).
     /// `days.jsonl` lines that fail to parse are dropped on the floor of
     /// the load loop rather than failing the store: they are our own cache,
     /// and a torn append is survivable.
+    ///
+    /// For a caller holding [`lock_store`]; one that does not uses
+    /// [`Self::open_read_only`].
     pub fn open(dir: &Path) -> io::Result<Self> {
-        fs::create_dir_all(dir)?;
-        // Files written by an older version may sit at the umask default —
-        // tighten them now rather than only at the next create.
-        enforce_private(&Self::state_path(dir));
-        enforce_private(&Self::days_path(dir));
+        Self::open_with(dir, false)
+    }
+
+    /// The store as it is on disk, for a caller that does not hold
+    /// [`lock_store`] and only reads: the panel, painted at start-up while
+    /// the scan thread may be committing. Nothing is created, renamed,
+    /// quarantined or deleted, and [`Self::commit`] and
+    /// [`Self::append_days`] write nothing. An unreadable `state.json` is an
+    /// error here, left for the next locked open to quarantine. A hot file
+    /// that does not match its snapshot may be one a commit is replacing
+    /// right now, so the pair is read again, a few times, before the
+    /// snapshot is used alone: complete, and at worst a few passes behind.
+    pub fn open_read_only(dir: &Path) -> io::Result<Self> {
+        Self::open_with(dir, true)
+    }
+
+    fn open_with(dir: &Path, read_only: bool) -> io::Result<Self> {
+        if !read_only {
+            fs::create_dir_all(dir)?;
+            // Files written by an older version may sit at the umask
+            // default — tighten them now rather than only at the next create.
+            enforce_private(&Self::state_path(dir));
+            enforce_private(&Self::hot_path(dir));
+            enforce_private(&Self::days_path(dir));
+        }
         // `state_dirty` starts `false` only when what's now in memory is
-        // byte-for-byte what a fresh `open` would read straight back — a
+        // what a fresh `open` would read straight back — a
         // quarantined-and-rebuilt or altogether missing `state.json` needs a
         // real file in its place even if nothing mutates `state` before the
         // next `commit`, the same as an unconditional write always gave it.
-        let (state, state_dirty, foreign_newer_state) =
-            match fs::read_to_string(Self::state_path(dir)) {
-                Ok(text) => match serde_json::from_str::<ScannerState>(&text) {
-                    Ok(s) if s.version == SCHEMA_VERSION => (s, false, false),
-                    Ok(s) if s.version > SCHEMA_VERSION => {
-                        // A build newer than this one wrote it — the data is
-                        // intact and belongs to a version that will come back.
-                        // Renaming it aside would be indistinguishable from
-                        // discarding it the moment that version runs again.
-                        (ScannerState::default(), true, true)
-                    }
-                    _ => {
-                        let aside = dir.join(format!(
-                            "state.corrupt-{}.json",
-                            chrono::Utc::now().timestamp()
-                        ));
-                        let _ = fs::rename(Self::state_path(dir), aside);
-                        (ScannerState::default(), true, false)
-                    }
-                },
+        let mut attempts = 0;
+        let (state, state_dirty, foreign_newer_state, snapshot_digests, snapshot_pruned) = loop {
+            let snapshot = match fs::read_to_string(Self::state_path(dir)) {
+                Ok(text) => serde_json::from_str::<ScannerState>(&text).ok(),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    (ScannerState::default(), true, false)
+                    break (
+                        ScannerState::default(),
+                        true,
+                        false,
+                        HashMap::new(),
+                        BTreeMap::new(),
+                    );
                 }
                 Err(e) => return Err(e),
             };
+            match snapshot {
+                Some(mut s) if s.version == SCHEMA_VERSION => {
+                    let hot = if s.fold_id != 0 {
+                        Self::read_hot(dir)
+                    } else {
+                        None
+                    };
+                    let belongs = hot.as_ref().is_some_and(|h| h.base == s.fold_id);
+                    if read_only && hot.is_some() && !belongs && attempts < 3 {
+                        // A fold removes the hot file it retires, so one that
+                        // does not match is most likely being replaced right
+                        // now: give the writer a moment.
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        continue;
+                    }
+                    let (digests, pruned) = if read_only {
+                        (HashMap::new(), BTreeMap::new())
+                    } else {
+                        (
+                            s.files
+                                .iter()
+                                .map(|(p, st)| (p.clone(), (entry_digest(st), st.gen)))
+                                .collect(),
+                            s.pruned_generations.clone(),
+                        )
+                    };
+                    if let Some(hot) = hot.filter(|_| belongs) {
+                        Self::apply_hot(&mut s, hot);
+                    } else if !read_only {
+                        // Left by a fold that stopped between its rename
+                        // and its own removal of the old hot file, or by an
+                        // older build that rewrote the snapshot: it will
+                        // never match again, and every read-only open would
+                        // keep taking it for a race.
+                        let _ = fs::remove_file(Self::hot_path(dir));
+                    }
+                    break (s, false, false, digests, pruned);
+                }
+                Some(s) if s.version > SCHEMA_VERSION => {
+                    // A build newer than this one wrote it — the data is
+                    // intact and belongs to a version that will come back.
+                    // Renaming it aside would be indistinguishable from
+                    // discarding it the moment that version runs again.
+                    break (
+                        ScannerState::default(),
+                        true,
+                        true,
+                        HashMap::new(),
+                        BTreeMap::new(),
+                    );
+                }
+                _ if read_only => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "state.json does not parse; left for a locked open to quarantine",
+                    ));
+                }
+                _ => {
+                    let aside = dir.join(format!(
+                        "state.corrupt-{}.json",
+                        chrono::Utc::now().timestamp()
+                    ));
+                    let _ = fs::rename(Self::state_path(dir), aside);
+                    break (
+                        ScannerState::default(),
+                        true,
+                        false,
+                        HashMap::new(),
+                        BTreeMap::new(),
+                    );
+                }
+            }
+        };
         // One corruption or downgrade-then-corruption incident leaves one
         // more `state.corrupt-*.json` behind, and nothing else ever cleans
-        // them up — prune every time `open` runs, not only the run that
-        // just made one, so backups already sitting here from before this
-        // check existed get swept too.
-        prune_corrupt_backups(dir);
+        // them up — prune every time a locked `open` runs, not only the run
+        // that just made one, so backups already sitting here from before
+        // this check existed get swept too.
+        if !read_only {
+            prune_corrupt_backups(dir);
+        }
         let mut store = HistoryStore {
             dir: dir.to_path_buf(),
             state,
@@ -682,6 +913,10 @@ impl HistoryStore {
             state_dirty,
             foreign_newer_state,
             missing_files_pruned: false,
+            snapshot_digests,
+            snapshot_pruned,
+            read_only,
+            compact_threshold: DAYS_COMPACT_BYTES,
         };
         match fs::read_to_string(Self::days_path(dir)) {
             Ok(text) => {
@@ -746,6 +981,21 @@ impl HistoryStore {
         }
         store.state.global_map = map;
         Ok(store)
+    }
+
+    /// `state-hot.json`, or `None` when it is missing or does not parse —
+    /// either way the snapshot is used alone.
+    fn read_hot(dir: &Path) -> Option<HotState> {
+        let text = fs::read_to_string(Self::hot_path(dir)).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Lay a hot file over the snapshot it belongs to.
+    fn apply_hot(s: &mut ScannerState, hot: HotState) {
+        s.files.extend(hot.files);
+        s.global_ids = hot.global_ids;
+        s.next_batch = hot.next_batch;
+        s.compacted_size = hot.compacted_size;
     }
 
     /// Fold one validated line into `days`/the indexes: a later line whose
@@ -1121,6 +1371,9 @@ impl HistoryStore {
         if new.is_empty() {
             return Ok(());
         }
+        if self.read_only {
+            return Err(io::Error::other("history store opened read-only"));
+        }
         let batch = self.state.next_batch;
         let mut accepted: Vec<(String, DayLine)> = Vec::with_capacity(new.len());
         // Lines already queued earlier in this same call: a caller
@@ -1180,12 +1433,12 @@ impl HistoryStore {
         Ok(())
     }
 
-    /// Persist `state.json` atomically (tmp + rename) — but only when
-    /// [`Self::state_dirty`] says `state` actually differs from what's on
-    /// disk, and never when [`Self::foreign_newer_state`] is set — then
-    /// compact `days.jsonl` if [`Self::maybe_compact_days`]'s size trigger
-    /// says so (that trigger is unconditional; a `days.jsonl`-only pass with
-    /// an untouched `state` still needs to compact) — *unless*
+    /// Persist the state — but only when [`Self::state_dirty`] says it
+    /// differs from what's on disk, never when [`Self::foreign_newer_state`]
+    /// is set, and never on a [`Self::open_read_only`] store — then compact
+    /// `days.jsonl` if [`Self::maybe_compact_days`]'s size trigger says so
+    /// (that trigger is unconditional; a `days.jsonl`-only pass with an
+    /// untouched `state` still needs to compact) — *unless*
     /// `foreign_newer_state` is set, in which case compaction is skipped
     /// too: `open` already dropped every line a newer schema wrote from
     /// this run's in-memory `days` (any `v` greater than
@@ -1196,43 +1449,146 @@ impl HistoryStore {
     /// `state.json` unwritten: no reclamation while downgraded, however
     /// large `days.jsonl` grows in the meantime. The dirty guard earns its
     /// keep at this call's frequency: a scan pass that touched no file
-    /// still calls it once per manifest, `tickover stats` calls it dozens
-    /// of times a run, and `state.files` serialises to several megabytes on
-    /// a machine with ten thousand tracked files. The write that does
-    /// happen goes through a `BufWriter` into the private tmp file
-    /// [`create_private`] makes, flushed before `sync_data` and renamed
-    /// over the target, so a reader never sees a half-written state.
-    /// `days.jsonl` needs none of this — it only ever appends new lines.
+    /// still calls it once per manifest, and `tickover stats` calls it
+    /// dozens of times a run.
+    ///
+    /// What gets written is usually only `state-hot.json`
+    /// ([`Self::write_state`]). Before a compaction it is the whole
+    /// snapshot instead ([`Self::fold`]): a checkpoint folds a file's lines
+    /// into one `[0, H)` line on the strength of its cursor having reached
+    /// `H`, and that cursor has to be somewhere a later open cannot set
+    /// aside. A hot file can be set aside — and the rescan from the
+    /// snapshot's older cursor would then supersede the checkpoint line,
+    /// taking every token below that cursor with it.
     pub fn commit(&mut self) -> io::Result<()> {
-        self.write_state()?;
-        if self.foreign_newer_state {
+        if self.read_only || self.foreign_newer_state {
             return Ok(());
+        }
+        if self.compaction_due() {
+            self.fold()?;
+        } else {
+            self.write_state()?;
         }
         self.maybe_compact_days()?;
         // A second write, after the compaction, only when it recorded a new
-        // `compacted_size`. The cursors a checkpoint trusted were already on
-        // disk from the write above; a crash between the two costs one
-        // repeated check.
+        // `compacted_size`. The cursors a checkpoint trusted were already in
+        // the snapshot from the fold above; a crash between the two costs
+        // one repeated check.
         self.write_state()
     }
 
-    /// The `state.json` half of [`Self::commit`].
+    /// The state half of [`Self::commit`]: `state-hot.json` with the entries
+    /// that changed since the snapshot, or the whole snapshot when the change
+    /// is one a lost hot file must not be able to take back (see
+    /// [`HotState`]): an entry gone, an entry under a new generation, a
+    /// pruned generation added or cleared. Also a fold when the snapshot
+    /// predates this build's ids ([`ScannerState::fold_id`] `0`), is older
+    /// than [`FOLD_EVERY`], or the hot file would pass [`HOT_FOLD_BYTES`].
+    ///
+    /// Which entries changed is decided fresh every time, by comparing each
+    /// live entry's [`entry_digest`] with the snapshot's, never by keeping
+    /// track of edits as they happen: nothing that changes an entry has to
+    /// remember to say so.
     fn write_state(&mut self) -> io::Result<()> {
-        if !self.state_dirty || self.foreign_newer_state {
+        if !self.state_dirty || self.foreign_newer_state || self.read_only {
             return Ok(());
         }
+        let s = &self.state;
+        let snapshot_old = fs::metadata(Self::state_path(&self.dir))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_none_or(|age| age >= FOLD_EVERY);
+        let structural = self
+            .snapshot_digests
+            .keys()
+            .any(|p| !s.files.contains_key(p))
+            || s.pruned_generations != self.snapshot_pruned;
+        if s.fold_id == 0 || snapshot_old || structural {
+            return self.fold();
+        }
+        let mut files: BTreeMap<&str, &FileState> = BTreeMap::new();
+        for (p, st) in &s.files {
+            match self.snapshot_digests.get(p.as_str()) {
+                Some((_, gen)) if *gen != st.gen => return self.fold(),
+                // New since the snapshot, and already rewritten under a
+                // later generation: the snapshot would rescan it as
+                // generation 0, beside lines it cannot supersede.
+                None if st.gen != 0 => return self.fold(),
+                Some((digest, _)) if *digest == entry_digest(st) => {}
+                _ => {
+                    files.insert(p.as_str(), st);
+                }
+            }
+        }
+        let hot = HotStateRef {
+            base: s.fold_id,
+            next_batch: s.next_batch,
+            compacted_size: s.compacted_size,
+            global_ids: &s.global_ids,
+            files,
+        };
+        let mut bytes = serde_json::to_vec(&hot).map_err(io::Error::other)?;
+        if bytes.len() > HOT_FOLD_BYTES {
+            return self.fold();
+        }
+        bytes.push(b'\n');
+        let tmp = self.dir.join("state-hot.json.tmp");
+        {
+            let mut f = create_private(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_data().ok();
+        }
+        fs::rename(&tmp, Self::hot_path(&self.dir))?;
+        self.state_dirty = false;
+        Ok(())
+    }
+
+    /// Rewrite the whole snapshot, `state.json`, under a new
+    /// [`ScannerState::fold_id`] (tmp + rename, so a reader never sees half
+    /// of one), then remove the hot file, which stopped matching it: until
+    /// the next commit writes a hot file of its own, the snapshot alone is
+    /// the state. A failed write keeps the old id, so a hot file written
+    /// after it still belongs to the snapshot on disk.
+    fn fold(&mut self) -> io::Result<()> {
+        if self.foreign_newer_state || self.read_only {
+            return Ok(());
+        }
+        let old = self.state.fold_id;
+        self.state.fold_id = new_fold_id(old);
         self.state.version = SCHEMA_VERSION;
         let tmp = self.dir.join("state.json.tmp");
-        let target = Self::state_path(&self.dir);
-        {
+        let written = (|| {
             let f = create_private(&tmp)?;
             let mut w = io::BufWriter::new(f);
             serde_json::to_writer(&mut w, &self.state).map_err(io::Error::other)?;
             w.write_all(b"\n")?;
             w.flush()?;
             w.get_ref().sync_data().ok();
+            drop(w);
+            fs::rename(&tmp, Self::state_path(&self.dir))
+        })();
+        if let Err(e) = written {
+            self.state.fold_id = old;
+            return Err(e);
         }
-        fs::rename(&tmp, &target)?;
+        // The compaction that may follow trusts this snapshot's cursors, so
+        // the rename itself has to be on disk before it runs.
+        #[cfg(unix)]
+        if let Ok(d) = fs::File::open(&self.dir) {
+            d.sync_all().ok();
+        }
+        // The old hot file no longer matches and would only be read and set
+        // aside by every open until the next commit replaces it — by a
+        // read-only one several times over, taking the mismatch for a race.
+        let _ = fs::remove_file(Self::hot_path(&self.dir));
+        self.snapshot_digests = self
+            .state
+            .files
+            .iter()
+            .map(|(p, st)| (p.clone(), (entry_digest(st), st.gen)))
+            .collect();
+        self.snapshot_pruned = self.state.pruned_generations.clone();
         self.state_dirty = false;
         Ok(())
     }
@@ -1502,12 +1858,21 @@ impl HistoryStore {
     /// sits just over the threshold must not be rewritten on every commit
     /// that turns up one dead line.
     fn maybe_compact_days(&mut self) -> io::Result<()> {
-        let path = Self::days_path(&self.dir);
-        let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        if size < DAYS_COMPACT_BYTES.max(self.state.compacted_size.saturating_mul(3) / 2) {
+        if !self.compaction_due() {
             return Ok(());
         }
         self.compact_days()
+    }
+
+    /// [`Self::maybe_compact_days`]'s trigger, asked by [`Self::commit`]
+    /// first so it can fold the snapshot before a compaction runs.
+    fn compaction_due(&self) -> bool {
+        let size = fs::metadata(Self::days_path(&self.dir))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        size >= self
+            .compact_threshold
+            .max(self.state.compacted_size.saturating_mul(3) / 2)
     }
 
     /// Rewrite `days.jsonl` dropping genuinely dead lines
@@ -1992,6 +2357,533 @@ mod tests {
             .unwrap()
             .lines()
             .count()
+    }
+
+    /// The state as a comparable value: `HashMap`-free and order-free.
+    fn state_value(store: &HistoryStore) -> serde_json::Value {
+        // `next_batch` is left out: every open moves it past what
+        // `days.jsonl` already holds, whatever was saved.
+        let mut v = serde_json::to_value(store.state()).unwrap();
+        v.as_object_mut().unwrap().remove("fold_id");
+        v.as_object_mut().unwrap().remove("next_batch");
+        v
+    }
+
+    fn entry(cursor: u64, ids: &[&str]) -> FileState {
+        let mut st = FileState::fresh("d".into(), cursor, 1);
+        st.cursor = cursor;
+        for (n, id) in ids.iter().enumerate() {
+            st.mark_seen(id.to_string(), [n as u64, 1, 2, 3, 4]);
+        }
+        st
+    }
+
+    fn hot_files(dir: &Path) -> Vec<String> {
+        let hot: HotState =
+            serde_json::from_str(&fs::read_to_string(dir.join("state-hot.json")).unwrap()).unwrap();
+        hot.files.into_keys().collect()
+    }
+
+    #[test]
+    fn a_commit_writes_only_what_changed_and_a_reopen_reads_back_the_same_state() {
+        let dir = tmpdir("hot-roundtrip");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        {
+            let s = store.state_mut();
+            for (p, ids) in [
+                ("/a", vec!["a1", "a2"]),
+                ("/b", vec!["b1"]),
+                ("/c", vec!["c1"]),
+            ] {
+                s.files.insert(p.to_string(), entry(10, &ids));
+            }
+            s.pruned_generations.insert("/old".into(), 3);
+            s.pruned_generations.insert("/older".into(), 1);
+        }
+        store.commit().unwrap();
+        let snapshot = fs::read(dir.join("state.json")).unwrap();
+        assert!(
+            !dir.join("state-hot.json").exists(),
+            "the first write is a fold"
+        );
+
+        {
+            let s = store.state_mut();
+            s.files.get_mut("/b").unwrap().cursor = 20;
+            s.files
+                .get_mut("/b")
+                .unwrap()
+                .mark_seen("b2".into(), [9; 5]);
+            s.files.insert("/d".into(), entry(5, &["d1"]));
+            s.global_ids.push_back(GlobalKey::V2 {
+                k: "g".into(),
+                p: "/b".into(),
+            });
+        }
+        store.commit().unwrap();
+
+        assert_eq!(fs::read(dir.join("state.json")).unwrap(), snapshot);
+        assert_eq!(hot_files(&dir), vec!["/b".to_string(), "/d".to_string()]);
+        let reopened = HistoryStore::open(&dir).unwrap();
+        assert_eq!(state_value(&reopened), state_value(&store));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_change_a_rescan_could_not_see_again_folds_instead_of_going_hot() {
+        // Each of these, kept only in a hot file that later went missing,
+        // would come back wrong: a deleted file's lines with nothing to
+        // supersede them, a generation reused, a pruned record forgotten.
+        type Change = fn(&mut ScannerState);
+        let changes: [(&str, Change); 4] = [
+            ("entry gone", |s| {
+                s.files.remove("/b");
+            }),
+            ("new generation", |s| {
+                s.files.get_mut("/b").unwrap().reset("d2".into(), 1, 2)
+            }),
+            ("pruned added", |s| {
+                s.pruned_generations.insert("/x".into(), 1);
+            }),
+            ("pruned cleared", |s| {
+                s.pruned_generations.remove("/old");
+            }),
+        ];
+        for (what, change) in changes {
+            let dir = tmpdir("hot-structural");
+            let mut store = HistoryStore::open(&dir).unwrap();
+            store
+                .state_mut()
+                .files
+                .insert("/a".into(), entry(1, &["a"]));
+            store
+                .state_mut()
+                .files
+                .insert("/b".into(), entry(1, &["b"]));
+            store
+                .state_mut()
+                .pruned_generations
+                .insert("/old".into(), 2);
+            store.commit().unwrap();
+            let before = store.state().fold_id;
+
+            change(store.state_mut());
+            store.state_mut().files.get_mut("/a").unwrap().cursor = 9;
+            store.commit().unwrap();
+
+            let on_disk: ScannerState =
+                serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+            assert_ne!(on_disk.fold_id, before, "{what}");
+            let _ = fs::remove_file(dir.join("state-hot.json"));
+            let reopened = HistoryStore::open(&dir).unwrap();
+            assert_eq!(state_value(&reopened), state_value(&store), "{what}");
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn an_entry_nothing_changed_stays_out_of_the_hot_file_across_reopens() {
+        // `recent_usage` used to be a `HashMap`, whose serialized order
+        // changes with every rebuild: every untouched entry would then look
+        // changed, and the hot file would grow back into the snapshot.
+        let dir = tmpdir("hot-stable");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let ids: Vec<String> = (0..200).map(|n| format!("id-{n}")).collect();
+        let ids: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        store.state_mut().files.insert("/a".into(), entry(1, &ids));
+        store.state_mut().files.insert("/b".into(), entry(1, &ids));
+        store.commit().unwrap();
+        for round in 0..3 {
+            let mut store = HistoryStore::open(&dir).unwrap();
+            store.state_mut().files.get_mut("/b").unwrap().cursor += 1;
+            store.commit().unwrap();
+            assert_eq!(hot_files(&dir), vec!["/b".to_string()], "round {round}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_snapshot_written_before_hot_files_existed_is_read_whole_and_folded_on_the_next_write() {
+        let dir = tmpdir("hot-legacy");
+        let mut legacy = ScannerState {
+            version: SCHEMA_VERSION,
+            next_batch: 7,
+            compacted_size: 99,
+            ..Default::default()
+        };
+        legacy.files.insert("/a".into(), entry(3, &["x"]));
+        legacy.pruned_generations.insert("/gone".into(), 2);
+        legacy.global_ids.push_back(GlobalKey::V2 {
+            k: "k".into(),
+            p: "/a".into(),
+        });
+        let mut v = serde_json::to_value(&legacy).unwrap();
+        v.as_object_mut().unwrap().remove("fold_id");
+        fs::write(dir.join("state.json"), v.to_string()).unwrap();
+        // A hot file left over from some other snapshot must not apply.
+        fs::write(
+            dir.join("state-hot.json"),
+            r#"{"base":0,"files":{"/a":{"size":1,"mtime":1,"cursor":999,"digest":"","gen":0,"recent_ids":[]}}}"#,
+        )
+        .unwrap();
+
+        let mut store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(store.file_state(Path::new("/a")).unwrap().cursor, 3);
+        assert_eq!(store.state().pruned_generations.get("/gone"), Some(&2));
+        assert_eq!(store.state().compacted_size, 99);
+
+        store.state_mut().files.get_mut("/a").unwrap().cursor = 4;
+        store.commit().unwrap();
+        let written: ScannerState =
+            serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        assert_ne!(written.fold_id, 0, "the first write folds");
+        assert_eq!(
+            written.version, SCHEMA_VERSION,
+            "and keeps the version older builds read"
+        );
+        assert_eq!(written.files["/a"].cursor, 4);
+        assert_eq!(written.pruned_generations.get("/gone"), Some(&2));
+        assert_eq!(written.global_ids.len(), 1);
+        assert!(fs::read_dir(&dir).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("state.corrupt-")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_entry_new_since_the_snapshot_folds_when_its_generation_moves() {
+        // Kept only in a hot file that later went missing, the entry would
+        // be gone and rescanned as generation 0, beside generation-1 lines
+        // nothing could supersede.
+        let dir = tmpdir("hot-new-gen");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store.state_mut().files.insert("/a".into(), entry(1, &[]));
+        store.commit().unwrap();
+        store
+            .state_mut()
+            .files
+            .insert("/new".into(), entry(4, &["n"]));
+        store.commit().unwrap();
+        assert_eq!(hot_files(&dir), vec!["/new".to_string()]);
+        let before = store.state().fold_id;
+
+        store
+            .state_mut()
+            .files
+            .get_mut("/new")
+            .unwrap()
+            .reset("d2".into(), 1, 2);
+        store.commit().unwrap();
+
+        assert_ne!(store.state().fold_id, before);
+        assert!(
+            !dir.join("state-hot.json").exists(),
+            "the fold retires the hot file"
+        );
+        let snapshot: ScannerState =
+            serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        assert_eq!(snapshot.files["/new"].gen, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hot_file_missing_a_field_is_ignored_not_applied_as_empty() {
+        let dir = tmpdir("hot-partial");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store
+            .state_mut()
+            .files
+            .insert("/a".into(), entry(1, &["x"]));
+        store.state_mut().global_ids.push_back(GlobalKey::V2 {
+            k: "k".into(),
+            p: "/a".into(),
+        });
+        store.commit().unwrap();
+        let id = store.state().fold_id;
+        fs::write(dir.join("state-hot.json"), format!(r#"{{"base":{id}}}"#)).unwrap();
+        let reopened = HistoryStore::open(&dir).unwrap();
+        assert_eq!(reopened.state().global_ids.len(), 1);
+        assert_eq!(reopened.file_state(Path::new("/a")).unwrap().cursor, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_locked_open_removes_a_hot_file_that_no_longer_matches() {
+        let dir = tmpdir("hot-stale");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store.state_mut().files.insert("/a".into(), entry(1, &[]));
+        store.commit().unwrap();
+        store.state_mut().files.get_mut("/a").unwrap().cursor = 2;
+        store.commit().unwrap();
+        let stale = fs::read(dir.join("state-hot.json")).unwrap();
+        // A fold that stopped before removing the hot file it retired.
+        store
+            .state_mut()
+            .files
+            .get_mut("/a")
+            .unwrap()
+            .reset("d2".into(), 1, 2);
+        store.commit().unwrap();
+        fs::write(dir.join("state-hot.json"), &stale).unwrap();
+
+        let ro = HistoryStore::open_read_only(&dir).unwrap();
+        assert_eq!(ro.file_state(Path::new("/a")).unwrap().gen, 1);
+        assert!(
+            dir.join("state-hot.json").exists(),
+            "a read-only open leaves it"
+        );
+        let locked = HistoryStore::open(&dir).unwrap();
+        assert_eq!(locked.file_state(Path::new("/a")).unwrap().gen, 1);
+        assert!(!dir.join("state-hot.json").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_only_open_of_a_newer_builds_state_runs_empty_and_leaves_it() {
+        let dir = tmpdir("ro-newer");
+        let text = format!(r#"{{"version":{},"files":{{}}}}"#, SCHEMA_VERSION + 1);
+        fs::write(dir.join("state.json"), &text).unwrap();
+        let mut ro = HistoryStore::open_read_only(&dir).unwrap();
+        assert!(ro.state().files.is_empty());
+        ro.commit().unwrap();
+        assert_eq!(fs::read_to_string(dir.join("state.json")).unwrap(), text);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hot_file_that_does_not_belong_to_the_snapshot_is_ignored_never_quarantined() {
+        let dir = tmpdir("hot-foreign");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store
+            .state_mut()
+            .files
+            .insert("/a".into(), entry(1, &["x"]));
+        store.commit().unwrap();
+        store.state_mut().files.get_mut("/a").unwrap().cursor = 50;
+        store.commit().unwrap();
+        assert_eq!(
+            HistoryStore::open(&dir)
+                .unwrap()
+                .file_state(Path::new("/a"))
+                .unwrap()
+                .cursor,
+            50
+        );
+
+        // An older build rewrites the snapshot: it knows nothing of
+        // `fold_id` and drops it, and its own cursor is what counts now.
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("fold_id");
+        v["files"]["/a"]["cursor"] = serde_json::json!(7);
+        fs::write(dir.join("state.json"), v.to_string()).unwrap();
+        assert_eq!(
+            HistoryStore::open(&dir)
+                .unwrap()
+                .file_state(Path::new("/a"))
+                .unwrap()
+                .cursor,
+            7
+        );
+
+        // A hot file that does not parse is set aside the same way.
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store.state_mut().files.get_mut("/a").unwrap().cursor = 8;
+        store.commit().unwrap(); // folds: the snapshot had no id
+        store.state_mut().files.get_mut("/a").unwrap().cursor = 9;
+        store.commit().unwrap();
+        fs::write(dir.join("state-hot.json"), "{ torn").unwrap();
+        assert_eq!(
+            HistoryStore::open(&dir)
+                .unwrap()
+                .file_state(Path::new("/a"))
+                .unwrap()
+                .cursor,
+            8
+        );
+
+        // Set aside means removed by the locked open, not quarantined: it
+        // is this store's own disposable file, never anyone's only copy.
+        assert!(!dir.join("state-hot.json").exists());
+        assert!(fs::read_dir(&dir).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("state.corrupt-")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_only_open_creates_renames_and_writes_nothing() {
+        let missing = tmpdir("ro-missing").join("not-here");
+        let store = HistoryStore::open_read_only(&missing).unwrap();
+        assert!(store.state().files.is_empty());
+        assert!(!missing.exists(), "no directory made");
+
+        let dir = tmpdir("ro-corrupt");
+        fs::write(dir.join("state.json"), "{ not json").unwrap();
+        assert!(HistoryStore::open_read_only(&dir).is_err());
+        assert_eq!(
+            fs::read_to_string(dir.join("state.json")).unwrap(),
+            "{ not json"
+        );
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "nothing quarantined"
+        );
+
+        let dir = tmpdir("ro-commit");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store.state_mut().files.insert("/a".into(), entry(1, &[]));
+        store.commit().unwrap();
+        let snapshot = fs::read(dir.join("state.json")).unwrap();
+        let mut ro = HistoryStore::open_read_only(&dir).unwrap();
+        ro.state_mut().files.get_mut("/a").unwrap().cursor = 2;
+        ro.commit().unwrap();
+        assert!(ro.append_days(&[day("/a", 0, 1)]).is_err());
+        assert_eq!(fs::read(dir.join("state.json")).unwrap(), snapshot);
+        assert!(!dir.join("state-hot.json").exists());
+        assert!(!dir.join("days.jsonl").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_only_open_sees_the_hot_file_that_belongs_to_the_snapshot() {
+        let dir = tmpdir("ro-hot");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store.state_mut().files.insert("/a".into(), entry(1, &[]));
+        store.commit().unwrap();
+        store.state_mut().files.get_mut("/a").unwrap().cursor = 2;
+        store.commit().unwrap();
+        let ro = HistoryStore::open_read_only(&dir).unwrap();
+        assert_eq!(ro.file_state(Path::new("/a")).unwrap().cursor, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_compaction_folds_the_snapshot_first() {
+        // A checkpoint folds lines into `[0, H)` because the cursor reached
+        // `H`. If that cursor lived only in the hot file, losing the hot
+        // file would rewind it below `H`, and the rescan's seal would then
+        // kill the checkpoint line and every token in it.
+        let dir = tmpdir("hot-compact");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store.compact_threshold = 1;
+        store.state_mut().files.insert("/a".into(), entry(0, &[]));
+        store.commit().unwrap();
+        for (lo, hi) in [(0, 10), (10, 20), (20, 30)] {
+            pass(&mut store, "/a", (lo, hi), true, &[("h1", 5)]);
+            store.state_mut().files.get_mut("/a").unwrap().cursor = hi;
+        }
+        store.commit().unwrap();
+        let snapshot: ScannerState =
+            serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        assert_eq!(snapshot.files["/a"].cursor, 30);
+        assert!(line_count(&dir) < 3, "the commit compacted");
+        let _ = fs::remove_file(dir.join("state-hot.json"));
+        let store = HistoryStore::open(&dir).unwrap();
+        assert_eq!(live_by_hour(&store).get("h1"), Some(&15));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn losing_the_hot_file_at_random_moments_never_changes_the_live_figure() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self, n: u64) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0 % n
+            }
+        }
+        let files = ["/a", "/b", "/c"];
+        let hours = ["h1", "h2", "h3", "h4"];
+        let mut lost_any = false;
+        let mut compacted_any = false;
+        for seed in 1..=8u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let keep_dir = tmpdir(&format!("hot-sim-keep-{seed}"));
+            let lose_dir = tmpdir(&format!("hot-sim-lose-{seed}"));
+            let mut keep = HistoryStore::open(&keep_dir).unwrap();
+            let mut lose = HistoryStore::open(&lose_dir).unwrap();
+            // What each file holds: `(lo, hi, hour, input)` per pass, so a
+            // rescan from any cursor can re-derive exactly those bytes.
+            let mut content: Vec<Vec<(u64, u64, &str, u64)>> = vec![Vec::new(); 3];
+            let mut truth: BTreeMap<String, u64> = BTreeMap::new();
+            for store in [&mut keep, &mut lose] {
+                store.compact_threshold = 1;
+                for f in files {
+                    store.state_mut().files.insert(f.to_string(), entry(0, &[]));
+                }
+            }
+            for step in 0..80u64 {
+                let which = rng.next(3) as usize;
+                let lo = content[which].last().map_or(0, |s| s.1);
+                let hi = lo + 1 + rng.next(40);
+                let hour = hours[rng.next(4) as usize];
+                let input = 1 + rng.next(9);
+                content[which].push((lo, hi, hour, input));
+                *truth.entry(hour.to_string()).or_default() += input;
+                for store in [&mut keep, &mut lose] {
+                    pass(store, files[which], (lo, hi), true, &[(hour, input)]);
+                    store
+                        .state_mut()
+                        .files
+                        .get_mut(files[which])
+                        .unwrap()
+                        .cursor = hi;
+                }
+                if rng.next(3) == 0 {
+                    keep.commit().unwrap();
+                    lose.commit().unwrap();
+                }
+                if rng.next(6) == 0 {
+                    let before = line_count(&lose_dir);
+                    keep.commit().unwrap();
+                    lose.commit().unwrap();
+                    compacted_any |= line_count(&lose_dir) < before;
+                    keep = HistoryStore::open(&keep_dir).unwrap();
+                    keep.compact_threshold = 1;
+                    if rng.next(2) == 0 && lose_dir.join("state-hot.json").exists() {
+                        fs::remove_file(lose_dir.join("state-hot.json")).unwrap();
+                        lost_any = true;
+                    }
+                    lose = HistoryStore::open(&lose_dir).unwrap();
+                    lose.compact_threshold = 1;
+                    // The scanner's next pass: each file read again from
+                    // wherever its cursor now stands, to the end.
+                    for (n, f) in files.iter().enumerate() {
+                        let end = content[n].last().map_or(0, |s| s.1);
+                        let from = lose.file_state(Path::new(f)).unwrap().cursor;
+                        if from >= end {
+                            continue;
+                        }
+                        let mut buckets: BTreeMap<&str, u64> = BTreeMap::new();
+                        for &(slo, _, hour, input) in &content[n] {
+                            if slo >= from {
+                                *buckets.entry(hour).or_default() += input;
+                            }
+                        }
+                        let buckets: Vec<(&str, u64)> = buckets.into_iter().collect();
+                        pass(&mut lose, f, (from, end), true, &buckets);
+                        lose.state_mut().files.get_mut(*f).unwrap().cursor = end;
+                    }
+                }
+                assert_eq!(live_by_hour(&keep), truth, "seed {seed} step {step}, kept");
+                assert_eq!(live_by_hour(&lose), truth, "seed {seed} step {step}, lost");
+            }
+            let _ = fs::remove_dir_all(&keep_dir);
+            let _ = fs::remove_dir_all(&lose_dir);
+        }
+        assert!(
+            lost_any && compacted_any,
+            "the simulation never exercised its point"
+        );
     }
 
     #[test]
@@ -4130,6 +5022,7 @@ mod tests {
             .reset("d2".into(), 2, 2);
         store.commit().unwrap();
 
+        // A new generation is a fold: it goes into the snapshot itself.
         let after_bytes = fs::read(&path).unwrap();
         assert_ne!(
             before_bytes, after_bytes,
