@@ -5922,12 +5922,25 @@ fn quota_notice(status: &tickover::model::QuotaStatus) -> String {
 
 /// What a quota window is called on screen.
 ///
-/// The manifest's own label is a chip meant for the menu-bar pill — "5H",
+/// Short uppercase duration chips (`"5H"`, `"WK"`, `"D1"`) are expanded from
+/// the window's period (`"5-hour limit"`, `"Weekly limit"`); longer or mixed-
+/// case captions (`"Gemini · 5-hour"`, `"Credits used"`) already name what the
+/// limit applies to and stay verbatim.
+fn is_duration_chip(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 4
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+/// The manifest's own label is often a chip meant for the menu-bar pill — "5H",
 /// "WK" — and reading it in the panel costs a beat of translation every time.
-/// The window's declared length says the same thing in words, so use that when
-/// it lands on a duration with a name, and keep the manifest's label for the
-/// ones it doesn't. Derived from the length rather than the role, since a
-/// plugin is free to declare a primary window that isn't five hours long.
+/// The window's declared length says the same thing in words, so expand short
+/// chips from the duration when it lands on a duration with a name, and keep
+/// descriptive captions (or unrecognized durations) as written. Derived from
+/// the length rather than the role, since a plugin is free to declare a primary
+/// window that isn't five hours long.
 fn window_title(w: &Window) -> String {
     window_title_of(&w.label, w.role, w.period_minutes)
 }
@@ -5937,11 +5950,10 @@ fn window_title(w: &Window) -> String {
 /// replaces — a window that changed its caption as it emptied would read as a
 /// different window.
 fn window_title_of(label: &str, role: Role, period_minutes: Option<u64>) -> String {
-    // A quota that is not the subscription is named by the manifest, not by
-    // its length: a per-model weekly allowance titled "Weekly limit" would sit
-    // directly under the subscription's weekly row, saying the same words
-    // about a different number.
-    if role == Role::Extra {
+    // A quota that is not the subscription, or any descriptive manifest
+    // caption that already names what it limits, keeps its own label rather
+    // than collapsing into a generic duration phrase.
+    if role == Role::Extra || !is_duration_chip(label) {
         return label.to_string();
     }
     match period_minutes {
@@ -7329,6 +7341,28 @@ type ProjectionFn<'a> = dyn Fn(&Window, f64) -> Option<(f32, i32, String)> + 'a;
 /// that reported one becomes a row at all — the caller establishes that, and
 /// taking it as an argument keeps this from carrying a second, unreachable
 /// shape for the case it has already excluded.
+/// Whether a reported window is an unstarted floating-reset placeholder: `0%`
+/// consumed with `resets_at` sitting roughly one full period from `now`
+/// (providers like Antigravity advance `resetTime = now + period` until the
+/// first request starts the window). Showing a fake countdown for an unstarted
+/// window misleads the panel, so render it in the compact `not started` form.
+fn is_unstarted_floating_window(
+    now: u64,
+    used: f64,
+    resets_at: Option<u64>,
+    period_minutes: Option<u64>,
+) -> bool {
+    if used != 0.0 {
+        return false;
+    }
+    let (Some(reset), Some(mins)) = (resets_at, period_minutes.filter(|m| *m > 0)) else {
+        return false;
+    };
+    let period = mins.saturating_mul(60);
+    let slack = (period / 10).min(120);
+    reset >= now.saturating_add(period.saturating_sub(slack))
+}
+
 fn window_data(now: u64, w: &Window, used: f64, proj: Option<(f32, i32, String)>) -> WindowData {
     // Whether the reset clock carries a date. A week away needs one; five
     // hours away does not. Decided by length when the window states one —
@@ -7342,10 +7376,24 @@ fn window_data(now: u64, w: &Window, used: f64, proj: Option<(f32, i32, String)>
     // never declares `period_minutes` is exactly the case a date matters
     // most for, and `role == Extra` had no better answer than the role
     // either.
+    let name = window_title(w);
+    if is_unstarted_floating_window(now, used, w.resets_at, w.period_minutes) {
+        return WindowData {
+            label: ss(&name),
+            pct: 0.0,
+            not_started: true,
+            reset_rel: ss(""),
+            reset_rel_kind: ResetRelKind::Unknown,
+            reset_at: ss(""),
+            tooltip: ss(""),
+            proj_pct: 0.0,
+            proj_tone: 1,
+            burn_line: ss(""),
+        };
+    }
     let weekly = w
         .period_minutes
         .map_or(w.role == Role::Secondary, |m| m > 720);
-    let name = window_title(w);
     let (kind, rel, at, tooltip, _, _) =
         window_view(now, used, w.resets_at, w.period_minutes, weekly, &name);
     WindowData {
@@ -12205,11 +12253,21 @@ mod title_tests {
             window_title_of("Credits used", Role::Extra, Some(10_080)),
             "Credits used"
         );
+        assert_eq!(window_title_of("WK", Role::Extra, Some(10_080)), "WK");
         assert_eq!(
-            window_title_of("Credits used", Role::Primary, Some(10_080)),
+            window_title_of("WK", Role::Primary, Some(10_080)),
             "Weekly limit",
-            "the same label and length as Primary is captioned by the length instead — \
-             the reason a credit-spend window is not declared Primary"
+            "a short chip on Primary/Secondary is captioned by the length"
+        );
+        // Descriptive Primary/Secondary labels stay verbatim so providers with
+        // multiple groups can name which group a quota belongs to.
+        assert_eq!(
+            window_title_of("Gemini · 5-hour", Role::Primary, Some(300)),
+            "Gemini · 5-hour"
+        );
+        assert_eq!(
+            window_title_of("Gemini · Weekly", Role::Secondary, Some(10_080)),
+            "Gemini · Weekly"
         );
     }
 
@@ -12263,6 +12321,37 @@ mod title_tests {
             "a same-day reset needs no date: {:?}",
             data.reset_at
         );
+    }
+
+    #[test]
+    fn unstarted_floating_window_renders_without_fake_countdown() {
+        // 0% used with reset roughly a full period ahead (within 120s) is an
+        // unstarted placeholder whose reset moves with the clock.
+        for delta in [18_000, 18_000 - 60] {
+            let w = win("Claude & GPT · 5-hour", Role::Extra, 0.0, delta, 300);
+            let data = window_data(NOW, &w, 0.0, None);
+            assert!(data.not_started, "delta {delta} must mark not_started");
+            assert_eq!(data.reset_rel, "");
+            assert_eq!(data.reset_at, "");
+        }
+
+        // Any spend > 0%, an already-ticking 0% window further from reset, or a
+        // missing reset keeps the normal bar rendering.
+        let active = win("Claude & GPT · 5-hour", Role::Extra, 0.017, 18_000 - 5, 300);
+        assert!(!window_data(NOW, &active, 0.017, None).not_started);
+
+        let ticking_zero = win("Claude & GPT · 5-hour", Role::Extra, 0.0, 18_000 - 600, 300);
+        assert!(!window_data(NOW, &ticking_zero, 0.0, None).not_started);
+
+        let no_reset = Window {
+            key: "w0:".to_string(),
+            label: "5H".into(),
+            role: Role::Primary,
+            used_percent: Some(0.0),
+            resets_at: None,
+            period_minutes: Some(300),
+        };
+        assert!(!window_data(NOW, &no_reset, 0.0, None).not_started);
     }
 
     /// Direct `ProviderReading` fixture, mirroring what a log-file-engine

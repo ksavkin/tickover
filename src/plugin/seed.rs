@@ -515,8 +515,11 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "antigravity.toml",
         id: "antigravity",
-        to_version: "1.3.0",
+        to_version: "1.3.1",
         previous_sha256: &[
+            // 1.3.0 — generic 5H/WK and 3P·5H/3P·WK chips instead of group names.
+            // sha256 of antigravity.toml as shipped at manifest version 1.3.0.
+            "ac6d7bc1a6e5e490b77e644860808b634fb11d83c0b73576280b064428be363e",
             // 1.2.0 — before `[[window_ping]]`, so neither 5-hour window was
             // ever auto-pinged.
             // sha256 of antigravity.toml as shipped at manifest version 1.2.0.

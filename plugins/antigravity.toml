@@ -26,7 +26,7 @@ name         = "Antigravity"
 menu_label   = "Ag"
 order        = 40
 requires_reader = ["http-post", "remaining-fraction", "window-identity", "keychain-expiry", "oauth-refresh", "oauth-client-discovery", "reading-history"]
-version      = "1.3.0"
+version      = "1.3.1"
 engine       = "http-api"
 refresh_secs = 60
 
@@ -55,7 +55,7 @@ refresh_secs = 60
 # ── Gemini models ────────────────────────────────────────────────────────
 [[windows]]
 id       = "gemini-5h"
-label    = "5H"
+label    = "Gemini · 5-hour"
 role     = "primary"
 [windows.period]
 mode    = "assumed"
@@ -67,7 +67,7 @@ resets_at_format        = "iso8601"
 
 [[windows]]
 id       = "gemini-wk"
-label    = "WK"
+label    = "Gemini · Weekly"
 role     = "secondary"
 [windows.period]
 mode    = "assumed"
@@ -80,7 +80,7 @@ resets_at_format        = "iso8601"
 # ── Claude and GPT models ────────────────────────────────────────────────
 [[windows]]
 id       = "3p-5h"
-label    = "3P·5H"
+label    = "Claude & GPT · 5-hour"
 role     = "extra"
 [windows.period]
 mode    = "assumed"
@@ -92,7 +92,7 @@ resets_at_format        = "iso8601"
 
 [[windows]]
 id       = "3p-wk"
-label    = "3P·WK"
+label    = "Claude & GPT · Weekly"
 role     = "extra"
 [windows.period]
 mode    = "assumed"

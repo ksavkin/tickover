@@ -2752,9 +2752,10 @@ fn the_shipped_antigravity_manifest_is_accepted() {
             .find(|w| w.id == id)
             .unwrap_or_else(|| panic!("{id}"))
     };
-    for (id, role, period, bucket, group) in [
+    for (id, label, role, period, bucket, group) in [
         (
             "gemini-5h",
+            "Gemini · 5-hour",
             Role::Primary,
             300u64,
             "gemini-5h",
@@ -2762,6 +2763,7 @@ fn the_shipped_antigravity_manifest_is_accepted() {
         ),
         (
             "gemini-wk",
+            "Gemini · Weekly",
             Role::Secondary,
             10080,
             "gemini-weekly",
@@ -2769,6 +2771,7 @@ fn the_shipped_antigravity_manifest_is_accepted() {
         ),
         (
             "3p-5h",
+            "Claude & GPT · 5-hour",
             Role::Extra,
             300,
             "3p-5h",
@@ -2776,6 +2779,7 @@ fn the_shipped_antigravity_manifest_is_accepted() {
         ),
         (
             "3p-wk",
+            "Claude & GPT · Weekly",
             Role::Extra,
             10080,
             "3p-weekly",
@@ -2783,6 +2787,7 @@ fn the_shipped_antigravity_manifest_is_accepted() {
         ),
     ] {
         let w = by_id(id);
+        assert_eq!(w.label, label, "{id} label");
         assert_eq!(w.role, role, "{id} role");
         assert!(
             !w.required,
