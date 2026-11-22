@@ -998,9 +998,9 @@ mod tests {
             .to_string();
         let hour1 = Utc::now().format("%Y-%m-%dT%H").to_string();
         let mut first = line(&hour0, "claude", "p", 1_000_000);
-        first.model = "claude-opus-4".into();
+        first.model = "claude-opus-4-8".into();
         let mut second = line(&hour1, "claude", "p", 1_000_000);
-        second.model = "claude-haiku-4".into();
+        second.model = "claude-haiku-4-5".into();
         store.append_days(&[first, second]).unwrap();
         store.commit().unwrap();
         let store = HistoryStore::open(&dir).unwrap();
@@ -1013,8 +1013,8 @@ mod tests {
             2,
             "both models the session used must be tracked separately"
         );
-        assert_eq!(sess.models["claude-opus-4"].input, 1_000_000);
-        assert_eq!(sess.models["claude-haiku-4"].input, 1_000_000);
+        assert_eq!(sess.models["claude-opus-4-8"].input, 1_000_000);
+        assert_eq!(sess.models["claude-haiku-4-5"].input, 1_000_000);
         assert_eq!(
             sess.totals.input, 2_000_000,
             "the combined total still sums both"
@@ -1028,7 +1028,7 @@ mod tests {
             sess.models.iter().map(|(m, t)| (m.clone(), *t)).collect();
         let blended = crate::history::pricing::cost_for_models(&models).unwrap();
         let priced_at_first_model_only =
-            crate::history::pricing::cost_usd("claude-opus-4", &sess.totals).unwrap();
+            crate::history::pricing::cost_usd("claude-opus-4-8", &sess.totals).unwrap();
         assert!(
             (blended - priced_at_first_model_only).abs() > 1.0,
             "blended={blended} single-model={priced_at_first_model_only}"

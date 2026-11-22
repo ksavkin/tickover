@@ -262,8 +262,8 @@
     setText("card-cache", hit === null ? "—" : fixed(hit, 0) + "%");
     if (data.cost_on) {
       setText("card-cost", a.cost === null ? "—" : fmtHeadlineUsd(a.cost) + (a.partial ? "*" : ""));
-      setText("card-cost-note", a.partial ? "at list price, partial — unpriced models excluded"
-        : a.cost === null ? "no list price for these models" : "at list price");
+      setText("card-cost-note", a.partial ? "API-equivalent, partial — unpriced models excluded"
+        : a.cost === null ? "no list price for these models" : "API-equivalent, not your bill");
     }
   }
 

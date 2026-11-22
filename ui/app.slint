@@ -1113,6 +1113,14 @@ export component AppWindow inherits Window {
                                                 color: Theme.text-faint;
                                             }
                                         }
+                                        // With a provider left uncounted its note takes the
+                                        // right-hand slot, so the cost of what was counted
+                                        // sits beside the counted figure instead of vanishing.
+                                        if root.activity.not-counted != "" && root.activity.legend-cost != "" : Text {
+                                            text: root.activity.legend-cost;
+                                            font-size: 9px;
+                                            color: Theme.text-faint;
+                                        }
                                         if root.activity.legend-counted == "" && root.activity.legend-cached != "" : Text {
                                             text: root.activity.legend-cached;
                                             font-size: 9px;

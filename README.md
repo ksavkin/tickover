@@ -270,11 +270,12 @@ Tests run under a substituted `HOME` — the invocation and the reason are in
   Codex and Claude's CLI, the two shipped manifests that set a message for it.
 - **The panel is dark only**; the tray pill follows the system theme. No
   notifications, no Linux.
-- **No cost accounting by default.** An estimated dollar figure from
-  published list prices exists (`tickover stats`, the panel's Activity
-  card, the HTML report) but only once switched on by hand-editing the
-  settings file — see [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) —
-  and it is always an estimate against a bundled price table, never a bill.
+- **Cost is an API-equivalent, never a bill.** The dollar figure in
+  `tickover stats`, the panel's Activity card and the HTML report is what
+  the same tokens would cost at published API list prices, from a price
+  snapshot built into the app; a model it has no exact price for shows `—`.
+  On a subscription it is not what you paid. One settings-file key hides it
+  — see [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md#cost-figures).
 
 ## License
 

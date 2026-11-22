@@ -298,9 +298,9 @@ fn text_out(
                 // condition, so the two never disagree about what a
                 // partial estimate means.
                 let note = if partial {
-                    "list price, opt-in, partial — unpriced models excluded"
+                    "API-equivalent, partial — unpriced models excluded"
                 } else {
-                    "list price, opt-in"
+                    "API-equivalent"
                 };
                 s.push_str(&format!("est. cost {:>8.2} USD ({note})\n", usd));
             }
@@ -606,7 +606,7 @@ mod tests {
         let dir = tmpdir(tag);
         let mut store = HistoryStore::open(&dir).unwrap();
         store
-            .append_days(&[day("claude-sonnet-4"), day("mystery-model-x")])
+            .append_days(&[day("claude-sonnet-4-6"), day("mystery-model-x")])
             .unwrap();
         store.commit().unwrap();
         let store = HistoryStore::open(&dir).unwrap();
@@ -623,7 +623,7 @@ mod tests {
         let out = text_out(&st, &[], &[], true);
         assert!(
             out.contains(
-                "est. cost    18.00 USD (list price, opt-in, partial — unpriced models excluded)"
+                "est. cost    18.00 USD (API-equivalent, partial — unpriced models excluded)"
             ),
             "got:\n{out}"
         );
@@ -633,14 +633,14 @@ mod tests {
     fn text_out_carries_no_partial_note_when_every_model_is_priced() {
         let dir = tmpdir("text-full");
         let mut store = HistoryStore::open(&dir).unwrap();
-        store.append_days(&[day("claude-sonnet-4")]).unwrap();
+        store.append_days(&[day("claude-sonnet-4-6")]).unwrap();
         store.commit().unwrap();
         let store = HistoryStore::open(&dir).unwrap();
         let enabled: std::collections::HashSet<String> =
             ["claude".to_string()].into_iter().collect();
         let st = query::compute(&store, 30, &enabled);
         let out = text_out(&st, &[], &[], true);
-        assert!(out.contains("est. cost    18.00 USD (list price, opt-in)\n"));
+        assert!(out.contains("est. cost    18.00 USD (API-equivalent)\n"));
         assert!(!out.contains("partial"));
         let _ = std::fs::remove_dir_all(&dir);
     }

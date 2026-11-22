@@ -621,12 +621,15 @@ pub fn set_menu_bar_text(v: bool) {
     set_bool("menu_bar_text", v);
 }
 
-/// Show estimated list-price cost in `stats`/panel/report. Off by
-/// default: subscription users' numbers would be notional anyway, and a
-/// dollar figure beside quota bars reads as real spend when it is not.
+/// Show the API-equivalent list-price cost in `stats`/panel/report. On
+/// unless the key is stored `false`: the figure is labelled as what the
+/// same tokens would cost at API prices, not a bill, and it is the one
+/// number that weighs a cache read for what it is worth instead of as a
+/// token like any other. The key keeps its old `_opt_in` name so an
+/// explicit `false` written while this defaulted off still holds.
 #[cfg_attr(not(feature = "history"), allow(dead_code))]
 pub fn history_cost_estimate() -> bool {
-    get_bool("history_cost_estimate_opt_in")
+    get_bool_opt("history_cost_estimate_opt_in").unwrap_or(true)
 }
 /// Bound by the settings sheet's cost-toggle; until then the setter has no
 /// caller — `allow` rather than delete because the toggle is part of the
@@ -1469,6 +1472,19 @@ mod tests {
     /// as `plugin_enabled`/`plugin_ping`, with no well-known-id bridge to
     /// worry about. Runs against a disposable temp file (`with_test_config_path`)
     /// — never the real `config.json` a running app instance may hold open.
+    #[test]
+    fn cost_shows_unless_switched_off_and_an_old_false_still_holds() {
+        with_test_config_path(|| {
+            assert!(history_cost_estimate(), "an absent key shows the cost");
+            // A `false` written while this defaulted off is a choice, not
+            // a leftover, and must keep hiding it.
+            set_history_cost_estimate(false);
+            assert!(!history_cost_estimate());
+            set_history_cost_estimate(true);
+            assert!(history_cost_estimate());
+        });
+    }
+
     #[test]
     fn plugin_option_defaults_then_reads_back_the_override() {
         with_test_config_path(|| {
