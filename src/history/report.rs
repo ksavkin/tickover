@@ -1285,8 +1285,7 @@ fn habits(h: &mut String, st: &Stats) {
             h,
             r#"<span class="mono" style="font-size: 10px; color: var(--meta);">{day_name}</span>"#,
         );
-        for hr in 0..24 {
-            let v = st.weekday_hours[w][hr];
+        for (hr, &v) in st.weekday_hours[w].iter().enumerate() {
             let level = if v == 0 {
                 0
             } else {
