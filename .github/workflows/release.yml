@@ -68,7 +68,7 @@ jobs:
       # (`src/plugin/registry.rs` checks a sha256) should not be looser than
       # that about its own build.
       - name: Check out
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Nothing after this reads the repository again, so the checkout
           # token has no reason to be left behind in `.git/config`.
@@ -96,7 +96,7 @@ jobs:
       # not cached there and the same reasoning applies here: two targets on
       # macOS make the release tree wider still.
       - name: Cache crate downloads
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -151,7 +151,7 @@ jobs:
           Compress-Archive target/release/tickover.exe "tickover-$label-windows-x86_64.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.name }}
           path: "*.zip"
@@ -168,7 +168,7 @@ jobs:
       # this job does, and a `workflow_dispatch` run is supposed to prove the
       # whole pipeline, not just the two build jobs feeding it.
       - name: Download artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: out
           merge-multiple: true
@@ -201,7 +201,7 @@ jobs:
       # whether the pipeline actually produced what it claims to.
       - name: Upload rehearsal artifact
         if: github.ref_type != 'tag'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-rehearsal
           path: out
