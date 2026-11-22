@@ -25,6 +25,7 @@ lives in one folder:
 | `ping-workdir/` | present only when the OS temp directory can't be used for a ping's working directory. Each ping still gets its own fresh, empty, owner-only subdirectory in here, removed once the command exits — this folder itself is not, so an empty one can persist. The normal case runs the ping from the OS's own temp directory instead, never from here |
 | `history/` | the local usage-history store, present when the `history` build feature is compiled in (the default; see [`DEVELOPMENT.md`](DEVELOPMENT.md)): `state.json` (per-file scan progress), `state-hot.json` (what changed in it since it was last written whole) and `days.jsonl` (append-only hourly usage buckets), all owner-only on macOS, plus a `lock` file the tray app and `tickover stats` share so neither's scan interleaves with the other's. `days.jsonl` is compacted once it passes 16 MB; `state.json` grows with how many provider files have ever been scanned, not with how often the app runs |
 | `prices.toml` | optional, yours to create: per-model prices that replace or add to the built-in snapshot — see [Cost figures](#cost-figures) |
+| `projects.toml` | optional, yours to create: `[aliases]` mapping raw project names or prefixes (`"wt-*"`) to a repository name on display — see [Project grouping](#project-grouping) |
 | `reports/` | one self-contained HTML file per `tickover stats --report` run, or a press of the panel's own "Full report" pill — `usage-<timestamp>.html`, owner-only on macOS. Only the newest five files named this way are kept: each new one deletes the older ones. Anything named otherwise, such as a report written with `--report=PATH` under a name of your own, is never touched |
 
 `config.json` and the manifests are plain text and safe to edit by hand
@@ -126,6 +127,35 @@ file that cannot be read, does not parse, names a field other than these
 four or prices one id twice (`GPT-5.4` and `codex/gpt-5.4` are the same id)
 is ignored as a whole, and the report's price line says why. Edits take
 effect within a few seconds; the app need not be restarted.
+
+## Project grouping
+
+`days.jsonl` keeps each bucket's raw project basename untouched. When queried
+for the panel's Activity card, `tickover stats` or the HTML report, transient
+directories are grouped on display:
+
+- **Auto-ping scratch directories** (`tickover-ping-*`, `codex-limits-ping-*`,
+  `ping-workdir`) roll into `Tickover auto-ping`.
+- **Worktrees under `.claude/worktrees/`** resolve back to their parent
+  repository name using the transcript path (recovering multi-hyphen names from
+  non-worktree sessions in the same store when present).
+- **Unmapped agent/worker worktrees** (`agent-*`, `w<N>-*` without a parent
+  repository path) roll into `Agent worktrees`.
+
+`projects.toml` in the same config folder lets you add manual exact or
+trailing-wildcard (`"wt-*"`) overrides under `[aliases]` — longest prefix
+wins over built-in rules, and edits take effect within a few seconds without
+restarting:
+
+```toml
+[aliases]
+"codex-limits-tray" = "tickover"
+"wt-*" = "tickover"
+```
+
+Fixed group labels (`Tickover auto-ping`, `Agent worktrees`) carry no
+repository name and stay unmasked under `--mask` or the report's *Mask
+projects* switch.
 
 ## Environment variables
 

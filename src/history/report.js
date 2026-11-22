@@ -188,8 +188,15 @@
   var el = document.getElementById("report-data");
   var data = el && JSON.parse(el.textContent);
   var mask = document.getElementById("mask");
+  var UNMASKED_PROJECTS = { "Tickover auto-ping": true, "Agent worktrees": true };
   var aliases = Object.create(null);
-  if (data) data.projects.forEach(function (name, i) { aliases[name] = "project-" + (i + 1); });
+  if (data) {
+    var aliasIndex = 0;
+    data.projects.forEach(function (name) {
+      if (UNMASKED_PROJECTS[name]) aliases[name] = name;
+      else aliases[name] = "project-" + (++aliasIndex);
+    });
+  }
 
   function applyMask() {
     document.querySelectorAll(".proj").forEach(function (node) {

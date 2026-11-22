@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
 
+use crate::history::projects::ProjectGrouper;
 use crate::history::store::{DayLine, HistoryStore};
 
 /// Token-class counters shared by every grouping.
@@ -169,6 +170,7 @@ pub fn compute(
     let mut sessions: HashMap<String, SessionStat> = HashMap::new();
     // Day-total map feeding both `daily` (bounded) and `heatmap` (52 wk).
     let mut day_totals: BTreeMap<NaiveDate, u64> = BTreeMap::new();
+    let grouper = ProjectGrouper::from_store(store);
 
     for d in store.live_days() {
         if !enabled.contains(&d.provider) {
@@ -213,7 +215,8 @@ pub fn compute(
                 .or_default()
                 .add(d);
         }
-        projects.entry(d.project.clone()).or_default().add(d);
+        let project = grouper.resolve(&d.project, &d.file);
+        projects.entry(project.clone()).or_default().add(d);
         models.entry(d.model.clone()).or_default().add(d);
         provider_models
             .entry(d.provider.clone())
@@ -231,7 +234,7 @@ pub fn compute(
             .or_insert_with(|| SessionStat {
                 session: d.session.clone(),
                 provider: d.provider.clone(),
-                project: d.project.clone(),
+                project,
                 models: BTreeMap::new(),
                 first_hour: d.hour.clone(),
                 last_hour: d.hour.clone(),
@@ -451,8 +454,9 @@ pub fn panel(
 ) -> PanelSummary {
     let now = Local::now();
     let today = now.date_naive();
+    let grouper = ProjectGrouper::from_store(store);
     let mut out = PanelSummary {
-        last_seen: last_seen(store, enabled),
+        last_seen: last_seen(store, enabled, &grouper),
         ..Default::default()
     };
 
@@ -546,7 +550,10 @@ pub fn panel(
         // and not a session either — the totals above describe coverage,
         // not activity, so they alone stay unconditional.
         if d.has_activity() {
-            projects.entry(d.project.clone()).or_default().add(d);
+            projects
+                .entry(grouper.resolve(&d.project, &d.file))
+                .or_default()
+                .add(d);
             sessions.insert(format!("{}:{}", d.provider, d.session));
             price_units
                 .entry((d.provider.clone(), d.model.clone()))
@@ -652,13 +659,19 @@ pub fn panel(
 fn last_seen(
     store: &HistoryStore,
     enabled: &std::collections::HashSet<String>,
+    grouper: &ProjectGrouper,
 ) -> Option<(DateTime<Local>, String)> {
     store
         .live_days()
         .filter(|d| enabled.contains(&d.provider) && d.has_activity())
-        .filter_map(|d| parse_bucket_hour(&d.hour).map(|h| (h, d.project.clone())))
+        .filter_map(|d| parse_bucket_hour(&d.hour).map(|h| (h, d)))
         .max_by(|a, b| a.0.cmp(&b.0))
-        .map(|(h, project)| (h.with_timezone(&Local), project))
+        .map(|(h, d)| {
+            (
+                h.with_timezone(&Local),
+                grouper.resolve(&d.project, &d.file),
+            )
+        })
 }
 
 /// Whether `hour` has exactly the shape every bucket the scanner writes

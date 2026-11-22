@@ -15,6 +15,7 @@ use chrono::{DateTime, Local, Timelike};
 use serde::Serialize;
 
 use crate::history::pricing;
+use crate::history::projects::{self, ProjectGrouper};
 use crate::history::query::{self, Stats, Totals};
 use crate::history::report;
 use crate::history::store::{DayLine, HistoryStore};
@@ -123,6 +124,7 @@ pub fn build(
     let mut sessions: HashMap<String, u32> = HashMap::new();
     let mut session_list: Vec<(u32, u32)> = Vec::new();
     let mut grouped: BTreeMap<RowKey, Totals> = BTreeMap::new();
+    let grouper = ProjectGrouper::from_store(store);
 
     for d in store.live_days() {
         if !enabled.contains(&d.provider) || !d.has_activity() {
@@ -134,7 +136,8 @@ pub fn build(
         let local: DateTime<Local> = hour_utc.with_timezone(&Local);
         let provider = intern(&mut providers, &d.provider);
         let model = intern(&mut models, &d.model);
-        let project = intern(&mut projects, &d.project);
+        let proj_name = grouper.resolve(&d.project, &d.file);
+        let project = intern(&mut projects, &proj_name);
         let session = session_index(&mut sessions, &mut session_list, d, provider, project);
         grouped
             .entry((
@@ -252,15 +255,28 @@ pub fn embed_json(data: &ReportData) -> Result<String, serde_json::Error> {
         .replace('\u{2029}', "\\u2029"))
 }
 
-/// Replace every project name with `project-N`, in all-time order, wherever
-/// the report would print or embed one. What `--mask` does; the name must not
-/// survive anywhere in the file, not merely be hidden on screen.
+/// Replace every user project name with `project-N`, in all-time order,
+/// wherever the report would print or embed one. Fixed app group labels
+/// (`Tickover auto-ping`, `Agent worktrees`) carry no user repository name and
+/// remain unmasked. What `--mask` does; user names must not survive anywhere
+/// in the file, not merely be hidden on screen.
 pub fn mask_projects(st: &mut Stats, data: &mut ReportData) {
+    let is_unmasked = |name: &str| {
+        name == projects::AUTO_PING_PROJECT || name == projects::UNMAPPED_WORKTREE_PROJECT
+    };
+    let mut idx = 0usize;
     let aliases: HashMap<String, String> = data
         .projects
         .iter()
-        .enumerate()
-        .map(|(i, name)| (name.clone(), format!("project-{}", i + 1)))
+        .map(|name| {
+            let masked = if is_unmasked(name) {
+                name.clone()
+            } else {
+                idx += 1;
+                format!("project-{idx}")
+            };
+            (name.clone(), masked)
+        })
         .collect();
     let alias = |name: &str| {
         aliases
@@ -374,6 +390,28 @@ mod tests {
             .sessions
             .iter()
             .all(|s| s.project.starts_with("project-")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn masking_preserves_fixed_group_labels_while_numbering_user_projects() {
+        let dir = tmpdir("mask-grouped");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        store
+            .append_days(&[
+                line("raw-ping", "tickover-ping-999", "claude-sonnet-4-6", 900, 1),
+                line("raw-repo", "secret-repo", "claude-sonnet-4-6", 100, 1),
+            ])
+            .unwrap();
+        let enabled: HashSet<String> = ["claude".to_string()].into_iter().collect();
+        let mut st = query::compute(&store, 30, &enabled);
+        let mut data = build(&store, &st, &enabled, false);
+        mask_projects(&mut st, &mut data);
+        let json = embed_json(&data).unwrap();
+        assert!(!json.contains("secret-repo"), "{json}");
+        assert_eq!(data.projects, [projects::AUTO_PING_PROJECT, "project-1"]);
+        assert_eq!(st.projects[0].0, projects::AUTO_PING_PROJECT);
+        assert_eq!(st.projects[1].0, "project-1");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

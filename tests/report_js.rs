@@ -479,3 +479,43 @@ fn the_script_prints_numbers_the_way_the_page_does() {
     assert_eq!(answer, want);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn grouped_projects_add_up_the_same() {
+    if !node_or_skip() {
+        return;
+    }
+    let mut wt = line(
+        "2026-09-21T10",
+        "claude",
+        "agent-deadbeef",
+        "claude-sonnet-4",
+        "s-wt",
+        4,
+    );
+    wt.file =
+        "/Users/u/.claude/projects/-Users-u-work-alpha--claude-worktrees-agent-deadbeef/s.jsonl"
+            .into();
+    let mut main_alpha = line(
+        "2026-09-20T10",
+        "claude",
+        "alpha",
+        "claude-sonnet-4",
+        "s-main",
+        3,
+    );
+    main_alpha.file = "/Users/u/.claude/projects/-Users-u-work-alpha/s.jsonl".into();
+    let ping = line(
+        "2026-09-22T12",
+        "claude",
+        "tickover-ping-123",
+        "claude-sonnet-4",
+        "s-ping",
+        2,
+    );
+    let unmapped = line("2026-09-22T14", "codex", "w1-fix", "gpt-5", "s-unmapped", 5);
+    let lines = vec![main_alpha, wt, ping, unmapped];
+    assert_period(&lines, None, None, "grouped-all");
+    let day = |d| NaiveDate::from_ymd_opt(2026, 9, d);
+    assert_period(&lines, day(21), day(22), "grouped-slice");
+}
