@@ -60,15 +60,20 @@ monthly allowance, and a credit period with balances. Neither this
 ping nor a renewal one (below) is ever launched while the provider's own
 host does not resolve — the tick simply tries again once it does.
 
-Antigravity, which does have a rolling window, deliberately has no `[ping]`.
+**Antigravity** declares two `[[window_ping]]` entries — one per 5-hour
+window (`gemini-5h` with `agy -p hello --model gemini-3.8-flash-low`, and
+`3p-5h` with `agy -p hello --model gpt-oss-120b-medium`) — because each
+model group counts only its own prompts. Like every plugin's ping,
+Antigravity's toggle is **off by default** and has an important caveat:
 Google has confirmed banning accounts over third-party tools and proxies
-driving Antigravity's underlying quota, with reports of the ban cascading to
+automating Antigravity's underlying quota, with bans reported cascading to
 Gemini CLI / Code Assist on the same account — see this
 [gemini-cli discussion](https://github.com/google-gemini/gemini-cli/discussions/20632).
 [`leonidlouis/antigravity-quota-refresher`](https://github.com/leonidlouis/antigravity-quota-refresher),
-a tool built for exactly the job `[ping]` does for Codex and Claude, is marked deprecated for this reason —
-its users got banned. Nothing here second-guesses that: Antigravity stays
-read-only, however tempting an empty window is to nudge.
+a tool built specifically to refresh Antigravity quotas automatically, is
+marked deprecated for this reason after its users got banned. Antigravity
+stays read-only unless you explicitly switch its auto-ping toggle on; enable
+it only if you accept that account-ban risk.
 
 The mechanism, its bounds and where the command runs are in
 the README and in

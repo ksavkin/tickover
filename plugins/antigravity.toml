@@ -26,7 +26,7 @@ name         = "Antigravity"
 menu_label   = "Ag"
 order        = 40
 requires_reader = ["http-post", "remaining-fraction", "window-identity", "keychain-expiry", "oauth-refresh", "oauth-client-discovery", "reading-history"]
-version      = "1.2.0"
+version      = "1.3.0"
 engine       = "http-api"
 refresh_secs = 60
 
@@ -101,6 +101,33 @@ assumed = 10080
 remaining_fraction_path = "groups[displayName=Claude and GPT models].buckets[bucketId=3p-weekly].remainingFraction"
 resets_at_path          = "groups[displayName=Claude and GPT models].buckets[bucketId=3p-weekly].resetTime"
 resets_at_format        = "iso8601"
+
+# Auto-ping: one command per 5-hour window, because each group counts only
+# its own models — a Gemini prompt starts `gemini-5h` and nothing else, and
+# a GPT-OSS prompt starts `3p-5h` (and, as a side effect nothing on the
+# command line can avoid, `3p-wk` with it). Measured 15.11.2026 with agy
+# 1.5.9: `agy -p hello --model gpt-oss-120b-medium` exited 0 in 4 s and
+# moved `3p-5h` from an unstarted 0% to 0.017%, leaving the Gemini group
+# alone; an unknown `--model` exits 1 at once without spending anything.
+# Each is the cheapest model of its group. `agy` has no alias that tracks
+# the cheapest model the way Claude's `haiku` does, so these ids will need
+# a manifest update when Google retires them; until then a retired one
+# fails, and is retried a period later rather than every ten minutes
+# (`main.rs::ping_due` on a reset that moves with the clock, which is what
+# an unstarted Antigravity window states).
+#
+# `[[window_ping]]` rather than `[ping]`: a build that predates it sees no
+# ping at all here, which is what it saw before — not a `[ping]` it would
+# retry every ten minutes against that moving reset.
+[[window_ping]]
+window = "gemini-5h"
+bin    = "agy"
+args   = ["-p", "hello", "--model", "gemini-3.8-flash-low"]
+
+[[window_ping]]
+window = "3p-5h"
+bin    = "agy"
+args   = ["-p", "hello", "--model", "gpt-oss-120b-medium"]
 
 # POST with an empty JSON body `{}` (measured: the endpoint parses the body and
 # accepts `{}`; an unknown field is rejected, so `{}` is what it wants). The

@@ -515,8 +515,12 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "antigravity.toml",
         id: "antigravity",
-        to_version: "1.2.0",
+        to_version: "1.3.0",
         previous_sha256: &[
+            // 1.2.0 — before `[[window_ping]]`, so neither 5-hour window was
+            // ever auto-pinged.
+            // sha256 of antigravity.toml as shipped at manifest version 1.2.0.
+            "5edef9870d52f32d3c17514018cda5747fb3dedee58c67fe70f0b00afc207f53",
             // 1.1.4 — before `[history]`, so an install left on it never
             // collects token usage from `conversations/*.db`.
             // sha256 of antigravity.toml as shipped at manifest version 1.1.4.

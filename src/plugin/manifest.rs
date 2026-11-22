@@ -179,6 +179,15 @@ pub struct PluginManifest {
     /// `[ping]` — optional auto-ping command run after a window resets.
     pub ping: Option<PingConfig>,
 
+    /// `[[window_ping]]` — auto-ping commands that each start one named
+    /// window, for a provider with more than one 5-hour window, or whose
+    /// windows need different commands to start (Antigravity's Gemini and
+    /// third-party groups each count only their own models). See
+    /// [`WindowPingConfig`] for why this is a table of its own rather than
+    /// more fields under `[ping]`.
+    #[serde(default)]
+    pub window_ping: Vec<WindowPingConfig>,
+
     /// `[[option]]` — declarative bool options the plugin exposes to its own
     /// engine substitution (`{option.<key>}` in a header, URL or log-file
     /// path — see the engines' own docs). Purely declarative here: this
@@ -3011,47 +3020,55 @@ impl PluginManifest {
         // usual install locations — and "the plugin runs /some/absolute/thing"
         // is a worse sentence to have to put in a trust dialog than it is to
         // simply refuse.
+        //
+        // `[ping] args` reaches the install-time trust dialog verbatim
+        // (`main.rs`'s `build_trust_message` renders the command line a
+        // ping will run) before it is ever spawned as one — the bounds
+        // in `validate_ping_command` are for that dialog, not the spawn
+        // itself (`std::process::Command::arg` takes arbitrary bytes safely
+        // either way): an unbounded count or length lets a manifest push
+        // the untrusted-host warning that dialog carries clean off the
+        // bottom. `[[window_ping]]` commands reach the same dialog and get
+        // the same checks.
         if let Some(ping) = &self.ping {
-            if ping.bin.trim().is_empty() {
-                return Err("`[ping] bin` must not be empty".to_string());
-            }
-            // `:` alone is a no-op on this platform's own charset check —
-            // `contains('/')`/`contains('\\')` already refuse a Unix or
-            // Windows separator — but on Windows `C:evil` is a **prefixed
-            // relative** path (relative to whatever directory drive `C:` is
-            // current on), not the bare name it looks like beside `/`/`\`.
-            if ping.bin.contains(['/', '\\', ':']) {
+            validate_ping_command("[ping]", &ping.bin, &ping.args)?;
+        }
+        let mut pinged_windows = std::collections::HashSet::new();
+        for wp in &self.window_ping {
+            let table = format!("[[window_ping]] window = \"{}\":", wp.window);
+            validate_ping_command(&table, &wp.bin, &wp.args)?;
+            // Matched on the declared `id`, never on a position: a ping is
+            // pinned to one window, and a reordering of `[[windows]]` must not
+            // quietly point it at another.
+            let Some(target) = self
+                .windows
+                .iter()
+                .find(|w| !w.id.is_empty() && w.id == wp.window)
+            else {
                 return Err(format!(
-                    "`[ping] bin = \"{}\"` must be a bare program name, not a path",
-                    ping.bin
+                    "`[[window_ping]] window = \"{}\"` names no `[[windows]]` entry with that `id`",
+                    wp.window
+                ));
+            };
+            // An enumerating entry is many windows under one id; which of them
+            // a single command starts is not something this table can say.
+            if target.for_each.is_some() {
+                return Err(format!(
+                    "`[[window_ping]] window = \"{}\"` names an enumerating (`for_each`) window",
+                    wp.window
                 ));
             }
-            // `[ping] args` reaches the install-time trust dialog verbatim
-            // (`main.rs`'s `build_trust_message` renders the command line a
-            // ping will run) before it is ever spawned as one — the bounds
-            // below are for that dialog, not the spawn itself
-            // (`std::process::Command::arg` takes arbitrary bytes safely
-            // either way): an unbounded count or length lets a manifest push
-            // the untrusted-host warning that dialog carries clean off the
-            // bottom.
-            if ping.args.len() > PING_ARGS_MAX_COUNT {
+            if !pinged_windows.insert(wp.window.as_str()) {
                 return Err(format!(
-                    "`[ping] args` names {} entries — a ping is a short, fixed command line, and \
-                     {PING_ARGS_MAX_COUNT} is more than any real one needs",
-                    ping.args.len()
+                    "`[[window_ping]] window = \"{}\"` is declared more than once",
+                    wp.window
                 ));
             }
-            if ping.args.iter().any(|a| a.is_empty()) {
-                return Err(
-                    "`[ping] args` entries must not be empty — an empty argument says nothing in \
-                     the trust dialog and does nothing on the command line"
-                        .to_string(),
-                );
-            }
-            if let Some(bad) = ping.args.iter().find(|a| a.len() > PING_ARG_MAX_BYTES) {
+            if self.ping.is_some() && target.role == Role::Primary {
                 return Err(format!(
-                    "`[ping] args` has an entry of {} bytes — the limit is {PING_ARG_MAX_BYTES}",
-                    bad.len()
+                    "`[[window_ping]] window = \"{}\"` is the primary window, which `[ping]` \
+                     already pings",
+                    wp.window
                 ));
             }
         }
@@ -3160,6 +3177,27 @@ impl PluginManifest {
             for (i, arg) in ping.args.iter().enumerate() {
                 control_char_fields.push((
                     format!("`[ping] args[{i}]`"),
+                    arg.as_str(),
+                    CharClass::Wide,
+                ));
+            }
+        }
+        for (n, wp) in self.window_ping.iter().enumerate() {
+            // The same command line `[ping]`'s is, reaching the same dialog;
+            // `window` becomes part of a config key and a log line.
+            control_char_fields.push((
+                format!("`[[window_ping]]` #{n} `window`"),
+                wp.window.as_str(),
+                CharClass::Wide,
+            ));
+            control_char_fields.push((
+                format!("`[[window_ping]]` #{n} `bin`"),
+                wp.bin.as_str(),
+                CharClass::Wide,
+            ));
+            for (i, arg) in wp.args.iter().enumerate() {
+                control_char_fields.push((
+                    format!("`[[window_ping]]` #{n} `args[{i}]`"),
                     arg.as_str(),
                     CharClass::Wide,
                 ));
@@ -5487,6 +5525,77 @@ const PING_ARGS_MAX_COUNT: usize = 32;
 /// single entry cannot push the untrusted-host clause off the bottom of the
 /// install-time trust dialog that renders the whole command line.
 const PING_ARG_MAX_BYTES: usize = 256;
+
+/// One `[[window_ping]]` — a command that starts the window named by
+/// `window` (a `[[windows]] id`), run while that window sits empty, under the
+/// same per-plugin toggle as `[ping]` but with its own record of when it last
+/// ran (`config::plugin_window_pinged_at`).
+///
+/// A table of its own, not more fields under `[ping]`, for the build that
+/// predates it. An older reader ignores a key it does not know, so anything
+/// added under `[ping]` would leave that build running `[ping]` with none of
+/// what came with it. For Antigravity that is not merely fewer pings: an
+/// empty Antigravity window states a reset one period from *now*, moving
+/// with every reading, and only a build that knows that shape retries a
+/// failed ping a period later instead of every ten minutes. A manifest that
+/// pings through `[[window_ping]]` alone is, to an older build, a manifest
+/// with no ping at all — exactly what it was before — so no
+/// `requires_reader` entry is needed, and declaring one would only make
+/// that build refuse the whole manifest, readings included.
+///
+/// No `renews_token`: renewing a lapsed token is `[ping]`'s job, triggered
+/// by a reading rather than a window, and one command per provider does it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WindowPingConfig {
+    /// The `id` of the `[[windows]]` entry this command starts. Must name a
+    /// declared, non-enumerating window, at most one `[[window_ping]]` per
+    /// window, and never the `primary` window when `[ping]` is also declared
+    /// (that one is already `[ping]`'s).
+    pub window: String,
+    /// Bare program name, resolved exactly like `[ping] bin`.
+    pub bin: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// The checks `[ping]` and every `[[window_ping]]` share: a bare program name
+/// and a short, bounded command line (see the call site in `validate` for
+/// why each bound exists). `table` names the section in the message.
+fn validate_ping_command(table: &str, bin: &str, args: &[String]) -> Result<(), String> {
+    if bin.trim().is_empty() {
+        return Err(format!("`{table} bin` must not be empty"));
+    }
+    // `:` alone is a no-op on this platform's own charset check —
+    // `contains('/')`/`contains('\\')` already refuse a Unix or
+    // Windows separator — but on Windows `C:evil` is a **prefixed
+    // relative** path (relative to whatever directory drive `C:` is
+    // current on), not the bare name it looks like beside `/`/`\`.
+    if bin.contains(['/', '\\', ':']) {
+        return Err(format!(
+            "`{table} bin = \"{bin}\"` must be a bare program name, not a path"
+        ));
+    }
+    if args.len() > PING_ARGS_MAX_COUNT {
+        return Err(format!(
+            "`{table} args` names {} entries — a ping is a short, fixed command line, and \
+             {PING_ARGS_MAX_COUNT} is more than any real one needs",
+            args.len()
+        ));
+    }
+    if args.iter().any(|a| a.is_empty()) {
+        return Err(format!(
+            "`{table} args` entries must not be empty — an empty argument says nothing in \
+             the trust dialog and does nothing on the command line"
+        ));
+    }
+    if let Some(bad) = args.iter().find(|a| a.len() > PING_ARG_MAX_BYTES) {
+        return Err(format!(
+            "`{table} args` has an entry of {} bytes — the limit is {PING_ARG_MAX_BYTES}",
+            bad.len()
+        ));
+    }
+    Ok(())
+}
 
 // ── [[option]] ────────────────────────────────────────────────────────────
 

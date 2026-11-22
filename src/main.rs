@@ -2352,7 +2352,9 @@ fn run_slow_timer(
             {
                 let ps = ctx.plugins.borrow();
                 let written = record_seen_windows(&ps, &current, now);
-                for m in ps.iter().filter(|m| m.ping.is_some() && plugin_enabled(m)) {
+                for m in ps.iter().filter(|m| {
+                    (m.ping.is_some() || !m.window_ping.is_empty()) && plugin_enabled(m)
+                }) {
                     // The filter above already established `plugin_enabled(m)`;
                     // passed as `true` rather than asked a second time. Checked
                     // before either lookup below so a plugin whose ping toggle
@@ -2436,7 +2438,10 @@ fn run_slow_timer(
                         None
                     };
                     if let Some((surface_key, renewal)) = due {
-                        let ping = m.ping.as_ref().expect("filtered by ping.is_some() above");
+                        let ping = m
+                            .ping
+                            .as_ref()
+                            .expect("a renewal is only wanted when `[ping]` is declared");
                         // This gate is asked every tick a renewal stays due —
                         // see `ping_network_gate`'s own doc for why that is
                         // fine (the resolve, not the ask, is what's cached).
@@ -2457,74 +2462,87 @@ fn run_slow_timer(
                     let Some(first_id) = first_surface_reading_id(m) else {
                         continue;
                     };
-                    // `written` first — `record_seen_windows` just above may have
-                    // recorded exactly this window on this very tick, and
-                    // `seen_window_for` would otherwise reread and reparse
-                    // `config.json` to learn what this loop's own caller already
-                    // knows (that write is what invalidated `config`'s cache in
-                    // the first place). Falling back to `seen_window_for` with
-                    // `m`, not a lookup by reading id: this loop already holds
-                    // the manifest, and the registry key is namespaced by the
-                    // *owner's* id, so asking with `m` reads exactly the key
-                    // `record_seen_windows` wrote for it. Going back through
-                    // the reading id would run `owning_manifest` again only to
-                    // have it answer `None` for a reading id two manifests both
-                    // claim — costing this provider its auto-ping over a
-                    // collision the panel is right to be cautious about and the
-                    // ping need not be.
-                    let Some(primary_key) = primary_window_key(m) else {
-                        continue;
-                    };
-                    let seen_window = written
-                        .get(&(m.id.clone(), first_id.clone(), primary_key.clone()))
-                        .copied()
-                        .or_else(|| seen_window_for(m, &first_id, &primary_key));
-                    let Some(window) = ping_window(
-                        m,
-                        current.iter().find(|r| r.id == first_id),
-                        seen_window.as_ref().and_then(|s| s.period_minutes),
-                    ) else {
-                        continue;
-                    };
-                    let seen = seen_window.map_or(0, |s| s.at);
-                    if !ping_due(
-                        window.used_percent,
-                        window.resets_at,
-                        window.period_minutes,
-                        seen,
-                        pinged_at,
-                        now,
-                    ) {
-                        continue;
+                    // `[ping]`: the primary window of the first surface, under
+                    // the plugin's one `pinged_at`. A manifest that pings only
+                    // through `[[window_ping]]` declares none.
+                    'primary: {
+                        let Some(ping) = m.ping.as_ref() else {
+                            break 'primary;
+                        };
+                        // `written` first — `record_seen_windows` just above may have
+                        // recorded exactly this window on this very tick, and
+                        // `seen_window_for` would otherwise reread and reparse
+                        // `config.json` to learn what this loop's own caller already
+                        // knows (that write is what invalidated `config`'s cache in
+                        // the first place). Falling back to `seen_window_for` with
+                        // `m`, not a lookup by reading id: this loop already holds
+                        // the manifest, and the registry key is namespaced by the
+                        // *owner's* id, so asking with `m` reads exactly the key
+                        // `record_seen_windows` wrote for it. Going back through
+                        // the reading id would run `owning_manifest` again only to
+                        // have it answer `None` for a reading id two manifests both
+                        // claim — costing this provider its auto-ping over a
+                        // collision the panel is right to be cautious about and the
+                        // ping need not be.
+                        let Some(primary_key) = primary_window_key(m) else {
+                            break 'primary;
+                        };
+                        let seen_window = written
+                            .get(&(m.id.clone(), first_id.clone(), primary_key.clone()))
+                            .copied()
+                            .or_else(|| seen_window_for(m, &first_id, &primary_key));
+                        let Some(window) = ping_window(
+                            m,
+                            current.iter().find(|r| r.id == first_id),
+                            seen_window.as_ref().and_then(|s| s.period_minutes),
+                        ) else {
+                            break 'primary;
+                        };
+                        let seen = seen_window.map_or(0, |s| s.at);
+                        if !ping_due(
+                            window.used_percent,
+                            window.resets_at,
+                            window.period_minutes,
+                            seen,
+                            pinged_at,
+                            now,
+                        ) {
+                            break 'primary;
+                        }
+                        // This gate is asked every tick the window stays due —
+                        // see `ping_network_gate`'s own doc for why that is fine
+                        // (the resolve, not the ask, is what's cached).
+                        // `pinged_at` is still untouched at this point, so
+                        // `Pending` or `Unreachable` cost nothing: this window is
+                        // still due, and fires on whichever later tick finally
+                        // sees the host resolve.
+                        if ping_network_gate(&m.id, ping_host(m).as_deref())
+                            != PingNetwork::Reachable
+                        {
+                            break 'primary;
+                        }
+                        // Resolved before `set_plugin_pinged_at` below — see
+                        // `ping_binary`'s own doc for the window ping's half of
+                        // its reasoning: writing `pinged_at` for a run that
+                        // never happened would spend this window's one ping on
+                        // nothing, silencing it until the window ends. Checking
+                        // first means a binary that reappears mid-window still
+                        // gets pinged before it does, not only at the next one.
+                        let Some(bin) = ping_binary(&m.id, &ping.bin) else {
+                            break 'primary;
+                        };
+                        // Recorded first, and the command run on this same tick. There
+                        // is deliberately no delay between the two: a gap is a window
+                        // in which the app can be quit with the ping recorded and never
+                        // sent, which on-disk state would then remember for good.
+                        // `pinged_at_while` hands the stamp back when the run never
+                        // started — see its own doc for why that undo matters.
+                        pinged_at_while(&m.id, now, || spawn_hello(bin, ping.args.clone(), None));
                     }
-                    // This gate is asked every tick the window stays due —
-                    // see `ping_network_gate`'s own doc for why that is fine
-                    // (the resolve, not the ask, is what's cached).
-                    // `pinged_at` is still untouched at this point, so
-                    // `Pending` or `Unreachable` cost nothing: this window is
-                    // still due, and fires on whichever later tick finally
-                    // sees the host resolve.
-                    if ping_network_gate(&m.id, ping_host(m).as_deref()) != PingNetwork::Reachable {
-                        continue;
-                    }
-                    let ping = m.ping.as_ref().expect("filtered by ping.is_some() above");
-                    // Resolved before `set_plugin_pinged_at` below — see
-                    // `ping_binary`'s own doc for the window ping's half of
-                    // its reasoning: writing `pinged_at` for a run that
-                    // never happened would spend this window's one ping on
-                    // nothing, silencing it until the window ends. Checking
-                    // first means a binary that reappears mid-window still
-                    // gets pinged before it does, not only at the next one.
-                    let Some(bin) = ping_binary(&m.id, ping) else {
-                        continue;
-                    };
-                    // Recorded first, and the command run on this same tick. There
-                    // is deliberately no delay between the two: a gap is a window
-                    // in which the app can be quit with the ping recorded and never
-                    // sent, which on-disk state would then remember for good.
-                    // `pinged_at_while` hands the stamp back when the run never
-                    // started — see its own doc for why that undo matters.
-                    pinged_at_while(&m.id, now, || spawn_hello(bin, ping.args.clone(), None));
+                    // `[[window_ping]]`: each named window on the same
+                    // surface, each under its own record — see
+                    // `run_window_pings`.
+                    run_window_pings(m, &first_id, &current, &written, now);
                 }
             }
 
@@ -4410,6 +4428,120 @@ fn ping_window(
     })
 }
 
+/// [`ping_window`] for a window named by its `[[windows]] id` — the one a
+/// `[[window_ping]]` starts — rather than for whichever window is primary.
+/// The same shape of answer: what the reading says about that window, or,
+/// when it says nothing, a length to project the boundary with. `None` for an
+/// errored reading, no reading, or an `id` the manifest does not declare
+/// (`validate` refuses that last one at load).
+fn named_ping_window(
+    m: &PluginManifest,
+    reading: Option<&ProviderReading>,
+    window_id: &str,
+    remembered_period_minutes: Option<u64>,
+) -> Option<PingWindow> {
+    let reading = reading?;
+    if reading.error.is_some() {
+        return None;
+    }
+    let (index, declared) = m
+        .windows
+        .iter()
+        .enumerate()
+        .find(|(_, w)| !w.id.is_empty() && w.id == window_id)?;
+    let key = tickover::plugin::window_key(declared, index);
+    let window = match reading.windows.iter().find(|w| w.key == key) {
+        Some(w) => PingWindow {
+            used_percent: w.used_percent,
+            resets_at: w.resets_at,
+            period_minutes: w.period_minutes,
+        },
+        None => PingWindow {
+            used_percent: None,
+            resets_at: None,
+            period_minutes: match declared.period.mode {
+                manifest::PeriodMode::Assumed => declared.period.assumed,
+                manifest::PeriodMode::FromField => remembered_period_minutes,
+                manifest::PeriodMode::FromBounds => {
+                    declared.period.assumed.or(remembered_period_minutes)
+                }
+            },
+        },
+    };
+    Some(window)
+}
+
+/// Run every `[[window_ping]]` of `m` whose window is due — each judged by
+/// [`ping_due`] against its own record (`config::plugin_window_pinged_at`),
+/// so starting one window neither spends nor delays another's ping. The
+/// caller has already checked the plugin is enabled and its ping toggle on.
+///
+/// Read from the first surface, as `[ping]`'s primary window is: that is the
+/// surface the seen-window registry's ping fallback is written for, and the
+/// only one a CLI started without any account selection can be assumed to
+/// speak for.
+fn run_window_pings(
+    m: &PluginManifest,
+    first_id: &str,
+    current: &[ProviderReading],
+    written: &HashMap<(String, String, String), config::SeenWindow>,
+    now: u64,
+) {
+    let reading = current.iter().find(|r| r.id == first_id);
+    for wp in &m.window_ping {
+        let pinged_at = config::plugin_window_pinged_at(&m.id, &wp.window);
+        // Remembered length first, the same order `[ping]`'s path asks in:
+        // `written` holds what this very tick recorded.
+        let declared_key = m
+            .windows
+            .iter()
+            .enumerate()
+            .find(|(_, w)| !w.id.is_empty() && w.id == wp.window)
+            .map(|(i, w)| tickover::plugin::window_key(w, i));
+        let Some(declared_key) = declared_key else {
+            continue;
+        };
+        let seen_window = written
+            .get(&(m.id.clone(), first_id.to_string(), declared_key.clone()))
+            .copied()
+            .or_else(|| seen_window_for(m, first_id, &declared_key));
+        let Some(window) = named_ping_window(
+            m,
+            reading,
+            &wp.window,
+            seen_window.as_ref().and_then(|s| s.period_minutes),
+        ) else {
+            continue;
+        };
+        if !ping_due(
+            window.used_percent,
+            window.resets_at,
+            window.period_minutes,
+            seen_window.map_or(0, |s| s.at),
+            pinged_at,
+            now,
+        ) {
+            continue;
+        }
+        // Asked only once a window is due, as on `[ping]`'s path; a
+        // `Pending` or `Unreachable` answer leaves the record untouched, so
+        // the window stays due for a later tick.
+        if ping_network_gate(&m.id, ping_host(m).as_deref()) != PingNetwork::Reachable {
+            return;
+        }
+        let Some(bin) = ping_binary(&m.id, &wp.bin) else {
+            continue;
+        };
+        diag::line(format!(
+            "auto-ping: {} window {} is empty, running {}",
+            m.id, wp.window, wp.bin
+        ));
+        window_pinged_at_while(&m.id, &wp.window, now, || {
+            spawn_hello(bin, wp.args.clone(), None)
+        });
+    }
+}
+
 // ── Seen-window registry ────────────────────────────────────────────────────
 //
 // One record of what each provider last *stated* about each of its quota
@@ -4917,8 +5049,38 @@ fn ping_due(
     let period = period_minutes
         .filter(|m| *m > 0)
         .map_or(ASSUMED_WINDOW_SECS, |m| m.saturating_mul(60));
-    window_start(resets_at, period, seen_window, now)
-        .is_some_and(|start| pinged_at.saturating_add(PING_GRACE_SECS) < start)
+    let Some(start) = window_start(resets_at, period, seen_window, now) else {
+        return false;
+    };
+    if pinged_at.saturating_add(PING_GRACE_SECS) >= start {
+        return false;
+    }
+    // A window that "began" within the floor of now, still empty, is either
+    // one that really did just begin or one whose reset moves with the clock
+    // because nothing has started it — Antigravity's shape for an unstarted
+    // window is a reset exactly one period from the moment of the reading.
+    // The two cannot be told apart from one reading, and only the second
+    // matters here: read as stated, it "began" again on every reading, so a
+    // ping that failed to start it (a retired `--model` is refused with exit
+    // 1) was owed again each time the floor above passed — a process every
+    // ten minutes, indefinitely. So a fresh-looking start owes a ping only a
+    // full period after the last one, the same retry a silent Codex window
+    // gets from `window_start`'s projection. Only for a *stated* reset: a
+    // vanished one already retries a period apart through that projection,
+    // whose boundary lands within the floor of `now` on every retry by
+    // construction. A stated window that genuinely began just now loses
+    // nothing by it: a ping that started a window is at least a period
+    // behind the next boundary, so only a ping that achieved nothing — or
+    // one sent into a window already running at a rounded 0% — is ever held
+    // back.
+    if pinged_at > 0
+        && resets_at.is_some()
+        && now.saturating_sub(start) < PING_MIN_INTERVAL_SECS
+        && now.saturating_sub(pinged_at) < period
+    {
+        return false;
+    }
+    true
 }
 
 /// How many renewal attempts one distinct `TokenRenewal` value spends at the
@@ -7448,17 +7610,38 @@ fn quote_command_arg(arg: &str) -> String {
 /// while running something else is how a third-party manifest would get a
 /// command executed without ever saying so.
 fn ping_command_line(ping: &manifest::PingConfig) -> String {
+    command_line(&ping.bin, &ping.args)
+}
+
+/// Every command the plugin's one ping toggle can run — `[ping]`, then each
+/// `[[window_ping]]` in manifest order — joined with `"; "`. The toggle runs
+/// all of them, so its label names all of them: a label naming only the
+/// first would be the checkbox-says-one-thing case [`ping_command_line`]
+/// exists to rule out.
+fn ping_commands_label(m: &PluginManifest) -> String {
+    m.ping
+        .iter()
+        .map(ping_command_line)
+        .chain(
+            m.window_ping
+                .iter()
+                .map(|wp| command_line(&wp.bin, &wp.args)),
+        )
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn command_line(bin: &str, args: &[String]) -> String {
     // `bin` is quoted by the same rule as the args: the checkbox shows a
     // command line, and a `bin` with whitespace in it would read as the
     // first of the args. (The validator refuses a path separator in `bin`,
     // but whitespace in a bare program name it does not — and quoting is
     // display-only either way, so quoting it always is the safe read.)
-    let bin = quote_command_arg(&ping.bin);
-    if ping.args.is_empty() {
+    let bin = quote_command_arg(bin);
+    if args.is_empty() {
         bin
     } else {
-        let args = ping
-            .args
+        let args = args
             .iter()
             .map(|a| quote_command_arg(a))
             .collect::<Vec<_>>()
@@ -7500,8 +7683,8 @@ fn plugin_row(m: &PluginManifest) -> PluginRow {
         menu_label: ss(&m.menu_label),
         engine: ss(engine_label(m.engine)),
         enabled: plugin_enabled(m),
-        has_ping: m.ping.is_some(),
-        ping_command: ss(m.ping.as_ref().map(ping_command_line).unwrap_or_default()),
+        has_ping: m.ping.is_some() || !m.window_ping.is_empty(),
+        ping_command: ss(ping_commands_label(m)),
         ping_enabled: config::plugin_ping(&m.id),
         surfaces: ModelRc::from(Rc::new(VecModel::from(surfaces))),
         options: ModelRc::from(Rc::new(VecModel::from(options))),
@@ -9941,18 +10124,18 @@ static PING_BIN_MISSING: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(N
 /// spending the window's one ping on a run that never happened, silencing
 /// it until the window ends: a binary that reappears mid-window still gets
 /// pinged before it does, not only at the next one.
-fn ping_binary(plugin_id: &str, ping: &manifest::PingConfig) -> Option<std::path::PathBuf> {
-    let key = (plugin_id.to_string(), ping.bin.clone());
+fn ping_binary(plugin_id: &str, bin_name: &str) -> Option<std::path::PathBuf> {
+    let key = (plugin_id.to_string(), bin_name.to_string());
     let mut guard = PING_BIN_MISSING.lock().unwrap_or_else(|e| e.into_inner());
     let missing = guard.get_or_insert_with(HashSet::new);
-    match find_bin(&ping.bin) {
+    match find_bin(bin_name) {
         Some(bin) => {
             missing.remove(&key);
             Some(bin)
         }
         None => {
             if note_missing(missing, key) {
-                diag::line(format!("auto-ping: {} binary not found", ping.bin));
+                diag::line(format!("auto-ping: {bin_name} binary not found"));
             }
             None
         }
@@ -10009,7 +10192,7 @@ fn run_renewal_ping(
     renewal: TokenRenewal,
     now: u64,
 ) -> bool {
-    let Some(bin) = ping_binary(plugin_id, ping) else {
+    let Some(bin) = ping_binary(plugin_id, &ping.bin) else {
         return false;
     };
     let (previous, credited) = credit_renewal(&surface_key, renewal);
@@ -10045,6 +10228,24 @@ fn pinged_at_while(plugin_id: &str, now: u64, attempt: impl FnOnce() -> bool) ->
     let ran = attempt();
     if !ran {
         config::set_plugin_pinged_at(plugin_id, before);
+    }
+    ran
+}
+
+/// [`pinged_at_while`] for one `[[window_ping]]` window's own record
+/// (`config::plugin_window_pinged_at`) — the same borrow-then-restore, for
+/// the same reason.
+fn window_pinged_at_while(
+    plugin_id: &str,
+    window: &str,
+    now: u64,
+    attempt: impl FnOnce() -> bool,
+) -> bool {
+    let before = config::plugin_window_pinged_at(plugin_id, window);
+    config::set_plugin_window_pinged_at(plugin_id, window, now);
+    let ran = attempt();
+    if !ran {
+        config::set_plugin_window_pinged_at(plugin_id, window, before);
     }
     ran
 }
@@ -13909,6 +14110,145 @@ mod title_tests {
         }
     }
 
+    fn shipped_antigravity() -> PluginManifest {
+        PluginManifest::from_str(include_str!("../plugins/antigravity.toml"))
+            .expect("the shipped Antigravity manifest is valid")
+    }
+
+    fn antigravity_window(key: &str, used: f64, in_secs: u64) -> Window {
+        Window {
+            key: key.to_string(),
+            label: key.to_string(),
+            role: Role::Extra,
+            used_percent: Some(used),
+            resets_at: Some(NOW + in_secs),
+            period_minutes: Some(300),
+        }
+    }
+
+    /// Antigravity pings both 5-hour windows, each with its own group's
+    /// model, and only through `[[window_ping]]` — a build that predates
+    /// that table must see no ping here at all (see the manifest's own
+    /// comment), so a `[ping]` creeping back in is a regression this catches.
+    #[test]
+    fn the_shipped_antigravity_manifest_pings_both_five_hour_windows_and_nothing_else() {
+        let m = shipped_antigravity();
+        assert!(
+            m.ping.is_none(),
+            "an older build must find no `[ping]` here"
+        );
+        let targets: Vec<(&str, &str)> = m
+            .window_ping
+            .iter()
+            .map(|wp| {
+                (
+                    wp.window.as_str(),
+                    wp.args.last().map_or("", String::as_str),
+                )
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                ("gemini-5h", "gemini-3.8-flash-low"),
+                ("3p-5h", "gpt-oss-120b-medium")
+            ]
+        );
+        assert_eq!(
+            ping_commands_label(&m),
+            "agy -p hello --model gemini-3.8-flash-low; agy -p hello --model gpt-oss-120b-medium",
+            "the one toggle runs both commands, so its label names both"
+        );
+    }
+
+    /// Each `[[window_ping]]` reads its own window off the reading, by the
+    /// key its declared id builds — not the primary one `ping_window` reads —
+    /// and an unstarted Antigravity window (0%, reset one period out) is due
+    /// for its ping while a running one is not.
+    #[test]
+    fn named_ping_window_reads_the_window_its_id_names() {
+        let m = shipped_antigravity();
+        let reading = reading_with(
+            vec![
+                antigravity_window("gemini-5h:", 4.0, 3 * 3600),
+                antigravity_window("3p-5h:", 0.0, 5 * 3600),
+            ],
+            None,
+        );
+        let gemini = named_ping_window(&m, Some(&reading), "gemini-5h", None).unwrap();
+        assert_eq!(gemini.used_percent, Some(4.0));
+        let third_party = named_ping_window(&m, Some(&reading), "3p-5h", None).unwrap();
+        assert_eq!(third_party.used_percent, Some(0.0));
+        assert_eq!(third_party.resets_at, Some(NOW + 5 * 3600));
+
+        let due =
+            |w: &PingWindow| ping_due(w.used_percent, w.resets_at, w.period_minutes, 0, 0, NOW);
+        assert!(
+            due(&third_party),
+            "the unstarted 3P window is owed its ping"
+        );
+        assert!(!due(&gemini), "the running Gemini window is left alone");
+    }
+
+    /// No figure is not a reason to ping: an errored reading, a window the
+    /// manifest does not declare, and no reading at all each answer `None`,
+    /// as `ping_window` does. A window the reading simply omits still has a
+    /// length to project from — its declared `assumed` period.
+    #[test]
+    fn named_ping_window_answers_nothing_it_cannot_read() {
+        let m = shipped_antigravity();
+        let failed = reading_with(Vec::new(), Some("HTTP 503"));
+        assert!(named_ping_window(&m, Some(&failed), "3p-5h", None).is_none());
+        assert!(named_ping_window(&m, None, "3p-5h", None).is_none());
+        let silent = reading_with(Vec::new(), None);
+        assert!(named_ping_window(&m, Some(&silent), "no-such-window", None).is_none());
+        let omitted = named_ping_window(&m, Some(&silent), "3p-5h", None).unwrap();
+        assert_eq!(omitted.used_percent, None);
+        assert_eq!(omitted.resets_at, None);
+        assert_eq!(
+            omitted.period_minutes,
+            Some(300),
+            "the declared `assumed` length"
+        );
+    }
+
+    /// Antigravity omits an exhausted bucket from its proto3 response rather
+    /// than reporting `remainingFraction: 0`, so `named_ping_window` returns an
+    /// absent reading (`used_percent: None`, `resets_at: None`) with the
+    /// manifest's `assumed` period. While the last stated reset in the
+    /// seen-window registry is still in the future, `ping_due` must leave that
+    /// exhausted window alone; once the boundary passes without a ping inside
+    /// it, the ping becomes due.
+    #[test]
+    fn named_ping_window_does_not_ping_exhausted_vanished_gemini_window_before_reset() {
+        let m = shipped_antigravity();
+        let reading = reading_with(Vec::new(), None);
+        let window = named_ping_window(&m, Some(&reading), "gemini-5h", None).unwrap();
+        let future_reset = NOW + 3600;
+        assert!(
+            !ping_due(
+                window.used_percent,
+                window.resets_at,
+                window.period_minutes,
+                future_reset,
+                0,
+                NOW,
+            ),
+            "exhausted window still before its remembered reset must not ping"
+        );
+        assert!(
+            ping_due(
+                window.used_percent,
+                window.resets_at,
+                window.period_minutes,
+                future_reset,
+                0,
+                future_reset,
+            ),
+            "once that remembered reset passes, the ping becomes due"
+        );
+    }
+
     /// The loop above `ping_due`, which its own tests cannot see: they are pure
     /// functions over scalars and would keep passing over a loop that never
     /// reaches them. Which is what nearly happened — the loop used to find its
@@ -14712,6 +15052,45 @@ mod title_tests {
         assert!(
             ping_due(None, None, None, boundary, pinged, NOW),
             "a period later the boundary has moved on, so the ping is owed again"
+        );
+    }
+
+    /// Antigravity's shape for a window nobody has started: 0% used and a
+    /// reset exactly one period from *now*, moving forward with every
+    /// reading. Read as stated, that window always "began just now", so a
+    /// ping that did not start it (a retired `--model`, which `agy` refuses
+    /// with exit 1) looked owed again the moment the ten-minute floor
+    /// passed — a process every ten minutes for as long as the toggle
+    /// stayed on. It must wait a period instead, the same retry a silent
+    /// Codex window gets.
+    #[test]
+    fn ping_due_retries_a_floating_reset_a_period_later_not_every_floor() {
+        let floating = |now: u64| Some(now + 5 * 3600);
+        assert!(
+            ping_due(Some(0.0), floating(NOW), FIVE_H, 0, 0, NOW),
+            "never pinged: an unstarted window is owed its ping"
+        );
+        let pinged = NOW - 11 * 60; // a ping that started nothing
+        assert!(
+            !ping_due(Some(0.0), floating(NOW), FIVE_H, 0, pinged, NOW),
+            "eleven minutes after a ping that achieved nothing"
+        );
+        let later = pinged + 5 * 3600;
+        assert!(
+            ping_due(Some(0.0), floating(later), FIVE_H, 0, pinged, later),
+            "a period later the retry is owed"
+        );
+    }
+
+    /// Even when the system clock is smaller than one full window period, a
+    /// never-pinged floating reset (`pinged_at == 0`) must still fire rather
+    /// than matching `now.saturating_sub(0) < period`.
+    #[test]
+    fn ping_due_fires_on_floating_reset_when_never_pinged_even_at_small_clock() {
+        let now = 1_000;
+        assert!(
+            ping_due(Some(0.0), Some(now + 5 * 3600), FIVE_H, 0, 0, now),
+            "pinged_at == 0 means never pinged, regardless of clock magnitude"
         );
     }
 
@@ -17564,7 +17943,7 @@ mod title_tests {
             args: Vec::new(),
             renews_token: true,
         };
-        assert_eq!(ping_binary(&plugin_id, &ping), None);
+        assert_eq!(ping_binary(&plugin_id, &ping.bin), None);
     }
 
     /// A missing `[ping]` binary is caught by `ping_binary` before
