@@ -1205,6 +1205,50 @@ fn rules() -> Vec<Rule> {
             names: "257 bytes",
         },
         Rule {
+            // A ping is pinned to a window by its declared id, never by
+            // position: a reordering must not quietly point it elsewhere.
+            says: "a window ping names a declared window",
+            broken_by: plus(LOGFILE, "[[window_ping]]\nwindow = \"nope\"\nbin = \"agy\""),
+            names: "names no `[[windows]]` entry",
+        },
+        Rule {
+            says: "a window ping cannot start one row of an enumerating entry, so it may not name one",
+            broken_by: plus(
+                &changed(
+                    &http_declaring(r#"["for-each-windows", "window-identity"]"#),
+                    "role  = \"primary\"",
+                    "role  = \"extra\"\nid = \"lim\"\nfor_each = \"limits\"\nelement_id_path = \"id\"",
+                ),
+                "[[window_ping]]\nwindow = \"lim\"\nbin = \"agy\"",
+            ),
+            names: "enumerating",
+        },
+        Rule {
+            says: "one window has one ping",
+            broken_by: plus(
+                &changed(
+                    &declaring(r#"["window-identity"]"#),
+                    "label = \"5H\"",
+                    "id    = \"five\"\nlabel = \"5H\"",
+                ),
+                "[[window_ping]]\nwindow = \"five\"\nbin = \"agy\"\n\n\
+                 [[window_ping]]\nwindow = \"five\"\nbin = \"agy\"",
+            ),
+            names: "declared more than once",
+        },
+        Rule {
+            says: "the primary window is `[ping]`'s when both are declared, so it is not pinged twice",
+            broken_by: plus(
+                &changed(
+                    &declaring(r#"["window-identity"]"#),
+                    "label = \"5H\"",
+                    "id    = \"five\"\nlabel = \"5H\"",
+                ),
+                "[ping]\nbin = \"codex\"\n\n[[window_ping]]\nwindow = \"five\"\nbin = \"agy\"",
+            ),
+            names: "which `[ping]`",
+        },
+        Rule {
             // One shared helper, one row: every field it covers (`allowed_hosts`
             // here, but the same check reaches `[ping] args`, every label,
             // `message`, `service`, `targets`, `client.id_env`/`secret_env`/
@@ -3258,6 +3302,7 @@ fn the_corpus_has_a_line_for_every_rule_the_validator_enforces() {
         "fn validate_http(&self)",
         "fn validate_auth(&self)",
         "fn validate_account_ping_options(&self)",
+        "fn validate_ping_command(",
         "fn validate_templates(&self)",
     ];
     // `check_entry_id` is one refusal shared by `validate_windows` and

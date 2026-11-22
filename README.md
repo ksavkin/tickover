@@ -2,8 +2,8 @@
 
 Your AI coding-assistant quota windows, kept running back to back. When a
 provider's 5-hour window has reset and is sitting empty, Tickover — once you
-switch it on for that provider; Codex and Claude today — sends one tiny
-prompt so the new window starts counting now, not at your first real
+switch it on for that provider; Codex, Claude, and Antigravity today — sends
+one tiny prompt so the new window starts counting now, not at your first real
 request hours later. It also meters what is left: the 5-hour and weekly
 windows of Codex, Claude and Antigravity, Grok's credit usage for its
 current billing period, the balances of Grok, GitHub Copilot and Codex
@@ -54,11 +54,12 @@ to set up.
 
 A 5-hour window starts at your first request, not at the reset. Reset at
 03:00, first prompt at 09:00: six hours of quota went nowhere. Tickover
-watches each provider's primary window and, when it sees it sitting
-**empty** — reset, nothing used — runs one small command: `codex exec …
-hello`, `claude -p hello --model haiku`. That window starts counting now —
-and because a window starts at the first request, a weekly window that had
-reset starts with it.
+watches each provider's primary window — or each named 5-hour window under
+`[[window_ping]]` — and, when it sees it sitting **empty** — reset, nothing
+used — runs one small command: `codex exec … hello`, `claude -p hello --model
+haiku`, or `agy -p hello --model …`. That window starts counting now — and
+because a window starts at the first request, a weekly window that had reset
+starts with it.
 
 The test is "empty", not "the reset just happened", so a machine asleep at
 the boundary pings when it wakes instead of losing the window for good — but
@@ -70,7 +71,10 @@ that one run — normally under the OS temp directory, removed once the
 command exits — so there is nothing there for a prompt to pick up, with the
 Codex sandbox read-only and the usual CLI directories *appended* to `PATH`.
 Off by default, a switch per provider; costs a few tokens per window. The
-Codex and Claude manifests declare one today.
+Codex and Claude manifests declare `[ping]`, and Antigravity declares
+per-window `[[window_ping]]` entries for both of its 5-hour windows (read the
+Google account-ban warning in [`docs/PROVIDERS.md`](docs/PROVIDERS.md#auto-ping)
+before enabling Antigravity's toggle).
 
 A manifest can also set `[ping] renews_token = true` — Claude's does — which
 arms a second trigger for that same command: a surface whose auth chain

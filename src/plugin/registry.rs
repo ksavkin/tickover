@@ -1587,6 +1587,20 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
         }
         line
     });
+    // `[[window_ping]]` commands run under the same toggle, after the same
+    // kind of reset, so they belong in the same clause: each named, after
+    // `[ping]`'s own, joined the way the Settings toggle's label joins them.
+    let window_pings = m.window_ping.iter().map(|wp| {
+        if wp.args.is_empty() {
+            wp.bin.clone()
+        } else {
+            format!("{} {}", wp.bin, wp.args.join(" "))
+        }
+    });
+    let ping = ping
+        .into_iter()
+        .chain(window_pings)
+        .reduce(|a, b| format!("{a}; {b}"));
 
     let untrusted_hosts: Vec<String> = dest_hosts
         .iter()
@@ -2938,6 +2952,64 @@ mod tests {
         assert_eq!(
             analyze_trust(&m, TRUSTED_HOSTS).ping.as_deref(),
             Some("claude -p hello — also run when its token has expired or is no longer accepted"),
+        );
+    }
+
+    /// A `[[window_ping]]` runs a command exactly as `[ping]` does, so it is
+    /// disclosed exactly as `[ping]` is — named in the dialog, and enough on
+    /// its own to require approval. A manifest that pings only through it
+    /// (Antigravity's shape) must not install in silence.
+    #[test]
+    fn window_pings_are_disclosed_and_need_approval_like_ping() {
+        let base = r#"
+            id         = "x"
+            name       = "X"
+            menu_label = "X"
+            order      = 1
+            engine     = "log-file"
+            requires_reader = ["window-identity"]
+            [[windows]]
+            id    = "five"
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [[windows]]
+            id    = "other"
+            label = "O5"
+            role  = "extra"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "q"
+            resets_at_path = "s"
+            [logfile]
+            root = "~/.x"
+            glob = "*.jsonl"
+            container_key = "rate_limits"
+            [[window_ping]]
+            window = "five"
+            bin    = "agy"
+            args   = ["-p", "hello"]
+            [[window_ping]]
+            window = "other"
+            bin    = "agy"
+            args   = ["-p", "hi"]
+        "#;
+        let m = PluginManifest::from_str(base).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert_eq!(disclosure.ping.as_deref(), Some("agy -p hello; agy -p hi"));
+        // `requires_approval` reads that same `ping` value (a log-file
+        // manifest needs approval for its local files anyway, so this
+        // assertion alone could not tell the two causes apart).
+        assert!(
+            disclosure.requires_approval,
+            "a command that runs needs approval whichever table names it"
         );
     }
 

@@ -959,8 +959,8 @@ fn set_plugin_seen_window(id: &str, reset: u64) {
 }
 
 thread_local! {
-    /// The floor the one-second tick loop actually reads for whether a
-    /// plugin's auto-ping is due, for exactly as long as this process
+    /// Keyed by the config key it shadows. The floor the one-second tick
+    /// loop actually reads for whether a plugin's auto-ping is due, for exactly as long as this process
     /// cannot confirm the value landed in `config.json`.
     /// [`set_plugin_pinged_at`] fills this in whenever [`set_u64`] fails,
     /// and empties it again the moment a later write does land — without
@@ -982,21 +982,43 @@ thread_local! {
 /// When this plugin's auto-ping last fired — `0` if it never has. See the
 /// section comment above and [`PINGED_AT_MEMORY`]'s own doc.
 pub fn plugin_pinged_at(id: &str) -> u64 {
-    PINGED_AT_MEMORY
-        .with(|m| m.borrow().get(id).copied())
-        .unwrap_or_else(|| get_u64(&format!("plugin.{id}.pinged_at")))
+    pinged_at_at(&format!("plugin.{id}.pinged_at"))
 }
 pub fn set_plugin_pinged_at(id: &str, when: u64) {
-    if set_u64(&format!("plugin.{id}.pinged_at"), when) {
+    set_pinged_at_at(&format!("plugin.{id}.pinged_at"), when);
+}
+
+/// When this plugin's `[[window_ping]]` for `window` (a `[[windows]] id`)
+/// last fired — `0` if it never has. One record per window rather than the
+/// plugin's single [`plugin_pinged_at`]: two windows of one provider empty
+/// and fill independently, and a ping that just started one says nothing
+/// about the other. Removed with the rest of the plugin's keys
+/// ([`remove_plugin_keys`]); a window the manifest stops declaring leaves its
+/// key behind, which costs one integer and, if the window comes back, at most
+/// one ping sooner than it would otherwise have been sent.
+pub fn plugin_window_pinged_at(id: &str, window: &str) -> u64 {
+    pinged_at_at(&format!("plugin.{id}.pinged_at.{window}"))
+}
+pub fn set_plugin_window_pinged_at(id: &str, window: &str, when: u64) {
+    set_pinged_at_at(&format!("plugin.{id}.pinged_at.{window}"), when);
+}
+
+fn pinged_at_at(key: &str) -> u64 {
+    PINGED_AT_MEMORY
+        .with(|m| m.borrow().get(key).copied())
+        .unwrap_or_else(|| get_u64(key))
+}
+fn set_pinged_at_at(key: &str, when: u64) {
+    if set_u64(key, when) {
         // Landed (or already held this value) — the file is authoritative
         // again, and a stale shadow left standing would outlive the outage
         // it was recorded for.
         PINGED_AT_MEMORY.with(|m| {
-            m.borrow_mut().remove(id);
+            m.borrow_mut().remove(key);
         });
     } else {
         PINGED_AT_MEMORY.with(|m| {
-            m.borrow_mut().insert(id.to_string(), when);
+            m.borrow_mut().insert(key.to_string(), when);
         });
     }
 }
@@ -1075,11 +1097,11 @@ pub fn remove_plugin_keys(id: &str) {
     // would outlive the config key it stood in for, and a reinstalled
     // plugin under the same id would inherit a floor that was never really
     // its own.
+    let prefix = format!("plugin.{id}.");
     PINGED_AT_MEMORY.with(|m| {
-        m.borrow_mut().remove(id);
+        m.borrow_mut().retain(|k, _| !k.starts_with(&prefix));
     });
     let Some(p) = path() else { return };
-    let prefix = format!("plugin.{id}.");
     let keep = format!("plugin.{id}.builtin_migrated");
     let mut cfg = load();
     let Some(obj) = cfg.as_object_mut() else {
@@ -1768,9 +1790,29 @@ mod tests {
             assert_eq!(plugin_seen_window("acme"), 1_700_000_000);
             assert_eq!(plugin_pinged_at("acme"), 1_700_000_005);
 
+            set_plugin_window_pinged_at("acme", "3p-5h", 1_700_000_009);
+            set_plugin_window_pinged_at("other", "3p-5h", 1_700_000_222);
+            assert_eq!(plugin_window_pinged_at("acme", "3p-5h"), 1_700_000_009);
+            assert_eq!(
+                plugin_pinged_at("acme"),
+                1_700_000_005,
+                "a window's record is its own, not the plugin's"
+            );
+            assert_eq!(plugin_window_pinged_at("acme", "gemini-5h"), 0);
+
             remove_plugin_keys("acme");
             assert_eq!(plugin_seen_window("acme"), 0, "removed with the plugin");
             assert_eq!(plugin_pinged_at("acme"), 0, "removed with the plugin");
+            assert_eq!(
+                plugin_window_pinged_at("acme", "3p-5h"),
+                0,
+                "removed with the plugin"
+            );
+            assert_eq!(
+                plugin_window_pinged_at("other", "3p-5h"),
+                1_700_000_222,
+                "another plugin's window record is untouched"
+            );
             assert_eq!(
                 plugin_seen_window("other"),
                 1_700_000_111,

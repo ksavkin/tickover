@@ -82,6 +82,7 @@ credential source and calling whatever host it declares. See
 | `[[surface]]` | array of tables | no | one synthesized `"default"` surface | see [`[[surface]]`](#surface) |
 | `[[option]]` | array of tables | no | empty | boolean toggles the manifest declares for the settings sheet, substituted into requests as `{option.<key>}` — see [`[[option]]`](#option) |
 | `[ping]` | table | no | absent = no auto-ping | see [`[ping]`](#ping) |
+| `[[window_ping]]` | array of tables | no | empty | per-window auto-ping commands, keyed by `[[windows]] id` — see [`[[window_ping]]`](#window_ping) |
 
 Values for enum-typed fields (`engine`, `role`, `from`, `transform`, `type`,
 `mode`, `resets_at_format`) are lower-case, hyphenated (`"log-file"`,
@@ -1108,6 +1109,26 @@ paragraph separators U+2028/9) — refused at load, for the same reason: one of
 these can rewrite a trust dialog, a log line, or the panel around it without
 a single visible character looking wrong.
 
+### `[[window_ping]]`
+
+Optional array of per-window commands, for providers with more than one
+5-hour window or whose windows need separate commands to start (Antigravity's
+Gemini and third-party groups count only their own models). Shares the
+plugin's single auto-ping toggle and host check with `[ping]`, with an
+independent `plugin.<id>.pinged_at.<window>` timestamp per entry — see
+[Per-window pings (`[[window_ping]]`)](#per-window-pings-window_ping) below.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `window` | string | — (required) | `id` of a non-enumerating (`for_each`-free) `[[windows]]` entry in the same manifest; each `window` may appear in at most one `[[window_ping]]`, and may not name the `primary` window when `[ping]` is also declared |
+| `bin` | string | — (required) | bare program name, validated identically to `[ping] bin` |
+| `args` | array of strings | empty | command arguments, validated identically to `[ping] args` (at most 32, non-empty, each at most 256 bytes, no control or bidi characters) |
+
+Declared as a top-level table of its own rather than under `[ping]`, with no
+`requires_reader` capability: an older build ignores unknown top-level tables
+and keeps reading quotas as before, instead of refusing the manifest outright
+or running `[ping]` on an unstarted window's moving reset every ten minutes.
+
 ### `[history]`
 
 Optional. Declares that the provider writes a local usage log the history
@@ -1590,6 +1611,39 @@ outage spends neither the shared floor nor one of the attempts counted here
 renewal is due exactly as it was once that check reports the host reachable
 again.
 
+### Per-window pings (`[[window_ping]]`)
+
+A manifest with multiple independent 5-hour windows — or windows started by
+different commands — declares one `[[window_ping]]` per target window instead
+of (or alongside, for non-primary windows) `[ping]`. Each entry names its
+target by `[[windows]] id`, never by array position:
+
+- **Validation (`manifest::validate`).** `window` must match a declared
+  non-empty `[[windows]] id` whose entry has no `for_each`, may appear at most
+  once across `[[window_ping]]`, and may not name the `primary` window when
+  `[ping]` is also present. `bin` and `args` go through the exact same
+  `validate_ping_command` and control-character checks as `[ping]`.
+- **No `requires_reader` capability.** Because older readers ignore unknown
+  top-level tables, placing per-window commands in `[[window_ping]]` instead of
+  adding fields under `[ping]` means an older build simply sees no ping rather
+  than failing to load the manifest or running `[ping]` without the
+  floating-reset rule below.
+- **State and UI.** Every `[[window_ping]]` shares the plugin's auto-ping
+  toggle in Settings — whose label joins `[ping]` and every `[[window_ping]]`
+  command with `"; "` — and the install-time trust dialog (`analyze_trust`)
+  discloses all of them the same way. Each window keeps its own timestamp in
+  `config.json` under `plugin.<id>.pinged_at.<window>` (cleared with the rest
+  of the plugin's keys on uninstall), so starting one window neither spends nor
+  delays another's ping.
+- **Floating-reset retry rule (`ping_due`).** An unstarted Antigravity window
+  reports `0%` used with a stated reset (`resets_at = Some`) one full period
+  from *now*, advancing with every reading. Without an extra guard, a failed
+  ping (such as a retired `--model` exiting 1) would look older than a newly
+  computed start the moment the 10-minute floor passed. When `pinged_at > 0`
+  and a stated reset's computed `start` lands inside `PING_MIN_INTERVAL_SECS`
+  of `now`, `ping_due` waits one full `period` after `pinged_at` before
+  retrying.
+
 ### Where the ping's command runs
 
 Not in the home directory. These CLIs read the directory they start in —
@@ -1734,11 +1788,10 @@ installing the plugin and, for an `opt_in` surface, ticking one checkbox:
   `refresh_secs` schedule starting right after the app launches — there is no
   "click to fetch" step standing between installing/enabling a hostile
   manifest and its first outbound request.
-- **Run an arbitrary local command on a timer**, via `[ping]`'s `bin`/`args` —
-  gated by the auto-ping toggle (`auto_ping_codex` / `auto_ping_claude` in
-  `src/config.rs`), which defaults to **off**, so this one does require the
-  user to opt in explicitly; once on, `bin` can be anything, not only the
-  provider's own CLI.
+- **Run an arbitrary local command on a timer**, via `[ping]` or
+  `[[window_ping]]` (`bin`/`args`) — gated by the plugin's auto-ping toggle,
+  which defaults to **off**, so this one does require the user to opt in
+  explicitly; once on, `bin` can be anything, not only the provider's own CLI.
 
 None of this is a bug to fix in this app — it's what "the manifest folder is
 the only source of truth for which providers exist" (above) necessarily
@@ -1783,15 +1836,16 @@ honestly, send my credential somewhere I'd expect", not "can this manifest be
 tricked into sending it somewhere it doesn't intend to". A manifest that
 intends to exfiltrate reads exactly as consistent as one that doesn't.
 
-### `[ping]` executes an arbitrary local binary
+### `[ping]` and `[[window_ping]]` execute an arbitrary local binary
 
-It's meant for a provider's own CLI (`codex exec hello`, `claude -p hello`),
-but the manifest format doesn't restrict `bin`/`args` beyond that convention
-— treat a plugin's `[ping]` section with the same scrutiny you'd give any
-script you're about to let run automatically on a timer. It's gated by the
-auto-ping toggle, off by default (see [Trust model](#trust-model) above), but
-turning that toggle on for an untrusted manifest is exactly as risky as
-running any other command that manifest could name.
+They are meant for a provider's own CLI (`codex exec hello`, `claude -p hello`,
+`agy -p hello`), but the manifest format doesn't restrict `bin`/`args` beyond
+that convention — treat a plugin's `[ping]` or `[[window_ping]]` sections with
+the same scrutiny you'd give any script you're about to let run automatically
+on a timer. They share the per-plugin auto-ping toggle, off by default (see
+[Trust model](#trust-model) above), and turning that toggle on for an untrusted
+manifest is exactly as risky as running any other command that manifest could
+name.
 
 `renews_token` is a second trigger for the same command — a lapsed auth chain
 or an HTTP 401, not only a resting window — bounded by the same ten-minute
@@ -1816,9 +1870,10 @@ resolved, which is the manifest author's choice, not this app's (see
 [Trust model](#trust-model)).
 
 The manifest format has no code-execution surface of its own beyond
-`[ping]` — everything else is declarative JSON-path reads through a fixed,
-reviewed set of engines and credential-store readers. "Declarative" bounds
-*how* a manifest can act, not *what* it's allowed to target.
+`[ping]` and `[[window_ping]]` — everything else is declarative JSON-path reads
+through a fixed, reviewed set of engines and credential-store readers.
+"Declarative" bounds *how* a manifest can act, not *what* it's allowed to
+target.
 
 The pair `[surface.auth.client]` discovers is a secret in exactly this same
 sense, kept to the same rule: never logged, never written anywhere. It lives
@@ -2834,7 +2889,7 @@ written to disk, the caller runs `analyze_trust` on the parsed
 | `untrusted_hosts` | the subset of `dest_hosts` outside the caller's `trusted_hosts` set — disclosure only, see below for why it doesn't gate `requires_approval` |
 | `local_files` | every local file, or file-*shaped* source, the manifest reads: an auth step's own credential file (`credentials-file`/`credentials-map`/`reject-when`/`oauth-refresh`'s `path`), `[[http.value]] path`, `[http.version] files`, an `oauth-refresh` step's `[surface.auth.client]` discovery (`files`, `bins` labelled by name rather than a path, `id_env`/`secret_env` labelled as an environment variable, `id_pattern`/`secret_pattern` labelled and length-capped), an `electron-safe-storage` step's `config_path`, `engine = "log-file"`'s own `root`/`glob` read scope (one `"<root>/<glob>"` entry, `root` shown literally — `~` included, unexpanded — unless `root_env` is set, in which case it's `"$<root_env>"`, joined with `root_env_join` when the manifest sets one), and `[account] path` (a `jwt-file` lookup's own token file) |
 | `credential_sources` | every `env`/`keychain`/`win-credential`/`electron-safe-storage` auth step's *own* source, named specifically — `"env $VAR"`, `"keychain \"service\""`, one `"credential manager \"target\""` per target tried, `"electron safe storage <config_path> (key \"...\")"` — rather than just the step *kind* `auth_types` already carries; `credentials-file`/`credentials-map` don't repeat here since their file is already in `local_files` |
-| `ping` | the command this manifest runs after a window resets, if it declares one — with a trailing note that it also runs when its token has expired or is no longer accepted, when `renews_token` is set (see [Renewing a lapsed token](#renewing-a-lapsed-token)) |
+| `ping` | the commands this manifest runs after a window resets (`[ping]`, then each `[[window_ping]]` joined with `"; "`), if it declares any — with a trailing note on `[ping]` that it also runs when its token has expired or is no longer accepted, when `renews_token` is set (see [Renewing a lapsed token](#renewing-a-lapsed-token)) |
 | `requires_approval` | see below |
 
 **Mandatory approval gate.** `requires_approval` is `true` when *any* of the
@@ -2849,8 +2904,8 @@ following hold:
    A plain `env` step is excluded from "store-backed" here: a var is
    something the user set themselves, not a store this manifest goes
    digging in (it can still trip condition 4 below, just not this one).
-2. It declares `[ping]` — an arbitrary local command is worth stopping for
-   whatever the engine.
+2. It declares `[ping]` or `[[window_ping]]` — an arbitrary local command is
+   worth stopping for whatever the engine.
 3. `local_files` is non-empty — a manifest reading a local file of its own
    choosing (including `engine = "log-file"`'s own read scope) is the same
    "something on this machine leaves it, or a manifest picks what a request
