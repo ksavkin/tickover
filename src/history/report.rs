@@ -6,57 +6,52 @@
 //! project basenames are still sensitive enough for that.
 //!
 //! The page Rust renders is the whole report for all of history and works
-//! with scripts off. `report.js` adds the period picker: it sums the rows
-//! [`report_data`] embedded, and writes the
-//! result back through `data-k`/`data-w` hooks and `<template>` rows. Those
-//! templates are this module's own row functions called with `@name@` holes,
-//! so the markup has one author; only the arithmetic exists twice, and
-//! `tests/report_js.rs` holds the two together.
+//! with scripts off. `report.js` adds the period picker, period-over-period
+//! comparison, chart toggles, sortable/expandable breakdown, and CSV export
+//! using the rows [`report_data`] embedded, writing back through
+//! `data-k` hooks and `<template>` rows authored here so markup stays in one
+//! place while `tests/report_js.rs` verifies Rust/JS arithmetic parity.
 //!
 //! Every interpolated string goes through [`esc`]; numbers are formatted
 //! by this module only. Provider content never reaches the store, so the
-//! report can contain none — there is nothing to escape *from*, and the
-//! escape is defence against metadata like project names anyway.
+//! report can contain none — `esc` guards metadata such as project names.
 
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use chrono::{Datelike, Local};
+use chrono::{Datelike, Duration, Local, NaiveDate};
 
 use crate::history::pricing;
+use crate::history::projects::AUTO_PING_PROJECT;
 use crate::history::query::{self, Stats, Totals};
 use crate::history::report_data::{self, ReportData};
 
-/// The picker. Public for the parity test, which runs this exact text.
+/// The picker and interactive report controller. Public for the parity test.
 pub const REPORT_JS: &str = include_str!("report.js");
 
 /// Live quota card for the report's "RIGHT NOW" strip — supplied by the
 /// panel when it already has a fresh reading; the CLI passes `&[]` and
-/// the section is simply absent (an empty strip would lie by omission).
+/// the section is absent (an empty strip would lie by omission).
 pub struct QuotaNow {
     pub provider: String,
     pub label: String,
     pub used_pct: f64,
     pub projected_pct: Option<f64>,
     pub reset_hint: String,
-    /// `None` whenever `projected_pct` is — the caller only ever fills this
-    /// once the projection itself was drawn, so the card never states a pace
-    /// for a window its own bar has nothing to show for.
+    /// `None` whenever `projected_pct` is — the caller only fills this
+    /// once the projection itself was drawn.
     pub burn_per_hour: Option<u64>,
 }
 
-/// Status colors needed where a CSS variable won't do — SVG `stroke`/
-/// `fill` accepts `var()`, so only the computed-worst-case choice in
-/// `right_now` and the habits bars need literals. Both pick from the same
-/// tokens the stylesheet declares.
 mod c {
     pub const OK: &str = "#35d79a";
     pub const WARN: &str = "#d29922";
     pub const CRIT: &str = "#f85149";
-    /// The habits bars' muted teal — inside the SVG-less markup it could
-    /// be a var, but a named constant reads clearer next to the ramp.
-    pub const HABIT: &str = "#265c4c";
+    pub const SERIES: [&str; 6] = [
+        "#56d4bd", "#d97757", "#a78bfa", "#dfa93f", "#6cb6ff", "#f0883e",
+    ];
 }
 
 pub fn provider_color(id: &str) -> &'static str {
@@ -70,8 +65,7 @@ pub fn provider_color(id: &str) -> &'static str {
     }
 }
 
-/// Provider display name — the report shows Title-case, ids stay
-/// lowercase internally.
+/// Provider display name — Title-case for UI, lowercase ids internally.
 pub fn provider_name(id: &str) -> &str {
     match id {
         "claude" => "Claude",
@@ -83,7 +77,7 @@ pub fn provider_name(id: &str) -> &str {
     }
 }
 
-/// HTML-escape — the one function every interpolated string takes.
+/// HTML-escape — every interpolated string flows through this.
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -105,7 +99,6 @@ pub fn fmt_tokens(n: u64) -> String {
 }
 
 pub fn fmt_int(n: u64) -> String {
-    // thousands-separated integer
     let s = n.to_string();
     let mut out = String::new();
     for (i, ch) in s.chars().enumerate() {
@@ -127,8 +120,8 @@ pub fn fmt_usd(v: Option<f64>) -> String {
     }
 }
 
-/// The headline card's figure: whole dollars read better at that size, but
-/// a short period can sit under one, and "$0" would say it cost nothing.
+/// The headline card's figure: whole dollars read better at that size, while
+/// sub-dollar totals keep cent/sub-cent precision.
 pub fn fmt_headline_usd(x: f64) -> String {
     if x >= 1000.0 {
         format!("${:.1}K", x / 1000.0)
@@ -143,27 +136,18 @@ pub fn active_days_label(n: u64) -> String {
     format!("{n} active {}", if n == 1 { "day" } else { "days" })
 }
 
-/// [`pricing::cost_for_models`] rendered through [`fmt_usd`], with a
-/// trailing `*` when `models` includes one this table has no price for —
-/// a sum missing a whole model's share must not print as confidently as
-/// one that knows every model it summed.
-fn fmt_usd_for_models(models: &[(String, Totals)]) -> String {
-    let (v, partial) = pricing::cost_summary(models);
+fn fmt_cost_pair(v: Option<f64>, partial: bool) -> String {
     let s = fmt_usd(v);
-    if partial {
+    if v.is_some() && partial {
         format!("{s}*")
     } else {
         s
     }
 }
 
-/// How many reports [`write()`] keeps in its own folder. Each one carries the
-/// whole history, about 1 MB, and every press of the panel's button writes
-/// a new one, so without a limit the folder only ever grows.
+/// How many reports [`write()`] keeps in its own folder.
 pub const KEEP_REPORTS: usize = 5;
 
-/// Whether `name` is one [`write()`] would have chosen itself:
-/// `usage-YYYYMMDD-HHMMSS.html`, nothing more and nothing less.
 fn is_own_report_name(name: &str) -> bool {
     let Some(stamp) = name
         .strip_prefix("usage-")
@@ -179,13 +163,8 @@ fn is_own_report_name(name: &str) -> bool {
             .all(|(i, c)| i == 8 || c.is_ascii_digit())
 }
 
-/// Delete all but the newest `keep` reports in `dir`, never `current`.
-/// Only names shaped the way [`write()`] chooses them count — the name is
-/// the only mark of ownership, so a file given such a name by hand counts
-/// too; anything named otherwise is never touched, and neither is a
-/// symlink, whatever it is called. The timestamp in the name orders
-/// them. Best effort: a file that cannot be removed stays, and the next
-/// report tries again. Returns how many were removed.
+/// Delete all but the newest `keep` reports in `dir`, never `current` and
+/// never symlinks. Returns how many were removed.
 pub fn prune_reports(dir: &Path, keep: usize, current: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -206,10 +185,9 @@ pub fn prune_reports(dir: &Path, keep: usize, current: &Path) -> usize {
         .count()
 }
 
-/// Write the report. `path: None` → `<config>/tickover/reports/
-/// usage-<yyyymmdd-hhmmss>.html`, after which all but the newest
-/// [`KEEP_REPORTS`] of those are deleted ([`prune_reports`]); the file is
-/// created `0600`. Returns the path actually written.
+/// Write the report. `path: None` writes to `<config>/tickover/reports/
+/// usage-<yyyymmdd-hhmmss>.html` and prunes older own reports past
+/// [`KEEP_REPORTS`]. Created `0600`.
 pub fn write(
     st: &Stats,
     path: Option<PathBuf>,
@@ -248,8 +226,6 @@ pub fn write(
         let mut f = opts.open(&path)?;
         f.write_all(html.as_bytes())?;
     }
-    // Ensure mode even when the file pre-existed (create+truncate keeps
-    // the old mode otherwise).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -279,20 +255,15 @@ fn render(
     if !quota.is_empty() {
         right_now(&mut h, quota);
     }
-    filtered(&mut h, |h| headline(h, st, cost_on));
-    coverage(&mut h, st);
     filtered(&mut h, |h| {
-        tools(h, st, cost_on);
-        context_efficiency(h, st);
-        hot_zones_and_models(h, st);
-        weekly_trail(h, st);
+        headline(h, st, data, cost_on);
+        activity_chart(h, st, cost_on);
+        breakdown(h, st, cost_on);
+        projects_and_sessions(h, st, cost_on);
+        habits(h, st);
     });
     heatmap(&mut h, st);
-    filtered(&mut h, |h| {
-        habits_and_sessions(h, st, cost_on);
-        wrapped(h, st, cost_on);
-    });
-    footer(&mut h, sources, &pricing_line(st, cost_on));
+    footer(&mut h, sources, &pricing_line(st, cost_on), cost_on);
     templates(&mut h);
     h.push_str("</div></div>\n<script type=\"application/json\" id=\"report-data\">");
     h.push_str(&embedded);
@@ -302,46 +273,59 @@ fn render(
     Ok(h)
 }
 
-/// Wrap the sections a period changes, for the picker to hide when a period
-/// holds nothing. `display: contents`, so the page's own layout sees through.
 fn filtered(h: &mut String, section: impl FnOnce(&mut String)) {
     h.push_str("<div class=\"pf\">\n");
     section(h);
     h.push_str("</div>\n");
 }
 
-/// The rows the picker redraws, as `<template>`s: each row function again,
-/// handed `@name@` where it would take a value.
 fn templates(h: &mut String) {
     let mut t = |id: &str, row: &dyn Fn(&mut String)| {
         let _ = write!(h, r#"<template id="{id}">"#);
         row(h);
         h.push_str("</template>\n");
     };
-    t("tpl-seg", &|h| {
-        tool_segment(h, "@w@", "@c@", "@radius@", "@name@", "@label@")
-    });
-    t("tpl-legend", &|h| tool_legend(h, "@c@", "@name@", "@w@"));
-    t("tpl-tool", &|h| {
-        tool_row(
+    t("tpl-legend", &|h| chart_legend(h, "@c@", "@name@", "@v@"));
+    t("tpl-bd-prov", &|h| {
+        bd_provider_row(
             h,
+            "@id@",
+            "@arrow@",
             "@c@",
             "@name@",
-            ["@cr@", "@cw@", "@inp@", "@out@"],
-            "@tokens@",
-            "@last@",
+            &[
+                "@in@", "@out@", "@cw@", "@cr@", "@hit@", "@tot@", "@cost@", "@share@", "@cpm@",
+            ],
         )
     });
-    t("tpl-context", &|h| {
-        context_row(h, "@name@", "@pp@", "@color@")
+    t("tpl-bd-model", &|h| {
+        bd_model_row(
+            h,
+            "@parent@",
+            "@closed@",
+            "@m@",
+            &[
+                "@in@", "@out@", "@cw@", "@cr@", "@hit@", "@tot@", "@cost@", "@share@", "@cpm@",
+            ],
+        )
     });
     t("tpl-project", &|h| {
-        project_row(h, "@name@", "@w@", "@share@", "@v@", "@color@", "@fill@")
+        project_row(
+            h,
+            "@name@",
+            "@pts@",
+            "@sparkop@",
+            "@w@",
+            "@cost@",
+            "@tok@",
+            "@share@",
+            "@color@",
+            "@fill@",
+        )
     });
-    t("tpl-model", &|h| model_row(h, "@m@", "@v@", "@w@"));
     t("tpl-session", &|h| {
         session_row(
-            h, "@i@", "@proj@", "@date@", "@prov@", "@span@", "@tok@", "@cost@",
+            h, "@i@", "@proj@", "@date@", "@prov@", "@model@", "@span@", "@tok@", "@cost@",
         )
     });
 }
@@ -354,9 +338,10 @@ fn period(h: &mut String) {
 <button type="button" class="btn" data-p="30" aria-pressed="false">30d</button>
 <button type="button" class="btn" data-p="90" aria-pressed="false">90d</button>
 <button type="button" class="btn" data-p="month" aria-pressed="false">This month</button>
-<button type="button" class="btn" data-p="all" aria-pressed="false">All</button>
+<button type="button" class="btn" data-p="all" aria-pressed="true">All</button>
 <label class="mono period-date">from <input type="date" id="p-from"></label>
 <label class="mono period-date">to <input type="date" id="p-to"></label>
+<label class="btn" style="font-size: 11px;"><input type="checkbox" id="compare" checked style="margin: 0; accent-color: var(--ok);"> Compare previous</label>
 <span class="spacer"></span>
 <span class="secnote" data-k="p-note"></span>
 </div>
@@ -377,10 +362,7 @@ const HEAD: &str = r##"<!doctype html>
   --track: #1e232b; --track-soft: #171b22; --hairline: #262b34;
   --text: #e8eaed; --muted: #8b929d; --meta: #767d89;
   --ok: #35d79a; --warn: #d29922; --crit: #f85149;
-  --cache-read: #39424f; --cache-read-base: #232a34; --cache-write: #2d5f8f;
-  --input: #6cb6ff; --output: #f0883e;
-  --p-claude: #d97757; --p-codex: #56d4bd; --p-agy: #a78bfa;
-  --p-grok: #dfa93f; --p-copilot: #4a515c;
+  --cache-read: #39424f; --input: #6cb6ff; --output: #f0883e;
   --heat0: #161a20; --heat1: #17392e; --heat2: #1d5c46; --heat3: #2a9770; --heat4: #35d79a;
 }
 @media (prefers-color-scheme: light) {
@@ -389,10 +371,7 @@ const HEAD: &str = r##"<!doctype html>
     --track: #e2e0d9; --track-soft: #eceae4; --hairline: #d8d5cc;
     --text: #17191d; --muted: #5b6068; --meta: #6f747c;
     --ok: #10845f; --warn: #9a6a10; --crit: #b3261e;
-    --cache-read: #8b9098; --cache-read-base: #eceae4; --cache-write: #0b6247;
-    --input: #1f6feb; --output: #b3560f;
-    --p-claude: #b2543a; --p-codex: #157f6c; --p-agy: #6d4fc4;
-    --p-grok: #8a6208; --p-copilot: #8b9098;
+    --cache-read: #8b9098; --input: #1f6feb; --output: #b3560f;
     --heat0: #eceae4; --heat1: #cfe8dd; --heat2: #9fd4bf; --heat3: #4fae8a; --heat4: #10845f;
   }
 }
@@ -401,10 +380,7 @@ html.light {
   --track: #e2e0d9; --track-soft: #eceae4; --hairline: #d8d5cc;
   --text: #17191d; --muted: #5b6068; --meta: #6f747c;
   --ok: #10845f; --warn: #9a6a10; --crit: #b3261e;
-  --cache-read: #8b9098; --cache-read-base: #eceae4; --cache-write: #0b6247;
-  --input: #1f6feb; --output: #b3560f;
-  --p-claude: #b2543a; --p-codex: #157f6c; --p-agy: #6d4fc4;
-  --p-grok: #8a6208; --p-copilot: #8b9098;
+  --cache-read: #8b9098; --input: #1f6feb; --output: #b3560f;
   --heat0: #eceae4; --heat1: #cfe8dd; --heat2: #9fd4bf; --heat3: #4fae8a; --heat4: #10845f;
 }
 html.dark {
@@ -412,10 +388,7 @@ html.dark {
   --track: #1e232b; --track-soft: #171b22; --hairline: #262b34;
   --text: #e8eaed; --muted: #8b929d; --meta: #767d89;
   --ok: #35d79a; --warn: #d29922; --crit: #f85149;
-  --cache-read: #39424f; --cache-read-base: #232a34; --cache-write: #2d5f8f;
-  --input: #6cb6ff; --output: #f0883e;
-  --p-claude: #d97757; --p-codex: #56d4bd; --p-agy: #a78bfa;
-  --p-grok: #dfa93f; --p-copilot: #4a515c;
+  --cache-read: #39424f; --input: #6cb6ff; --output: #f0883e;
   --heat0: #161a20; --heat1: #17392e; --heat2: #1d5c46; --heat3: #2a9770; --heat4: #35d79a;
 }
 * { box-sizing: border-box; }
@@ -423,36 +396,25 @@ body { margin: 0; background: var(--bg); }
 a { color: var(--ok); text-decoration: none; }
 .mono { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace; }
 .shell { max-width: 1120px; margin: 0 auto; padding: 0 32px;
-  display: flex; flex-direction: column; gap: 40px; }
+  display: flex; flex-direction: column; gap: 32px; }
 .topbar { display: flex; align-items: center; gap: 12px; padding: 0 32px;
-  height: 60px; border-bottom: 1px solid var(--track); background: var(--topbar); }
+  height: 58px; border-bottom: 1px solid var(--track); background: var(--topbar); }
 .btn { font: inherit; font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
   font-size: 11px; background: var(--surface); color: var(--text);
-  border: 1px solid var(--hairline); border-radius: 6px; padding: 6px 10px;
+  border: 1px solid var(--hairline); border-radius: 6px; padding: 5px 10px;
   cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+.btn[aria-pressed="true"] { border-color: var(--ok); color: var(--ok); }
+.seg { display: inline-flex; gap: 4px; }
 h2.sec { margin: 0; font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
   font-size: 12px; font-weight: 700; letter-spacing: 0.17em; }
 .secnote { color: var(--meta); font-size: 13px; }
 .card { background: var(--surface); border: 1px solid var(--track); border-radius: 12px; }
-.pill { display: inline-flex; align-items: center; gap: 7px;
-  border: 1px solid var(--hairline); border-radius: 999px;
-  padding: 5px 12px 5px 9px; font-size: 11px; color: var(--text);
-  font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace; }
-.bar-track { height: 10px; border-radius: 3px; background: var(--track-soft); overflow: hidden; }
+.bar-track { height: 8px; border-radius: 3px; background: var(--track-soft); overflow: hidden; }
 .bar-fill { height: 100%; border-radius: 3px; background: var(--input); }
-.hatch-cr { background-image: repeating-linear-gradient(45deg,
-  var(--cache-read) 0 2px, var(--cache-read-base) 2px 4px); }
-.hatch-none { background-image: repeating-linear-gradient(45deg,
-  var(--hairline) 0 3px, var(--surface) 3px 6px);
-  border: 1px dashed var(--hairline); border-radius: 2px; }
-.hatch-proj { background-image: repeating-linear-gradient(135deg,
-  var(--ok) 0 2px, transparent 2px 5px); opacity: 0.30; }
-.proj-masked { letter-spacing: 0.02em; }
 .pf { display: contents; }
 .pf.off { display: none; }
 .period { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
-.period[hidden], #sec-context[hidden] { display: none; }
-.period .btn[aria-pressed="true"] { border-color: var(--ok); color: var(--ok); }
+.period[hidden], [hidden] { display: none !important; }
 .period-date { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--meta); }
 .period-date input { font: inherit; color: var(--text); background: var(--surface);
   border: 1px solid var(--hairline); border-radius: 6px; padding: 5px 8px; color-scheme: dark; }
@@ -460,30 +422,49 @@ h2.sec { margin: 0; font-family: 'JetBrains Mono', ui-monospace, Menlo, monospac
   html:not(.dark) .period-date input { color-scheme: light; }
 }
 html.light .period-date input { color-scheme: light; }
+.grid2 { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 24px; }
+.grid6 { display: grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap: 14px; }
+@media (max-width: 960px) { .grid6 { grid-template-columns: repeat(3, minmax(0,1fr)); } }
 @media (max-width: 720px) {
-  .shell { padding: 0 16px; gap: 28px; }
+  .shell { padding: 0 16px; gap: 24px; }
   .topbar { padding: 0 16px; }
-  .grid2, .grid3, .grid6 { grid-template-columns: 1fr !important; }
+  .grid2 { grid-template-columns: 1fr !important; }
+  .grid6 { grid-template-columns: repeat(2, minmax(0,1fr)) !important; }
+  .qrow { grid-template-columns: 110px 64px minmax(0,1fr) !important; }
+  .qrow-extra { display: none !important; }
 }
 @media print {
   body { background: #fff; }
   .topbar { position: static; }
-  .period { display: none; }
+  .period, .seg { display: none; }
 }
-.grid2 { display: grid; grid-template-columns: minmax(0,1.25fr) minmax(0,1fr); gap: 24px; }
-.grid2e { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 24px; }
-.grid3 { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 20px; }
-.grid6 { display: grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap: 16px; }
-.row { display: flex; align-items: baseline; gap: 12px; }
+.row { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
 .spacer { flex-grow: 1; }
 .dim { color: var(--muted); }
 .meta { color: var(--meta); }
-.tooltip { position: absolute; background: var(--surface); border: 1px solid var(--hairline);
-  border-radius: 8px; padding: 9px 12px; font-size: 11px; pointer-events: none;
-  font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
-  display: none; z-index: 5; }
-svg .tip { opacity: 0; }
-svg g.wk:hover .tip { opacity: 1; }
+.delta { font-size: 11px; min-height: 15px; color: var(--meta); }
+.delta-up { color: var(--warn); }
+.delta-dn { color: var(--ok); }
+.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+table.bd { width: 100%; border-collapse: collapse; font-size: 12px; min-width: 760px; }
+table.bd th { font-size: 10px; letter-spacing: 0.12em; color: var(--meta); font-weight: 600;
+  text-align: right; padding: 8px 10px; border-bottom: 1px solid var(--track); cursor: pointer; user-select: none; white-space: nowrap; }
+table.bd th:first-child { text-align: left; }
+table.bd td { padding: 9px 10px; border-bottom: 1px solid var(--track-soft); text-align: right; white-space: nowrap; }
+table.bd td:first-child { text-align: left; }
+tr.prov-row { cursor: pointer; }
+tr.prov-row:hover { background: var(--track-soft); }
+tr.model-row { color: var(--muted); font-size: 11px; }
+tr.model-row.is-closed { display: none; }
+.scroll-x { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.qrow { display: grid; grid-template-columns: 120px 68px minmax(0,1fr) 120px 90px 140px; gap: 14px; align-items: center; }
+.prow { display: grid; grid-template-columns: minmax(90px,130px) 64px minmax(50px,1fr) 64px 58px 36px; gap: 10px; align-items: center; }
+.srow { display: grid; grid-template-columns: 24px minmax(0,1fr) 120px 54px 58px 60px; gap: 10px; align-items: baseline; }
+@media (max-width: 520px) {
+  .prow { grid-template-columns: minmax(76px,110px) 52px minmax(36px,1fr) 56px 48px 32px; gap: 6px; }
+  .srow { grid-template-columns: 20px minmax(0,1fr) 54px 54px; }
+  .srow-hide { display: none; }
+}
 </style>
 </head>
 <body>
@@ -517,9 +498,9 @@ fn title(h: &mut String, st: &Stats) {
     };
     let _ = write!(
         h,
-        r#"<div style="padding-top: 44px; display: flex; flex-direction: column; gap: 10px;">
-<h1 class="mono" style="margin: 0; font-size: 42px; font-weight: 600; letter-spacing: -0.03em; line-height: 1.05;">Where your tokens went</h1>
-<p style="margin: 0; color: var(--muted); font-size: 14px; max-width: 720px; line-height: 1.6;"><span data-k="range">{range}</span>, read from CLI history files on this machine. Nothing was uploaded; this file has no network calls and no external assets.</p>
+        r#"<div style="padding-top: 32px; display: flex; flex-direction: column; gap: 8px;">
+<h1 class="mono" style="margin: 0; font-size: 36px; font-weight: 600; letter-spacing: -0.03em; line-height: 1.08;">Where your tokens went</h1>
+<p style="margin: 0; color: var(--muted); font-size: 14px; max-width: 720px; line-height: 1.55;"><span data-k="range">{range}</span>, read from CLI history files on this machine. Nothing was uploaded; no network calls and no external assets.</p>
 </div>
 "#
     );
@@ -527,18 +508,15 @@ fn title(h: &mut String, st: &Stats) {
 
 fn right_now(h: &mut String, quota: &[QuotaNow]) {
     h.push_str(
-        r#"<div style="display: flex; flex-direction: column; gap: 14px;">
+        r#"<div style="display: flex; flex-direction: column; gap: 10px;">
 <div class="row"><h2 class="sec">RIGHT NOW</h2>
-<span class="secnote">live quota, projected forward at the window's current pace</span></div>
-<div class="grid3">
+<span class="secnote">live quota strip, projected forward at the window's pace</span></div>
+<div class="card" style="padding: 12px 18px; display: flex; flex-direction: column; gap: 10px;">
 "#,
     );
     for q in quota {
         let used = q.used_pct.clamp(0.0, 100.0);
         let proj = q.projected_pct.unwrap_or(used).clamp(0.0, 100.0);
-        // 90 here, not the round-number 85 this used to say: the panel's own
-        // hatch turns amber at 90, and a card and its own bar disagreeing on
-        // where amber starts would tell two stories about the same window.
         let color = if used >= 90.0 || proj >= 100.0 {
             c::CRIT
         } else if used >= 70.0 || proj >= 90.0 {
@@ -552,25 +530,16 @@ fn right_now(h: &mut String, quota: &[QuotaNow]) {
             .unwrap_or_else(|| "—".into());
         let _ = write!(
             h,
-            r#"<div class="card" style="padding: 18px 20px 16px; display: flex; flex-direction: column; gap: 12px;">
-<div class="mono" style="display: flex; align-items: center; gap: 8px;">
-<span style="width: 8px; height: 8px; border-radius: 50%; background: {pc};"></span>
-<span style="font-size: 11px; font-weight: 700; letter-spacing: 0.15em;">{name}</span>
-<span class="spacer"></span>
+            r#"<div class="qrow mono" style="font-size: 12px;">
+<span style="display: inline-flex; align-items: center; gap: 7px; font-weight: 600;"><span style="width: 7px; height: 7px; border-radius: 50%; background: {pc};"></span>{name}</span>
 <span style="font-size: 11px; color: var(--muted);">{label}</span>
-</div>
-<div class="mono" style="display: flex; align-items: baseline; gap: 8px;">
-<span style="font-size: 30px; font-weight: 600; letter-spacing: -0.02em; line-height: 1; color: {color};">{used:.0}%</span>
-<span style="font-size: 12px; color: var(--meta);">used · projected {proj:.0}%</span>
-</div>
-<div style="height: 7px; border-radius: 4px; background: var(--track); position: relative; overflow: hidden;">
+<div style="height: 6px; border-radius: 3px; background: var(--track); position: relative; overflow: hidden;">
 <div style="position: absolute; inset: 0 auto 0 0; width: {proj:.0}%; background-image: repeating-linear-gradient(135deg, {color} 0 2px, transparent 2px 5px); opacity: 0.35;"></div>
-<div style="position: absolute; inset: 0 auto 0 0; width: {used:.0}%; background: {color}; border-radius: 4px;"></div>
+<div style="position: absolute; inset: 0 auto 0 0; width: {used:.0}%; background: {color}; border-radius: 3px;"></div>
 </div>
-<div class="mono" style="display: flex; justify-content: space-between; font-size: 11px; color: var(--meta);">
-<span>burn <span style="color: var(--text);">{burn}</span></span>
-<span>{reset}</span>
-</div>
+<span class="qrow-extra" style="font-size: 11px; color: {color}; text-align: right;">{used:.0}% · ~{proj:.0}%</span>
+<span class="qrow-extra" style="font-size: 11px; color: var(--muted); text-align: right;">{burn}</span>
+<span class="qrow-extra" style="font-size: 11px; color: var(--meta); text-align: right;">{reset}</span>
 </div>
 "#,
             pc = provider_color(&q.provider),
@@ -586,90 +555,152 @@ fn right_now(h: &mut String, quota: &[QuotaNow]) {
     h.push_str("</div></div>\n");
 }
 
-fn headline(h: &mut String, st: &Stats, cost_on: bool) {
+/// Cache-read dollar cost for `models` using each model's cache-read rate.
+pub fn cache_read_cost(models: &[(String, Totals)]) -> (Option<f64>, bool) {
+    let cr_only: Vec<(String, Totals)> = models
+        .iter()
+        .map(|(m, t)| {
+            (
+                m.clone(),
+                Totals {
+                    cache_read: t.cache_read,
+                    ..Totals::default()
+                },
+            )
+        })
+        .collect();
+    pricing::cost_summary(&cr_only)
+}
+
+fn headline(h: &mut String, st: &Stats, data: &ReportData, cost_on: bool) {
+    let total_tokens = st.total.sum();
     let active_days = st.active_days;
     let sessions = st.sessions.len() as u64;
-    let msgs_per_day = st.total.messages.checked_div(active_days).unwrap_or(0);
-    let avg_msg = st.total.sum().checked_div(st.total.messages).unwrap_or(0);
-    let cache = st
-        .total
-        .cache_hit_pct()
-        .map(|p| format!("{p:.0}%"))
-        .unwrap_or_else(|| "—".into());
-    let cost_card = if cost_on {
-        let models: Vec<(String, Totals)> = st.models.clone();
-        // A model this table doesn't know still contributed tokens the sum
-        // leaves out entirely — the headline must say so rather than let a
-        // partial total pass for the whole picture.
-        let (v, partial) = pricing::cost_summary(&models);
-        (
-            "EST. COST".to_string(),
-            "cost",
-            v.map(|x| {
-                let s = fmt_headline_usd(x);
-                if partial {
-                    format!("{s}*")
-                } else {
-                    s
-                }
-            })
-            .unwrap_or_else(|| "—".into()),
-            if partial {
-                "API-equivalent, partial — unpriced models excluded".to_string()
-            } else if v.is_none() {
-                "no list price for these models".to_string()
-            } else {
-                "API-equivalent, not your bill".to_string()
-            },
-        )
+    let span_days = match (st.daily.keys().next(), st.daily.keys().next_back()) {
+        (Some(a), Some(b)) => ((*b - *a).num_days() + 1).max(1) as u64,
+        _ => 1,
+    };
+    let (cost, partial) = if cost_on {
+        pricing::cost_summary(&st.models)
     } else {
-        (
-            "THIS WEEK".to_string(),
-            "week",
-            fmt_tokens(st.week.sum()),
-            "tokens, Mon → today, whatever the period".to_string(),
+        (None, false)
+    };
+    let (cr_cost, cr_partial) = if cost_on {
+        cache_read_cost(&st.models)
+    } else {
+        (None, false)
+    };
+    let star = if partial { "*" } else { "" };
+
+    let cost_val = if !cost_on {
+        "off".to_string()
+    } else {
+        cost.map(|c| format!("{}{star}", fmt_headline_usd(c)))
+            .unwrap_or_else(|| "—".into())
+    };
+    let cost_note = if !cost_on {
+        "cost accounting disabled".to_string()
+    } else if partial {
+        "API-equivalent, partial — unpriced models excluded".to_string()
+    } else if cost.is_none() {
+        "no list price for these models".to_string()
+    } else {
+        "API-equivalent, not your bill".to_string()
+    };
+
+    let tokens_note = if total_tokens == 0 {
+        "in + out + cache".to_string()
+    } else {
+        let tok_pct = st.total.cache_read as f64 * 100.0 / total_tokens as f64;
+        match (cost_on, cost, cr_cost) {
+            (true, Some(c), Some(crc)) if c > 0.0 => {
+                let usd_pct = crc * 100.0 / c;
+                let m = if partial || cr_partial { "*" } else { "" };
+                format!("cache read {tok_pct:.0}% tok · {usd_pct:.0}% ${m}")
+            }
+            _ => format!("cache read {tok_pct:.0}% tok"),
+        }
+    };
+
+    let per_day_val = if active_days == 0 {
+        "—".to_string()
+    } else if cost_on {
+        cost.map(|c| format!("{}{star}", fmt_usd(Some(c / active_days as f64))))
+            .unwrap_or_else(|| "—".into())
+    } else {
+        fmt_tokens(total_tokens / active_days)
+    };
+
+    let pace_val = if cost_on {
+        cost.map(|c| format!("{}{star}/mo", fmt_headline_usd(c / span_days as f64 * 30.0)))
+            .unwrap_or_else(|| "—".into())
+    } else {
+        format!(
+            "{}/mo",
+            fmt_tokens((total_tokens as f64 / span_days as f64 * 30.0).round() as u64)
         )
     };
+
+    let plan_sum: f64 = st
+        .providers
+        .iter()
+        .filter_map(|p| data.plans.get(p).copied())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .sum();
+    let (plan_val, plan_note) = if !cost_on {
+        ("—".to_string(), "cost off".to_string())
+    } else if plan_sum > 0.0 {
+        let prorated = plan_sum * (span_days as f64 / 30.0);
+        let val = cost
+            .filter(|_| prorated > 0.0)
+            .map(|c| format!("×{:.1}{star}", c / prorated))
+            .unwrap_or_else(|| "—".into());
+        (
+            val,
+            format!("API-equiv ÷ {}/mo (not savings)", fmt_usd(Some(plan_sum))),
+        )
+    } else {
+        ("—".to_string(), "set [plans] in prices.toml".to_string())
+    };
+
     let cards = [
+        ("API-EQUIVALENT", "cost", cost_val, cost_note),
+        ("TOKENS", "tokens", fmt_tokens(total_tokens), tokens_note),
         (
-            "TOKENS".to_string(),
-            "tokens",
-            fmt_tokens(st.total.sum()),
-            "in + out + cache".to_string(),
-        ),
-        cost_card,
-        (
-            "SESSIONS".to_string(),
-            "sessions",
-            fmt_int(sessions),
-            active_days_label(active_days),
+            "ACTIVE DAYS",
+            "days",
+            fmt_int(active_days),
+            format!("{sessions} sessions · {} msgs", fmt_int(st.total.messages)),
         ),
         (
-            "MESSAGES".to_string(),
-            "messages",
-            fmt_int(st.total.messages),
-            format!("{msgs_per_day} / active day"),
+            "PER ACTIVE DAY",
+            "per-day",
+            per_day_val,
+            if cost_on {
+                "API-equiv / active day".to_string()
+            } else {
+                "tokens / active day".to_string()
+            },
         ),
         (
-            "AVG / MESSAGE".to_string(),
-            "avg",
-            fmt_tokens(avg_msg),
-            "across all providers".to_string(),
+            "MONTHLY PACE",
+            "pace",
+            pace_val,
+            format!("at {span_days}d pace"),
         ),
-        (
-            "CACHE HIT".to_string(),
-            "cache",
-            cache,
-            "context reused".to_string(),
-        ),
+        ("VS PLAN", "plan", plan_val, plan_note),
     ];
+
     h.push_str(r#"<div class="grid6">"#);
     for (label, key, value, note) in cards {
+        let value = esc(&value);
+        let note = esc(&note);
         let _ = write!(
             h,
-            r#"<div class="card" style="padding: 16px 18px; display: flex; flex-direction: column; gap: 6px;">
+            r#"<div class="card" style="padding: 14px 16px; display: flex; flex-direction: column; gap: 5px;">
 <div class="mono" style="font-size: 10px; letter-spacing: 0.13em; color: var(--meta);">{label}</div>
-<div class="mono" data-k="card-{key}" style="font-size: 24px; font-weight: 600; letter-spacing: -0.025em; line-height: 1.1;">{value}</div>
+<div class="mono" data-k="card-{key}" style="font-size: 22px; font-weight: 600; letter-spacing: -0.025em; line-height: 1.1;">{value}</div>
+<div class="mono delta" data-k="delta-{key}"></div>
 <div data-k="card-{key}-note" style="font-size: 11px; color: var(--muted);">{note}</div>
 </div>
 "#
@@ -678,377 +709,604 @@ fn headline(h: &mut String, st: &Stats, cost_on: bool) {
     h.push_str("</div>\n");
 }
 
-fn coverage(h: &mut String, st: &Stats) {
-    h.push_str(
-        r#"<div class="card" style="padding: 16px 20px; display: flex; align-items: center; gap: 14px; flex-wrap: wrap;">
-<span class="mono" style="font-size: 10px; letter-spacing: 0.15em; color: var(--meta);">COVERAGE</span>
-"#,
+fn chart_legend(h: &mut String, c: &str, name: &str, v: &str) {
+    let _ = write!(
+        h,
+        r#"<span style="display: inline-flex; align-items: center; gap: 6px;"><span style="width: 9px; height: 9px; border-radius: 2px; background: {c};"></span><span style="color: var(--text);">{name}</span> <span class="meta">{v}</span></span>"#,
     );
-    for p in &st.providers {
-        let _ = writeln!(
-            h,
-            r#"<span class="pill"><span style="width: 7px; height: 7px; border-radius: 50%; background: {color};"></span>{name}</span>"#,
-            color = provider_color(p),
-            name = esc(provider_name(p)),
-        );
+}
+
+fn activity_chart(h: &mut String, st: &Stats, cost_on: bool) {
+    let daily: Vec<(NaiveDate, &Totals)> = st.daily.iter().map(|(d, t)| (*d, t)).collect();
+    let (first_d, last_d) = match (daily.first(), daily.last()) {
+        (Some((a, _)), Some((b, _))) => (*a, *b),
+        _ => {
+            let today = Local::now().date_naive();
+            (today, today)
+        }
+    };
+    let span_days = ((last_d - first_d).num_days() + 1).max(1);
+    let weekly = span_days > 90;
+    let monday_of = |d: NaiveDate| d - Duration::days(d.weekday().num_days_from_monday() as i64);
+
+    let mut keys = Vec::new();
+    let mut cursor = if weekly { monday_of(first_d) } else { first_d };
+    let end_key = if weekly { monday_of(last_d) } else { last_d };
+    while cursor <= end_key {
+        keys.push(cursor);
+        cursor += Duration::days(if weekly { 7 } else { 1 });
     }
-    h.push_str(
-        r#"<span class="spacer"></span>
-<span style="font-size: 12px; color: var(--meta);">Token counts are exact as logged; costs are API-equivalents at public list prices, not your invoice.</span>
-</div>
-"#,
-    );
-}
-
-/// The 4-class token mix bar used in "YOUR TOOLS" rows, as percentages of
-/// `[cache read, cache write, input, output]`.
-fn mix_bar(h: &mut String, [cr, cw, input, output]: [&str; 4]) {
-    let _ = write!(
-        h,
-        r#"<div style="display: flex; gap: 2px; height: 10px;"><div class="hatch-cr" style="width:{cr}%;border-radius:2px 0 0 2px;"></div><div style="width:{cw}%;background:var(--cache-write);"></div><div style="width:{input}%;background:var(--input);"></div><div style="width:{output}%;background:var(--output);border-radius:0 2px 2px 0;"></div></div>"#,
-    );
-}
-
-fn tool_segment(h: &mut String, w: &str, c: &str, radius: &str, name: &str, label: &str) {
-    let _ = write!(
-        h,
-        r#"<div style="width: {w}%; background: {c}; border-radius: {radius};" title="{name} {label}%"></div>"#,
-    );
-}
-
-fn tool_legend(h: &mut String, c: &str, name: &str, w: &str) {
-    let _ = write!(
-        h,
-        r#"<span style="display: inline-flex; align-items: center; gap: 7px;"><span style="width: 9px; height: 9px; border-radius: 2px; background: {c};"></span><span style="color: var(--text);">{name}</span> {w}%</span>"#,
-    );
-}
-
-fn tool_row(h: &mut String, c: &str, name: &str, mix: [&str; 4], tokens: &str, last: &str) {
-    let _ = write!(
-        h,
-        r#"<div style="display: grid; grid-template-columns: 150px minmax(0,1fr) 110px 90px; gap: 20px; align-items: center;">
-<span class="mono" style="display: inline-flex; align-items: center; gap: 8px; font-size: 12px;"><span style="width: 9px; height: 9px; border-radius: 2px; background: {c};"></span>{name}</span>
-"#,
-    );
-    mix_bar(h, mix);
-    let _ = writeln!(
-        h,
-        r#"<span class="mono" style="font-size: 12px; text-align: right; color: var(--text);">{tokens}</span><span class="mono" style="font-size: 12px; text-align: right; color: var(--text);">{last}</span></div>"#,
-    );
-}
-
-fn tools(h: &mut String, st: &Stats, cost_on: bool) {
-    let total = st.total.sum().max(1);
-    let _ = write!(
-        h,
-        r#"<div style="display: flex; flex-direction: column; gap: 14px;">
-<div class="row"><h2 class="sec">YOUR TOOLS</h2>
-<span class="secnote">share of <span data-k="tools-total">{tot}</span> tokens</span></div>
-<div class="card" style="padding: 22px 24px 20px; display: flex; flex-direction: column; gap: 18px;">
-<div id="t-bar" style="display: flex; gap: 2px; height: 14px;">"#,
-        tot = fmt_tokens(st.total.sum()),
-    );
-    let n = st.by_provider.len();
-    for (i, (p, t)) in st.by_provider.iter().enumerate() {
-        let w = t.sum() as f64 * 100.0 / total as f64;
-        let radius = match (i == 0, i + 1 == n) {
-            (true, true) => "3px",
-            (true, false) => "3px 0 0 3px",
-            (false, true) => "0 3px 3px 0",
-            _ => "0",
-        };
-        tool_segment(
-            h,
-            &format!("{w:.1}"),
-            provider_color(p),
-            radius,
-            &esc(provider_name(p)),
-            &format!("{w:.0}"),
-        );
+    if keys.is_empty() {
+        keys.push(first_d);
     }
-    h.push_str("</div>\n<div id=\"t-legend\" class=\"mono\" style=\"display: flex; gap: 24px; font-size: 11px; color: var(--muted);\">");
-    for (p, t) in &st.by_provider {
-        tool_legend(
-            h,
-            provider_color(p),
-            &esc(provider_name(p)),
-            &format!("{:.0}", t.sum() as f64 * 100.0 / total as f64),
-        );
+
+    let total_val: f64 = st.daily.values().map(|t| t.sum() as f64).sum();
+    let mut bucket_vals: BTreeMap<NaiveDate, f64> = keys.iter().map(|&k| (k, 0.0)).collect();
+    for (d, t) in &st.daily {
+        let bk = if weekly { monday_of(*d) } else { *d };
+        *bucket_vals.entry(bk).or_default() += t.sum() as f64;
     }
-    h.push_str(
-        r#"</div>
-<div style="height: 1px; background: var(--track);"></div>
-<div style="display: flex; flex-direction: column; gap: 14px;">
-<div class="mono" style="display: grid; grid-template-columns: 150px minmax(0,1fr) 110px 90px; gap: 20px; font-size: 10px; letter-spacing: 0.13em; color: var(--meta);">
-<span>PROVIDER</span><span>TOKEN MIX</span><span style="text-align: right;">TOKENS</span><span style="text-align: right;">"#,
-    );
-    h.push_str(if cost_on { "EST. COST" } else { "MESSAGES" });
-    h.push_str("</span></div>\n<div id=\"t-rows\" style=\"display: flex; flex-direction: column; gap: 14px;\">\n");
-    for (p, t) in &st.by_provider {
-        let sum = t.sum();
-        let pct = |v: u64| format!("{:.0}", v as f64 * 100.0 / sum.max(1) as f64);
-        let last = if cost_on {
-            // Priced at the provider×model split — never at a guessed blend.
-            fmt_usd_for_models(&st.provider_models(p))
+    let max_val = bucket_vals
+        .values()
+        .copied()
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+
+    const W: f64 = 1072.0;
+    const H: f64 = 200.0;
+    const L: f64 = 56.0;
+    const R: f64 = 1064.0;
+    const TOP: f64 = 16.0;
+    const BASE: f64 = 180.0;
+    let plot_w = R - L;
+    let plot_h = BASE - TOP;
+    let n = keys.len().max(1) as f64;
+    let slot = plot_w / n;
+    let bar_w = (slot * 0.72).clamp(2.0, 28.0);
+
+    let mut svg = String::new();
+    for step in 0..=3 {
+        let frac = step as f64 / 3.0;
+        let y = BASE - frac * plot_h;
+        let stroke = if step == 0 {
+            "var(--hairline)"
         } else {
-            fmt_int(t.messages)
+            "var(--track)"
         };
-        tool_row(
-            h,
-            provider_color(p),
-            &esc(provider_name(p)),
-            [
-                &pct(t.cache_read),
-                &pct(t.cache_write),
-                &pct(t.input),
-                &pct(t.output + t.thinking),
-            ],
-            &fmt_tokens(sum),
-            &last,
+        let label = fmt_tokens((max_val * frac).round() as u64);
+        let _ = write!(
+            svg,
+            r#"<line x1="{L}" y1="{y:.1}" x2="{R}" y2="{y:.1}" stroke="{stroke}" stroke-width="1"/><text x="{lx}" y="{ty:.1}" text-anchor="end" font-size="10" fill="var(--meta)" font-family="ui-monospace,monospace">{label}</text>"#,
+            lx = L - 8.0,
+            ty = y + 3.0,
         );
     }
-    h.push_str(
-        r#"</div></div>
-<div class="mono" style="display: flex; gap: 22px; padding-top: 4px; border-top: 1px solid var(--track); font-size: 11px; color: var(--muted);">
-<span style="display: inline-flex; align-items: center; gap: 7px;"><span class="hatch-cr" style="width: 12px; height: 9px; border-radius: 2px;"></span>cache read</span>
-<span style="display: inline-flex; align-items: center; gap: 7px;"><span style="width: 12px; height: 9px; border-radius: 2px; background: var(--cache-write);"></span>cache write</span>
-<span style="display: inline-flex; align-items: center; gap: 7px;"><span style="width: 12px; height: 9px; border-radius: 2px; background: var(--input);"></span>input</span>
-<span style="display: inline-flex; align-items: center; gap: 7px;"><span style="width: 12px; height: 9px; border-radius: 2px; background: var(--output);"></span>output</span>
+    for (i, bk) in keys.iter().enumerate() {
+        let v = bucket_vals.get(bk).copied().unwrap_or(0.0);
+        if v > 0.0 {
+            let x = L + i as f64 * slot + (slot - bar_w) / 2.0;
+            let bh = (v / max_val) * plot_h;
+            let y = BASE - bh;
+            let _ = write!(
+                svg,
+                r#"<rect x="{x:.1}" y="{y:.1}" width="{bar_w:.1}" height="{bh:.1}" fill="{fill}" rx="1"><title>{bk} — {val}</title></rect>"#,
+                fill = c::SERIES[0],
+                val = fmt_tokens(v.round() as u64),
+            );
+        }
+    }
+
+    let cost_pressed = if cost_on { "true" } else { "false" };
+    let tok_pressed = if cost_on { "false" } else { "true" };
+    let cost_hidden = if cost_on { "" } else { " hidden" };
+    let mid_d = keys[keys.len() / 2];
+    let _ = write!(
+        h,
+        r#"<div style="display: flex; flex-direction: column; gap: 12px;">
+<div class="row">
+<h2 class="sec">ACTIVITY OVER TIME</h2>
+<span class="secnote" data-k="ch-note">{unit} per {cadence}, {cnt} {cadence}s</span>
 <span class="spacer"></span>
-<span>Grok and Antigravity report no cache-write class.</span>
+<div id="chart-metric" class="seg">
+<button type="button" class="btn" data-m="cost" aria-pressed="{cost_pressed}"{cost_hidden}>Cost ($)</button>
+<button type="button" class="btn" data-m="tokens" aria-pressed="{tok_pressed}">Tokens</button>
 </div>
-</div></div>
-"#,
+<div id="chart-group" class="seg">
+<button type="button" class="btn" data-g="provider" aria-pressed="true">Provider</button>
+<button type="button" class="btn" data-g="model" aria-pressed="false">Model</button>
+<button type="button" class="btn" data-g="project" aria-pressed="false">Project</button>
+</div>
+</div>
+<div class="card" style="padding: 18px 20px 14px; display: flex; flex-direction: column; gap: 10px;">
+<svg id="ch-svg" viewBox="0 0 {W:.0} {H:.0}" width="100%" role="img" aria-label="Activity over time">{svg}</svg>
+<div class="mono" style="display: flex; justify-content: space-between; font-size: 10px; color: var(--meta);">
+<span data-k="ch-first">{first}</span><span data-k="ch-mid">{mid}</span><span data-k="ch-last">{last}</span>
+</div>
+<div id="ch-legend" class="mono" style="display: flex; flex-wrap: wrap; gap: 16px; font-size: 11px; color: var(--muted);">"#,
+        unit = if cost_on { "API-equiv USD" } else { "tokens" },
+        cadence = if weekly { "week" } else { "day" },
+        cnt = keys.len(),
+        first = keys
+            .first()
+            .map(|d| d.format("%d %b %Y").to_string())
+            .unwrap_or_default(),
+        mid = mid_d.format("%d %b %Y"),
+        last = keys
+            .last()
+            .map(|d| d.format("%d %b %Y").to_string())
+            .unwrap_or_default(),
     );
-}
-
-fn context_row(h: &mut String, name: &str, pp: &str, color: &str) {
-    let _ = write!(
+    chart_legend(
         h,
-        r#"<div class="mono" style="display: grid; grid-template-columns: 110px minmax(0,1fr) 48px; gap: 14px; align-items: center; font-size: 11px;">
-<span class="dim">{name}</span>
-<div style="height: 6px; border-radius: 3px; background: var(--track); overflow: hidden;"><div style="height: 100%; border-radius: 3px; width: {pp}%; background: {color};"></div></div>
-<span style="text-align: right;">{pp}%</span>
-</div>
-"#,
+        c::SERIES[0],
+        "Total",
+        &fmt_tokens(total_val.round() as u64),
     );
-}
-
-fn context_efficiency(h: &mut String, st: &Stats) {
-    let Some(pct) = st.total.cache_hit_pct() else {
-        return;
-    };
-    let saved = st
-        .total
-        .cache_hit_pct()
-        .map(|_| fmt_tokens(st.total.cache_read))
-        .unwrap_or_default();
-    let _ = write!(
-        h,
-        r#"<div id="sec-context" style="display: flex; flex-direction: column; gap: 14px;">
-<div class="row"><h2 class="sec">CONTEXT EFFICIENCY</h2>
-<span class="secnote">cache read ÷ (cache read + cache write + input)</span></div>
-<div class="card" style="padding: 24px; display: grid; grid-template-columns: 300px minmax(0,1fr); gap: 40px; align-items: center;">
-<div style="display: flex; flex-direction: column; gap: 8px;">
-<div class="mono" data-k="ctx-pct" style="font-size: 64px; font-weight: 600; letter-spacing: -0.04em; line-height: 1; color: var(--ok);">{pct:.0}%</div>
-<div style="font-size: 13px; color: var(--muted); line-height: 1.6;">of the context you sent was served from cache — <span data-k="ctx-saved">{saved}</span> tokens not re-billed at full input price.</div>
-</div>
-<div style="display: flex; flex-direction: column; gap: 10px;">
-<div style="display: flex; gap: 2px; height: 26px;">
-<div class="hatch-cr" data-w="ctx-read" style="width: {pct:.0}%; border-radius: 3px 0 0 3px;"></div>
-<div data-w="ctx-input" style="width: {rest:.0}%; background: var(--input); border-radius: 0 3px 3px 0;"></div>
-</div>
-<div class="mono" style="display: flex; justify-content: space-between; font-size: 11px; color: var(--muted);">
-<span>cache read <span data-k="ctx-read">{cr}</span></span><span>input <span data-k="ctx-input">{inp}</span></span>
-</div>
-<div id="c-rows" style="display: flex; flex-direction: column; gap: 7px; padding-top: 8px; border-top: 1px solid var(--track);">
-"#,
-        pct = pct,
-        rest = 100.0 - pct,
-        cr = fmt_tokens(st.total.cache_read),
-        inp = fmt_tokens(st.total.input),
-        saved = saved,
-    );
-    for (p, t) in &st.by_provider {
-        let Some(pp) = t.cache_hit_pct() else {
-            continue;
-        };
-        let color = if pp < 50.0 { c::WARN } else { c::OK };
-        context_row(h, &esc(provider_name(p)), &format!("{pp:.0}"), color);
-    }
-    h.push_str("</div></div></div></div>\n");
-}
-
-fn hot_zones_and_models(h: &mut String, st: &Stats) {
-    if st.projects.is_empty() {
-        return;
-    }
-    let total = st.total.sum().max(1);
-    let top_p: Vec<_> = st.projects.iter().take(6).collect();
-    let rest_p: u64 = st.projects.iter().skip(6).map(|(_, t)| t.sum()).sum();
-    let max_p = top_p.first().map(|(_, t)| t.sum()).unwrap_or(1).max(1);
-    h.push_str(
-        r#"<div class="grid2">
-<div style="display: flex; flex-direction: column; gap: 14px;">
-<h2 class="sec">PROJECT HOT ZONES</h2>
-<div class="card" style="padding: 20px 24px; display: flex; flex-direction: column; gap: 12px;">
-<div id="p-rows" style="display: flex; flex-direction: column; gap: 12px;">
-"#,
-    );
-    let row = |h: &mut String, name: &str, tokens: u64, dimmed: bool| {
-        project_row(
-            h,
-            &esc(name),
-            &format!("{:.0}", tokens as f64 * 100.0 / max_p as f64),
-            &format!("{:.0}", tokens as f64 * 100.0 / total as f64),
-            &fmt_tokens(tokens),
-            if dimmed { "var(--meta)" } else { "var(--text)" },
-            if dimmed {
-                "var(--cache-read)"
-            } else {
-                "var(--input)"
-            },
-        )
-    };
-    for (name, t) in &top_p {
-        row(h, name, t.sum(), false);
-    }
-    if rest_p > 0 {
-        let n = st.projects.len() - top_p.len();
-        row(h, &format!("{n} others"), rest_p, true);
-    }
-    h.push_str(
-        r#"</div>
-<div style="font-size: 12px; color: var(--meta); padding-top: 6px; border-top: 1px solid var(--track);"><span class="mono" style="color: var(--muted);">Mask projects</span> hides names on screen only; this file still contains them. To share a report, write one with <span class="mono" style="color: var(--muted);">tickover stats --report --mask</span>.</div>
-</div></div>
-<div style="display: flex; flex-direction: column; gap: 14px;">
-<h2 class="sec">MOST-USED MODELS</h2>
-<div id="m-rows" class="card" style="padding: 20px 24px; display: flex; flex-direction: column; gap: 12px;">
-"#,
-    );
-    let max_m = st.models.first().map(|(_, t)| t.sum()).unwrap_or(1).max(1);
-    for (m, t) in st.models.iter().take(6) {
-        let w = t.sum() as f64 * 100.0 / max_m as f64;
-        model_row(h, &esc(m), &fmt_tokens(t.sum()), &format!("{w:.0}"));
-    }
     h.push_str("</div></div></div>\n");
 }
 
-fn model_row(h: &mut String, m: &str, v: &str, w: &str) {
+fn bd_provider_row(h: &mut String, id: &str, arrow: &str, c: &str, name: &str, cells: &[&str; 9]) {
     let _ = write!(
         h,
-        r#"<div style="display: flex; flex-direction: column; gap: 5px;">
-<div class="mono" style="display: flex; justify-content: space-between; align-items: baseline; font-size: 12px;">
-<span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{m}</span>
-<span style="color: var(--muted); padding-left: 12px;">{v}</span>
-</div>
-<div class="bar-track" style="height: 8px;"><div class="bar-fill" style="width: {w}%;"></div></div>
-</div>
+        r#"<tr class="prov-row mono" data-prov="{id}" aria-expanded="false">
+<td><span style="display: inline-flex; align-items: center; gap: 8px; font-weight: 600;"><span class="bd-arrow" style="color: var(--meta);">{arrow}</span><span style="width: 8px; height: 8px; border-radius: 2px; background: {c};"></span>{name}</span></td>
+<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td style="font-weight: 600;">{}</td><td>{}</td><td>{}</td><td>{}</td>
+</tr>
 "#,
+        cells[0], cells[1], cells[2], cells[3], cells[4], cells[5], cells[6], cells[7], cells[8],
     );
 }
 
-fn project_row(h: &mut String, name: &str, w: &str, share: &str, v: &str, color: &str, fill: &str) {
+fn bd_model_row(h: &mut String, parent: &str, closed: &str, m: &str, cells: &[&str; 9]) {
     let _ = write!(
         h,
-        r#"<div style="display: grid; grid-template-columns: 150px minmax(0,1fr) 76px 54px; gap: 16px; align-items: center;">
+        r#"<tr class="model-row{closed} mono" data-parent="{parent}">
+<td style="padding-left: 28px;">{m}</td>
+<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>
+</tr>
+"#,
+        cells[0], cells[1], cells[2], cells[3], cells[4], cells[5], cells[6], cells[7], cells[8],
+    );
+}
+
+fn breakdown(h: &mut String, st: &Stats, cost_on: bool) {
+    let total_cost = if cost_on {
+        pricing::cost_for_models(&st.models).filter(|c| *c > 0.0)
+    } else {
+        None
+    };
+
+    h.push_str(
+        r#"<div style="display: flex; flex-direction: column; gap: 12px;">
+<div class="row">
+<h2 class="sec">BREAKDOWN</h2>
+<span class="secnote">provider → models, click a row to expand</span>
+<span class="spacer"></span>
+<button type="button" class="btn" id="bd-toggle-all">Expand all</button>
+<button type="button" class="btn" id="export-csv">Export CSV</button>
+</div>
+<div class="card table-wrap" style="padding: 8px 14px;">
+<table id="bd-table" class="bd mono">
+<thead><tr>
+<th data-sort="name">PROVIDER / MODEL</th>
+<th data-sort="in">IN</th>
+<th data-sort="out">OUT</th>
+<th data-sort="cw">CACHE WRITE</th>
+<th data-sort="cr">CACHE READ</th>
+<th data-sort="hit">CACHE HIT</th>
+<th data-sort="total">TOTAL</th>
+<th data-sort="cost">COST</th>
+<th data-sort="share">% OF $</th>
+<th data-sort="cpm">$ / MSG</th>
+</tr></thead>
+<tbody id="bd-body">
+"#,
+    );
+
+    let cells_of = |t: &Totals, models: &[(String, Totals)]| -> [String; 9] {
+        let hit = t
+            .cache_hit_pct()
+            .map(|p| format!("{p:.0}%"))
+            .unwrap_or_else(|| "—".into());
+        let (cost, partial) = if cost_on {
+            pricing::cost_summary(models)
+        } else {
+            (None, false)
+        };
+        let share = match (total_cost, cost) {
+            (Some(tc), Some(rc)) => format!("{:.0}%", rc * 100.0 / tc),
+            _ => "—".into(),
+        };
+        let cpm = match cost {
+            Some(c) if t.messages > 0 => fmt_cost_pair(Some(c / t.messages as f64), partial),
+            _ => "—".into(),
+        };
+        [
+            fmt_tokens(t.input),
+            fmt_tokens(t.output + t.thinking),
+            fmt_tokens(t.cache_write),
+            fmt_tokens(t.cache_read),
+            hit,
+            fmt_tokens(t.sum()),
+            if cost_on {
+                fmt_cost_pair(cost, partial)
+            } else {
+                "—".into()
+            },
+            share,
+            cpm,
+        ]
+    };
+
+    for (p, t) in &st.by_provider {
+        let p_models = st.provider_models(p);
+        let pc = cells_of(t, &p_models);
+        let pc_ref = [
+            pc[0].as_str(),
+            pc[1].as_str(),
+            pc[2].as_str(),
+            pc[3].as_str(),
+            pc[4].as_str(),
+            pc[5].as_str(),
+            pc[6].as_str(),
+            pc[7].as_str(),
+            pc[8].as_str(),
+        ];
+        bd_provider_row(
+            h,
+            &esc(p),
+            "▸",
+            provider_color(p),
+            &esc(provider_name(p)),
+            &pc_ref,
+        );
+        for (m, mt) in &p_models {
+            let single = [(m.clone(), *mt)];
+            let mc = cells_of(mt, &single);
+            let mc_ref = [
+                mc[0].as_str(),
+                mc[1].as_str(),
+                mc[2].as_str(),
+                mc[3].as_str(),
+                mc[4].as_str(),
+                mc[5].as_str(),
+                mc[6].as_str(),
+                mc[7].as_str(),
+                mc[8].as_str(),
+            ];
+            bd_model_row(h, &esc(p), " is-closed", &esc(m), &mc_ref);
+        }
+    }
+    h.push_str("</tbody></table></div></div>\n");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_row(
+    h: &mut String,
+    name: &str,
+    pts: &str,
+    sparkop: &str,
+    w: &str,
+    cost: &str,
+    tok: &str,
+    share: &str,
+    color: &str,
+    fill: &str,
+) {
+    let _ = write!(
+        h,
+        r#"<div class="prow">
 <span class="mono proj" data-name="{name}" style="font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: {color};">{name}</span>
+<svg viewBox="0 0 64 16" width="64" height="16" aria-hidden="true" style="opacity: {sparkop};"><polyline fill="none" stroke="{fill}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" points="{pts}"/></svg>
 <div class="bar-track"><div class="bar-fill" style="width: {w}%; background: {fill};"></div></div>
-<span class="mono" style="font-size: 12px; text-align: right; color: var(--text);">{v}</span>
+<span class="mono" style="font-size: 12px; text-align: right; color: var(--text);">{cost}</span>
+<span class="mono" style="font-size: 11px; text-align: right; color: var(--muted);">{tok}</span>
 <span class="mono" style="font-size: 11px; text-align: right; color: var(--meta);">{share}%</span>
 </div>
 "#,
     );
 }
 
-/// Weekly totals (Mon-start) for the burn trail — derived from the
-/// heatmap data (which is Sun-start, so regroup by ISO week).
-fn weekly_series(st: &Stats) -> Vec<(chrono::NaiveDate, u64)> {
-    use std::collections::BTreeMap;
-    let mut weeks: BTreeMap<chrono::NaiveDate, u64> = BTreeMap::new();
-    for row in &st.heatmap {
-        for (d, v) in row {
-            let monday = *d - chrono::Duration::days(d.weekday().num_days_from_monday() as i64);
-            *weeks.entry(monday).or_default() += v;
-        }
-    }
-    // Quiet weeks inside the span stay, flat at zero; the heatmap's empty run
-    // before the first week of use and after the last is not part of it.
-    let mut series: Vec<_> = weeks.into_iter().collect();
-    while series.last().is_some_and(|(_, v)| *v == 0) {
-        series.pop();
-    }
-    let first = series.iter().position(|(_, v)| *v > 0).unwrap_or(0);
-    series.split_off(first)
-}
-
-fn weekly_trail(h: &mut String, st: &Stats) {
-    let weeks = weekly_series(st);
-    if weeks.is_empty() {
-        return;
-    }
-    const W: f64 = 1072.0;
-    const H: f64 = 180.0;
-    const TOP: f64 = 20.0;
-    const BASE: f64 = 160.0;
-    let max = weeks.iter().map(|(_, v)| *v).max().unwrap_or(1).max(1) as f64;
-    let n = weeks.len().max(2) as f64;
-    let x = |i: usize| i as f64 / (n - 1.0) * W;
-    let y = |v: u64| BASE - (v as f64 / max) * (BASE - TOP);
-    let mut pts = String::new();
-    let mut area = format!("M0,{BASE} ");
-    for (i, (_, v)) in weeks.iter().enumerate() {
-        let _ = write!(pts, "{:.1},{:.1} ", x(i), y(*v));
-        let _ = write!(area, "L{:.1},{:.1} ", x(i), y(*v));
-    }
-    let _ = write!(area, "L{W:.0},{BASE} Z");
-    // Peak week gets the dashed marker + tooltip, like the mock.
-    let (peak_i, (peak_w, peak_v)) = weeks
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, (_, v))| *v)
-        .map(|(i, (d, v))| (i, (*d, *v)))
-        .unwrap_or((0, (chrono::Local::now().date_naive(), 0)));
+#[allow(clippy::too_many_arguments)]
+fn session_row(
+    h: &mut String,
+    i: &str,
+    proj: &str,
+    date: &str,
+    prov: &str,
+    model: &str,
+    span: &str,
+    tok: &str,
+    cost: &str,
+) {
     let _ = write!(
         h,
-        r#"<div style="display: flex; flex-direction: column; gap: 14px;">
-<div class="row"><h2 class="sec">WEEKLY BURN TRAIL</h2>
-<span class="secnote" data-k="tr-note">tokens per week, {n} weeks</span></div>
-<div class="card" style="padding: 22px 24px 16px; display: flex; flex-direction: column; gap: 10px; position: relative;">
-<svg id="tr-svg" viewBox="0 0 {W:.0} {H:.0}" width="100%" role="img" aria-label="Weekly token totals, peaking at {peak_fmt} the week of {peak_date}.">
-<line x1="0" y1="{TOP}" x2="{W}" y2="{TOP}" stroke="var(--track)" stroke-width="1"></line>
-<line x1="0" y1="70" x2="{W}" y2="70" stroke="var(--track)" stroke-width="1"></line>
-<line x1="0" y1="120" x2="{W}" y2="120" stroke="var(--track)" stroke-width="1"></line>
-<line x1="0" y1="{BASE}" x2="{W}" y2="{BASE}" stroke="var(--hairline)" stroke-width="1"></line>
-<path id="tr-area" d="{area}" fill="var(--ok)" fill-opacity="0.10"></path>
-<polyline id="tr-line" points="{pts}" fill="none" stroke="var(--ok)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"></polyline>
-<line id="tr-mark" x1="{px:.0}" y1="{TOP}" x2="{px:.0}" y2="{BASE}" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 3"></line>
-<circle id="tr-dot" cx="{px:.0}" cy="{py:.1}" r="5" fill="var(--ok)" stroke="var(--surface)" stroke-width="2"><title>week of {peak_date} — {peak_fmt} tokens</title></circle>
-</svg>
-<div class="mono" style="display: flex; justify-content: space-between; font-size: 10px; color: var(--meta);">
-<span data-k="tr-first">{first}</span><span data-k="tr-last">{last}</span>
+        r#"<div class="srow" style="padding-bottom: 8px; border-bottom: 1px solid var(--track-soft);">
+<span class="mono" style="font-size: 12px; color: var(--meta);">{i}</span>
+<span style="display: flex; flex-direction: column; gap: 2px; min-width: 0;">
+<span class="mono proj" data-name="{proj}" style="font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{proj}</span>
+<span style="font-size: 11px; color: var(--meta);">{date} · {prov}</span>
+</span>
+<span class="mono srow-hide" style="font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{model}</span>
+<span class="mono srow-hide" style="font-size: 12px; text-align: right; color: var(--muted);">{span}</span>
+<span class="mono" style="font-size: 12px; text-align: right; color: var(--muted);">{tok}</span>
+<span class="mono" style="font-size: 12px; text-align: right; color: var(--text);">{cost}</span>
 </div>
+"#,
+    );
+}
+
+fn projects_and_sessions(h: &mut String, st: &Stats, cost_on: bool) {
+    let total_tokens = st.total.sum().max(1);
+    let total_cost = if cost_on {
+        pricing::cost_for_models(&st.models).filter(|c| *c > 0.0)
+    } else {
+        None
+    };
+
+    let mut ping_entry: Option<(&String, &Totals)> = None;
+    let mut user_projects: Vec<(&String, &Totals)> = Vec::new();
+    for (name, t) in &st.projects {
+        if name == AUTO_PING_PROJECT {
+            ping_entry = Some((name, t));
+        } else {
+            user_projects.push((name, t));
+        }
+    }
+
+    let proj_cost = |name: &str| -> (Option<f64>, bool) {
+        if cost_on {
+            pricing::cost_summary(&st.project_models(name))
+        } else {
+            (None, false)
+        }
+    };
+    if cost_on {
+        user_projects.sort_by(|a, b| {
+            let ca = proj_cost(a.0).0;
+            let cb = proj_cost(b.0).0;
+            match (ca, cb) {
+                (Some(x), Some(y)) => y
+                    .partial_cmp(&x)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.1.sum().cmp(&a.1.sum()))
+                    .then_with(|| a.0.cmp(b.0)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => b.1.sum().cmp(&a.1.sum()).then_with(|| a.0.cmp(b.0)),
+            }
+        });
+    }
+
+    let top_p: Vec<_> = user_projects.iter().take(10).copied().collect();
+    let max_metric = top_p
+        .first()
+        .map(|(name, t)| {
+            if total_cost.is_some() {
+                proj_cost(name).0.unwrap_or(0.0)
+            } else {
+                t.sum() as f64
+            }
+        })
+        .unwrap_or(1.0)
+        .max(1e-9);
+    let denom = total_cost.unwrap_or(total_tokens as f64);
+
+    h.push_str(
+        r#"<div class="grid2">
+<div style="display: flex; flex-direction: column; gap: 12px;">
+<h2 class="sec">PROJECTS</h2>
+<div class="card" style="padding: 18px 20px; display: flex; flex-direction: column; gap: 10px;">
+<div id="p-rows" style="display: flex; flex-direction: column; gap: 10px;">
+"#,
+    );
+    let emit_project = |h: &mut String,
+                        name: &str,
+                        tokens: u64,
+                        c_pair: (Option<f64>, bool),
+                        dimmed: bool,
+                        show_spark: bool| {
+        let m_val = if total_cost.is_some() {
+            c_pair.0.unwrap_or(0.0)
+        } else {
+            tokens as f64
+        };
+        let w = (m_val * 100.0 / max_metric).min(100.0);
+        let share = m_val * 100.0 / denom;
+        let cost_str = if cost_on {
+            fmt_cost_pair(c_pair.0, c_pair.1)
+        } else {
+            "—".to_string()
+        };
+        project_row(
+            h,
+            &esc(name),
+            "0,14 64,14",
+            if show_spark { "1" } else { "0" },
+            &format!("{w:.0}"),
+            &cost_str,
+            &fmt_tokens(tokens),
+            &format!("{share:.0}"),
+            if dimmed { "var(--meta)" } else { "var(--text)" },
+            if dimmed {
+                "var(--cache-read)"
+            } else {
+                "var(--input)"
+            },
+        );
+    };
+    for (name, t) in &top_p {
+        emit_project(h, name, t.sum(), proj_cost(name), false, true);
+    }
+    if user_projects.len() > 10 {
+        let rest_tokens: u64 = user_projects[10..].iter().map(|(_, t)| t.sum()).sum();
+        let mut rest_models: HashMap<String, Totals> = HashMap::new();
+        for (name, _) in &user_projects[10..] {
+            for (m, mt) in st.project_models(name) {
+                let entry = rest_models.entry(m).or_default();
+                entry.input += mt.input;
+                entry.output += mt.output;
+                entry.cache_read += mt.cache_read;
+                entry.cache_write += mt.cache_write;
+                entry.thinking += mt.thinking;
+                entry.messages += mt.messages;
+            }
+        }
+        let rest_vec: Vec<(String, Totals)> = rest_models.into_iter().collect();
+        let rest_cost = if cost_on {
+            pricing::cost_summary(&rest_vec)
+        } else {
+            (None, false)
+        };
+        emit_project(
+            h,
+            &format!("{} others", user_projects.len() - 10),
+            rest_tokens,
+            rest_cost,
+            true,
+            false,
+        );
+    }
+    h.push_str("</div>\n");
+    if let Some((name, t)) = ping_entry {
+        h.push_str(
+            r#"<div id="p-ping" style="padding-top: 8px; border-top: 1px solid var(--track);">"#,
+        );
+        emit_project(h, name, t.sum(), proj_cost(name), true, false);
+        h.push_str("</div>\n");
+    } else {
+        h.push_str(
+            r#"<div id="p-ping" hidden style="padding-top: 8px; border-top: 1px solid var(--track);"></div>"#,
+        );
+    }
+    h.push_str(
+        r#"<div style="font-size: 12px; color: var(--meta); padding-top: 6px; border-top: 1px solid var(--track);"><span class="mono" style="color: var(--muted);">Mask projects</span> hides names on screen only. To share a report, use <span class="mono" style="color: var(--muted);">tickover stats --report --mask</span>.</div>
+</div></div>
+<div style="display: flex; flex-direction: column; gap: 12px;">
+<div class="row"><h2 class="sec">TOP SESSIONS</h2>
+<span class="secnote" data-k="s-note">top 10 in all history</span></div>
+<div class="card" style="padding: 18px 20px; display: flex; flex-direction: column; gap: 10px;">
+<div class="srow mono" style="font-size: 10px; letter-spacing: 0.13em; color: var(--meta);">
+<span>#</span><span>PROJECT · DATE</span><span class="srow-hide">MODEL</span><span class="srow-hide" style="text-align: right;">LEN</span><span style="text-align: right;">TOKENS</span><span style="text-align: right;">COST</span>
+</div>
+<div id="s-rows" style="display: flex; flex-direction: column; gap: 9px;">
+"#,
+    );
+
+    let mut sessions = st.sessions.clone();
+    let sess_cost = |s: &query::SessionStat| -> (Option<f64>, bool) {
+        if !cost_on {
+            return (None, false);
+        }
+        let models: Vec<(String, Totals)> = s.models.iter().map(|(m, t)| (m.clone(), *t)).collect();
+        pricing::cost_summary(&models)
+    };
+    if cost_on {
+        sessions.sort_by(|a, b| {
+            let ca = sess_cost(a).0;
+            let cb = sess_cost(b).0;
+            match (ca, cb) {
+                (Some(x), Some(y)) => y
+                    .partial_cmp(&x)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.totals.sum().cmp(&a.totals.sum())),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => b.totals.sum().cmp(&a.totals.sum()),
+            }
+        });
+    }
+    for (i, s) in sessions.iter().take(10).enumerate() {
+        let span = session_span(&s.first_hour, &s.last_hour);
+        let date = query::parse_bucket_hour(&s.first_hour)
+            .map(|h| h.with_timezone(&Local).format("%d %b %Y").to_string())
+            .unwrap_or_else(|| s.first_hour.clone());
+        let (c, partial) = sess_cost(s);
+        let cost = if cost_on {
+            fmt_cost_pair(c, partial)
+        } else {
+            "—".into()
+        };
+        let model = s.top_model();
+        session_row(
+            h,
+            &(i + 1).to_string(),
+            &esc(&s.project),
+            &date,
+            &esc(provider_name(&s.provider)),
+            &esc(if model.is_empty() { "—" } else { model }),
+            &span,
+            &fmt_tokens(s.totals.sum()),
+            &cost,
+        );
+    }
+    h.push_str("</div></div></div></div>\n");
+}
+
+fn habits(h: &mut String, st: &Stats) {
+    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let mut max = 0u64;
+    let mut total = 0u64;
+    let mut peak = (0usize, 0usize);
+    for (w, row) in st.weekday_hours.iter().enumerate() {
+        for (hr, &v) in row.iter().enumerate() {
+            total += v;
+            if v > max {
+                max = v;
+                peak = (w, hr);
+            }
+        }
+    }
+    let denom = max.max(1) as f64;
+    let peak_share = st.weekday_hours[peak.0][peak.1] as f64 * 100.0 / total.max(1) as f64;
+    h.push_str(
+        r#"<div style="display: flex; flex-direction: column; gap: 12px;">
+<div class="row"><h2 class="sec">USAGE HABITS</h2>
+<span class="secnote">day of week × hour, local time</span></div>
+<div class="card" style="padding: 18px 20px; display: flex; flex-direction: column; gap: 10px;">
+<div class="scroll-x">
+<div style="display: grid; grid-template-columns: 36px repeat(24, minmax(12px, 1fr)); gap: 3px; min-width: 420px; align-items: center;">
+<span></span>
+"#,
+    );
+    for hr in 0..24 {
+        let label = if hr % 3 == 0 {
+            format!("{hr:02}")
+        } else {
+            String::new()
+        };
+        let _ = write!(
+            h,
+            r#"<span class="mono" style="font-size: 9px; color: var(--meta); text-align: center;">{label}</span>"#,
+        );
+    }
+    for (w, day_name) in DAYS.iter().enumerate() {
+        let _ = write!(
+            h,
+            r#"<span class="mono" style="font-size: 10px; color: var(--meta);">{day_name}</span>"#,
+        );
+        for hr in 0..24 {
+            let v = st.weekday_hours[w][hr];
+            let level = if v == 0 {
+                0
+            } else {
+                (1 + (v as f64 / denom * 3.999) as usize).min(4)
+            };
+            let _ = write!(
+                h,
+                r#"<div data-wh="{w}-{hr}" title="{day_name} {hr:02}:00 — {tok}" style="height: 14px; border-radius: 2px; background: var(--heat{level});"></div>"#,
+                tok = fmt_tokens(v),
+            );
+        }
+    }
+    let _ = write!(
+        h,
+        r#"</div></div>
+<div style="font-size: 12px; color: var(--muted); padding-top: 6px; border-top: 1px solid var(--track);">Peak slot <span class="mono" data-k="hb-peak" style="color: var(--text);">{day} {hr:02}:00</span> — <span data-k="hb-share">{peak_share:.0}</span>% of tokens in this period.</div>
 </div></div>
 "#,
-        W = W as u32,
-        H = H as u32,
-        TOP = TOP,
-        BASE = BASE,
-        n = weeks.len(),
-        area = area,
-        pts = pts.trim(),
-        px = x(peak_i),
-        py = y(peak_v),
-        peak_fmt = fmt_tokens(peak_v),
-        peak_date = peak_w.format("%d %b %Y"),
-        first = weeks
-            .first()
-            .map(|(d, _)| d.format("%b %Y").to_string())
-            .unwrap_or_default(),
-        last = weeks
-            .last()
-            .map(|(d, _)| d.format("%b %Y").to_string())
-            .unwrap_or_default(),
+        day = DAYS[peak.0],
+        hr = peak.1,
     );
 }
 
@@ -1072,11 +1330,11 @@ fn heatmap(h: &mut String, st: &Stats) {
         .map(|(d, t)| (*d, t.sum()));
     let _ = write!(
         h,
-        r#"<div style="display: flex; flex-direction: column; gap: 14px;">
-<div class="row"><h2 class="sec">52 WEEKS</h2>
-<span class="secnote">{active} active days · current streak {streak} · all history, whatever the period</span></div>
-<div class="card" style="padding: 22px 24px; display: flex; flex-direction: column; gap: 12px;">
-<div style="display: flex; gap: 12px; align-items: flex-start;">
+        r#"<details class="card" style="padding: 16px 20px;">
+<summary class="mono" style="cursor: pointer; font-size: 12px; font-weight: 700; letter-spacing: 0.14em;">52 WEEKS <span style="font-weight: 400; letter-spacing: normal; color: var(--meta);">· {active} active days · streak {streak} · all history, whatever the period</span></summary>
+<div style="margin-top: 14px; display: flex; flex-direction: column; gap: 12px;">
+<div class="scroll-x">
+<div style="display: flex; gap: 12px; align-items: flex-start; min-width: 780px;">
 <div class="mono" style="display: flex; flex-direction: column; gap: 3px; font-size: 9px; color: var(--meta); padding-top: 1px;">
 <span style="height: 12px; line-height: 12px;">Sun</span><span style="height: 12px; line-height: 12px;">Mon</span><span style="height: 12px;"></span><span style="height: 12px; line-height: 12px;">Wed</span><span style="height: 12px;"></span><span style="height: 12px; line-height: 12px;">Fri</span><span style="height: 12px;"></span>
 </div>
@@ -1084,8 +1342,6 @@ fn heatmap(h: &mut String, st: &Stats) {
 "#,
         streak = st.streak_days,
     );
-    // Column-major order: `grid-auto-flow: column` fills row-by-row per
-    // column, so emit day-by-day within each week row.
     for week in &st.heatmap {
         for (d, v) in week {
             let level = if *v == 0 {
@@ -1100,7 +1356,7 @@ fn heatmap(h: &mut String, st: &Stats) {
             );
         }
     }
-    h.push_str("</div></div>\n");
+    h.push_str("</div></div></div>\n");
     let busiest_s = busiest
         .map(|(d, v)| format!("{} — {}", d.format("%d %b %Y"), fmt_tokens(v)))
         .unwrap_or_else(|| "—".into());
@@ -1119,117 +1375,12 @@ fn heatmap(h: &mut String, st: &Stats) {
 </span>
 <span>more</span>
 </div>
-</div></div>
+</div></details>
 "#
     );
 }
 
-fn habits_and_sessions(h: &mut String, st: &Stats, cost_on: bool) {
-    let max_h = st.active_hours.iter().copied().max().unwrap_or(1).max(1);
-    let total = st.active_hours.iter().sum::<u64>().max(1);
-    let peak_h = st
-        .active_hours
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, v)| *v)
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    let peak_share = st.active_hours[peak_h] as f64 * 100.0 / total as f64;
-    h.push_str(
-        r#"<div class="grid2e">
-<div style="display: flex; flex-direction: column; gap: 14px;">
-<div class="row"><h2 class="sec">USAGE HABITS</h2>
-<span class="secnote">tokens by hour, local time</span></div>
-<div class="card" style="padding: 22px 24px 16px; display: flex; flex-direction: column; gap: 10px;">
-<div style="display: flex; align-items: flex-end; gap: 4px; height: 130px;">
-"#,
-    );
-    for (hr, v) in st.active_hours.iter().enumerate() {
-        let px = (*v as f64 / max_h as f64 * 124.0).max(3.0);
-        let _ = write!(
-            h,
-            r#"<div data-hr="{hr}" title="{hr:02}:00 — {v}" style="flex-grow:1;height:{px:.0}px;border-radius:3px 3px 0 0;background:{habit};"></div>"#,
-            habit = c::HABIT,
-            v = fmt_tokens(*v),
-        );
-    }
-    let _ = write!(
-        h,
-        r#"</div>
-<div class="mono" style="display: flex; justify-content: space-between; font-size: 10px; color: var(--meta);">
-<span>00</span><span>06</span><span>12</span><span>18</span><span>23</span>
-</div>
-<div style="font-size: 12px; color: var(--muted); padding-top: 6px; border-top: 1px solid var(--track);">Peak hour <span class="mono" data-k="hb-peak" style="color: var(--text);">{peak_h:02}:00</span> — <span data-k="hb-share">{peak_share:.0}</span>% of everything you burned.</div>
-</div></div>
-<div style="display: flex; flex-direction: column; gap: 14px;">
-<div class="row"><h2 class="sec">TOP BURN SESSIONS</h2>
-<span class="secnote" data-k="s-note">single sessions, all time</span></div>
-<div class="card" style="padding: 20px 24px; display: flex; flex-direction: column; gap: 11px;">
-<div class="mono" style="display: grid; grid-template-columns: 26px minmax(0,1fr) 74px 66px 62px; gap: 12px; font-size: 10px; letter-spacing: 0.13em; color: var(--meta);">
-<span>#</span><span>PROJECT · DATE</span><span style="text-align: right;">LENGTH</span><span style="text-align: right;">TOKENS</span><span style="text-align: right;">COST</span>
-</div>
-<div id="s-rows" style="display: flex; flex-direction: column; gap: 11px;">
-"#
-    );
-    for (i, s) in st.sessions.iter().take(5).enumerate() {
-        let span = session_span(&s.first_hour, &s.last_hour);
-        // The local day, like the period that selects this session: the
-        // stored hour is UTC, and can sit on the far side of midnight.
-        let date = query::parse_bucket_hour(&s.first_hour)
-            .map(|h| h.with_timezone(&Local).format("%d %b %Y").to_string())
-            .unwrap_or_else(|| s.first_hour.clone());
-        let cost = if cost_on {
-            // Priced per model the session actually used, never a guessed
-            // blend at whichever model its first bucket happened to log.
-            let models: Vec<(String, Totals)> =
-                s.models.iter().map(|(m, t)| (m.clone(), *t)).collect();
-            fmt_usd_for_models(&models)
-        } else {
-            "—".into()
-        };
-        session_row(
-            h,
-            &(i + 1).to_string(),
-            &esc(&s.project),
-            &date,
-            &esc(provider_name(&s.provider)),
-            &span,
-            &fmt_tokens(s.totals.sum()),
-            &cost,
-        );
-    }
-    h.push_str("</div></div></div></div>\n");
-}
-
-#[allow(clippy::too_many_arguments)] // Eight cells, each already a string.
-fn session_row(
-    h: &mut String,
-    i: &str,
-    proj: &str,
-    date: &str,
-    prov: &str,
-    span: &str,
-    tok: &str,
-    cost: &str,
-) {
-    let _ = write!(
-        h,
-        r#"<div style="display: grid; grid-template-columns: 26px minmax(0,1fr) 74px 66px 62px; gap: 12px; align-items: baseline; padding-bottom: 9px; border-bottom: 1px solid var(--track-soft);">
-<span class="mono" style="font-size: 12px; color: var(--meta);">{i}</span>
-<span style="display: flex; flex-direction: column; gap: 2px; min-width: 0;">
-<span class="mono proj" data-name="{proj}" style="font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{proj}</span>
-<span style="font-size: 11px; color: var(--meta);">{date} · {prov}</span>
-</span>
-<span class="mono" style="font-size: 12px; text-align: right; color: var(--muted);">{span}</span>
-<span class="mono" style="font-size: 12px; text-align: right;">{tok}</span>
-<span class="mono" style="font-size: 12px; text-align: right; color: var(--muted);">{cost}</span>
-</div>
-"#,
-    );
-}
-
-/// `"YYYY-MM-DDTHH"` × 2 → "6h 41m"-ish label (hours only — buckets are
-/// hour-granular, so minutes would be invented precision).
+/// `"YYYY-MM-DDTHH"` × 2 → `"6h"` or `"2d 3h"` (buckets are hour-granular).
 pub fn session_span(first: &str, last: &str) -> String {
     fn parse(h: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         let d = chrono::NaiveDate::parse_from_str(h.get(..10)?, "%Y-%m-%d").ok()?;
@@ -1251,9 +1402,7 @@ pub fn session_span(first: &str, last: &str) -> String {
 }
 
 /// What the cache saved: those tokens at full input price minus their actual
-/// cache-read price — an estimate of an estimate, so it is printed with `≈`.
-/// A model this table can't price contributes nothing to the sum, silently,
-/// unless it actually read from cache; the second value says so.
+/// cache-read price.
 pub fn cache_saved(models: &[(String, Totals)]) -> (f64, bool) {
     let mut any_unpriced_with_reads = false;
     let saved = models
@@ -1281,80 +1430,6 @@ pub fn cache_saved(models: &[(String, Totals)]) -> (f64, bool) {
     (saved, any_unpriced_with_reads)
 }
 
-fn wrapped(h: &mut String, st: &Stats, cost_on: bool) {
-    if st.providers.is_empty() {
-        return;
-    }
-    let busiest = st
-        .daily
-        .iter()
-        .max_by_key(|(_, t)| t.sum())
-        .map(|(d, t)| format!("{} — {}", d.format("%d %b"), fmt_tokens(t.sum())))
-        .unwrap_or_else(|| "—".into());
-    let top_model = st
-        .models
-        .first()
-        .map(|(m, _)| m.clone())
-        .unwrap_or_default();
-    let top_proj = st
-        .projects
-        .first()
-        .map(|(p, _)| p.clone())
-        .unwrap_or_default();
-    let saved_row = if cost_on {
-        let (approx, any_unpriced_with_reads) = cache_saved(&st.models);
-        let marker = if any_unpriced_with_reads { "*" } else { "" };
-        format!(
-            r#"<div style="display: flex; justify-content: space-between; align-items: baseline; padding: 11px 0; border-bottom: 1px solid var(--track);">
-<span class="mono" style="font-size: 10px; letter-spacing: 0.13em; color: var(--meta);">SAVED BY CACHE</span>
-<span class="mono" data-k="w-saved" style="font-size: 14px;">≈ {}{marker}</span>
-</div>"#,
-            fmt_usd(Some(approx))
-        )
-    } else {
-        String::new()
-    };
-    let _ = write!(
-        h,
-        r#"<div class="card" style="border-color: var(--hairline); border-radius: 14px; padding: 36px 40px; display: grid; grid-template-columns: minmax(0,1fr) 380px; gap: 48px; align-items: center;">
-<div style="display: flex; flex-direction: column; gap: 14px;">
-<span class="mono" data-k="w-label" style="font-size: 11px; letter-spacing: 0.22em; color: var(--ok);">SO FAR</span>
-<div class="mono" data-k="w-total" style="font-size: 76px; font-weight: 600; letter-spacing: -0.045em; line-height: 0.95;">{total}</div>
-<p style="margin: 0; font-size: 15px; color: var(--muted); line-height: 1.65; max-width: 480px;">tokens through your assistants on this machine, across <span data-k="w-days" style="color: var(--text);">{days}</span>.</p>
-</div>
-<div style="display: flex; flex-direction: column;">
-<div style="display: flex; justify-content: space-between; align-items: baseline; padding: 11px 0; border-bottom: 1px solid var(--track);">
-<span class="mono" style="font-size: 10px; letter-spacing: 0.13em; color: var(--meta);">CURRENT STREAK</span>
-<span class="mono" style="font-size: 14px;">{streak} days</span>
-</div>
-<div style="display: flex; justify-content: space-between; align-items: baseline; padding: 11px 0; border-bottom: 1px solid var(--track);">
-<span class="mono" style="font-size: 10px; letter-spacing: 0.13em; color: var(--meta);">BUSIEST DAY</span>
-<span class="mono" data-k="w-busiest" style="font-size: 14px;">{busiest}</span>
-</div>
-<div style="display: flex; justify-content: space-between; align-items: baseline; padding: 11px 0; border-bottom: 1px solid var(--track);">
-<span class="mono" style="font-size: 10px; letter-spacing: 0.13em; color: var(--meta);">TOP MODEL</span>
-<span class="mono" data-k="w-model" style="font-size: 14px;">{top_model}</span>
-</div>
-<div style="display: flex; justify-content: space-between; align-items: baseline; padding: 11px 0; border-bottom: 1px solid var(--track);">
-<span class="mono" style="font-size: 10px; letter-spacing: 0.13em; color: var(--meta);">TOP PROJECT</span>
-<span class="mono proj" data-k="w-project" data-name="{top_proj_esc}" style="font-size: 14px;">{top_proj}</span>
-</div>
-{saved_row}
-</div>
-</div>
-"#,
-        total = fmt_tokens(st.total.sum()),
-        days = active_days_label(st.active_days),
-        streak = st.streak_days,
-        top_model = esc(&top_model),
-        top_proj = esc(&top_proj),
-        top_proj_esc = esc(&top_proj),
-    );
-}
-
-/// The price line under every cost: which snapshot priced it, and which
-/// models it could not — across the whole embedded history, not the
-/// picked period, so it never changes under the period picker.
 fn pricing_line(st: &Stats, cost_on: bool) -> String {
     if !cost_on {
         return String::new();
@@ -1383,7 +1458,7 @@ fn pricing_line(st: &Stats, cost_on: bool) -> String {
     line
 }
 
-fn footer(h: &mut String, sources: &[String], prices: &str) {
+fn footer(h: &mut String, sources: &[String], prices: &str, cost_on: bool) {
     let srcs = if sources.is_empty() {
         "local history files".to_string()
     } else {
@@ -1393,11 +1468,16 @@ fn footer(h: &mut String, sources: &[String], prices: &str) {
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let estimate_note = if cost_on {
+        " Costs are API-equivalent estimates at published list prices, not your bill."
+    } else {
+        ""
+    };
     let _ = write!(
         h,
-        r#"<div style="padding: 8px 0 44px; display: flex; gap: 40px; border-top: 1px solid var(--track);">
-<div style="max-width: 560px; font-size: 12px; color: var(--meta); line-height: 1.7; padding-top: 14px;">
-Generated {now} by tickover {ver}. Read from {srcs}. Duplicate message ids removed; Codex cumulative counters differenced. Claude sub-agent turns count once, from their own transcript file.{prices}
+        r#"<div style="padding: 8px 0 40px; display: flex; gap: 32px; flex-wrap: wrap; border-top: 1px solid var(--track);">
+<div style="max-width: 620px; font-size: 12px; color: var(--meta); line-height: 1.7; padding-top: 14px;">
+Generated {now} by tickover {ver}. Read from {srcs}. Duplicate message ids removed; Codex cumulative counters differenced. Claude sub-agent turns count once, from their own transcript file.{prices}{estimate_note}
 </div>
 <span class="spacer"></span>
 <div class="mono" style="font-size: 11px; color: var(--meta); text-align: right; line-height: 1.8; padding-top: 14px;">file mode 0600<br>no network calls<br>no external assets</div>
@@ -1456,8 +1536,6 @@ mod tests {
         }
         fs::write(dir.join("mine.html"), "x").unwrap();
         fs::write(dir.join("usage-latest.html"), "x").unwrap();
-        // The oldest name, passed as the report just written, survives
-        // even though it falls outside the newest `keep`.
         let current = dir.join(&own[0]);
 
         let removed = prune_reports(&dir, 3, &current);
@@ -1501,9 +1579,6 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
-    /// One session's bucket for a given model — round numbers throughout
-    /// so the rendered dollar figures land on exact cent/dollar strings,
-    /// not ones a test would have to fight floating rounding to match.
     fn day(hour: &str, model: &str, cache_read: u64) -> DayLine {
         DayLine {
             v: SCHEMA_VERSION,
@@ -1534,8 +1609,6 @@ mod tests {
     ) -> String {
         let data = report_data::build(store, st, enabled, true);
         let html = render(st, true, &[], &[], &data).unwrap();
-        // The page alone: the script spells out every caption it might
-        // write, which would satisfy any assertion about what is showing.
         let end = html.find(r#"<script type="application/json""#).unwrap();
         html[..end].to_string()
     }
@@ -1572,9 +1645,12 @@ mod tests {
                 .collect()
         };
         let texts = quoted("setText(\"");
-        assert!(texts.len() > 20, "{texts:?}");
+        assert!(texts.len() >= 15, "{texts:?}");
         for key in texts {
             assert!(html.contains(&format!("data-k=\"{key}\"")), "data-k {key}");
+        }
+        for key in quoted("setDelta(\"") {
+            assert!(html.contains(&format!("data-k=\"{key}\"")), "delta {key}");
         }
         for key in quoted("setWidth(\"") {
             assert!(html.contains(&format!("data-w=\"{key}\"")), "data-w {key}");
@@ -1586,7 +1662,9 @@ mod tests {
         {
             assert!(html.contains(&format!("id=\"{key}\"")), "id {key}");
         }
-        for hole in ["@w@", "@name@", "@tok@", "@proj@", "@pp@", "@m@"] {
+        for hole in [
+            "@id@", "@name@", "@tok@", "@proj@", "@m@", "@pts@", "@cost@",
+        ] {
             assert!(html.contains(hole), "{hole}");
         }
         let _ = fs::remove_dir_all(&dir);
@@ -1594,9 +1672,6 @@ mod tests {
 
     #[test]
     fn a_report_with_cost_on_marks_every_partial_sum() {
-        // One session, one provider, two models: one this table prices
-        // ("claude-sonnet-4-6"), one it does not ("mystery-model-x", which
-        // also reads from cache so the cache-savings row mixes too).
         let dir = tmpdir("report-partial-cost");
         let mut store = HistoryStore::open(&dir).unwrap();
         let hour = chrono::Utc::now().format("%Y-%m-%dT%H").to_string();
@@ -1614,27 +1689,38 @@ mod tests {
 
         let html = render_for(&store, &st, &enabled);
 
-        // Headline EST. COST: only "claude-sonnet-4-6" prices (3.0 + 15.0
-        // per 1M at its own rate = $18), and the caption says so.
         assert!(html.contains("$18*"), "headline must mark the partial sum");
         assert!(
             html.contains("API-equivalent, partial — unpriced models excluded"),
             "headline caption must name the exclusion"
         );
-        // Per-provider row and session row sum the same two models —
-        // both must carry the same marker.
         assert!(
             html.contains("$18.00*"),
-            "the per-provider and per-session cost cells must be marked"
+            "breakdown, projects, and sessions cost cells must carry the partial marker"
         );
-        // SAVED BY CACHE: only the unpriced model has cache reads, so the
-        // estimate is $0 with nothing to add — still marked, since that
-        // $0 is not "no savings", it is "unknown savings".
         assert!(
-            html.contains("≈ $0*"),
-            "the cache-savings row must be marked when only an unpriced model read from cache"
+            html.contains("cache read 11% tok") && !html.contains("0% $*"),
+            "when only unpriced models had cache reads, no bogus $ share appears: {html}"
         );
         let _ = fs::remove_dir_all(&dir);
+
+        let dir2 = tmpdir("report-partial-cost-cr");
+        let mut store2 = HistoryStore::open(&dir2).unwrap();
+        store2
+            .append_days(&[
+                day(&hour, "claude-sonnet-4-6", 1_000_000),
+                day(&hour, "mystery-model-x", 500_000),
+            ])
+            .unwrap();
+        store2.commit().unwrap();
+        let store2 = HistoryStore::open(&dir2).unwrap();
+        let st2 = query::compute(&store2, 30, &enabled);
+        let html2 = render_for(&store2, &st2, &enabled);
+        assert!(
+            html2.contains("cache read 27% tok · 2% $*"),
+            "cache-read share note must show both token and cost shares and mark partial cache reads: {html2}"
+        );
+        let _ = fs::remove_dir_all(&dir2);
     }
 
     #[test]
@@ -1655,12 +1741,113 @@ mod tests {
         assert!(html.contains("$18"), "the priced total still shows");
         assert!(
             !html.contains("$18*"),
-            "a fully priced sum must not be marked"
+            "fully priced sum must not be marked"
         );
         assert!(
             !html.contains("partial"),
             "no caption should mention partial coverage"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn right_now_renders_as_compact_rows() {
+        let dir = tmpdir("report-right-now");
+        let store = HistoryStore::open(&dir).unwrap();
+        let enabled: std::collections::HashSet<String> =
+            ["claude".to_string()].into_iter().collect();
+        let st = query::compute(&store, 30, &enabled);
+        let data = report_data::build(&store, &st, &enabled, true);
+        let quota = [QuotaNow {
+            provider: "claude".into(),
+            label: "5H".into(),
+            used_pct: 42.0,
+            projected_pct: Some(75.0),
+            reset_hint: "2h 10m".into(),
+            burn_per_hour: Some(12_000),
+        }];
+        let html = render(&st, true, &quota, &[], &data).unwrap();
+        let strip = &html[..html.find(r#"<script type="application/json""#).unwrap()];
+        assert!(strip.contains("class=\"qrow mono\""), "compact row layout");
+        assert!(strip.contains("42% · ~75%"), "used and projected pct");
+        assert!(strip.contains("12K/h"), "burn rate");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_ratio_card_renders_when_configured_and_dash_when_absent() {
+        let dir = tmpdir("report-plan-ratio");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let hour = chrono::Utc::now().format("%Y-%m-%dT%H").to_string();
+        store
+            .append_days(&[day(&hour, "claude-sonnet-4-6", 0)])
+            .unwrap();
+        store.commit().unwrap();
+        let store = HistoryStore::open(&dir).unwrap();
+        let enabled: std::collections::HashSet<String> =
+            ["claude".to_string()].into_iter().collect();
+        let st = query::compute(&store, 30, &enabled);
+        let mut data = report_data::build(&store, &st, &enabled, true);
+
+        let absent_html = render(&st, true, &[], &[], &data).unwrap();
+        let absent_head = &absent_html[..absent_html
+            .find(r#"<script type="application/json""#)
+            .unwrap()];
+        assert!(absent_head.contains("set [plans] in prices.toml"));
+
+        data.plans.insert("claude".to_string(), 200.0);
+        let set_html = render(&st, true, &[], &[], &data).unwrap();
+        let set_head = &set_html[..set_html.find(r#"<script type="application/json""#).unwrap()];
+        // $18 over 1d vs $200/30 = $6.67 => ×2.7
+        assert!(set_head.contains("×2.7"), "{set_head}");
+        assert!(set_head.contains("API-equiv ÷ $200/mo (not savings)"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fifty_two_weeks_section_is_collapsed_by_default() {
+        let dir = tmpdir("report-52w-collapsed");
+        let store = HistoryStore::open(&dir).unwrap();
+        let enabled = std::collections::HashSet::new();
+        let st = query::compute(&store, 30, &enabled);
+        let html = render_for(&store, &st, &enabled);
+        assert!(html.contains(r#"<details class="card""#));
+        assert!(!html.contains(r#"<details class="card" open"#));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn projects_section_separates_auto_ping_row() {
+        let dir = tmpdir("report-auto-ping-row");
+        let mut store = HistoryStore::open(&dir).unwrap();
+        let hour = chrono::Utc::now().format("%Y-%m-%dT%H").to_string();
+        let mut ping_day = day(&hour, "claude-haiku-4-5", 0);
+        ping_day.project = "tickover-ping-99".into();
+        ping_day.session = "s-ping".into();
+        let mut repo_day = day(&hour, "claude-sonnet-4-6", 0);
+        repo_day.project = "my-repo".into();
+        store.append_days(&[ping_day, repo_day]).unwrap();
+        store.commit().unwrap();
+        let store = HistoryStore::open(&dir).unwrap();
+        let enabled: std::collections::HashSet<String> =
+            ["claude".to_string()].into_iter().collect();
+        let st = query::compute(&store, 30, &enabled);
+        let html = render_for(&store, &st, &enabled);
+        let ping_start = html.find(r#"id="p-ping""#).unwrap();
+        assert!(html[ping_start..].contains(AUTO_PING_PROJECT));
+        assert!(html[..ping_start].contains("my-repo"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn habits_section_renders_seven_by_twenty_four_weekday_hour_grid() {
+        let dir = tmpdir("report-habits-grid");
+        let store = HistoryStore::open(&dir).unwrap();
+        let enabled = std::collections::HashSet::new();
+        let st = query::compute(&store, 30, &enabled);
+        let html = render_for(&store, &st, &enabled);
+        let cells = html.matches("data-wh=\"").count();
+        assert_eq!(cells, 7 * 24);
         let _ = fs::remove_dir_all(&dir);
     }
 }

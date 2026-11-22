@@ -127,23 +127,14 @@ fn rounded(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
 }
 
-/// Every week from the first to the last, zero where nothing happened.
-fn dense_weeks(weeks: &BTreeMap<NaiveDate, u64>) -> Vec<Value> {
-    let mut out = Vec::new();
-    if let (Some(first), Some(last)) = (weeks.keys().next(), weeks.keys().next_back()) {
-        let mut week = *first;
-        while week <= *last {
-            let total = weeks.get(&week).copied().unwrap_or(0);
-            out.push(json!([week.to_string(), total]));
-            week += chrono::Duration::weeks(1);
-        }
-    }
-    out
-}
-
 fn round_cost(v: &Value) -> Value {
     let c = v["cost"].as_f64().map(rounded);
     json!({ "cost": c, "partial": v["partial"] })
+}
+
+fn round_cr_cost(v: &Value) -> Value {
+    let c = v["cr_cost"].as_f64().map(rounded);
+    json!({ "cost": c, "partial": v["cr_partial"] })
 }
 
 /// The reference figures, in the shape `aggregate` answers in, with the
@@ -162,7 +153,8 @@ fn expected(st: &Stats) -> Value {
             let models: Vec<(String, Totals)> =
                 s.models.iter().map(|(m, t)| (m.clone(), *t)).collect();
             json!({
-                "provider": s.provider, "project": s.project, "totals": totals(&s.totals),
+                "provider": s.provider, "project": s.project, "top_model": s.top_model(),
+                "totals": totals(&s.totals),
                 "cost": cost(&models),
                 "first": utc_hour(&s.first_hour), "last": utc_hour(&s.last_hour),
                 "first_day": local_date(&s.first_hour).to_string(),
@@ -177,30 +169,49 @@ fn expected(st: &Stats) -> Value {
         .keys()
         .map(|p| (p, cost(&st.provider_models(p))))
         .collect();
-    let (saved, saved_partial) = report::cache_saved(&st.models);
-    let mut weeks: BTreeMap<NaiveDate, u64> = BTreeMap::new();
-    for (d, t) in &st.daily {
-        let monday =
-            *d - chrono::Duration::days(chrono::Datelike::weekday(d).num_days_from_monday() as i64);
-        *weeks.entry(monday).or_default() += t.sum();
-    }
-    let busiest = st
+    let provider_models: BTreeMap<&String, Value> = st
+        .by_provider
+        .keys()
+        .map(|p| {
+            let entries: Vec<Value> = st
+                .provider_models(p)
+                .into_iter()
+                .map(|(m, t)| {
+                    let c = cost(&[(m.clone(), t)]);
+                    json!([m, totals(&t), c])
+                })
+                .collect();
+            (p, Value::Array(entries))
+        })
+        .collect();
+    let project_costs: BTreeMap<&String, Value> = st
+        .projects
+        .iter()
+        .map(|(p, _)| (p, cost(&st.project_models(p))))
+        .collect();
+    let daily: BTreeMap<String, Value> = st
         .daily
         .iter()
-        .max_by_key(|(_, t)| t.sum())
-        .map(|(d, t)| json!([d.to_string(), t.sum()]));
+        .map(|(d, t)| (d.to_string(), totals(t)))
+        .collect();
+    let weekday_hours: Vec<Vec<u64>> = st.weekday_hours.iter().map(|r| r.to_vec()).collect();
+    let (cr_v, cr_p) = report::cache_read_cost(&st.models);
+    let cr_cost = json!({ "cost": cr_v.map(rounded), "partial": cr_p });
+    let (saved, saved_partial) = report::cache_saved(&st.models);
     json!({
         "total": totals(&st.total),
         "by_provider": by_provider,
         "provider_costs": provider_costs,
+        "provider_models": provider_models,
         "models": ranked(&st.models),
         "projects": ranked(&st.projects),
+        "project_costs": project_costs,
         "sessions": sessions,
-        "active_hours": st.active_hours.to_vec(),
+        "weekday_hours": weekday_hours,
+        "daily": daily,
         "active_days": st.active_days,
-        "busiest": busiest,
-        "weeks": dense_weeks(&weeks),
         "cost": cost(&st.models),
+        "cr_cost": cr_cost,
         "saved": rounded(saved),
         "saved_partial": saved_partial,
         "hit": st.total.cache_hit_pct().map(rounded),
@@ -215,31 +226,50 @@ fn normalized(a: &Value) -> Value {
         .iter()
         .map(|s| {
             json!({
-                "provider": s["provider"], "project": s["project"], "totals": s["totals"],
+                "provider": s["provider"], "project": s["project"], "top_model": s["top_model"],
+                "totals": s["totals"],
                 "cost": round_cost(s),
                 "first": s["first"], "last": s["last"], "first_day": s["first_day"],
             })
         })
         .collect();
     sessions.sort_by_key(Value::to_string);
-    let provider_costs: BTreeMap<String, Value> = a["provider_costs"]
+    let round_cost_map = |field: &str| -> BTreeMap<String, Value> {
+        a[field]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, c)| (k.clone(), round_cost(c)))
+            .collect()
+    };
+    let provider_models: BTreeMap<String, Value> = a["provider_models"]
         .as_object()
         .unwrap()
         .iter()
-        .map(|(p, c)| (p.clone(), round_cost(c)))
+        .map(|(p, list)| {
+            let entries: Vec<Value> = list
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| json!([entry[0], entry[1], round_cost(&entry[2])]))
+                .collect();
+            (p.clone(), Value::Array(entries))
+        })
         .collect();
     json!({
         "total": a["total"],
         "by_provider": a["by_provider"],
-        "provider_costs": provider_costs,
+        "provider_costs": round_cost_map("provider_costs"),
+        "provider_models": provider_models,
         "models": a["models"],
         "projects": a["projects"],
+        "project_costs": round_cost_map("project_costs"),
         "sessions": sessions,
-        "active_hours": a["active_hours"],
+        "weekday_hours": a["weekday_hours"],
+        "daily": a["daily"],
         "active_days": a["active_days"],
-        "busiest": a["busiest"],
-        "weeks": a["weeks"],
         "cost": round_cost(a),
+        "cr_cost": round_cr_cost(a),
         "saved": rounded(a["saved"].as_f64().unwrap()),
         "hit": a["hit"].as_f64().map(rounded),
         "saved_partial": a["saved_partial"],
@@ -518,4 +548,65 @@ fn grouped_projects_add_up_the_same() {
     assert_period(&lines, None, None, "grouped-all");
     let day = |d| NaiveDate::from_ymd_opt(2026, 9, d);
     assert_period(&lines, day(21), day(22), "grouped-slice");
+}
+
+#[test]
+fn prev_period_computes_preceding_spans() {
+    if !node_or_skip() {
+        return;
+    }
+    let dir = tmpdir("prev-period");
+    let store = store_of(&dir, &history());
+    let data = payload(&store, &stats(&store), true);
+    let out = run_node(
+        &dir,
+        &data,
+        "{ all: r.prevPeriod(null, null, '2026-08-20', '2026-09-22'), w7: r.prevPeriod('2026-09-16', '2026-09-22', '2026-08-20', '2026-09-22'), openStart: r.prevPeriod(null, '2026-08-22', '2026-08-20', '2026-09-22') }",
+    );
+    assert_eq!(out["all"], Value::Null);
+    assert_eq!(out["w7"], json!(["2026-09-09", "2026-09-15"]));
+    assert_eq!(out["openStart"], json!(["2026-08-17", "2026-08-19"]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn plan_ratio_handles_configured_partial_and_empty_plans() {
+    if !node_or_skip() {
+        return;
+    }
+    let dir = tmpdir("plan-ratio");
+    let store = store_of(&dir, &history());
+    let data = payload(&store, &stats(&store), true);
+    let out = run_node(
+        &dir,
+        &data,
+        "{ empty: r.planRatio(400, false, {}, ['claude'], 30), ok: r.planRatio(400, true, {claude: 200, grok: 50}, ['claude', 'codex'], 15), none: r.planRatio(null, false, {claude: 200}, ['claude'], 30) }",
+    );
+    assert!(out["empty"]["ratio"].is_null());
+    assert!(out["none"]["ratio"].is_null());
+    assert_eq!(out["ok"]["monthlySum"], json!(200));
+    assert_eq!(out["ok"]["partial"], json!(true));
+    assert!((out["ok"]["ratio"].as_f64().unwrap() - 4.0).abs() < 1e-9);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn build_csv_escapes_fields_per_rfc4180() {
+    if !node_or_skip() {
+        return;
+    }
+    let dir = tmpdir("csv");
+    let store = store_of(&dir, &history());
+    let data = payload(&store, &stats(&store), true);
+    let out = run_node(
+        &dir,
+        &data,
+        "{ escaped: r.csvRow(['a,b', 'c\"d', 'e\\nf', 'plain']), csv: r.buildCsv(r.aggregate(data, null, null), data) }",
+    );
+    assert_eq!(out["escaped"], json!("\"a,b\",\"c\"\"d\",\"e\nf\",plain"));
+    let csv = out["csv"].as_str().unwrap();
+    assert!(csv.starts_with("Provider,Model,Input,Output,Cache Write,Cache Read,Cache Hit %,Total Tokens,Cost USD,Share %,Cost Per Msg USD\n"));
+    assert!(csv.contains("Claude,(all),"));
+    assert!(csv.contains("Codex,gpt-5,"));
+    let _ = std::fs::remove_dir_all(&dir);
 }

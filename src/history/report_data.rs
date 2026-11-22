@@ -58,11 +58,13 @@ pub struct ProviderEntry {
 }
 
 /// One model. `saved_per_mtok` is what a million cache-read tokens saved
-/// against the full input price; `None` for a model with no list price.
+/// against the full input price; `cr_per_mtok` is the list price of a million
+/// cache-read tokens; both are `None` for a model with no list price.
 #[derive(Debug, Serialize)]
 pub struct ModelEntry {
     pub name: String,
     pub saved_per_mtok: Option<f64>,
+    pub cr_per_mtok: Option<f64>,
 }
 
 /// The JSON embedded in the report.
@@ -106,6 +108,16 @@ fn saved_per_mtok(model: &str) -> Option<f64> {
     let as_input = pricing::cost_usd(model, &tokens(1_000_000, 0))?;
     let as_cache = pricing::cost_usd(model, &tokens(0, 1_000_000))?;
     Some(as_input - as_cache)
+}
+
+fn cr_per_mtok(model: &str) -> Option<f64> {
+    pricing::cost_usd(
+        model,
+        &Totals {
+            cache_read: 1_000_000,
+            ..Totals::default()
+        },
+    )
 }
 
 /// Build the payload from the same lines `st` was computed from. `st` only
@@ -213,6 +225,7 @@ pub fn build(
             .into_iter()
             .map(|name| ModelEntry {
                 saved_per_mtok: saved_per_mtok(&name),
+                cr_per_mtok: cr_per_mtok(&name),
                 name,
             })
             .collect(),

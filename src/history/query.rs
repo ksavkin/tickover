@@ -75,6 +75,18 @@ pub struct SessionStat {
     pub totals: Totals,
 }
 
+impl SessionStat {
+    /// Model name carrying the most tokens in this session (ties break
+    /// lexicographically; empty string if `models` is empty).
+    pub fn top_model(&self) -> &str {
+        self.models
+            .iter()
+            .max_by(|(ma, ta), (mb, tb)| ta.sum().cmp(&tb.sum()).then_with(|| mb.cmp(ma)))
+            .map(|(m, _)| m.as_str())
+            .unwrap_or("")
+    }
+}
+
 /// The whole query surface, computed once from `live_days()`.
 pub struct Stats {
     /// Providers that contributed at least one live bucket.
@@ -95,6 +107,8 @@ pub struct Stats {
     /// Per-provider model split — pricing needs it: a provider's cost is
     /// the sum over its models, never a blend priced at one rate.
     pub by_provider_model: BTreeMap<String, Vec<(String, Totals)>>,
+    /// Per-project model split — lets callers price each project accurately.
+    pub by_project_model: BTreeMap<String, Vec<(String, Totals)>>,
     /// Local calendar day → totals, ascending, covering the last `days`
     /// days (sparse days absent).
     pub daily: BTreeMap<NaiveDate, Totals>,
@@ -105,6 +119,8 @@ pub struct Stats {
     /// Token volume by local hour-of-day, all-time — the report's
     /// "active hours" strip.
     pub active_hours: [u64; 24],
+    /// Token volume by `[mon_0..sun_6][local_hour_0..23]` for active buckets.
+    pub weekday_hours: [[u64; 24]; 7],
     /// Sessions sorted by total desc.
     pub sessions: Vec<SessionStat>,
     /// Consecutive local days ending today (or yesterday, if today has no
@@ -149,9 +165,11 @@ pub fn compute(
         projects: Vec::new(),
         models: Vec::new(),
         by_provider_model: BTreeMap::new(),
+        by_project_model: BTreeMap::new(),
         daily: BTreeMap::new(),
         heatmap: Vec::new(),
         active_hours: [0; 24],
+        weekday_hours: [[0; 24]; 7],
         sessions: Vec::new(),
         streak_days: 0,
         active_days: 0,
@@ -167,6 +185,7 @@ pub fn compute(
     let mut projects: HashMap<String, Totals> = HashMap::new();
     let mut models: HashMap<String, Totals> = HashMap::new();
     let mut provider_models: HashMap<String, HashMap<String, Totals>> = HashMap::new();
+    let mut project_models: HashMap<String, HashMap<String, Totals>> = HashMap::new();
     let mut sessions: HashMap<String, SessionStat> = HashMap::new();
     // Day-total map feeding both `daily` (bounded) and `heatmap` (52 wk).
     let mut day_totals: BTreeMap<NaiveDate, u64> = BTreeMap::new();
@@ -224,6 +243,14 @@ pub fn compute(
             .entry(d.model.clone())
             .or_default()
             .add(d);
+        project_models
+            .entry(project.clone())
+            .or_default()
+            .entry(d.model.clone())
+            .or_default()
+            .add(d);
+        let wd = local.weekday().num_days_from_monday() as usize;
+        st.weekday_hours[wd][local.hour() as usize] += d.sum();
         *day_totals.entry(day).or_default() += d.sum();
         if day >= daily_floor {
             st.daily.entry(day).or_default().add(d);
@@ -254,6 +281,10 @@ pub fn compute(
     st.projects = sorted_desc(projects);
     st.models = sorted_desc(models);
     st.by_provider_model = provider_models
+        .into_iter()
+        .map(|(p, m)| (p, sorted_desc(m)))
+        .collect();
+    st.by_project_model = project_models
         .into_iter()
         .map(|(p, m)| (p, sorted_desc(m)))
         .collect();
@@ -352,6 +383,15 @@ impl Stats {
     pub fn provider_models(&self, provider: &str) -> Vec<(String, Totals)> {
         self.by_provider_model
             .get(provider)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// This project's per-model totals — the input `pricing` needs for a
+    /// project-level estimate.
+    pub fn project_models(&self, project: &str) -> Vec<(String, Totals)> {
+        self.by_project_model
+            .get(project)
             .cloned()
             .unwrap_or_default()
     }
