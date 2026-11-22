@@ -74,6 +74,8 @@ struct OverrideEntry {
 struct OverrideFile {
     #[serde(default)]
     models: BTreeMap<String, OverrideEntry>,
+    #[serde(default)]
+    plans: BTreeMap<String, f64>,
 }
 
 /// The user's overrides, or why the file was set aside. An invalid file
@@ -83,6 +85,7 @@ struct OverrideFile {
 /// not working.
 struct Overrides {
     models: BTreeMap<String, Price>,
+    plans: BTreeMap<String, f64>,
     error: Option<String>,
 }
 
@@ -107,6 +110,7 @@ static OVERRIDES: Mutex<Option<OverridesCache>> = Mutex::new(None);
 fn no_overrides() -> Overrides {
     Overrides {
         models: BTreeMap::new(),
+        plans: BTreeMap::new(),
         error: None,
     }
 }
@@ -139,10 +143,12 @@ fn overrides() -> Arc<Overrides> {
         None => no_overrides(),
         Some(Err(e)) => Overrides {
             models: BTreeMap::new(),
+            plans: BTreeMap::new(),
             error: Some(e.clone()),
         },
         Some(Ok(t)) => parse_overrides(t).unwrap_or_else(|e| Overrides {
             models: BTreeMap::new(),
+            plans: BTreeMap::new(),
             error: Some(e),
         }),
     });
@@ -191,8 +197,22 @@ fn parse_overrides(text: &str) -> Result<Overrides, String> {
             return Err(format!("{id}: priced twice under the same id"));
         }
     }
+    let mut plans = BTreeMap::new();
+    for (provider, monthly_usd) in file.plans {
+        let key = provider.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return Err("plan provider id must not be empty".to_string());
+        }
+        if !monthly_usd.is_finite() || monthly_usd <= 0.0 {
+            return Err(format!("{provider}: plan price must be a positive number"));
+        }
+        if plans.insert(key, monthly_usd).is_some() {
+            return Err(format!("{provider}: plan priced twice under the same id"));
+        }
+    }
     Ok(Overrides {
         models,
+        plans,
         error: None,
     })
 }
@@ -270,6 +290,12 @@ fn lookup(
 
 fn price_for(model: &str) -> Option<Price> {
     lookup(model, &overrides().models, &SNAPSHOT.models)
+}
+
+/// Monthly subscription prices (USD/month) keyed by lowercase provider id,
+/// read from `[plans]` in `prices.toml`. Empty unless configured by the user.
+pub fn plan_prices() -> BTreeMap<String, f64> {
+    overrides().plans.clone()
 }
 
 /// Where the prices came from, for the line beside every cost figure:
@@ -630,5 +656,33 @@ cache_write = 0
             known,
             ("gemini-3.8-flash-n".to_string(), Totals::default())
         ]));
+    }
+
+    #[test]
+    fn valid_plan_prices_parse_and_normalize_keys() {
+        let o = parse_overrides(
+            r#"
+[plans]
+Claude = 200
+codex = 20.0
+"#,
+        )
+        .unwrap();
+        assert_eq!(o.plans.get("claude"), Some(&200.0));
+        assert_eq!(o.plans.get("codex"), Some(&20.0));
+    }
+
+    #[test]
+    fn invalid_plan_prices_reject_the_whole_file() {
+        for bad in [
+            "[plans]\nclaude = 0\n",
+            "[plans]\nclaude = -10\n",
+            "[plans]\nclaude = nan\n",
+            "[plans]\nclaude = inf\n",
+            "[plans]\n\"  \" = 20\n",
+            "[plans]\nClaude = 200\nclaude = 200\n",
+        ] {
+            assert!(parse_overrides(bad).is_err(), "{bad:?}");
+        }
     }
 }

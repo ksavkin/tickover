@@ -75,6 +75,9 @@ pub struct ReportData {
     /// The generating machine's UTC offset when it wrote this, for the label.
     pub tz: String,
     pub cost_on: bool,
+    /// Configured monthly subscription prices (USD/month) per provider id,
+    /// from `[plans]` in `prices.toml`. Empty unless the user set them.
+    pub plans: BTreeMap<String, f64>,
     /// Ascending local dates with any activity.
     pub days: Vec<String>,
     pub providers: Vec<ProviderEntry>,
@@ -196,6 +199,7 @@ pub fn build(
         generated: now.date_naive().format("%Y-%m-%d").to_string(),
         tz: now.format("%:z").to_string(),
         cost_on,
+        plans: pricing::plan_prices(),
         days,
         providers: sorted_names(&providers)
             .into_iter()

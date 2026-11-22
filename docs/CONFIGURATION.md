@@ -128,6 +128,17 @@ four or prices one id twice (`GPT-5.4` and `codex/gpt-5.4` are the same id)
 is ignored as a whole, and the report's price line says why. Edits take
 effect within a few seconds; the app need not be restarted.
 
+You can also list optional monthly subscription prices (USD/month) per
+provider under `[plans]` in `prices.toml`. Subscription prices are never
+guessed; when configured, the HTML report compares the API-equivalent total
+against the prorated plan cost for the selected period:
+
+```toml
+[plans]
+claude = 200
+codex = 200
+```
+
 ## Project grouping
 
 `days.jsonl` keeps each bucket's raw project basename untouched. When queried
