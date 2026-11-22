@@ -254,13 +254,7 @@ pub(crate) fn open_in_browser(path: &std::path::Path) {
 }
 
 pub(crate) fn fmt_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1e6)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1e3)
-    } else {
-        n.to_string()
-    }
+    report::fmt_tokens(n)
 }
 
 fn text_out(
@@ -652,6 +646,14 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["est_cost_usd"], serde_json::json!(18.0));
         assert_eq!(v["est_cost_usd_missing_models"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn fmt_tokens_formats_billions_compactly() {
+        assert_eq!(fmt_tokens(15_460_000_000), "15.5B");
+        assert_eq!(fmt_tokens(999_900_000), "999.9M");
+        assert_eq!(fmt_tokens(1_500), "1.5K");
+        assert_eq!(fmt_tokens(42), "42");
     }
 
     #[test]
