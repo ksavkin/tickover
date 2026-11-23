@@ -191,6 +191,15 @@ pub(crate) const CAPABILITIES: &[Capability] = &[
         implemented: true,
         keys: &["balances.*"],
     },
+    // Multi-root usage history (`[history] extra_roots`). Listed *before*
+    // `reading-history` so its `history.*` wildcard does not shadow this key:
+    // an older build with `reading-history` would silently ignore `extra_roots`
+    // and miss the extra directories rather than telling the user to update.
+    Capability {
+        name: "history-extra-roots",
+        implemented: true,
+        keys: &["history.extra_roots"],
+    },
     // Usage history. `[history]` tells the history scanner where this
     // provider's local token records live and which extractor parses them.
     // A build without this ignores the section — which is the bad outcome
@@ -395,6 +404,19 @@ pub(crate) const CAPABILITIES: &[Capability] = &[
         name: "oauth-client-discovery",
         implemented: true,
         keys: &["surface.auth.client.*"],
+    },
+    // Native-store refresh tokens on `oauth-refresh`: `refresh_service`
+    // (macOS Keychain) and `refresh_targets` (Windows Credential Manager).
+    // An older build ignores both fields and falls back solely to `path`,
+    // silently reporting "sign in again" when only native storage holds the
+    // refresh token.
+    Capability {
+        name: "oauth-refresh-store",
+        implemented: true,
+        keys: &[
+            "surface.auth.refresh_service",
+            "surface.auth.refresh_targets",
+        ],
     },
 ];
 

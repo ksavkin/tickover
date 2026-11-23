@@ -82,6 +82,22 @@ pub struct ProviderScan {
     pub outcome: scanner::ScanOutcome,
 }
 
+/// All configured history roots (`root` plus any `extra_roots`) for footer
+/// attribution in the generated report.
+pub fn declared_sources(manifests: &[PluginManifest]) -> Vec<String> {
+    let mut sources = Vec::new();
+    for m in manifests {
+        let Some(h) = &m.history else { continue };
+        sources.push(h.root.clone());
+        for extra in &h.extra_roots {
+            if !sources.contains(extra) {
+                sources.push(extra.clone());
+            }
+        }
+    }
+    sources
+}
+
 /// One scan tick across every loaded manifest that declares `[history]`.
 /// The wall-clock budget is divided evenly across them up front — a shared
 /// deadline would let the first provider's cold corpus starve the rest for
@@ -115,19 +131,19 @@ pub fn scan_tick(
         // leaves its slice unused — the next provider starts its own.
         let deadline = Instant::now() + slice;
         let options = options_for(m);
-        let root = crate::plugin::engine_logfile::resolve_root_fields(
+        let primary = crate::plugin::engine_logfile::resolve_root_fields(
             &h.root,
             &h.root_env,
             &h.root_env_join,
             &options,
         );
-        if !root.is_dir() {
-            scans.push(ProviderScan {
-                provider: m.id.clone(),
-                root_missing: true,
-                outcome: scanner::ScanOutcome::default(),
-            });
-            continue;
+        let mut roots = vec![primary];
+        for extra in &h.extra_roots {
+            let resolved =
+                crate::plugin::expand_home(&crate::plugin::substitute_options(extra, &options));
+            if !roots.contains(&resolved) {
+                roots.push(resolved);
+            }
         }
         let extractor = formats::extractor_for(h.format);
         // `glob` gets the same `{option.<key>}` substitution `root` just
@@ -139,19 +155,40 @@ pub fn scan_tick(
         // actually resolves: the glob would search for its own literal
         // `{option.…}` text and match nothing, ever.
         let glob = crate::plugin::substitute_options(&h.glob, &options);
-        let outcome = scanner::scan_root(
-            store,
-            &m.id,
-            &root,
-            &glob,
-            extractor.as_ref(),
-            deadline,
-            known,
-        );
+        let mut any_dir = false;
+        let mut combined = scanner::ScanOutcome::default();
+        for root in &roots {
+            if !root.is_dir() {
+                continue;
+            }
+            if any_dir && (combined.partial || Instant::now() >= deadline) {
+                // Earlier root already spent this tick's slice; carry `partial`
+                // so the caller schedules a follow-up pass for remaining roots.
+                combined.partial = true;
+                break;
+            }
+            any_dir = true;
+            let outcome = scanner::scan_root(
+                store,
+                &m.id,
+                root,
+                &glob,
+                extractor.as_ref(),
+                deadline,
+                known,
+            );
+            combined.files_seen += outcome.files_seen;
+            combined.files_scanned += outcome.files_scanned;
+            combined.bytes_read += outcome.bytes_read;
+            combined.records += outcome.records;
+            combined.skipped_unparsed += outcome.skipped_unparsed;
+            combined.claimed_by_another += outcome.claimed_by_another;
+            combined.partial |= outcome.partial;
+        }
         scans.push(ProviderScan {
             provider: m.id.clone(),
-            root_missing: false,
-            outcome,
+            root_missing: !any_dir,
+            outcome: combined,
         });
     }
     // Confirmed against the filesystem itself, not against whichever roots
@@ -166,4 +203,97 @@ pub fn scan_tick(
     // stopped walking this way — only the file's own deletion does.
     store.prune_missing_files();
     scans
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn scan_tick_scans_primary_and_extra_roots_together() {
+        let base = std::env::temp_dir().join(format!("tickover-multiroot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root_a = base.join("cli");
+        let root_b = base.join("ide");
+        let store_dir = base.join("store");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+
+        let line = |id: &str, tok: u64| {
+            serde_json::json!({
+                "timestamp": "2026-11-23T10:00:00Z",
+                "type": "assistant",
+                "message": {
+                    "id": id,
+                    "model": "claude-sonnet-4-6",
+                    "usage": {
+                        "input_tokens": tok,
+                        "output_tokens": 50,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0
+                    }
+                }
+            })
+            .to_string()
+        };
+        std::fs::write(root_a.join("a.jsonl"), format!("{}\n", line("m1", 100))).unwrap();
+        std::fs::write(root_b.join("b.jsonl"), format!("{}\n", line("m2", 200))).unwrap();
+
+        let toml = format!(
+            r#"
+id = "sample"
+name = "Sample"
+menu_label = "Sa"
+order = 1
+engine = "http-api"
+requires_reader = ["reading-history", "history-extra-roots"]
+[[windows]]
+label = "5H"
+role = "primary"
+[windows.period]
+mode = "assumed"
+assumed = 300
+[windows.source]
+used_percent_path = "p"
+resets_at_path = "r"
+[http]
+[[http.request]]
+url = "https://example.com/u"
+[history]
+format = "claude-transcripts"
+root = "{root_a}"
+extra_roots = ["{root_b}"]
+glob = "*.jsonl"
+"#,
+            root_a = root_a.display(),
+            root_b = root_b.display()
+        );
+        let manifest = PluginManifest::from_str(&toml).unwrap();
+        let known: HashSet<&str> = ["sample"].into_iter().collect();
+        let mut store = store::HistoryStore::open(&store_dir).unwrap();
+        let manifests = vec![manifest];
+
+        let scans = scan_tick(&mut store, &manifests, &known, &|_| BTreeMap::new());
+        assert_eq!(scans.len(), 1);
+        assert!(!scans[0].root_missing);
+        assert_eq!(scans[0].outcome.files_seen, 2);
+        assert_eq!(scans[0].outcome.files_scanned, 2);
+        assert_eq!(scans[0].outcome.records, 2);
+        store.commit().unwrap();
+
+        let enabled: HashSet<String> = ["sample".to_string()].into_iter().collect();
+        let stats = query::compute(&store, query::ALL_DAYS, &enabled);
+        assert_eq!(stats.total.input, 300);
+        assert_eq!(stats.total.output, 100);
+
+        // Removing root_a still scans root_b cleanly without setting root_missing.
+        std::fs::remove_dir_all(&root_a).unwrap();
+        let scans2 = scan_tick(&mut store, &manifests, &known, &|_| BTreeMap::new());
+        assert!(!scans2[0].root_missing);
+        assert_eq!(scans2[0].outcome.files_seen, 1);
+        assert_eq!(scans2[0].outcome.records, 0);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

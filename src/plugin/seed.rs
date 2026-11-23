@@ -515,8 +515,11 @@ pub const BUILTIN_UPGRADES: &[BuiltinUpgrade] = &[
     BuiltinUpgrade {
         file: "antigravity.toml",
         id: "antigravity",
-        to_version: "1.3.1",
+        to_version: "1.3.2",
         previous_sha256: &[
+            // 1.3.1 — read refresh token only from legacy file and scanned only CLI history.
+            // sha256 of antigravity.toml as shipped at manifest version 1.3.1.
+            "0b60a75f87bf84f5355dca26605e808cdff048f9016b3136f2fc2088473e8150",
             // 1.3.0 — generic 5H/WK and 3P·5H/3P·WK chips instead of group names.
             // sha256 of antigravity.toml as shipped at manifest version 1.3.0.
             "ac6d7bc1a6e5e490b77e644860808b634fb11d83c0b73576280b064428be363e",

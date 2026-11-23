@@ -273,6 +273,7 @@ const SURFACES_MAX_COUNT: usize = 8;
 const CLIENT_FILES_MAX_COUNT: usize = 16;
 const CLIENT_BINS_MAX_COUNT: usize = 8;
 const SOURCE_CONTAINERS_MAX_COUNT: usize = 8;
+const HISTORY_EXTRA_ROOTS_MAX_COUNT: usize = 16;
 
 fn default_true() -> bool {
     true
@@ -809,10 +810,20 @@ impl PluginManifest {
         for (field, empty) in [
             ("root", h.root.trim().is_empty()),
             ("glob", h.glob.trim().is_empty()),
+            (
+                "extra_roots",
+                h.extra_roots.iter().any(|r| r.trim().is_empty()),
+            ),
         ] {
             if empty {
                 return Err(format!("`[history] {field}` must not be empty"));
             }
+        }
+        if h.extra_roots.len() > HISTORY_EXTRA_ROOTS_MAX_COUNT {
+            return Err(format!(
+                "`[history] extra_roots` names {} entries — at most {HISTORY_EXTRA_ROOTS_MAX_COUNT}",
+                h.extra_roots.len()
+            ));
         }
         if h.root_env.as_deref().is_some_and(|e| e.trim().is_empty()) {
             return Err("`[history] root_env` names no environment variable".to_string());
@@ -2115,7 +2126,12 @@ impl PluginManifest {
                         ("message", step.message.is_none()),
                     ],
                     AuthType::OauthRefresh => &[
-                        ("path", step.path.is_none()),
+                        (
+                            "path",
+                            step.path.is_none()
+                                && step.refresh_service.is_none()
+                                && step.refresh_targets.as_ref().is_none_or(|t| t.is_empty()),
+                        ),
                         ("token_json_path", step.token_json_path.is_none()),
                         ("token_url", step.token_url.is_none()),
                         // The pair is required, but not from these two fields
@@ -2248,7 +2264,18 @@ impl PluginManifest {
                         ],
                         AuthType::OauthRefresh => {
                             let mut blank = vec![
-                                ("path", is_blank(&step.path)),
+                                ("path", is_present_but_blank(&step.path)),
+                                (
+                                    "refresh_service",
+                                    is_present_but_blank(&step.refresh_service),
+                                ),
+                                (
+                                    "refresh_targets",
+                                    step.refresh_targets.as_deref().is_some_and(|targets| {
+                                        targets.is_empty()
+                                            || targets.iter().any(|t| t.trim().is_empty())
+                                    }),
+                                ),
                                 ("token_json_path", is_blank(&step.token_json_path)),
                                 ("token_url", is_blank(&step.token_url)),
                                 ("client_id", is_present_but_blank(&step.client_id)),
@@ -2730,6 +2757,22 @@ impl PluginManifest {
                 if step.token_url.is_some() && step.kind != AuthType::OauthRefresh {
                     return Err(format!(
                         "surface \"{}\": auth step {i} (`{}`) sets `token_url`, which only \
+                         `oauth-refresh` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.refresh_service.is_some() && step.kind != AuthType::OauthRefresh {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `refresh_service`, which only \
+                         `oauth-refresh` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.refresh_targets.is_some() && step.kind != AuthType::OauthRefresh {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `refresh_targets`, which only \
                          `oauth-refresh` steps honour",
                         surface.id,
                         auth_type_name(step.kind)
@@ -3301,10 +3344,30 @@ impl PluginManifest {
                         CharClass::Wide,
                     ));
                 }
+                if let Some(refresh_service) = &step.refresh_service {
+                    control_char_fields.push((
+                        format!(
+                            "surface \"{}\": a `{step_name}` auth step's `refresh_service`",
+                            surface.id
+                        ),
+                        refresh_service.as_str(),
+                        CharClass::Wide,
+                    ));
+                }
                 for (i, target) in step.targets.iter().flatten().enumerate() {
                     control_char_fields.push((
                         format!(
                             "surface \"{}\": a `{step_name}` auth step's `targets[{i}]`",
+                            surface.id
+                        ),
+                        target.as_str(),
+                        CharClass::Wide,
+                    ));
+                }
+                for (i, target) in step.refresh_targets.iter().flatten().enumerate() {
+                    control_char_fields.push((
+                        format!(
+                            "surface \"{}\": a `{step_name}` auth step's `refresh_targets[{i}]`",
                             surface.id
                         ),
                         target.as_str(),
@@ -3437,6 +3500,9 @@ impl PluginManifest {
         // root_env_join` does above.
         if let Some(h) = &self.history {
             dotdot_fields.push(("`[history] root`".to_string(), h.root.as_str()));
+            for (i, r) in h.extra_roots.iter().enumerate() {
+                dotdot_fields.push((format!("`[history] extra_roots[{i}]`"), r.as_str()));
+            }
         }
         if let Some(http) = &self.http {
             for v in &http.value {
@@ -3619,6 +3685,13 @@ impl PluginManifest {
                 h.root.as_str(),
                 Substituted::OptionsOnly,
             ));
+            for (i, r) in h.extra_roots.iter().enumerate() {
+                templates.push((
+                    format!("`[history] extra_roots[{i}]`"),
+                    r.as_str(),
+                    Substituted::OptionsOnly,
+                ));
+            }
             templates.push((
                 "`[history] glob`".to_string(),
                 h.glob.as_str(),
@@ -4722,6 +4795,11 @@ pub struct HistoryConfig {
     /// Root directory the history scanner walks (subject to `root_env`
     /// override and `~` expansion — see [`crate::plugin::expand_home`]).
     pub root: String,
+    /// Additional roots scanned alongside `root` using the same `format` and
+    /// `glob` (not subject to `root_env`). Needs `requires_reader =
+    /// ["history-extra-roots"]`.
+    #[serde(default)]
+    pub extra_roots: Vec<String>,
     /// Glob (relative to `root`) matching history files. For
     /// `antigravity-sqlite` this matches the `*.db` conversation stores;
     /// for the JSONL formats it matches transcript/rollout files.
@@ -5110,6 +5188,17 @@ pub struct AuthStep {
     /// windows.
     pub message: Option<String>,
 
+    /// `oauth-refresh`: macOS Keychain service name checked for the refresh
+    /// token payload before falling back to `path` (unwraps `go-keyring`
+    /// markers). Needs `requires_reader = ["oauth-refresh-store"]`.
+    #[serde(default)]
+    pub refresh_service: Option<String>,
+    /// `oauth-refresh`: Windows Credential Manager targets checked for the
+    /// refresh token payload before falling back to `path` (unwraps
+    /// `go-keyring` markers). Needs `requires_reader =
+    /// ["oauth-refresh-store"]`.
+    #[serde(default)]
+    pub refresh_targets: Option<Vec<String>>,
     /// `oauth-refresh`: where to send the token exchange. Checked against this
     /// surface's `allowed_hosts` at fetch time — `auth::resolve_token` runs
     /// ahead of the engine's own `allowed_hosts` check on the main request, so

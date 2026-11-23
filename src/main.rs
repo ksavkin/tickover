@@ -7309,10 +7309,7 @@ fn open_history_report(ctx: &Ctx) {
             })
         })
         .collect();
-    let sources: Vec<String> = plugins
-        .iter()
-        .filter_map(|m| m.history.as_ref().map(|h| h.root.clone()))
-        .collect();
+    let sources = tickover::history::declared_sources(&plugins);
     let cost_on = config::history_cost_estimate();
     let data = tickover::history::report_data::build(store, &stats, &enabled, cost_on);
     match tickover::history::report::write(&stats, None, cost_on, &quota, &sources, &data) {

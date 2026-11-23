@@ -1398,10 +1398,15 @@ fn credential_source_labels(step: &AuthStep) -> Vec<String> {
                 });
             }
         }
-        AuthType::CredentialsFile
-        | AuthType::CredentialsMap
-        | AuthType::RejectWhen
-        | AuthType::OauthRefresh => {}
+        AuthType::OauthRefresh => {
+            if let Some(service) = &step.refresh_service {
+                labels.push(format!("keychain \"{service}\""));
+            }
+            for target in step.refresh_targets.iter().flatten() {
+                labels.push(format!("credential manager \"{target}\""));
+            }
+        }
+        AuthType::CredentialsFile | AuthType::CredentialsMap | AuthType::RejectWhen => {}
     }
     labels
 }
@@ -1466,6 +1471,12 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
         let scope = history_scope(h);
         if !local_files.contains(&scope) {
             local_files.push(scope);
+        }
+        for extra in &h.extra_roots {
+            let scope = format!("{extra}/{}", h.glob);
+            if !local_files.contains(&scope) {
+                local_files.push(scope);
+            }
         }
     }
     // `jwt-file`'s own token file — the same gap a credential-file auth
@@ -3294,6 +3305,77 @@ mod tests {
         assert!(
             disclosure.requires_approval,
             "reading a local file, however it's named, needs approval"
+        );
+    }
+
+    #[test]
+    fn oauth_refresh_store_and_history_extra_roots_are_disclosed() {
+        let toml = r#"
+            id = "sample"
+            name = "Sample"
+            menu_label = "Sa"
+            order = 1
+            engine = "http-api"
+            requires_reader = ["oauth-refresh", "oauth-refresh-store", "reading-history", "history-extra-roots"]
+            [[windows]]
+            label = "5H"
+            role = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [http]
+            [[http.request]]
+            url = "https://example.com/usage"
+            [[surface]]
+            id = "default"
+            label = "Default"
+            allowed_hosts = ["example.com", "oauth2.googleapis.com"]
+            [[surface.auth]]
+            type = "oauth-refresh"
+            refresh_service = "gemini"
+            refresh_targets = ["gemini:antigravity"]
+            token_json_path = "token.refresh_token"
+            token_url = "https://oauth2.googleapis.com/token"
+            client_id = "cid"
+            client_secret = "csec"
+            [history]
+            format = "antigravity-sqlite"
+            root = "~/.gemini/antigravity-cli/conversations"
+            extra_roots = ["~/.gemini/antigravity/conversations"]
+            glob = "*.db"
+        "#;
+        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert!(
+            disclosure
+                .credential_sources
+                .contains(&"keychain \"gemini\"".to_string()),
+            "{:?}",
+            disclosure.credential_sources
+        );
+        assert!(
+            disclosure
+                .credential_sources
+                .contains(&"credential manager \"gemini:antigravity\"".to_string()),
+            "{:?}",
+            disclosure.credential_sources
+        );
+        assert!(
+            disclosure
+                .local_files
+                .contains(&"~/.gemini/antigravity-cli/conversations/*.db".to_string()),
+            "{:?}",
+            disclosure.local_files
+        );
+        assert!(
+            disclosure
+                .local_files
+                .contains(&"~/.gemini/antigravity/conversations/*.db".to_string()),
+            "{:?}",
+            disclosure.local_files
         );
     }
 

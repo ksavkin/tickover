@@ -184,10 +184,7 @@ fn run(output: Output, manifests: Vec<PluginManifest>) -> i32 {
             if mask {
                 report_data::mask_projects(&mut stats, &mut data);
             }
-            let sources: Vec<String> = enabled_manifests
-                .iter()
-                .filter_map(|m| m.history.as_ref().map(|h| h.root.clone()))
-                .collect();
+            let sources = tickover::history::declared_sources(&enabled_manifests);
             let path = match report::write(&stats, path, cost_on, &[], &sources, &data) {
                 Ok(p) => p,
                 Err(e) => {

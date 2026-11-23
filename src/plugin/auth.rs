@@ -534,7 +534,7 @@ fn keychain_step(
 /// handled so an item written by any version this app might meet unwraps to the
 /// same JSON — matching the library's own read path
 /// (`keyring_darwin.go`), rather than the current write format alone.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn unwrap_go_keyring(raw: &str) -> Result<String, String> {
     const BASE64_PREFIX: &str = "go-keyring-base64:";
     const HEX_PREFIX: &str = "go-keyring-encoded:";
@@ -838,7 +838,7 @@ fn expiry_seconds(value: &Value) -> Option<i64> {
 /// multi-byte character in a corrupt payload would crash the credential path
 /// (which must return `Err`, never panic) instead of being rejected. Any
 /// non-ASCII byte simply fails `is_ascii_hexdigit` and yields `None`.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     if !bytes.len().is_multiple_of(2) {
@@ -1375,12 +1375,87 @@ const REFRESH_BACKOFF_SECS: i64 = 300;
 /// [`REFRESH_CACHE`]'s own doc) — a `Hit` needs no client at all, and a
 /// `Backoff` resolves one only to compare it against the entry's own
 /// `client_id`.
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+fn extract_store_refresh(raw: &str, token_json_path: &str, source: &str) -> Result<String, String> {
+    let json = unwrap_go_keyring(raw)?;
+    extract_token(&json, token_json_path)
+        .ok_or_else(|| format!("no refresh token at `{token_json_path}` in {source}"))
+}
+
+fn resolve_refresh_token(step: &AuthStep, token_json_path: &str) -> Result<Option<String>, String> {
+    let mut last_err: Option<String> = None;
+
+    #[cfg(target_os = "macos")]
+    if let Some(service) = step.refresh_service.as_deref() {
+        match keychain_password(service) {
+            Ok(Some(raw)) => {
+                match extract_store_refresh(
+                    &raw,
+                    token_json_path,
+                    &format!("Keychain item '{service}'"),
+                ) {
+                    Ok(tok) => return Ok(Some(tok)),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(targets) = step.refresh_targets.as_deref() {
+        for target in targets {
+            if let Some(raw) = win_credential(target) {
+                match extract_store_refresh(
+                    &raw,
+                    token_json_path,
+                    &format!("credential '{target}'"),
+                ) {
+                    Ok(tok) => return Ok(Some(tok)),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+        }
+    }
+
+    if let Some(path) = step.path.as_deref() {
+        let file = super::expand_home(path);
+        if file.is_file() {
+            match super::read_regular_file(&file, super::SMALL_FILE_MAX_BYTES) {
+                Some(text) => {
+                    if let Some(tok) = extract_token(&text, token_json_path) {
+                        return Ok(Some(tok));
+                    }
+                    last_err = Some(format!(
+                        "no refresh token at `{token_json_path}` in {}",
+                        file.display()
+                    ));
+                }
+                None => {
+                    last_err = Some(format!("{} is not a readable regular file", file.display()));
+                }
+            }
+        }
+    }
+
+    match last_err {
+        Some(err) => Err(err),
+        None => Ok(None),
+    }
+}
+
 fn oauth_refresh_step(
     step: &AuthStep,
     allowed_hosts: &[String],
     provider: &str,
 ) -> Result<Option<String>, String> {
-    let path = require_str("oauth-refresh", "path", step.path.as_deref())?;
+    if step.path.is_none()
+        && step.refresh_service.is_none()
+        && step.refresh_targets.as_ref().is_none_or(|t| t.is_empty())
+    {
+        require_str("oauth-refresh", "path", None)?;
+    }
     let token_json_path = require_str(
         "oauth-refresh",
         "token_json_path",
@@ -1398,26 +1473,12 @@ fn oauth_refresh_step(
         ));
     }
 
-    // The refresh-token file next, now that the request this step would
-    // eventually make is known to be allowed at all: someone who has never
-    // signed in to this surface has nothing at `path` — the common case for
-    // most people this manifest reaches — but that check comes *after* the
-    // allow-list precisely so a manifest whose `token_url` was never going
-    // to be permitted does not even get to read a file that might not be
-    // there, before a `client` table's discovery scan (hundreds of
-    // megabytes) is reached either.
-    let file = super::expand_home(path);
-    if !file.is_file() {
+    // Read the refresh token after `token_url` and `allowed_hosts` pass, and
+    // before resolving the client pair (`[surface.auth.client]` discovery scans
+    // hundreds of megabytes, so an unsigned-in machine exits Absent right here).
+    let Some(refresh_token) = resolve_refresh_token(step, token_json_path)? else {
         return Ok(None); // not signed in here, or never has been
-    }
-    let text = super::read_regular_file(&file, super::SMALL_FILE_MAX_BYTES)
-        .ok_or_else(|| format!("{} is not a readable regular file", file.display()))?;
-    let refresh_token = extract_token(&text, token_json_path).ok_or_else(|| {
-        format!(
-            "no refresh token at `{token_json_path}` in {}",
-            file.display()
-        )
-    })?;
+    };
 
     // The installed-app pair, resolved only where it is actually needed
     // below (a cache `Hit` never calls this). Without a `client` table this
@@ -3664,6 +3725,8 @@ mod tests {
             json_path: None,
             unless_json_path: None,
             message: None,
+            refresh_service: None,
+            refresh_targets: None,
             token_url: None,
             client_id: None,
             client_secret: None,
@@ -4031,6 +4094,57 @@ mod tests {
     fn oauth_refresh_step_missing_required_field_is_error() {
         let step = auth_step(AuthType::OauthRefresh);
         assert!(oauth_refresh_step(&step, &[], "test provider").is_err());
+    }
+
+    #[test]
+    fn oauth_refresh_step_absent_when_only_store_names_absent_service_and_targets() {
+        let mut step = auth_step(AuthType::OauthRefresh);
+        step.refresh_service = Some(format!(
+            "tickover-nonexistent-refresh-service-{}",
+            std::process::id()
+        ));
+        step.refresh_targets = Some(vec![format!(
+            "tickover-nonexistent-refresh-target-{}",
+            std::process::id()
+        )]);
+        step.token_json_path = Some("token.refresh_token".to_string());
+        step.token_url = Some("https://oauth2.googleapis.com/token".to_string());
+        step.client_id = Some("test-client-id".to_string());
+        step.client_secret = Some("test-client-secret".to_string());
+        assert_eq!(
+            oauth_refresh_step(
+                &step,
+                &["oauth2.googleapis.com".to_string()],
+                "test provider"
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn extract_store_refresh_unwraps_go_keyring_base64_and_errors_when_missing() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let payload = serde_json::json!({
+            "token": {
+                "access_token": "expired-access",
+                "refresh_token": "r-store-123"
+            }
+        })
+        .to_string();
+        let wrapped = format!("go-keyring-base64:{}", STANDARD.encode(payload));
+        assert_eq!(
+            extract_store_refresh(&wrapped, "token.refresh_token", "Keychain item 'gemini'"),
+            Ok("r-store-123".to_string())
+        );
+
+        let no_refresh = format!(
+            "go-keyring-base64:{}",
+            STANDARD.encode(r#"{"token":{"access_token":"x"}}"#)
+        );
+        let err =
+            extract_store_refresh(&no_refresh, "token.refresh_token", "Keychain item 'gemini'")
+                .expect_err("payload without refresh_token must error");
+        assert!(err.contains("token.refresh_token"), "{err}");
     }
 
     #[test]

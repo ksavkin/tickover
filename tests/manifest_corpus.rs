@@ -1383,6 +1383,17 @@ fn rules() -> Vec<Rule> {
             names: "root_env_join` must not be empty",
         },
         Rule {
+            says: "[history] extra_roots cannot list dozens of paths",
+            broken_by: plus(
+                &declaring("[\"reading-history\", \"history-extra-roots\"]"),
+                &format!(
+                    "[history]\nformat = \"codex-rollouts\"\nroot = \"~/h\"\nglob = \"*.jsonl\"\nextra_roots = [{}]",
+                    (0..17).map(|i| format!("\"~/e{i}\"")).collect::<Vec<_>>().join(", ")
+                ),
+            ),
+            names: "at most",
+        },
+        Rule {
             // A blank `container_field` compares against no field of any
             // container, ever — `[logfile] account_match`'s own doc calls
             // both halves required, but only this one is a plain `String`
@@ -1643,6 +1654,24 @@ fn rules() -> Vec<Rule> {
                 "token_json_path = \"token\"\ntoken_url       = \"https://oauth2.example.com/token\"",
             ),
             names: "token_url",
+        },
+        Rule {
+            says: "refresh_service only means something on an oauth-refresh step",
+            broken_by: changed(
+                &http_declaring(r#"["oauth-refresh-store"]"#),
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\nrefresh_service = \"sample\"",
+            ),
+            names: "refresh_service",
+        },
+        Rule {
+            says: "refresh_targets only means something on an oauth-refresh step",
+            broken_by: changed(
+                &http_declaring(r#"["oauth-refresh-store"]"#),
+                "token_json_path = \"token\"",
+                "token_json_path = \"token\"\nrefresh_targets = [\"sample\"]",
+            ),
+            names: "refresh_targets",
         },
         Rule {
             says: "client_id only means something on an oauth-refresh step",
@@ -2655,6 +2684,11 @@ fn the_shipped_antigravity_manifest_is_accepted() {
     );
     let refresh = &surface.auth[2];
     assert_eq!(refresh.kind, AuthType::OauthRefresh);
+    assert_eq!(refresh.refresh_service.as_deref(), Some("gemini"));
+    assert_eq!(
+        refresh.refresh_targets,
+        Some(vec!["gemini:antigravity".to_string()])
+    );
     assert_eq!(
         refresh.path.as_deref(),
         Some("~/.gemini/antigravity-cli/antigravity-oauth-token")
@@ -2731,17 +2765,24 @@ fn the_shipped_antigravity_manifest_is_accepted() {
         "keychain-expiry",
         "oauth-refresh",
         "oauth-client-discovery",
+        "oauth-refresh-store",
         "http-post",
         "remaining-fraction",
         "window-identity",
         "reading-history",
+        "history-extra-roots",
     ] {
         assert!(
             m.requires_reader.iter().any(|c| c == capability),
             "{capability} is load-bearing here"
         );
     }
-    assert_eq!(m.requires_reader.len(), 7, "and nothing else is claimed");
+    assert_eq!(m.requires_reader.len(), 9, "and nothing else is claimed");
+    let hist = m.history.as_ref().expect("antigravity declares [history]");
+    assert_eq!(
+        hist.extra_roots,
+        vec!["~/.gemini/antigravity/conversations".to_string()]
+    );
 
     // Four windows, each addressed by its stable bucketId — a typo in a
     // selector reads nothing and the row silently vanishes.
