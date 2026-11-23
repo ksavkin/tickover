@@ -11,6 +11,8 @@ mod autostart;
 mod config;
 mod diag;
 mod platform;
+#[cfg(feature = "history")]
+mod stats_cli;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -188,6 +190,48 @@ struct BalanceModel {
     model: Rc<VecModel<BalanceData>>,
     keys: Vec<String>,
 }
+
+/// The UI-side handle to the history store: a reopened-after-each-scan
+/// snapshot the refresh path reads for the quota-projection hatch and the
+/// Activity card. Scanning itself runs on a worker thread against its own
+/// store instance — this one is only ever read. `()` in a build without the
+/// feature, so the refresh signatures below stay uniform either way.
+#[cfg(feature = "history")]
+type HistoryShared = Rc<RefCell<Option<tickover::history::store::HistoryStore>>>;
+#[cfg(not(feature = "history"))]
+type HistoryShared = ();
+
+/// `quota_projection`'s per-tick memo: `(provider id, window start unix) →
+/// tokens spent since then`, so a tick that asks the same open window's
+/// burn for every plugin fetch it draws only touches the store once per
+/// window rather than once per ask. Keyed on tokens alone, not on tokens
+/// paired with hours elapsed — the hours half is cheap and depends on `now`,
+/// which moves every tick, so it is always recomputed fresh rather than
+/// cached alongside a figure that wouldn't need to be. Cleared whenever the
+/// answer could change: a new store snapshot, or the enabled plugin set.
+/// `()` in a build without the feature, matching [`HistoryShared`].
+#[cfg(feature = "history")]
+type ProjectionCache = Rc<RefCell<HashMap<(String, u64), Option<u64>>>>;
+#[cfg(not(feature = "history"))]
+type ProjectionCache = ();
+
+/// The scan-worker's plumbing: a sender it reports each commit on, and a
+/// busy flag so a slow scan is never stacked with a second one (the same
+/// one-thread-at-a-time rule [`Fetching`] gives provider fetches — the
+/// scanner walks provider directories, and two concurrent walks double the
+/// IO for nothing). The channel carries the freshly scanned store itself,
+/// not a bare notification — the worker already holds the exact snapshot a
+/// reopen would produce, so handing it over directly is what keeps the UI
+/// thread from ever parsing `days.jsonl` again after startup.
+#[cfg(feature = "history")]
+#[derive(Clone)]
+struct HistoryIo {
+    tx: mpsc::Sender<tickover::history::store::HistoryStore>,
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+#[cfg(not(feature = "history"))]
+#[derive(Clone)]
+struct HistoryIo;
 /// The plugin-manager rows shown in the settings sheet, one per loaded
 /// manifest (rebuilt from config on every relevant change).
 type PluginRows = Rc<VecModel<PluginRow>>;
@@ -281,17 +325,42 @@ struct Ctx {
     install_tx: mpsc::Sender<(PendingKind, RegistryEntry, InstallOutcome)>,
     anchor: Anchor,
     shown_at: Rc<Cell<Instant>>,
+    /// See [`HistoryShared`]. `()` when the feature is compiled out — the
+    /// field exists either way so refresh plumbing doesn't fork on the flag.
+    history: HistoryShared,
+    /// See [`ProjectionCache`]. `()` when the feature is compiled out, for
+    /// the same reason as `history`.
+    projection_cache: ProjectionCache,
+    /// See [`HistoryIo`]. Empty unit struct when the feature is compiled out.
+    #[cfg_attr(not(feature = "history"), allow(dead_code))]
+    history_io: HistoryIo,
     tray_click_at: Rc<Cell<Option<Instant>>>,
     tray_press_at: Rc<Cell<Option<Instant>>>,
     hidden_by_focus_at: Rc<Cell<Option<Instant>>>,
-    opened_by_activation_at: Rc<Cell<Option<(Instant, bool)>>>,
+    opened_by_activation_at: Rc<Cell<Option<Instant>>>,
+    /// A [`present_popover`] that asked for a placement before the winit
+    /// window had a size — `window().size()` reads 0×0 until the first
+    /// `Resized` event lands, and positioning a 0×0 frame drops it wherever
+    /// the window manager defaults to. The winit-event hook replays this
+    /// when the real size arrives. Timestamped so a request whose `Resized`
+    /// never came (the window was never realized — that presentation never
+    /// happened) cannot surface later and move a window the user has since
+    /// parked somewhere. The flag marks a *settling* request — one a landed
+    /// placement re-armed so the next `Resized` re-places against whatever
+    /// size the cap sync and platform layout actually produced; settling
+    /// replays bypass the dock-mode parking courtesy because they are the
+    /// same presentation still converging, not a new one.
+    pending_position: Rc<Cell<Option<PendingPosition>>>,
 }
 
 /// The refresh triple nearly every settings-sheet callback below closes
 /// with: rebuild the plugin-manager rows, rebuild the provider rows, and
-/// let the tray icon catch up. All three only run once `ctx.weak` still
-/// resolves — one guard shared by every call site, rather than each one
-/// wrapping its own copy of this same triple in an identical check.
+/// let the tray icon catch up — plus the Activity card, which every one of
+/// these callbacks can change the provider set of (enable/disable, a surface
+/// opt-in, reset, an option that re-fetches). All four only run once
+/// `ctx.weak` still resolves — one guard shared by every call site, rather
+/// than each one wrapping its own copy of this same triple in an identical
+/// check.
 fn refresh_all(ctx: &Ctx) {
     if let Some(app) = ctx.weak.upgrade() {
         refresh_plugins_model(&ctx.plugin_model, &ctx.plugins.borrow());
@@ -302,6 +371,10 @@ fn refresh_all(ctx: &Ctx) {
             &ctx.cache,
             &ctx.window_models,
             &ctx.balance_models,
+            Projection {
+                hist: &ctx.history,
+                cache: &ctx.projection_cache,
+            },
         );
         sync_tray_indicator(
             &ctx.tray,
@@ -310,6 +383,7 @@ fn refresh_all(ctx: &Ctx) {
             &ctx.cache,
             &ctx.tray_key,
         );
+        sync_activity(&app, ctx);
     }
 }
 
@@ -383,6 +457,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
+    // `tickover stats` is a CLI invocation, not a tray launch — it runs
+    // here, before the single-instance claim and any Slint/tray setup, so
+    // `tickover stats` in a terminal while the app is running prints stats
+    // rather than signalling the running copy to open its panel.
+    #[cfg(feature = "history")]
+    if let Some(code) = stats_cli::maybe_run(|| {
+        seed_and_upgrade_builtins(&seed::plugins_dir());
+        load_plugins()
+    }) {
+        std::process::exit(code);
+    }
+
     // Only when a pre-rename install was actually found and moved — a fresh
     // install never held the old login item this retires, and asking macOS
     // to touch one it does not hold can raise the same permission prompt
@@ -461,14 +547,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dismissed and absorbed checks both reason causally from (see
     // `tray_click_dismissed_panel`, `click_absorbed_by_its_activation`).
     let tray_press_at: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
-    // When an unexplained activation edge last opened the panel, and whether
-    // that open actually *placed* the window. The status-item click that
-    // caused it can still be in flight to the click drain — when it arrives
-    // it is the same gesture's other half and must be absorbed, not toggled;
-    // and only a placement is worth re-anchoring to the click's `rect` (a
-    // window the user parked should stay put). See
+    // When an unexplained activation edge last opened the panel. The
+    // status-item click that caused it can still be in flight to the click
+    // drain — when it arrives it is the same gesture's other half and must
+    // be absorbed, not toggled; and since the edge opened before the click's
+    // `rect` was known, the absorb also re-anchors the panel under the item
+    // actually pressed (a click the user made is licence enough — in dock
+    // mode the open itself deliberately did not move the window). See
     // `click_absorbed_by_its_activation`.
-    let opened_by_activation_at: Rc<Cell<Option<(Instant, bool)>>> = Rc::new(Cell::new(None));
+    let opened_by_activation_at: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
+    // A presentation that wanted to place the window but found it still
+    // 0×0 — winit realizes the window asynchronously after `show()`, so the
+    // size (and with it `set_position`'s frame math) is not yet real. The
+    // winit-event hook replays the placement on the first `Resized`.
+    let pending_position: Rc<Cell<Option<PendingPosition>>> = Rc::new(Cell::new(None));
     // Change-detection key for the tray indicator (avoids icon churn).
     // `sync_tray_indicator_from` treats an unchanged key as "nothing to draw"
     // and returns before ever setting the icon or tooltip — `None` here means
@@ -527,12 +619,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // trust dialog and the actual disk write both need the UI thread, so
     // only the network+sha256 half runs off it.
     let (install_tx, install_rx) = mpsc::channel::<(PendingKind, RegistryEntry, InstallOutcome)>();
+    // History scan worker → UI: the freshly scanned-and-committed store, so
+    // the UI thread only ever installs a snapshot, never opens one itself.
+    // The scan runs off the UI thread (IO under a wall-clock budget); the
+    // receiver lives in `run_slow_timer`.
+    #[cfg(feature = "history")]
+    let (history_tx, history_rx) = mpsc::channel::<tickover::history::store::HistoryStore>();
 
     // Slint creates the native macOS application lazily. Deferring tray
     // construction by one event-loop turn (`setup_tray`, below) makes the
     // status item durable even when the popover has not been shown yet —
     // declared here, ahead of that, so `Ctx` can carry it from the start.
     let tray: TraySlot = Rc::new(RefCell::new(None));
+
+    // The UI-side history snapshot (see [`HistoryShared`]): installed from
+    // each scan-worker commit; `()` when the feature is compiled out.
+    #[cfg(feature = "history")]
+    let history_cell: HistoryShared = Rc::new(RefCell::new(None));
+    #[cfg(not(feature = "history"))]
+    let history_cell: HistoryShared = ();
+
+    // See [`ProjectionCache`] — cleared alongside `history_cell` every time
+    // it changes, and wherever the enabled plugin set can.
+    #[cfg(feature = "history")]
+    let projection_cache: ProjectionCache = Rc::new(RefCell::new(HashMap::new()));
+    #[cfg(not(feature = "history"))]
+    let projection_cache: ProjectionCache = ();
 
     let ctx = Ctx {
         weak: app.as_weak(),
@@ -556,10 +668,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         install_tx: install_tx.clone(),
         anchor: anchor.clone(),
         shown_at: shown_at.clone(),
+        history: history_cell,
+        projection_cache,
+        #[cfg(feature = "history")]
+        history_io: HistoryIo {
+            tx: history_tx,
+            busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+        #[cfg(not(feature = "history"))]
+        history_io: HistoryIo,
         tray_click_at: tray_click_at.clone(),
         hidden_by_focus_at: hidden_by_focus_at.clone(),
         tray_press_at: tray_press_at.clone(),
         opened_by_activation_at: opened_by_activation_at.clone(),
+        pending_position: pending_position.clone(),
     };
 
     wire_ui_callbacks(&app, &ctx);
@@ -571,6 +693,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     wire_frameless_chrome(&app, &ctx);
 
     let (tray_menu, tray_init_timer) = setup_tray(&app, &ctx, menubar_on)?;
+
+    // Local usage history: the store the panel reads (projections + the
+    // Activity card) lives on the UI side and is reopened whenever the scan
+    // worker reports a commit. First open is synchronous — the panel can be
+    // raised before the first scan finishes, and "no store yet" must not
+    // read as "no history".
+    #[cfg(feature = "history")]
+    spawn_history_scan(&ctx);
+    #[cfg(feature = "history")]
+    {
+        // Read-only: this open does not hold the store lock, and the scan
+        // thread spawned just above may be committing at this moment.
+        *ctx.history.borrow_mut() = tickover::history::default_dir()
+            .and_then(|d| tickover::history::store::HistoryStore::open_read_only(&d).ok());
+        sync_activity(&app, &ctx);
+    }
 
     wire_plugin_manager_callbacks(&app, &ctx);
 
@@ -586,7 +724,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // render — every plugin is fetched on this thread, blocking.
         *cache.borrow_mut() = sync_fetch_all(&plugins.borrow());
     } else {
-        spawn_all_plugin_fetches(&plugins.borrow(), &plugin_tx, &fetching);
+        spawn_all_plugin_fetches(&plugins.borrow(), &plugin_tx, &fetching, Instant::now());
     }
     refresh_model(
         &app,
@@ -595,15 +733,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cache,
         &window_models,
         &balance_models,
+        Projection {
+            hist: &ctx.history,
+            cache: &ctx.projection_cache,
+        },
     );
     sync_tray_indicator(&tray, menubar_on, &plugins.borrow(), &cache, &tray_key);
 
     if std::env::var_os("TICKOVER_SHOW_ON_START").is_some() || platform::dock_mode() {
-        present_popover(&app, &anchor, &shown_at, Shown::ByAnythingElse);
+        present_popover(
+            &app,
+            &anchor,
+            &shown_at,
+            &pending_position,
+            Shown::ByAnythingElse,
+        );
     }
 
     if let Some(path) = snapshot_path {
-        present_popover(&app, &anchor, &shown_at, Shown::ByAnythingElse);
+        present_popover(
+            &app,
+            &anchor,
+            &shown_at,
+            &pending_position,
+            Shown::ByAnythingElse,
+        );
         // Snapshot the settings sheet instead of the gauges when asked.
         if std::env::var_os("TICKOVER_SNAPSHOT_SETTINGS").is_some() {
             app.set_settings_open(true);
@@ -673,6 +827,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Timers ──────────────────────────────────────────────────────────
     let _event_timer = run_fast_timer(&app, &ctx, tray_menu, plugin_rx, registry_rx, install_rx);
+    #[cfg(feature = "history")]
+    let _tick_timer = run_slow_timer(&app, &ctx, history_rx);
+    #[cfg(not(feature = "history"))]
     let _tick_timer = run_slow_timer(&app, &ctx);
 
     Timer::single_shot(Duration::from_millis(60), platform::set_accessory_policy);
@@ -691,20 +848,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// The panel's own "Refresh" button: a fetch of every plugin, and — once it
 /// lands — a rebuild of the provider rows.
 fn wire_ui_callbacks(app: &AppWindow, ctx: &Ctx) {
-    let ctx = ctx.clone();
-    app.on_refresh(move || {
-        spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
-        if let Some(app) = ctx.weak.upgrade() {
-            refresh_model(
-                &app,
-                &ctx.model,
+    {
+        let ctx = ctx.clone();
+        app.on_refresh(move || {
+            spawn_all_plugin_fetches(
                 &ctx.plugins.borrow(),
-                &ctx.cache,
-                &ctx.window_models,
-                &ctx.balance_models,
+                &ctx.plugin_tx,
+                &ctx.fetching,
+                Instant::now(),
             );
-        }
-    });
+            if let Some(app) = ctx.weak.upgrade() {
+                refresh_model(
+                    &app,
+                    &ctx.model,
+                    &ctx.plugins.borrow(),
+                    &ctx.cache,
+                    &ctx.window_models,
+                    &ctx.balance_models,
+                    Projection {
+                        hist: &ctx.history,
+                        cache: &ctx.projection_cache,
+                    },
+                );
+            }
+        });
+    }
+    // Activity card: the range toggle re-renders from the same snapshot,
+    // "Full report" opens the generated HTML, and the first-run button
+    // kicks a scan rather than waiting for the slow timer's cadence.
+    {
+        let ctx = ctx.clone();
+        let weak = app.as_weak();
+        app.on_activity_range_changed(move |_| {
+            if let Some(app) = weak.upgrade() {
+                sync_activity(&app, &ctx);
+            }
+        });
+    }
+    {
+        let ctx2 = ctx.clone();
+        app.on_open_report(move || open_history_report(&ctx2));
+        let ctx2 = ctx.clone();
+        let weak2 = app.as_weak();
+        app.on_check_log_paths(move || {
+            spawn_history_scan(&ctx2);
+            // `spawn_history_scan` raises `ctx.history_io.busy` before this
+            // returns — but nothing samples it until the next `sync_activity`
+            // call, which without this is whichever comes first: a range
+            // toggle, or the scan's own commit finishing. Sampling it here
+            // is what makes the button's only visible effect (the header
+            // switching to "scanning…") show up on the very click that
+            // asked for it, not on some later, unrelated event.
+            if let Some(app) = weak2.upgrade() {
+                sync_activity(&app, &ctx2);
+            }
+        });
+    }
 }
 
 /// Only platforms that draw their own edge around a frameless window want
@@ -737,10 +936,28 @@ fn wire_frameless_chrome(app: &AppWindow, ctx: &Ctx) {
                 if auto_hide && ctx.shown_at.get().elapsed() > Duration::from_millis(250) {
                     if let Some(app) = ctx.weak.upgrade() {
                         let _ = app.window().hide();
+                        // A hidden window's placement requests die with the
+                        // presentation — a settling re-arm must not survive
+                        // to re-place whatever opens next.
+                        ctx.pending_position.set(None);
                         // Remember *when*, so the click that took this focus
                         // away is not then read as a request to re-open.
                         ctx.hidden_by_focus_at.set(Some(Instant::now()));
                     }
+                }
+            }
+            // A placement deferred because the window was still 0×0 — its
+            // real size arrives as the first `Resized`. Replay it then, with
+            // the freshest anchor the click drain has since recorded — but
+            // never from inside this hook: it can run before the backend has
+            // stored the size the event carries, so `window().size()` here
+            // reads the *previous* size — 0×0 on the very first resize and
+            // the stale old frame on every settling one. Replaying one turn
+            // later always sees the size this resize installed.
+            if let WindowEvent::Resized(size) = event {
+                if size.width > 0 && size.height > 0 && ctx.pending_position.get().is_some() {
+                    let ctx = ctx.clone();
+                    Timer::single_shot(Duration::ZERO, move || replay_pending_position(&ctx));
                 }
             }
             EventResult::Propagate
@@ -755,6 +972,12 @@ fn wire_frameless_chrome(app: &AppWindow, ctx: &Ctx) {
     {
         let ctx = ctx.clone();
         app.on_start_drag(move || {
+            // The user just took manual control of the position — any
+            // deferred or settling placement must not yank it back, and a
+            // dragged window counts as placed: dock mode must not later
+            // move it as "never positioned".
+            ctx.pending_position.set(None);
+            POPOVER_PLACED.with(|placed| placed.set(true));
             if let Some(app) = ctx.weak.upgrade() {
                 app.window().with_winit_window(|win| {
                     let _ = win.drag_window();
@@ -908,12 +1131,14 @@ fn setup_tray(
 /// still answered: nothing here was this plugin's to remove.
 ///
 /// Returns whether the conventional-name slot is free of such a remnant:
-/// `false` only when a removal was attempted and failed (a `NotFound` on the
-/// removal attempt itself is a scan→remove race, already free). Callers use
-/// that to decide whether the rest of the removal bookkeeping may run —
-/// wiping `plugin.<id>.*` config while a broken `<id>.toml` survives would
-/// resurrect the plugin with its settings reset if the file ever parses
-/// again.
+/// `false` when a removal was attempted and failed, or when the metadata
+/// read that decides whether to attempt one failed for any reason but
+/// absence (`NotFound` on either read is a scan→remove race, already free).
+/// Callers use that to decide whether the rest of the removal bookkeeping
+/// may run — wiping `plugin.<id>.*` config while a broken `<id>.toml`
+/// survives would resurrect the plugin with its settings reset if the file
+/// ever parses again, and a metadata error says nothing about whether it
+/// still does.
 ///
 /// `symlink_metadata`, not `exists()`: a dangling symlink at the name blocks
 /// `install_write` just as surely, and `remove_file` on it removes the link,
@@ -929,8 +1154,16 @@ fn remove_unparsable_remnant(dir: &std::path::Path, id: &str) -> bool {
     if foreign {
         return true;
     }
-    let Ok(meta) = remnant.symlink_metadata() else {
-        return true;
+    let meta = match remnant.symlink_metadata() {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(e) => {
+            diag::line(format!(
+                "remove-plugin: could not check for a remnant at {}: {e}",
+                remnant.display()
+            ));
+            return false;
+        }
     };
     let gone = if meta.file_type().is_dir() {
         std::fs::remove_dir(&remnant)
@@ -968,6 +1201,13 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
         app.on_plugin_enabled_changed(move |id, on| {
             let id = id.to_string();
             config::set_plugin_enabled(&id, on);
+            // The projection cache is keyed by provider id alone, not by
+            // whether that provider is currently enabled, so this toggle
+            // can't actually stale an entry — cleared anyway, since a
+            // future keying that did depend on the enabled set would
+            // otherwise have one silent exception to find again.
+            #[cfg(feature = "history")]
+            ctx.projection_cache.borrow_mut().clear();
             if on {
                 // Re-enabled: fetch it now so its row appears without waiting
                 // for the next refresh cadence.
@@ -979,6 +1219,7 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                         plugin_options(m),
                         &ctx.plugin_tx,
                         &ctx.fetching,
+                        Instant::now(),
                     );
                 }
             } else {
@@ -1019,6 +1260,7 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                         plugin_options(m),
                         &ctx.plugin_tx,
                         &ctx.fetching,
+                        Instant::now(),
                     );
                 }
             } else {
@@ -1042,8 +1284,15 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
             // third-party manifest and every user config toggle untouched),
             // then reload the manifest set and re-fetch under it.
             let dir = seed::plugins_dir();
-            if let Err(e) = seed::reseed_defaults(&dir) {
-                diag::line(format!("could not reset plugins in {}: {e}", dir.display()));
+            match seed::reseed_defaults(&dir) {
+                Ok(outcome) => {
+                    for (path, e) in &outcome.failed {
+                        diag::line(format!("could not reset {}: {e}", path.display()));
+                    }
+                }
+                Err(e) => {
+                    diag::line(format!("could not reset plugins in {}: {e}", dir.display()));
+                }
             }
             let previous = ctx.plugins.borrow().clone();
             *ctx.plugins.borrow_mut() = load_plugins();
@@ -1054,12 +1303,19 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
             // own invalidation, separate from `ctx.cache.clear()` below.
             forget_changed_manifests(&previous, &ctx.plugins.borrow());
             ctx.cache.borrow_mut().clear();
+            #[cfg(feature = "history")]
+            ctx.projection_cache.borrow_mut().clear();
             // Clear in-flight markers so the fresh fetches below aren't
             // deduped away by an old worker that is still running against the
             // pre-reset manifest — otherwise its stale result would be the one
             // that lands in the (now-cleared) cache.
             ctx.fetching.borrow_mut().clear();
-            spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
+            spawn_all_plugin_fetches(
+                &ctx.plugins.borrow(),
+                &ctx.plugin_tx,
+                &ctx.fetching,
+                Instant::now(),
+            );
             refresh_all(&ctx);
         });
     }
@@ -1084,6 +1340,7 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                         plugin_options(m),
                         &ctx.plugin_tx,
                         &ctx.fetching,
+                        Instant::now(),
                     );
                 }
             }
@@ -1265,6 +1522,7 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                     &ctx.fetching,
                     &ctx.plugin_model,
                     &ctx.plugin_tx,
+                    &ctx.projection_cache,
                 );
                 if let Some(app) = ctx.weak.upgrade() {
                     refresh_model(
@@ -1274,6 +1532,10 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                         &ctx.cache,
                         &ctx.window_models,
                         &ctx.balance_models,
+                        Projection {
+                            hist: &ctx.history,
+                            cache: &ctx.projection_cache,
+                        },
                     );
                     sync_tray_indicator(
                         &ctx.tray,
@@ -1282,6 +1544,12 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                         &ctx.cache,
                         &ctx.tray_key,
                     );
+                    // Not routed through `refresh_all`: `reload_and_fetch`
+                    // above already did its plugin-manager half. A manifest
+                    // that declares `[history]` must show the Activity card
+                    // the moment it is imported, same as every other path
+                    // that changes the provider set.
+                    sync_activity(&app, &ctx);
                 }
             }
             // Every path above closed with a native dialog (`choose file` or
@@ -1428,6 +1696,7 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                 &ctx.fetching,
                 &ctx.plugin_model,
                 &ctx.plugin_tx,
+                &ctx.projection_cache,
             );
             if let Some(app) = ctx.weak.upgrade() {
                 refresh_model(
@@ -1437,6 +1706,10 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                     &ctx.cache,
                     &ctx.window_models,
                     &ctx.balance_models,
+                    Projection {
+                        hist: &ctx.history,
+                        cache: &ctx.projection_cache,
+                    },
                 );
                 sync_tray_indicator(
                     &ctx.tray,
@@ -1445,6 +1718,11 @@ fn wire_plugin_manager_callbacks(app: &AppWindow, ctx: &Ctx) {
                     &ctx.cache,
                     &ctx.tray_key,
                 );
+                // Not routed through `refresh_all`: `reload_and_fetch` above
+                // already did its plugin-manager half. Removing the last
+                // `[history]` provider must still hide the Activity card,
+                // same as every other path that changes the provider set.
+                sync_activity(&app, &ctx);
             }
         });
     }
@@ -1659,7 +1937,7 @@ fn run_fast_timer(
         // `reload_manifests_only`'s docs.
         let settings_open_now = app.get_settings_open();
         if settings_open_now && !settings_open_prev.get() {
-            reload_manifests_only(&ctx.plugins, &ctx.plugin_model);
+            reload_manifests_only(&ctx.plugins, &ctx.plugin_model, &ctx.projection_cache);
         }
         settings_open_prev.set(settings_open_now);
 
@@ -1752,6 +2030,7 @@ fn run_fast_timer(
                     &ctx.fetching,
                     &ctx.plugin_model,
                     &ctx.plugin_tx,
+                    &ctx.projection_cache,
                 );
                 got = true;
             }
@@ -1770,6 +2049,10 @@ fn run_fast_timer(
                 &ctx.cache,
                 &ctx.window_models,
                 &ctx.balance_models,
+                Projection {
+                    hist: &ctx.history,
+                    cache: &ctx.projection_cache,
+                },
             );
             sync_tray_indicator(
                 &ctx.tray,
@@ -1778,13 +2061,24 @@ fn run_fast_timer(
                 &ctx.cache,
                 &ctx.tray_key,
             );
+            // Not routed through `refresh_all`: `reload_and_fetch` above
+            // already did its plugin-manager half. Installing or updating a
+            // provider from the registry must show the Activity card the
+            // moment it lands, same as every other path that changes the
+            // provider set.
+            sync_activity(&app, &ctx);
         }
 
         drain_tray_clicks(&app, &ctx);
 
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == tray_menu.refresh_id {
-                spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
+                spawn_all_plugin_fetches(
+                    &ctx.plugins.borrow(),
+                    &ctx.plugin_tx,
+                    &ctx.fetching,
+                    Instant::now(),
+                );
                 refresh_model(
                     &app,
                     &ctx.model,
@@ -1792,6 +2086,10 @@ fn run_fast_timer(
                     &ctx.cache,
                     &ctx.window_models,
                     &ctx.balance_models,
+                    Projection {
+                        hist: &ctx.history,
+                        cache: &ctx.projection_cache,
+                    },
                 );
                 sync_tray_indicator(
                     &ctx.tray,
@@ -1827,15 +2125,27 @@ fn run_fast_timer(
 /// `refresh_secs` cadence, and auto-ping shortly after a 5-hour window
 /// resets. `main` must keep the returned [`Timer`] alive for the rest of
 /// the run.
-fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
+fn run_slow_timer(
+    app: &AppWindow,
+    ctx: &Ctx,
+    #[cfg(feature = "history")] history_rx: mpsc::Receiver<tickover::history::store::HistoryStore>,
+) -> Timer {
     let tick_timer = Timer::default();
     let weak = app.as_weak();
     let ctx = ctx.clone();
+    #[cfg(feature = "history")]
+    let history_rx = history_rx;
     let ticks = Cell::new(0u32);
+    // Rate-limits the "slow tick" log below to one line per 10 minutes — a
+    // tick over budget tends to repeat (the same expensive path runs again
+    // next second), and logging every one of them would just be noise on
+    // top of the slowdown it's reporting.
+    let last_slow_tick_logged = Cell::new(None::<Instant>);
     tick_timer.start(
         TimerMode::Repeated,
         Duration::from_millis(1000),
         move || {
+            let tick_started = Instant::now();
             let Some(app) = weak.upgrade() else { return };
             let n = ticks.get().wrapping_add(1);
             ticks.set(n);
@@ -1857,15 +2167,62 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                         plugin_options(m),
                         &ctx.plugin_tx,
                         &ctx.fetching,
+                        Instant::now(),
                     );
+                }
+            }
+
+            // Local usage history: the scan worker sends its own freshly
+            // committed store rather than a bare notification — installing
+            // it here is the only thing this thread does, so it never
+            // parses `days.jsonl` itself. Several commits can land in one
+            // tick (a cold corpus scans in several 8-pass rounds); only the
+            // last is worth installing, so the drain keeps that one and
+            // throws the rest away. Rescans run on a slow cadence of their
+            // own: the scanner is incremental, but every pass still stats
+            // the provider trees.
+            #[cfg(feature = "history")]
+            {
+                let mut latest = None;
+                while let Ok(store) = history_rx.try_recv() {
+                    latest = Some(store);
+                }
+                if let Some(store) = latest {
+                    *ctx.history.borrow_mut() = Some(store);
+                    ctx.projection_cache.borrow_mut().clear();
+                    sync_activity(&app, &ctx);
+                } else if scan_ended_without_a_store(
+                    app.get_activity().scanning,
+                    ctx.history_io
+                        .busy
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                ) {
+                    // A scan that ended with nothing to install (no history
+                    // directory yet, a lock that could not be taken, a
+                    // commit failure, a panic mid-scan) still clears `busy`
+                    // — but sends nothing here to notice it. Without this,
+                    // the card is left showing "scanning…" until some
+                    // unrelated event (a range toggle, the next scan's own
+                    // successful commit) happens to call `sync_activity`.
+                    sync_activity(&app, &ctx);
+                }
+                if n % 120 == 17 {
+                    spawn_history_scan(&ctx);
                 }
             }
 
             // Built once and threaded through the rest of this tick —
             // `refresh_model_from`, `sync_tray_indicator_from`, and the
             // ping loop below all read the same `current` rather than
-            // each rebuilding it from `cache` for itself.
+            // each rebuilding it from `cache` for itself. `current_reported`
+            // travels with it for the same reason — both read `ctx.cache`
+            // as it stood at this exact moment.
             let current = readings(&ctx.plugins.borrow(), &ctx.cache.borrow());
+            let current_reported = every_enabled_plugin_has_reported(
+                &ctx.plugins.borrow(),
+                &ctx.cache.borrow(),
+                plugin_enabled,
+            );
 
             // Rebuilding the Slint model is skipped while the popover is
             // not on screen — the common case for a menu-bar app — since
@@ -1883,10 +2240,23 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                     &app,
                     &ctx.model,
                     &ctx.plugins.borrow(),
-                    &current,
+                    ReadingsPass {
+                        current: &current,
+                        reported: current_reported,
+                    },
                     &ctx.window_models,
                     &ctx.balance_models,
+                    Projection {
+                        hist: &ctx.history,
+                        cache: &ctx.projection_cache,
+                    },
                 );
+                // The renderer announces a change once per frame it draws, so
+                // a model written while that announcement was lost (see
+                // `present_popover`) leaves the frame behind for good.
+                // Requesting one every tick the panel is on screen bounds any
+                // such stall to a second.
+                app.window().request_redraw();
             }
             // Cheap no-op unless data, theme, or the toggle actually changed.
             sync_tray_indicator_from(&ctx.tray, app.get_menu_bar_text(), &current, &ctx.tray_key);
@@ -1897,23 +2267,52 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
             // it has one — so it leaves a note instead, and this instance
             // answers the click that started it. Without this, launching the
             // app while it is already running does nothing whatsoever, which
-            // looks exactly like an app that failed to start.
-            if platform::take_show_request() && !app.window().is_visible() {
-                // The gate above skipped `refresh_model_from` for exactly
-                // this window (hidden when this tick started) — force it
-                // now, with the same `current`, so the popover this is
-                // about to show is not a tick behind.
-                if should_refresh_panel(app.window().is_visible(), true) {
-                    refresh_model_from(
+            // looks exactly like an app that failed to start. Consumed
+            // unconditionally — see `show_request_action`'s own doc for why
+            // a visible window still gets something done for it, not
+            // nothing, now that this branches on it instead of `!visible`.
+            let show_requested = platform::take_show_request();
+            match show_request_action(show_requested, app.window().is_visible()) {
+                ShowRequestAction::None => {}
+                ShowRequestAction::Raise => {
+                    // Already on screen, just possibly buried — dock mode,
+                    // another app in front — so bring it forward rather
+                    // than run the present-and-place sequence a hidden
+                    // window needs.
+                    use slint::winit_030::WinitWindowAccessor;
+                    app.window().with_winit_window(|w| w.focus_window());
+                    platform::activate_app();
+                }
+                ShowRequestAction::Present => {
+                    // The gate above skipped `refresh_model_from` for
+                    // exactly this window (hidden when this tick started) —
+                    // force it now, with the same `current`, so the popover
+                    // this is about to show is not a tick behind.
+                    if should_refresh_panel(app.window().is_visible(), true) {
+                        refresh_model_from(
+                            &app,
+                            &ctx.model,
+                            &ctx.plugins.borrow(),
+                            ReadingsPass {
+                                current: &current,
+                                reported: current_reported,
+                            },
+                            &ctx.window_models,
+                            &ctx.balance_models,
+                            Projection {
+                                hist: &ctx.history,
+                                cache: &ctx.projection_cache,
+                            },
+                        );
+                    }
+                    present_popover(
                         &app,
-                        &ctx.model,
-                        &ctx.plugins.borrow(),
-                        &current,
-                        &ctx.window_models,
-                        &ctx.balance_models,
+                        &ctx.anchor,
+                        &ctx.shown_at,
+                        &ctx.pending_position,
+                        Shown::ByAnythingElse,
                     );
                 }
-                present_popover(&app, &ctx.anchor, &ctx.shown_at, Shown::ByAnythingElse);
             }
 
             // Keep "· checked <registry-checked-at>" live (Slint only ever
@@ -1955,7 +2354,9 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
             {
                 let ps = ctx.plugins.borrow();
                 let written = record_seen_windows(&ps, &current, now);
-                for m in ps.iter().filter(|m| m.ping.is_some() && plugin_enabled(m)) {
+                for m in ps.iter().filter(|m| {
+                    (m.ping.is_some() || !m.window_ping.is_empty()) && plugin_enabled(m)
+                }) {
                     // The filter above already established `plugin_enabled(m)`;
                     // passed as `true` rather than asked a second time. Checked
                     // before either lookup below so a plugin whose ping toggle
@@ -2039,7 +2440,10 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                         None
                     };
                     if let Some((surface_key, renewal)) = due {
-                        let ping = m.ping.as_ref().expect("filtered by ping.is_some() above");
+                        let ping = m
+                            .ping
+                            .as_ref()
+                            .expect("a renewal is only wanted when `[ping]` is declared");
                         // This gate is asked every tick a renewal stays due —
                         // see `ping_network_gate`'s own doc for why that is
                         // fine (the resolve, not the ask, is what's cached).
@@ -2060,94 +2464,110 @@ fn run_slow_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                     let Some(first_id) = first_surface_reading_id(m) else {
                         continue;
                     };
-                    // `written` first — `record_seen_windows` just above may have
-                    // recorded exactly this window on this very tick, and
-                    // `seen_window_for` would otherwise reread and reparse
-                    // `config.json` to learn what this loop's own caller already
-                    // knows (that write is what invalidated `config`'s cache in
-                    // the first place). Falling back to `seen_window_for` with
-                    // `m`, not a lookup by reading id: this loop already holds
-                    // the manifest, and the registry key is namespaced by the
-                    // *owner's* id, so asking with `m` reads exactly the key
-                    // `record_seen_windows` wrote for it. Going back through
-                    // the reading id would run `owning_manifest` again only to
-                    // have it answer `None` for a reading id two manifests both
-                    // claim — costing this provider its auto-ping over a
-                    // collision the panel is right to be cautious about and the
-                    // ping need not be.
-                    let Some(primary_key) = primary_window_key(m) else {
-                        continue;
-                    };
-                    let seen_window = written
-                        .get(&(m.id.clone(), first_id.clone(), primary_key.clone()))
-                        .copied()
-                        .or_else(|| seen_window_for(m, &first_id, &primary_key));
-                    let Some(window) = ping_window(
-                        m,
-                        current.iter().find(|r| r.id == first_id),
-                        seen_window.as_ref().and_then(|s| s.period_minutes),
-                    ) else {
-                        continue;
-                    };
-                    let seen = seen_window.map_or(0, |s| s.at);
-                    if !ping_due(
-                        window.used_percent,
-                        window.resets_at,
-                        window.period_minutes,
-                        seen,
-                        pinged_at,
-                        now,
-                    ) {
-                        continue;
+                    // `[ping]`: the primary window of the first surface, under
+                    // the plugin's one `pinged_at`. A manifest that pings only
+                    // through `[[window_ping]]` declares none.
+                    'primary: {
+                        let Some(ping) = m.ping.as_ref() else {
+                            break 'primary;
+                        };
+                        // `written` first — `record_seen_windows` just above may have
+                        // recorded exactly this window on this very tick, and
+                        // `seen_window_for` would otherwise reread and reparse
+                        // `config.json` to learn what this loop's own caller already
+                        // knows (that write is what invalidated `config`'s cache in
+                        // the first place). Falling back to `seen_window_for` with
+                        // `m`, not a lookup by reading id: this loop already holds
+                        // the manifest, and the registry key is namespaced by the
+                        // *owner's* id, so asking with `m` reads exactly the key
+                        // `record_seen_windows` wrote for it. Going back through
+                        // the reading id would run `owning_manifest` again only to
+                        // have it answer `None` for a reading id two manifests both
+                        // claim — costing this provider its auto-ping over a
+                        // collision the panel is right to be cautious about and the
+                        // ping need not be.
+                        let Some(primary_key) = primary_window_key(m) else {
+                            break 'primary;
+                        };
+                        let seen_window = written
+                            .get(&(m.id.clone(), first_id.clone(), primary_key.clone()))
+                            .copied()
+                            .or_else(|| seen_window_for(m, &first_id, &primary_key));
+                        let Some(window) = ping_window(
+                            m,
+                            current.iter().find(|r| r.id == first_id),
+                            seen_window.as_ref().and_then(|s| s.period_minutes),
+                        ) else {
+                            break 'primary;
+                        };
+                        let seen = seen_window.map_or(0, |s| s.at);
+                        if !ping_due(
+                            window.used_percent,
+                            window.resets_at,
+                            window.period_minutes,
+                            seen,
+                            pinged_at,
+                            now,
+                        ) {
+                            break 'primary;
+                        }
+                        // This gate is asked every tick the window stays due —
+                        // see `ping_network_gate`'s own doc for why that is fine
+                        // (the resolve, not the ask, is what's cached).
+                        // `pinged_at` is still untouched at this point, so
+                        // `Pending` or `Unreachable` cost nothing: this window is
+                        // still due, and fires on whichever later tick finally
+                        // sees the host resolve.
+                        if ping_network_gate(&m.id, ping_host(m).as_deref())
+                            != PingNetwork::Reachable
+                        {
+                            break 'primary;
+                        }
+                        // Resolved before `set_plugin_pinged_at` below — see
+                        // `ping_binary`'s own doc for the window ping's half of
+                        // its reasoning: writing `pinged_at` for a run that
+                        // never happened would spend this window's one ping on
+                        // nothing, silencing it until the window ends. Checking
+                        // first means a binary that reappears mid-window still
+                        // gets pinged before it does, not only at the next one.
+                        let Some(bin) = ping_binary(&m.id, &ping.bin) else {
+                            break 'primary;
+                        };
+                        // Recorded first, and the command run on this same tick. There
+                        // is deliberately no delay between the two: a gap is a window
+                        // in which the app can be quit with the ping recorded and never
+                        // sent, which on-disk state would then remember for good.
+                        // `pinged_at_while` hands the stamp back when the run never
+                        // started — see its own doc for why that undo matters.
+                        pinged_at_while(&m.id, now, || spawn_hello(bin, ping.args.clone(), None));
                     }
-                    // This gate is asked every tick the window stays due —
-                    // see `ping_network_gate`'s own doc for why that is fine
-                    // (the resolve, not the ask, is what's cached).
-                    // `pinged_at` is still untouched at this point, so
-                    // `Pending` or `Unreachable` cost nothing: this window is
-                    // still due, and fires on whichever later tick finally
-                    // sees the host resolve.
-                    if ping_network_gate(&m.id, ping_host(m).as_deref()) != PingNetwork::Reachable {
-                        continue;
-                    }
-                    let ping = m.ping.as_ref().expect("filtered by ping.is_some() above");
-                    // Resolved before `set_plugin_pinged_at` below — see
-                    // `ping_binary`'s own doc for the window ping's half of
-                    // its reasoning: writing `pinged_at` for a run that
-                    // never happened would spend this window's one ping on
-                    // nothing, silencing it until the window ends. Checking
-                    // first means a binary that reappears mid-window still
-                    // gets pinged before it does, not only at the next one.
-                    let Some(bin) = ping_binary(&m.id, ping) else {
-                        continue;
-                    };
-                    // Recorded first, and the command run on this same tick. There
-                    // is deliberately no delay between the two: a gap is a window
-                    // in which the app can be quit with the ping recorded and never
-                    // sent, which on-disk state would then remember for good.
-                    // `pinged_at_while` hands the stamp back when the run never
-                    // started — see its own doc for why that undo matters.
-                    pinged_at_while(&m.id, now, || spawn_hello(bin, ping.args.clone(), None));
+                    // `[[window_ping]]`: each named window on the same
+                    // surface, each under its own record — see
+                    // `run_window_pings`.
+                    run_window_pings(m, &first_id, &current, &written, now);
                 }
+            }
+
+            // A tick that runs long starves repaint — nothing else here
+            // notices, so this is the only place that shows it. 200ms is a
+            // fifth of the tick's own 1-second period: past that point a
+            // once-a-second update starts reading as a stutter rather than
+            // a smooth countdown, well before the tick threatens to miss
+            // its next period outright.
+            let elapsed = tick_started.elapsed();
+            if elapsed > Duration::from_millis(200)
+                && last_slow_tick_logged
+                    .get()
+                    .is_none_or(|at| at.elapsed() >= Duration::from_secs(600))
+            {
+                diag::line(format!("slow tick: {} ms", elapsed.as_millis()));
+                last_slow_tick_logged.set(Some(Instant::now()));
             }
         },
     );
     tick_timer
 }
 
-/// Dock mode: clicking the Dock icon of a running app is an app-level
-/// reopen that never reaches the winit event loop, so a hidden panel would
-/// stay hidden with no way back. Watch the activation flag's rising edge
-/// instead — an edge, not the level, so hiding the window while the app is
-/// still frontmost doesn't immediately re-present it.
-///
-/// `panel_target_visibility` resolves each tick to a single target state
-/// rather than reacting per event, because several clicks can land inside
-/// one interval and their order is not recoverable afterwards.
-///
-/// Outside dock mode the returned [`Timer`] is simply never started — cheap
-/// to always build, so `main` can hold one `Timer` binding for it
-/// unconditionally, the same as every other timer here.
 /// Drain every queued status-item event, applying each left-button release
 /// as the panel toggle it asks for. Returns how many left clicks it
 /// applied — including ones absorbed or dismissed without a visible toggle,
@@ -2220,9 +2640,7 @@ fn drain_tray_clicks(app: &AppWindow, ctx: &Ctx) -> usize {
             // is dead on purpose.)
             let mark = ctx.opened_by_activation_at.take();
             let absorbed = app.window().is_visible()
-                && mark.is_some_and(|(at, _)| {
-                    click_absorbed_by_its_activation(Some(at), press_at, now)
-                });
+                && mark.is_some_and(|at| click_absorbed_by_its_activation(Some(at), press_at, now));
             diag::line(format!(
                 "tray click drained: visible={} dismissed={} absorbed={} active={}",
                 app.window().is_visible(),
@@ -2232,18 +2650,40 @@ fn drain_tray_clicks(app: &AppWindow, ctx: &Ctx) -> usize {
             ));
             if absorbed {
                 // The edge opened the panel before this click's `rect` was
-                // known — *if* that open placed the window, it sits wherever
-                // a stale or absent anchor put it, so move it under the item
-                // actually pressed. If the open left the window where the
-                // user parked it, the absorb must too: a mark this gesture
-                // did not cause is no licence to move their window.
-                if mark.is_some_and(|(_, moved)| moved) {
-                    position_popover(app, &ctx.anchor, Shown::ByTrayClick);
-                }
+                // known, so re-anchor it under the item actually pressed.
+                // The absorb itself already proved this gesture caused the
+                // open; in dock mode that open deliberately did *not* move
+                // the window, which would otherwise leave the panel at
+                // whatever parked position it last had — exactly the "opens
+                // somewhere else" this fixes. The cap re-syncs against the
+                // click's own monitor — a re-anchor across displays must not
+                // size the card for the screen it is leaving.
+                sync_providers_cap(app, &ctx.anchor);
+                position_popover(app, &ctx.anchor, &ctx.pending_position, Shown::ByTrayClick);
             } else if app.window().is_visible() {
-                let _ = app.window().hide();
+                // Visible — but hanging off this icon, or parked somewhere
+                // else? "Click the icon" means "the panel, here": a panel
+                // already under the item toggles closed, while one parked
+                // away from it (the launch open's fallback spot, or a dock
+                // window the user dragged aside) re-anchors — hiding a
+                // window the user was not looking at reads as "nothing
+                // happened", the click that "did not open" the panel.
+                if window_at_anchor(app, &ctx.anchor) {
+                    let _ = app.window().hide();
+                    // Hidden ends the presentation — no deferred or
+                    // settling placement may outlive it into the next one.
+                    ctx.pending_position.set(None);
+                } else {
+                    sync_providers_cap(app, &ctx.anchor);
+                    position_popover(app, &ctx.anchor, &ctx.pending_position, Shown::ByTrayClick);
+                }
             } else if !dismissed {
-                spawn_all_plugin_fetches(&ctx.plugins.borrow(), &ctx.plugin_tx, &ctx.fetching);
+                spawn_all_plugin_fetches(
+                    &ctx.plugins.borrow(),
+                    &ctx.plugin_tx,
+                    &ctx.fetching,
+                    Instant::now(),
+                );
                 if should_refresh_panel(app.window().is_visible(), true) {
                     refresh_model(
                         app,
@@ -2252,9 +2692,19 @@ fn drain_tray_clicks(app: &AppWindow, ctx: &Ctx) -> usize {
                         &ctx.cache,
                         &ctx.window_models,
                         &ctx.balance_models,
+                        Projection {
+                            hist: &ctx.history,
+                            cache: &ctx.projection_cache,
+                        },
                     );
                 }
-                present_popover(app, &ctx.anchor, &ctx.shown_at, Shown::ByTrayClick);
+                present_popover(
+                    app,
+                    &ctx.anchor,
+                    &ctx.shown_at,
+                    &ctx.pending_position,
+                    Shown::ByTrayClick,
+                );
             }
             tray_clicks += 1;
         }
@@ -2262,6 +2712,19 @@ fn drain_tray_clicks(app: &AppWindow, ctx: &Ctx) -> usize {
     tray_clicks
 }
 
+/// Dock mode: clicking the Dock icon of a running app is an app-level
+/// reopen that never reaches the winit event loop, so a hidden panel would
+/// stay hidden with no way back. Watch the activation flag's rising edge
+/// instead — an edge, not the level, so hiding the window while the app is
+/// still frontmost doesn't immediately re-present it.
+///
+/// `panel_target_visibility` resolves each tick to a single target state
+/// rather than reacting per event, because several clicks can land inside
+/// one interval and their order is not recoverable afterwards.
+///
+/// Outside dock mode the returned [`Timer`] is simply never started — cheap
+/// to always build, so `main` can hold one `Timer` binding for it
+/// unconditionally, the same as every other timer here.
 fn run_dock_reopen_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
     let reopen_timer = Timer::default();
     if platform::dock_mode() {
@@ -2322,9 +2785,9 @@ fn run_dock_reopen_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
             if want_visible && !visible {
                 // The panel was hidden — the tick timer's own gate has been
                 // skipping `refresh_model_from` for it — so it must be forced
-                // fresh here, the same `should_refresh_panel` idiom as every
-                // other `present_popover` call site in this file, rather than
-                // showing whatever the model last held.
+                // fresh here, the same `should_refresh_panel` idiom every
+                // other `present_popover` call site but the startup ones
+                // uses, rather than showing whatever the model last held.
                 if should_refresh_panel(visible, true) {
                     refresh_model(
                         &app,
@@ -2333,21 +2796,29 @@ fn run_dock_reopen_timer(app: &AppWindow, ctx: &Ctx) -> Timer {
                         &ctx.cache,
                         &ctx.window_models,
                         &ctx.balance_models,
+                        Projection {
+                            hist: &ctx.history,
+                            cache: &ctx.projection_cache,
+                        },
                     );
                 }
-                let moved =
-                    present_popover(&app, &ctx.anchor, &ctx.shown_at, Shown::ByAnythingElse);
+                present_popover(
+                    &app,
+                    &ctx.anchor,
+                    &ctx.shown_at,
+                    &ctx.pending_position,
+                    Shown::ByAnythingElse,
+                );
                 // An unexplained activation opened this panel: remember
-                // when — and whether it moved the window — so the
-                // status-item click that caused it, whose event can still
-                // be in flight, is absorbed as the same gesture rather than
-                // toggling the panel straight back off; and so the absorb
-                // knows whether a re-anchor is owed.
+                // when, so the status-item click that caused it, whose event
+                // can still be in flight, is absorbed as the same gesture
+                // rather than toggling the panel straight back off.
                 if became_active && clicks == 0 {
-                    ctx.opened_by_activation_at.set(Some((Instant::now(), moved)));
+                    ctx.opened_by_activation_at.set(Some(Instant::now()));
                 }
             } else if !want_visible && visible {
                 let _ = app.window().hide();
+                ctx.pending_position.set(None);
             }
         });
     }
@@ -2401,13 +2872,41 @@ fn truly_fresh_install() -> bool {
 /// `upgrade_builtin_manifests` alone, which is exactly how the regression
 /// this function fixes went unnoticed by the tests already guarding
 /// `upgrade_builtin_manifests`.
+///
+/// A seed step that could not write *anything at all* (the whole directory
+/// is unwritable, say) skips [`upgrade_builtin_manifests`] entirely this
+/// launch, rather than letting it read the still-empty `dir` the failure
+/// left behind. `codex.toml`/`claude.toml` ship `deliver_if_absent = false`
+/// — an install without them is assumed to have removed them on purpose —
+/// so `Absent` off an empty `dir` settles their marker for good whether or
+/// not a write ever actually ran; a disk full or read-only for one launch
+/// would otherwise cost either headline provider every future one. Leaving
+/// every marker untouched keeps `truly_fresh_install` true, so the whole
+/// sequence — seed included — simply retries next launch.
+///
+/// A seed step that wrote *some* names and not others (an obstruction at a
+/// single built-in's path, in an otherwise writable directory) is not that
+/// case: [`seed::SeedOutcome::failed`] names what it could not write, and
+/// `upgrade_builtin_manifests` still runs — the names it did write read back
+/// as `AlreadyCurrent` and settle normally, and the obstructed one reads as
+/// `OnDisk::Unreadable` (something is there, just not a plain file), which
+/// `classify_builtin` never settles, so it is retried every later launch
+/// exactly as it was this one.
 fn seed_and_upgrade_builtins(dir: &std::path::Path) {
     if truly_fresh_install() {
-        if let Err(e) = seed::seed_if_empty(dir) {
-            diag::line(format!(
-                "could not seed plugin manifests in {}: {e}",
-                dir.display()
-            ));
+        match seed::seed_if_empty(dir) {
+            Ok(outcome) => {
+                for (path, e) in &outcome.failed {
+                    diag::line(format!("could not seed {}: {e}", path.display()));
+                }
+            }
+            Err(e) => {
+                diag::line(format!(
+                    "could not seed plugin manifests in {}: {e}",
+                    dir.display()
+                ));
+                return;
+            }
         }
     }
     upgrade_builtin_manifests(dir);
@@ -2800,12 +3299,25 @@ fn forget_changed_manifests(old: &[PluginManifest], new: &[PluginManifest]) {
 /// settings-sheet open (see the `settings-open` rising-edge check in the fast
 /// timer) without adding a surprise network hit just for opening a sheet, and
 /// safe to call after the last plugin manifest was deleted without
-/// resurrecting the built-ins.
-fn reload_manifests_only(plugins: &Plugins, plugin_model: &PluginRows) {
+/// resurrecting the built-ins. Clearing `proj_cache` here, rather than at
+/// each call site, is what keeps every reload/install/remove path covered
+/// without depending on every future call site remembering to do it itself.
+fn reload_manifests_only(
+    plugins: &Plugins,
+    plugin_model: &PluginRows,
+    proj_cache: &ProjectionCache,
+) {
+    // `proj_cache` is `()` without the feature — there's nothing to clear,
+    // but the parameter still has to be named to keep this signature
+    // uniform for every call site.
+    #[cfg(not(feature = "history"))]
+    let _ = proj_cache;
     let previous = plugins.borrow().clone();
     *plugins.borrow_mut() = load_plugins();
     forget_changed_manifests(&previous, &plugins.borrow());
     refresh_plugins_model(plugin_model, &plugins.borrow());
+    #[cfg(feature = "history")]
+    proj_cache.borrow_mut().clear();
 }
 
 /// [`reload_manifests_only`] plus a fresh fetch of every (enabled) plugin —
@@ -2818,13 +3330,14 @@ fn reload_and_fetch(
     fetching: &Fetching,
     plugin_model: &PluginRows,
     tx: &mpsc::Sender<(String, u64, Vec<ProviderReading>)>,
+    proj_cache: &ProjectionCache,
 ) {
-    reload_manifests_only(plugins, plugin_model);
+    reload_manifests_only(plugins, plugin_model, proj_cache);
     // Clear in-flight markers so a fetch still running against the pre-reload
     // manifest set can't dedupe away the fresh one spawned below — mirrors
     // `reset-plugins`'s own comment on the same race.
     fetching.borrow_mut().clear();
-    spawn_all_plugin_fetches(&plugins.borrow(), tx, fetching);
+    spawn_all_plugin_fetches(&plugins.borrow(), tx, fetching, Instant::now());
 }
 
 /// `add-plugin`'s intended write target for a newly-imported manifest's
@@ -2872,8 +3385,20 @@ fn plugin_manifest_target(dir: &std::path::Path, id: &str) -> Option<std::path::
 /// broken badly enough that it no longer parses can no longer be reopened via
 /// `edit-plugin` to fix it by its conventional filename; the plugins folder
 /// (`open-plugins-folder`) is still reachable for that case.
+///
+/// Two files can still parse to the same `id` — a stray copy dropped in by
+/// hand, say — and `plugin::manifest::load_dir` already has a rule for
+/// exactly that: lowest `order`, ties broken by path, the same key
+/// `dedup_plugin_ids` uses to call every other claimant a duplicate and drop
+/// it. Directory-listing order agrees with that by coincidence at best — it
+/// is whatever the filesystem hands back, not even alphabetical on every one
+/// this runs on — so every match is collected and sorted by that same key
+/// rather than returning the first one the scan happens to meet. Anything
+/// less would let Edit open, and Remove delete, a file the app never
+/// actually loaded.
 fn find_plugin_manifest_path(dir: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
+    let mut candidates: Vec<(i64, std::path::PathBuf)> = Vec::new();
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
@@ -2888,12 +3413,16 @@ fn find_plugin_manifest_path(dir: &std::path::Path, id: &str) -> Option<std::pat
         {
             if let Ok(m) = PluginManifest::from_str(&text) {
                 if m.id == id {
-                    return Some(path);
+                    candidates.push((m.order, path));
                 }
             }
         }
     }
-    None
+    // `(order, path)`: every candidate here already shares `id`, so the
+    // `id` term `load_dir`'s own key also sorts by can never break a tie —
+    // this is that same key with the constant term dropped.
+    candidates.sort();
+    candidates.into_iter().next().map(|(_, path)| path)
 }
 
 /// Drop a removed plugin's provenance record from the registry lockfile at
@@ -3350,16 +3879,25 @@ fn drain_engine_diagnostics() {
 /// Kick off a background fetch for one plugin, unless it is disabled, or a
 /// fetch is already in flight for it (dedup by plugin id, so any number of
 /// plugins can be tracked with one `fetching` map). `active_surface_ids`/
-/// `options` are resolved by the caller at
-/// spawn time — the same instant a fetch is decided to happen — not inside
-/// the background thread, so a config change mid-flight can't retroactively
-/// alter an already-dispatched fetch.
+/// `options` are resolved by the caller, before this function decides
+/// whether a fetch actually happens — not inside the background thread, so
+/// a config change mid-flight can't retroactively alter an already-
+/// dispatched fetch.
+///
+/// `now` is a parameter rather than read here with `Instant::now()`, the
+/// same reason [`ping_probe_decision`] takes one: a test that wants to prove
+/// the stalled-fetch path needs an `InFlight` already older than
+/// [`FETCH_PATIENCE`], and the only way to build that without ever
+/// subtracting from `Instant::now()` — which panics if the result would
+/// precede the monotonic clock's own epoch — is to hand this function a
+/// `now` computed by *adding* to the `started` it recorded.
 fn spawn_plugin_fetch(
     m: &PluginManifest,
     active_surface_ids: Vec<String>,
     options: BTreeMap<String, bool>,
     tx: &mpsc::Sender<(String, u64, Vec<ProviderReading>)>,
     fetching: &Fetching,
+    now: Instant,
 ) {
     if !plugin_enabled(m) {
         return; // disabled plugins are never fetched
@@ -3372,7 +3910,7 @@ fn spawn_plugin_fetch(
     {
         let mut in_flight = fetching.borrow_mut();
         let existing = in_flight.get(&m.id).copied();
-        let elapsed = existing.map(|f| f.started.elapsed());
+        let elapsed = existing.map(|f| now.saturating_duration_since(f.started));
         match admit_fetch(elapsed, FETCH_PATIENCE) {
             Admission::Wait => return,
             // Never a second thread walking this plugin's own fetch
@@ -3406,7 +3944,7 @@ fn spawn_plugin_fetch(
             m.id.clone(),
             InFlight {
                 generation,
-                started: Instant::now(),
+                started: now,
                 stall_logged: false,
             },
         );
@@ -3497,9 +4035,17 @@ fn spawn_all_plugin_fetches(
     plugins: &[PluginManifest],
     tx: &mpsc::Sender<(String, u64, Vec<ProviderReading>)>,
     fetching: &Fetching,
+    now: Instant,
 ) {
     for m in plugins {
-        spawn_plugin_fetch(m, active_surface_ids(m), plugin_options(m), tx, fetching);
+        spawn_plugin_fetch(
+            m,
+            active_surface_ids(m),
+            plugin_options(m),
+            tx,
+            fetching,
+            now,
+        );
     }
 }
 
@@ -3601,6 +4147,20 @@ fn owning_manifest<'a>(
     });
     let only = claimants.next()?;
     claimants.next().is_none().then_some(only)
+}
+
+/// Whether the reading's provider gets the "quota only" badge — true when
+/// its manifest declares no `[history]` section. Always false without the
+/// feature: that build has no Activity card for the badge to refer to.
+#[cfg(feature = "history")]
+fn quota_only_badge(plugins: &[PluginManifest], reading_id: &str) -> bool {
+    owning_manifest(plugins, reading_id)
+        .map(|m| m.history.is_none())
+        .unwrap_or(false)
+}
+#[cfg(not(feature = "history"))]
+fn quota_only_badge(_: &[PluginManifest], _: &str) -> bool {
+    false
 }
 
 /// All provider readings, merged from each plugin's cached fetch result, in
@@ -3868,6 +4428,120 @@ fn ping_window(
             },
         },
     })
+}
+
+/// [`ping_window`] for a window named by its `[[windows]] id` — the one a
+/// `[[window_ping]]` starts — rather than for whichever window is primary.
+/// The same shape of answer: what the reading says about that window, or,
+/// when it says nothing, a length to project the boundary with. `None` for an
+/// errored reading, no reading, or an `id` the manifest does not declare
+/// (`validate` refuses that last one at load).
+fn named_ping_window(
+    m: &PluginManifest,
+    reading: Option<&ProviderReading>,
+    window_id: &str,
+    remembered_period_minutes: Option<u64>,
+) -> Option<PingWindow> {
+    let reading = reading?;
+    if reading.error.is_some() {
+        return None;
+    }
+    let (index, declared) = m
+        .windows
+        .iter()
+        .enumerate()
+        .find(|(_, w)| !w.id.is_empty() && w.id == window_id)?;
+    let key = tickover::plugin::window_key(declared, index);
+    let window = match reading.windows.iter().find(|w| w.key == key) {
+        Some(w) => PingWindow {
+            used_percent: w.used_percent,
+            resets_at: w.resets_at,
+            period_minutes: w.period_minutes,
+        },
+        None => PingWindow {
+            used_percent: None,
+            resets_at: None,
+            period_minutes: match declared.period.mode {
+                manifest::PeriodMode::Assumed => declared.period.assumed,
+                manifest::PeriodMode::FromField => remembered_period_minutes,
+                manifest::PeriodMode::FromBounds => {
+                    declared.period.assumed.or(remembered_period_minutes)
+                }
+            },
+        },
+    };
+    Some(window)
+}
+
+/// Run every `[[window_ping]]` of `m` whose window is due — each judged by
+/// [`ping_due`] against its own record (`config::plugin_window_pinged_at`),
+/// so starting one window neither spends nor delays another's ping. The
+/// caller has already checked the plugin is enabled and its ping toggle on.
+///
+/// Read from the first surface, as `[ping]`'s primary window is: that is the
+/// surface the seen-window registry's ping fallback is written for, and the
+/// only one a CLI started without any account selection can be assumed to
+/// speak for.
+fn run_window_pings(
+    m: &PluginManifest,
+    first_id: &str,
+    current: &[ProviderReading],
+    written: &HashMap<(String, String, String), config::SeenWindow>,
+    now: u64,
+) {
+    let reading = current.iter().find(|r| r.id == first_id);
+    for wp in &m.window_ping {
+        let pinged_at = config::plugin_window_pinged_at(&m.id, &wp.window);
+        // Remembered length first, the same order `[ping]`'s path asks in:
+        // `written` holds what this very tick recorded.
+        let declared_key = m
+            .windows
+            .iter()
+            .enumerate()
+            .find(|(_, w)| !w.id.is_empty() && w.id == wp.window)
+            .map(|(i, w)| tickover::plugin::window_key(w, i));
+        let Some(declared_key) = declared_key else {
+            continue;
+        };
+        let seen_window = written
+            .get(&(m.id.clone(), first_id.to_string(), declared_key.clone()))
+            .copied()
+            .or_else(|| seen_window_for(m, first_id, &declared_key));
+        let Some(window) = named_ping_window(
+            m,
+            reading,
+            &wp.window,
+            seen_window.as_ref().and_then(|s| s.period_minutes),
+        ) else {
+            continue;
+        };
+        if !ping_due(
+            window.used_percent,
+            window.resets_at,
+            window.period_minutes,
+            seen_window.map_or(0, |s| s.at),
+            pinged_at,
+            now,
+        ) {
+            continue;
+        }
+        // Asked only once a window is due, as on `[ping]`'s path; a
+        // `Pending` or `Unreachable` answer leaves the record untouched, so
+        // the window stays due for a later tick.
+        if ping_network_gate(&m.id, ping_host(m).as_deref()) != PingNetwork::Reachable {
+            return;
+        }
+        let Some(bin) = ping_binary(&m.id, &wp.bin) else {
+            continue;
+        };
+        diag::line(format!(
+            "auto-ping: {} window {} is empty, running {}",
+            m.id, wp.window, wp.bin
+        ));
+        window_pinged_at_while(&m.id, &wp.window, now, || {
+            spawn_hello(bin, wp.args.clone(), None)
+        });
+    }
 }
 
 // ── Seen-window registry ────────────────────────────────────────────────────
@@ -4377,8 +5051,38 @@ fn ping_due(
     let period = period_minutes
         .filter(|m| *m > 0)
         .map_or(ASSUMED_WINDOW_SECS, |m| m.saturating_mul(60));
-    window_start(resets_at, period, seen_window, now)
-        .is_some_and(|start| pinged_at.saturating_add(PING_GRACE_SECS) < start)
+    let Some(start) = window_start(resets_at, period, seen_window, now) else {
+        return false;
+    };
+    if pinged_at.saturating_add(PING_GRACE_SECS) >= start {
+        return false;
+    }
+    // A window that "began" within the floor of now, still empty, is either
+    // one that really did just begin or one whose reset moves with the clock
+    // because nothing has started it — Antigravity's shape for an unstarted
+    // window is a reset exactly one period from the moment of the reading.
+    // The two cannot be told apart from one reading, and only the second
+    // matters here: read as stated, it "began" again on every reading, so a
+    // ping that failed to start it (a retired `--model` is refused with exit
+    // 1) was owed again each time the floor above passed — a process every
+    // ten minutes, indefinitely. So a fresh-looking start owes a ping only a
+    // full period after the last one, the same retry a silent Codex window
+    // gets from `window_start`'s projection. Only for a *stated* reset: a
+    // vanished one already retries a period apart through that projection,
+    // whose boundary lands within the floor of `now` on every retry by
+    // construction. A stated window that genuinely began just now loses
+    // nothing by it: a ping that started a window is at least a period
+    // behind the next boundary, so only a ping that achieved nothing — or
+    // one sent into a window already running at a rounded 0% — is ever held
+    // back.
+    if pinged_at > 0
+        && resets_at.is_some()
+        && now.saturating_sub(start) < PING_MIN_INTERVAL_SECS
+        && now.saturating_sub(pinged_at) < period
+    {
+        return false;
+    }
+    true
 }
 
 /// How many renewal attempts one distinct `TokenRenewal` value spends at the
@@ -4755,14 +5459,75 @@ fn plugin_ping_armed(enabled: bool, ping_on: bool) -> bool {
 /// the popover is on screen and could otherwise show a tick-old number — or
 /// `forced` — it is about to be shown and would open on a tick-old number the
 /// instant it appeared, whether or not it happened to already be on screen.
-/// The tick's own gate and every `present_popover` call site but one — the
-/// unconditional refresh right after startup, which runs whether or not a
-/// popover is ever about to follow it — go through this same predicate, so
-/// "does a refresh belong here" has one answer for the tick and for showing
-/// the panel again later, rather than a hidden agreement between several
-/// `if`s that happen to match today.
+/// The tick's own gate and three of the five `present_popover` call sites go
+/// through this same predicate; the other two are the startup-only ones
+/// right after the unconditional first `refresh_model` — a popover shown
+/// there is already caught up, with nothing left for this predicate to
+/// decide. So "does a refresh belong here" has one answer for the tick and
+/// for showing the panel again later, rather than a hidden agreement between
+/// several `if`s that happen to match today.
 fn should_refresh_panel(visible: bool, forced: bool) -> bool {
     visible || forced
+}
+
+/// What a second launch's note calls for, once `platform::take_show_request`
+/// has actually consumed one this tick — `requested` is that call's own
+/// answer, so this never re-asks it, and never runs when it was `false`.
+/// `visible` is stale by the time either non-`None` case has run its own
+/// side effects, the same way every other reader of it earlier in this tick
+/// already is — nothing here relies on it staying accurate afterward.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShowRequestAction {
+    /// No note arrived this tick — `requested` was `false`.
+    None,
+    /// The window is already visible, just not necessarily on top of
+    /// everything (dock mode, another app in front) — bring it forward
+    /// rather than run the present-and-place sequence a hidden window needs.
+    Raise,
+    /// The window is hidden — show and place it fresh, the sequence every
+    /// other presentation in this file already runs.
+    Present,
+}
+
+/// `requested` came from `platform::take_show_request` itself consuming the
+/// note — a request the tick's own `if` used to gate on `!visible` as well,
+/// so one that arrived while the window was already up (buried, not
+/// necessarily gone) read as nothing to do and the note was still spent for
+/// nothing. [`ShowRequestAction::Raise`] is what a visible window gets
+/// instead: brought forward, not re-presented.
+fn show_request_action(requested: bool, visible: bool) -> ShowRequestAction {
+    if !requested {
+        ShowRequestAction::None
+    } else if visible {
+        ShowRequestAction::Raise
+    } else {
+        ShowRequestAction::Present
+    }
+}
+
+/// The store handle ([`HistoryShared`]) and its per-tick token memo
+/// ([`ProjectionCache`]) travel everywhere together — bundled into one
+/// parameter so `refresh_model`/`refresh_model_from` stay under clippy's
+/// argument-count ceiling instead of growing an eighth unrelated-looking
+/// slot for a cache the store handle already implies.
+#[derive(Clone, Copy)]
+struct Projection<'a> {
+    hist: &'a HistoryShared,
+    cache: &'a ProjectionCache,
+}
+
+/// `readings()`'s own list for this tick, plus whether every currently
+/// enabled plugin already has an entry in the cache that list was built
+/// from — the two pieces [`header_status`] needs, bundled the same way
+/// [`Projection`] bundles the history handle and its cache, for the same
+/// reason: `refresh_model_from` is already at clippy's argument-count
+/// ceiling, so this replaces the bare slice it used to take rather than
+/// growing an eighth slot.
+#[derive(Clone, Copy)]
+struct ReadingsPass<'a> {
+    current: &'a [ProviderReading],
+    /// See [`every_enabled_plugin_has_reported`]'s own doc.
+    reported: bool,
 }
 
 /// Rebuild the provider list from the cache. Two nested reconciles keep the UI
@@ -4784,15 +5549,21 @@ fn refresh_model(
     cache: &PluginCache,
     window_models: &WindowModels,
     balance_models: &BalanceModels,
+    proj: Projection<'_>,
 ) {
     let readings = readings(plugins, &cache.borrow());
+    let reported = every_enabled_plugin_has_reported(plugins, &cache.borrow(), plugin_enabled);
     refresh_model_from(
         app,
         model,
         plugins,
-        &readings,
+        ReadingsPass {
+            current: &readings,
+            reported,
+        },
         window_models,
         balance_models,
+        proj,
     );
 }
 
@@ -4805,10 +5576,12 @@ fn refresh_model_from(
     app: &AppWindow,
     model: &Providers,
     plugins: &[PluginManifest],
-    readings: &[ProviderReading],
+    pass: ReadingsPass<'_>,
     window_models: &WindowModels,
     balance_models: &BalanceModels,
+    proj: Projection<'_>,
 ) {
+    let readings = pass.current;
     let now = now_unix();
 
     let mut win_models = window_models.borrow_mut();
@@ -4825,9 +5598,17 @@ fn refresh_model_from(
                     // `seen_window_for` with the manifest just resolved one
                     // line up — looking up by reading id instead would rerun
                     // `owning_manifest` for every window this row asks about.
-                    let rows = window_rows(m, r, now, &|key| {
-                        m.and_then(|m| seen_window_for(m, &r.id, key))
-                    });
+                    let rows = window_rows(
+                        m,
+                        r,
+                        now,
+                        &|key| m.and_then(|m| seen_window_for(m, &r.id, key)),
+                        &|w, used| {
+                            m.map(|mm| mm.id.as_str()).and_then(|p| {
+                                quota_projection(proj.hist, proj.cache, p, w, used, now)
+                            })
+                        },
+                    );
                     let windows = reconcile_window_model(&mut win_models, &r.id, rows);
                     let brows = balance_rows(r, now);
                     let balances = reconcile_balance_model(&mut bal_models, &r.id, brows);
@@ -4835,7 +5616,14 @@ fn refresh_model_from(
                 }
                 Some(_) => (ModelRc::default(), ModelRc::default()),
             };
-            provider_data_from_reading(r, windows, balances)
+            let mut d = provider_data_from_reading(r, windows, balances);
+            // "quota only" badge (design §6-B): the manifest carries no
+            // `[history]` section, so Activity's totals never include this
+            // provider — the card's coverage note says as much; the badge
+            // says it at the row. A build without the feature has no Activity
+            // card to contradict, so it shows no badge either.
+            d.quota_only = quota_only_badge(plugins, &r.id);
+            d
         })
         .collect();
 
@@ -4856,7 +5644,7 @@ fn refresh_model_from(
     }
 
     let has_live = readings.iter().any(|r| r.error.is_none());
-    let (updated, updated_live) = header_status(has_live, !readings.is_empty());
+    let (updated, updated_live) = header_status(has_live, !readings.is_empty(), pass.reported);
     app.set_updated(ss(updated));
     app.set_updated_live(updated_live);
 }
@@ -4937,10 +5725,40 @@ fn reconcile_balance_model(
     ModelRc::from(fresh)
 }
 
-fn header_status(has_live_provider: bool, has_provider_reading: bool) -> (&'static str, bool) {
+/// Whether every currently enabled plugin already has an entry in `cache` —
+/// not whether it produced a *visible* reading, only whether a fetch for it
+/// has landed at all. `readings()` drops a "no credentials found" reading so
+/// completely that an empty `readings()` list means either "nothing fetched
+/// yet" or "every signed-in provider is actually signed out" identically;
+/// this is what [`header_status`] uses to tell the two apart. `enabled` is
+/// injected the same way [`readings_with`]'s own resolvers are, so a test
+/// can drive it without touching real config.
+fn every_enabled_plugin_has_reported(
+    plugins: &[PluginManifest],
+    cache: &HashMap<String, Vec<ProviderReading>>,
+    enabled: impl Fn(&PluginManifest) -> bool,
+) -> bool {
+    plugins
+        .iter()
+        .filter(|m| enabled(m))
+        .all(|m| cache.contains_key(&m.id))
+}
+
+/// The header's own words for what `readings()` came back with this tick.
+/// `all_enabled_have_reported` is the answer `has_provider_reading` alone
+/// cannot give: that one is `false` both when nothing has been fetched yet
+/// and when every provider fetched came back signed-out (`readings()` drops
+/// a "no credentials" reading before either ever reaches here), and those
+/// two states need different words — "reading…" is a promise something is
+/// still coming, which a settled, empty install never had coming at all.
+fn header_status(
+    has_live_provider: bool,
+    has_provider_reading: bool,
+    all_enabled_have_reported: bool,
+) -> (&'static str, bool) {
     if has_live_provider {
         ("LIVE", true)
-    } else if has_provider_reading {
+    } else if has_provider_reading || all_enabled_have_reported {
         ("no data", false)
     } else {
         ("reading…", false)
@@ -4965,8 +5783,18 @@ fn display_account(account: &str) -> String {
             .ok()
             .filter(|s| !s.is_empty())
     });
+    display_account_with(demo.as_deref(), account)
+}
+
+/// The rule itself, split out from the `OnceLock` that caches which
+/// environment answered it: once that lock has resolved for a process, no
+/// later `std::env::set_var`/`remove_var` can make [`display_account`]
+/// re-ask, which would make a test asserting "no override" order-dependent
+/// on every other test in this module that ever calls it — this half has no
+/// such memory, so it is what the rule is actually tested against.
+fn display_account_with(demo: Option<&str>, account: &str) -> String {
     match demo {
-        Some(demo) if !account.is_empty() => demo.clone(),
+        Some(demo) if !account.is_empty() => demo.to_string(),
         _ => account.to_string(),
     }
 }
@@ -5094,12 +5922,25 @@ fn quota_notice(status: &tickover::model::QuotaStatus) -> String {
 
 /// What a quota window is called on screen.
 ///
-/// The manifest's own label is a chip meant for the menu-bar pill — "5H",
+/// Short uppercase duration chips (`"5H"`, `"WK"`, `"D1"`) are expanded from
+/// the window's period (`"5-hour limit"`, `"Weekly limit"`); longer or mixed-
+/// case captions (`"Gemini · 5-hour"`, `"Credits used"`) already name what the
+/// limit applies to and stay verbatim.
+fn is_duration_chip(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 4
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+/// The manifest's own label is often a chip meant for the menu-bar pill — "5H",
 /// "WK" — and reading it in the panel costs a beat of translation every time.
-/// The window's declared length says the same thing in words, so use that when
-/// it lands on a duration with a name, and keep the manifest's label for the
-/// ones it doesn't. Derived from the length rather than the role, since a
-/// plugin is free to declare a primary window that isn't five hours long.
+/// The window's declared length says the same thing in words, so expand short
+/// chips from the duration when it lands on a duration with a name, and keep
+/// descriptive captions (or unrecognized durations) as written. Derived from
+/// the length rather than the role, since a plugin is free to declare a primary
+/// window that isn't five hours long.
 fn window_title(w: &Window) -> String {
     window_title_of(&w.label, w.role, w.period_minutes)
 }
@@ -5109,11 +5950,10 @@ fn window_title(w: &Window) -> String {
 /// replaces — a window that changed its caption as it emptied would read as a
 /// different window.
 fn window_title_of(label: &str, role: Role, period_minutes: Option<u64>) -> String {
-    // A quota that is not the subscription is named by the manifest, not by
-    // its length: a per-model weekly allowance titled "Weekly limit" would sit
-    // directly under the subscription's weekly row, saying the same words
-    // about a different number.
-    if role == Role::Extra {
+    // A quota that is not the subscription, or any descriptive manifest
+    // caption that already names what it limits, keeps its own label rather
+    // than collapsing into a generic duration phrase.
+    if role == Role::Extra || !is_duration_chip(label) {
         return label.to_string();
     }
     match period_minutes {
@@ -5221,6 +6061,12 @@ fn window_rows(
     r: &ProviderReading,
     now: u64,
     seen: &dyn Fn(&str) -> Option<config::SeenWindow>,
+    // Per-window projection hatch — a straight-line pace of the window's own
+    // percentage (`quota_pace`), with a burn figure added to the caption only
+    // when local history has counted tokens for it. `None` answers draw no
+    // hatch at all. Tests pass `NO_PROJ`; production passes a closure over
+    // the shared snapshot.
+    proj: &ProjectionFn<'_>,
 ) -> Vec<(String, WindowData)> {
     // A window the provider reported no percentage for is left out rather than
     // drawn as an empty bar over "no data": it occupies a block's worth of
@@ -5231,8 +6077,13 @@ fn window_rows(
         .windows
         .iter()
         .filter_map(|w| {
-            w.used_percent
-                .map(|used| (w.role, w.key.clone(), window_data(now, w, used)))
+            w.used_percent.map(|used| {
+                (
+                    w.role,
+                    w.key.clone(),
+                    window_data(now, w, used, proj(w, used)),
+                )
+            })
         })
         .collect();
     // Stable, and the reason the `slot` search below is allowed to assume
@@ -5324,8 +6175,1159 @@ fn not_started_row(label: &str, role: Role, period_minutes: u64) -> WindowData {
         reset_rel_kind: ResetRelKind::Unknown,
         reset_at: ss(""),
         tooltip: ss(""),
+        proj_pct: 0.0,
+        proj_tone: 1,
+        burn_line: ss(""),
     }
 }
+
+/// `proj_cache`'s memoized token sum for `key` — a miss runs `fetch` and
+/// remembers the answer, a hit skips the store entirely. `fetch` is called
+/// with nothing borrowed: it reaches into the history store, and holding
+/// `proj_cache` borrowed across that would panic the moment anything asked
+/// this same cache again before `fetch` returned (nothing does today, but
+/// the point is to be safe by construction rather than by that accident).
+#[cfg(feature = "history")]
+fn cached_window_tokens(
+    proj_cache: &ProjectionCache,
+    key: (String, u64),
+    fetch: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
+    if let Some(&hit) = proj_cache.borrow().get(&key) {
+        return hit;
+    }
+    let tokens = fetch();
+    proj_cache.borrow_mut().insert(key, tokens);
+    tokens
+}
+
+/// A window's start from what it currently states — `resets_at - period` —
+/// not [`window_start`], which also projects one forward once the provider
+/// has stopped reporting the window at all: this is asked only of a window
+/// that is still stating both of its own bounds, and answers `None` rather
+/// than guess when either is missing or the subtraction would wrap.
+fn window_hatch_start(w: &Window) -> Option<u64> {
+    w.resets_at?.checked_sub(w.period_minutes?.checked_mul(60)?)
+}
+
+/// The quota-projection hatch's time-linear half: a straight-line pace of
+/// the percentage already used, needing nothing from local history at all.
+/// A reading's own numbers already say everything this draws — spending
+/// bought `used` percent for however many tokens it took, so the same rate
+/// run at `tokens / elapsed` per hour over the hours left buys `used +
+/// (tokens / elapsed) * left * (used / tokens)` more; the token count
+/// cancels out of its own derivation, and this function never asks a caller
+/// for one. What is left is `used * period / elapsed`.
+///
+/// `None` before the window opens, once it has reset, when `used` is not
+/// yet positive, or before `elapsed` clears the floor below — a pace read
+/// off the first few minutes of a five-hour window is noise wearing a
+/// percentage sign, not a projection. The floor is `max(10 minutes, period
+/// / 10)` because both have to hold before the pace means anything: the
+/// window must have run for a flat ten minutes *and* for a tenth of its own
+/// length, and the larger of the two is the threshold that actually decides
+/// when both are true. Plainly: a window whose whole period is ten minutes
+/// or less never clears the floor and never draws a hatch at all — nothing
+/// shipped declares one that short.
+///
+/// Returns the percentage (clamped to 100, rounded to the whole point a
+/// caption ever shows), its tone (1 ok / 2 warn / 3 crit), and — set only
+/// once the pace crosses 100 — when that happens, so the caller can name it
+/// without this function formatting a time zone of its own.
+fn quota_pace(w: &Window, used: f64, now: u64) -> Option<(f32, i32, Option<u64>)> {
+    let reset = w.resets_at?;
+    let start = window_hatch_start(w)?;
+    if now <= start || now >= reset || used <= 0.0 {
+        return None;
+    }
+    let period = reset - start;
+    let elapsed = now - start;
+    if elapsed < 600.max(period / 10) {
+        return None;
+    }
+    let projected = used * period as f64 / elapsed as f64;
+    if projected < 100.0 {
+        // Rounded before the tone check and the return, not after: `elapsed`
+        // grows every second this is asked again, so the raw value drifts by
+        // a fraction of a point on every tick even when nothing about the
+        // reading itself has changed — invisible in a whole-percent caption,
+        // but the caller feeds this straight into an animated bar width
+        // (`QuotaBlock`'s `proj-pct`, `ui/widgets.slint`), where a value that
+        // never repeats retriggers that bar's own 700ms tween every second
+        // instead of ever letting it settle. Rounding first is the same
+        // choice `used-rounded` already makes for the measured half of the
+        // same bar — see `QuotaBlock`'s own doc: severity follows the
+        // *displayed* value, not the raw one.
+        let rounded = projected.round();
+        let tone = if rounded >= 90.0 { 2 } else { 1 };
+        return Some((rounded as f32, tone, None));
+    }
+    // Reaching the cap before reset is the crit state — it names when,
+    // clamped to the reset itself: the straight line can overshoot past it,
+    // but the window cannot cap any later than its own end.
+    let caps_at = start
+        .saturating_add((elapsed as f64 * 100.0 / used) as u64)
+        .min(reset);
+    Some((100.0, 3, Some(caps_at)))
+}
+
+/// The hatch's right-hand caption, composed the same way whichever cfg
+/// variant of [`quota_projection`] is asking: the crit case names when the
+/// pace caps out and nothing else — a rate that has already blown past 100%
+/// has nothing more useful to add — otherwise the arrow always appears, with
+/// `burn` (a token figure already formatted behind the `history` feature,
+/// since this function is not) in front of it whenever there is one.
+fn quota_caption(pct: f32, caps_at: Option<u64>, burn: Option<&str>) -> String {
+    match caps_at {
+        Some(caps_at) => {
+            let at = chrono::DateTime::from_timestamp(caps_at as i64, 0)
+                .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                .unwrap_or_default();
+            format!("caps ~{at}")
+        }
+        None => match burn {
+            Some(burn) => format!("burn {burn}/h → ~{pct:.0}%"),
+            None => format!("→ ~{pct:.0}%"),
+        },
+    }
+}
+
+/// The quota-projection hatch: [`quota_pace`]'s percentage and tone, plus a
+/// burn figure in the caption whenever local history has counted tokens for
+/// this window — never for an `Extra` window, whose tokens are the
+/// provider's account-wide spend rather than that one model's own. Drawing
+/// the hatch itself needs no history at all — the `not(feature = "history")`
+/// variant below draws the identical percentage and tone from the same
+/// [`quota_pace`] — only the caption's token half depends on the feature.
+#[cfg(feature = "history")]
+fn quota_projection(
+    hist: &HistoryShared,
+    proj_cache: &ProjectionCache,
+    provider: &str,
+    w: &Window,
+    used: f64,
+    now: u64,
+) -> Option<(f32, i32, String)> {
+    let (pct, tone, caps_at) = quota_pace(w, used, now)?;
+    // Looked up even once the pace has already capped out, where the
+    // caption below never uses it: an over-quota window still keeps
+    // `proj_cache` warm for whatever else asks about this exact (provider,
+    // start) later in the same tick — the HTML report's own burn figure,
+    // for one, which would otherwise have to scan the store a second time
+    // for a window this lookup already touched.
+    let burn = if w.role != Role::Extra {
+        window_hatch_start(w).and_then(|start| {
+            // The store-touching half, asked once per (provider, start) for
+            // as long as `proj_cache` isn't cleared — every other window row
+            // this tick draws for the same provider and window shares this
+            // one lookup. `fetch` runs with nothing borrowed going in, per
+            // `cached_window_tokens`'s own doc.
+            let tokens = cached_window_tokens(proj_cache, (provider.to_string(), start), || {
+                hist.borrow().as_ref().and_then(|store| {
+                    tickover::history::query::window_tokens(store, provider, start)
+                })
+            })?;
+            let elapsed_h = now.saturating_sub(start).max(1) as f64 / 3600.0;
+            Some(stats_cli::fmt_tokens(
+                (tokens as f64 / elapsed_h).round() as u64
+            ))
+        })
+    } else {
+        None
+    };
+    Some((pct, tone, quota_caption(pct, caps_at, burn.as_deref())))
+}
+
+#[cfg(not(feature = "history"))]
+fn quota_projection(
+    _: &HistoryShared,
+    _: &ProjectionCache,
+    _: &str,
+    w: &Window,
+    used: f64,
+    now: u64,
+) -> Option<(f32, i32, String)> {
+    let (pct, tone, caps_at) = quota_pace(w, used, now)?;
+    Some((pct, tone, quota_caption(pct, caps_at, None)))
+}
+
+#[cfg(all(test, not(feature = "history")))]
+mod quota_projection_without_history_tests {
+    use super::*;
+
+    /// The whole point of splitting `quota_pace` out on its own: with the
+    /// `history` feature compiled out, `HistoryShared` and `ProjectionCache`
+    /// are both `()` and there is no store to ask, yet the hatch still has
+    /// to draw — with the same plain arrow caption a live build shows before
+    /// local history has counted anything for the window.
+    #[test]
+    fn draws_the_hatch_with_the_plain_caption_and_no_store_at_all() {
+        let w = Window {
+            key: "5H:".into(),
+            label: "5H".into(),
+            role: Role::Primary,
+            used_percent: None,
+            resets_at: Some(1_018_000),
+            period_minutes: Some(300),
+        };
+        let (pct, tone, caption) = quota_projection(&(), &(), "codex", &w, 2.0, 1_001_800)
+            .expect("the hatch draws with the history feature compiled out entirely");
+        assert_eq!(pct, 20.0);
+        assert_eq!(tone, 1);
+        assert_eq!(caption, "→ ~20%");
+    }
+}
+
+#[cfg(test)]
+mod quota_pace_tests {
+    use super::*;
+
+    fn primary(resets_at: u64, period_minutes: u64) -> Window {
+        Window {
+            key: "5H:".into(),
+            label: "5H".into(),
+            role: Role::Primary,
+            used_percent: None,
+            resets_at: Some(resets_at),
+            period_minutes: Some(period_minutes),
+        }
+    }
+
+    // A five-hour window: period_secs = 18_000, floor = max(600, 1_800).
+    const START: u64 = 1_000_000;
+    const PERIOD_MIN: u64 = 300;
+    const PERIOD_SECS: u64 = PERIOD_MIN * 60;
+    const RESET: u64 = START + PERIOD_SECS;
+
+    #[test]
+    fn a_closed_window_never_projects() {
+        let w = primary(RESET, PERIOD_MIN);
+        assert_eq!(quota_pace(&w, 50.0, START - 500), None, "well before start");
+        assert_eq!(quota_pace(&w, 50.0, START), None, "not open yet");
+        assert_eq!(quota_pace(&w, 50.0, RESET), None, "already reset");
+        assert_eq!(quota_pace(&w, 50.0, RESET + 10), None, "past reset");
+    }
+
+    #[test]
+    fn below_the_floor_draws_nothing() {
+        let w = primary(RESET, PERIOD_MIN);
+        // Five minutes into a five-hour window is well under the 1_800s floor.
+        assert_eq!(quota_pace(&w, 2.0, START + 300), None);
+    }
+
+    #[test]
+    fn exactly_at_the_floor_projects_the_straight_line() {
+        let w = primary(RESET, PERIOD_MIN);
+        let now = START + 1_800; // the floor itself, inclusive
+        let (pct, tone, caps_at) = quota_pace(&w, 2.0, now).expect("the floor itself draws");
+        // used * period / elapsed = 2.0 * 18_000 / 1_800 = 20.0 exactly.
+        assert_eq!(pct, 20.0);
+        assert_eq!(tone, 1);
+        assert_eq!(caps_at, None);
+    }
+
+    #[test]
+    fn a_pace_past_the_cap_names_when_it_happens() {
+        let w = primary(RESET, PERIOD_MIN);
+        let now = START + 1_800;
+        // 15% used at the floor projects to 150%, well past the cap.
+        let (pct, tone, caps_at) = quota_pace(&w, 15.0, now).expect("well past 100%");
+        assert_eq!(pct, 100.0);
+        assert_eq!(tone, 3);
+        // caps_at = start + elapsed * 100 / used = 1_000_000 + 1_800*100/15.
+        assert_eq!(caps_at, Some(1_012_000));
+    }
+
+    #[test]
+    fn a_pace_past_the_cap_clamps_to_reset_when_the_raw_estimate_overshoots_it() {
+        // At this magnitude a u64 no longer round-trips through f64 exactly
+        // (the mantissa holds 52 bits): the raw estimate, mathematically
+        // equal to the reset here, computes eight seconds past it. `.min
+        // (reset)` is what stands between that rounding error and a caption
+        // naming a time after the window it belongs to has already ended.
+        const PERIOD_MINUTES: u64 = 153_722_867_280_912_930;
+        const PERIOD: u64 = PERIOD_MINUTES * 60; // 9_223_372_036_854_775_800
+        let w = primary(PERIOD, PERIOD_MINUTES); // start = 0, reset = PERIOD
+        let (_, _, caps_at) = quota_pace(&w, 50.0, PERIOD / 2).expect("well past 100%");
+        assert_eq!(
+            caps_at,
+            Some(PERIOD),
+            "the raw estimate overshoots the reset by 8s at this scale; the clamp pins it back"
+        );
+    }
+
+    #[test]
+    fn used_at_zero_never_projects() {
+        let w = primary(RESET, PERIOD_MIN);
+        assert_eq!(quota_pace(&w, 0.0, START + 1_800), None);
+    }
+}
+
+#[cfg(all(test, feature = "history"))]
+mod quota_projection_tests {
+    use super::*;
+
+    fn primary(resets_at: u64, period_minutes: u64) -> Window {
+        Window {
+            key: "5H:".into(),
+            label: "5H".into(),
+            role: Role::Primary,
+            used_percent: None,
+            resets_at: Some(resets_at),
+            period_minutes: Some(period_minutes),
+        }
+    }
+
+    const START: u64 = 1_000_000;
+    const PERIOD_MIN: u64 = 300;
+    const RESET: u64 = START + PERIOD_MIN * 60;
+    const NOW: u64 = START + 1_800; // exactly at the floor
+
+    #[test]
+    fn no_history_still_draws_the_hatch_with_a_plain_caption() {
+        let hist: HistoryShared = Rc::new(RefCell::new(None));
+        let cache: ProjectionCache = Rc::new(RefCell::new(HashMap::new()));
+        let w = primary(RESET, PERIOD_MIN);
+        let (pct, tone, caption) =
+            quota_projection(&hist, &cache, "codex", &w, 2.0, NOW).expect("no store still draws");
+        assert_eq!(pct, 20.0);
+        assert_eq!(tone, 1);
+        assert_eq!(caption, "→ ~20%");
+    }
+
+    #[test]
+    fn history_tokens_add_a_burn_figure_to_the_same_caption() {
+        let hist: HistoryShared = Rc::new(RefCell::new(None));
+        let cache: ProjectionCache = Rc::new(RefCell::new(HashMap::new()));
+        // Pre-seeded rather than fetched: `cached_window_tokens` never calls
+        // `fetch` on a hit, so this never touches `hist` (left empty above) —
+        // the same reason a real tick only ever asks the store once.
+        cache
+            .borrow_mut()
+            .insert(("codex".to_string(), START), Some(3_600));
+        let w = primary(RESET, PERIOD_MIN);
+        let (pct, tone, caption) = quota_projection(&hist, &cache, "codex", &w, 2.0, NOW)
+            .expect("open window, past the floor");
+        assert_eq!(pct, 20.0);
+        assert_eq!(tone, 1);
+        // 3_600 tokens over 0.5h (1_800s) is 7_200/h, formatted "7.2K".
+        assert_eq!(caption, "burn 7.2K/h → ~20%");
+    }
+
+    #[test]
+    fn an_extra_window_never_shows_a_burn_figure_even_with_history() {
+        let hist: HistoryShared = Rc::new(RefCell::new(None));
+        let cache: ProjectionCache = Rc::new(RefCell::new(HashMap::new()));
+        cache
+            .borrow_mut()
+            .insert(("codex".to_string(), START), Some(3_600));
+        let w = Window {
+            role: Role::Extra,
+            ..primary(RESET, PERIOD_MIN)
+        };
+        let (pct, tone, caption) = quota_projection(&hist, &cache, "codex", &w, 2.0, NOW)
+            .expect("an Extra window still draws its own hatch");
+        assert_eq!(pct, 20.0);
+        assert_eq!(tone, 1);
+        assert_eq!(
+            caption, "→ ~20%",
+            "an Extra window's tokens are the account's, not this window's own"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "history"))]
+mod projection_cache_tests {
+    use super::*;
+
+    /// A hit must never run `fetch` — the whole point of the memo is that a
+    /// tick asking the same (provider, start) more than once only touches
+    /// the store on the first ask.
+    #[test]
+    fn a_cached_key_never_calls_fetch_again() {
+        let cache: ProjectionCache = Rc::new(RefCell::new(HashMap::new()));
+        let calls = Cell::new(0u32);
+        let key = ("claude".to_string(), 1_000u64);
+
+        let first = cached_window_tokens(&cache, key.clone(), || {
+            calls.set(calls.get() + 1);
+            Some(42)
+        });
+        assert_eq!(first, Some(42));
+        assert_eq!(calls.get(), 1);
+
+        let second = cached_window_tokens(&cache, key.clone(), || {
+            calls.set(calls.get() + 1);
+            Some(0) // would prove a re-fetch happened if this won
+        });
+        assert_eq!(
+            second,
+            Some(42),
+            "the cached figure must survive, not the miss path's"
+        );
+        assert_eq!(calls.get(), 1, "the second ask must not have called fetch");
+
+        // A different key is a genuine miss and does call `fetch`.
+        let other = cached_window_tokens(&cache, ("codex".to_string(), 1_000), || {
+            calls.set(calls.get() + 1);
+            Some(7)
+        });
+        assert_eq!(other, Some(7));
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// `None` — "nothing counted yet" — is itself a cacheable answer, not a
+    /// miss to retry every tick.
+    #[test]
+    fn a_cached_none_also_survives_without_a_refetch() {
+        let cache: ProjectionCache = Rc::new(RefCell::new(HashMap::new()));
+        let calls = Cell::new(0u32);
+        let key = ("claude".to_string(), 1_000u64);
+
+        let first = cached_window_tokens(&cache, key.clone(), || {
+            calls.set(calls.get() + 1);
+            None
+        });
+        assert_eq!(first, None);
+        let second = cached_window_tokens(&cache, key, || {
+            calls.set(calls.get() + 1);
+            Some(99)
+        });
+        assert_eq!(
+            second, None,
+            "the cached miss must not be overwritten by a later fetch"
+        );
+        assert_eq!(calls.get(), 1);
+    }
+}
+
+/// Spawn the one-at-a-time history scan: the worker opens its own store
+/// handle, ticks the incremental scanner over every `[history]` manifest —
+/// each manifest's declared `[[option]]`s resolving its own `root` — and
+/// commits, then hands that same store to the slow timer over the channel.
+/// Sending the store the worker already has, rather than a notification the
+/// UI thread would answer by opening its own copy, is what keeps
+/// `days.jsonl` off the UI thread after startup — the object in hand is
+/// already exactly what a fresh `open` of the just-committed directory would
+/// produce. The `busy` cell is the one-thread-at-a-time rule [`Fetching`]
+/// gives provider fetches: a still-running scan is left to finish, never
+/// stacked with a second walker on the same directories.
+#[cfg(feature = "history")]
+fn spawn_history_scan(ctx: &Ctx) {
+    if ctx
+        .history_io
+        .busy
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    // Every manifest id the registry has, enabled or not — a provider
+    // merely toggled off for this run must keep whatever claim it holds
+    // on a shared path, not have it silently taken over and never handed
+    // back. Collected before the filter below, and as owned `String`s so
+    // it can move into the scan thread with `manifests`.
+    let known: std::collections::HashSet<String> =
+        ctx.plugins.borrow().iter().map(|m| m.id.clone()).collect();
+    // If a later edit ever moved this below the enabled filter (deriving
+    // `known` from `manifests` instead of the full registry), a provider
+    // disabled this run would silently disappear from `known` too, and a
+    // live claim on a path a differently-provider'd walk also reaches
+    // would go stale and get taken over for no reason. This only catches
+    // the mistake when something is actually disabled, the same as the
+    // bug itself only shows up then.
+    debug_assert!(
+        ctx.plugins.borrow().iter().all(|m| known.contains(&m.id)),
+        "known must mirror the full registry, taken before the enabled filter below"
+    );
+    let manifests: Vec<PluginManifest> = ctx
+        .plugins
+        .borrow()
+        .iter()
+        .filter(|m| m.history.is_some() && plugin_enabled(m))
+        .cloned()
+        .collect();
+    if manifests.is_empty() {
+        ctx.history_io
+            .busy
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
+    let tx = ctx.history_io.tx.clone();
+    let busy = ctx.history_io.busy.clone();
+    // `Builder::spawn` rather than `thread::spawn`: a refused spawn must
+    // not panic with `busy` already raised — see `spawn_plugin_fetch`.
+    if std::thread::Builder::new()
+        .spawn(move || {
+            let report_done = |store: Option<tickover::history::store::HistoryStore>| {
+                busy.store(false, std::sync::atomic::Ordering::SeqCst);
+                if let Some(store) = store {
+                    let _ = tx.send(store);
+                }
+            };
+            // A panic in a scan must still release `busy` — otherwise the
+            // card would sit on "scanning…" forever and never scan again.
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let dir = tickover::history::default_dir()?;
+                // `tickover stats` can scan this same store concurrently —
+                // the lock serializes open+scan+commit across processes.
+                let _lock = tickover::history::store::lock_store(&dir).ok()?;
+                let mut store = tickover::history::store::HistoryStore::open(&dir).ok()?;
+                let known: std::collections::HashSet<&str> =
+                    known.iter().map(|s| s.as_str()).collect();
+                // Resumable ticks: a pass that stopped on its wall-clock
+                // budget reports `partial`; a cold corpus takes a few.
+                for _ in 0..8 {
+                    let scans = tickover::history::scan_tick(
+                        &mut store,
+                        &manifests,
+                        &known,
+                        &plugin_options,
+                    );
+                    if let Err(e) = store.commit() {
+                        diag::line(format!("history: store commit failed: {e}"));
+                        return None;
+                    }
+                    if !scans.iter().any(|s| s.outcome.partial) {
+                        break;
+                    }
+                }
+                Some(store)
+            }));
+            match run {
+                Ok(store) => report_done(store),
+                Err(_) => {
+                    diag::line("history: scan thread panicked".into());
+                    report_done(None);
+                }
+            }
+        })
+        .is_err()
+    {
+        ctx.history_io
+            .busy
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        diag::line("history: could not spawn the scan thread".into());
+    }
+}
+#[cfg(not(feature = "history"))]
+fn spawn_history_scan(_: &Ctx) {}
+
+/// Whether the tick must call `sync_activity` on its own even though the
+/// scan channel produced no store to install this pass — the shape a scan
+/// that ends without one leaves (no history directory yet, a lock that
+/// could not be taken, a commit failure, a panic mid-scan): `busy` clears
+/// either way, but only the channel side of a finished scan is what
+/// normally triggers a resync. Without this, `still_busy` going `false`
+/// with nothing sent leaves the card showing "scanning…" until some
+/// unrelated event — a range toggle, the next scan's own successful commit
+/// — happens to call `sync_activity` for an unrelated reason.
+#[cfg(feature = "history")]
+fn scan_ended_without_a_store(card_shows_scanning: bool, still_busy: bool) -> bool {
+    card_shows_scanning && !still_busy
+}
+
+/// Push the Activity card's data to the window for whichever range its
+/// toggle currently shows. Every caller that can change what the card should
+/// show — start-up, `refresh_all` (enable/disable, a surface opt-in, reset,
+/// an option change), remove, importing a manifest, an install or update
+/// from the registry, the range toggle, the first-run button, and either end
+/// of a history scan — comes through here, one code path, so a toggle and
+/// fresh data can never disagree about what the card means.
+///
+/// Always calls [`activity_data`], even with no `[history]` manifest at
+/// all — that function's own `visible` decides whether the card shows,
+/// computed fresh from `plugins` every time. A call that returned early
+/// instead left whatever `ActivityData` a previous, non-empty set had
+/// produced on screen: the card, and the provider it last named, surviving
+/// the very set that named it going empty.
+#[cfg(feature = "history")]
+fn sync_activity(app: &AppWindow, ctx: &Ctx) {
+    use tickover::history::query::{PanelRange, Totals};
+    let plugins = ctx.plugins.borrow();
+    // Design §6: "not counted" names providers that cannot publish local
+    // history — the ones with no `[history]` section, like Copilot. A
+    // provider that declares history but saw no usage in range is counted;
+    // its contribution is simply zero.
+    let quota_only: Vec<String> = plugins
+        .iter()
+        .filter(|m| m.history.is_none() && plugin_enabled(m))
+        .map(|m| m.id.clone())
+        .collect();
+    // Buckets from a disabled provider stay on disk but leave every
+    // figure — same rule the scan and the card's coverage apply.
+    let enabled: std::collections::HashSet<String> = plugins
+        .iter()
+        .filter(|m| plugin_enabled(m))
+        .map(|m| m.id.clone())
+        .collect();
+    let range = match app.get_activity_range() {
+        1 => PanelRange::Week,
+        2 => PanelRange::Month,
+        _ => PanelRange::Day,
+    };
+    let cost_fn: tickover::history::query::CostFn = config::history_cost_estimate()
+        .then_some(&|_: &str, m: &str, t: &Totals| tickover::history::pricing::cost_usd(m, t));
+    let sum =
+        ctx.history.borrow().as_ref().map(|store| {
+            tickover::history::query::panel(store, range, &quota_only, &enabled, cost_fn)
+        });
+    if std::env::var_os("TICKOVER_DEBUG_ACTIVITY").is_some() {
+        if let Some(s) = &sum {
+            eprintln!(
+                "activity: state={:?} headline={} spark={:?} segs={:?} delta={:?}",
+                s.state, s.headline, s.spark, s.segments, s.delta,
+            );
+        }
+    }
+    let scanning = ctx
+        .history_io
+        .busy
+        .load(std::sync::atomic::Ordering::Relaxed);
+    // The strip appearing or hiding changes the card's real height — the
+    // list's cap already paid for it only if it was visible when measured,
+    // so a toggle while the panel is open must re-measure before the bottom
+    // edge rides off the screen (or a dead 240px stays reserved).
+    let was_visible = app.get_activity().visible;
+    app.set_activity(activity_data(sum.as_ref(), range, &plugins, scanning));
+    if app.get_activity().visible != was_visible {
+        sync_providers_cap(app, &ctx.anchor);
+    }
+}
+#[cfg(not(feature = "history"))]
+fn sync_activity(_: &AppWindow, _: &Ctx) {}
+
+/// Render a [`PanelSummary`](tickover::history::query::PanelSummary) into
+/// the card's Slint struct — every string and fraction the UI needs, so
+/// `ui/app.slint` draws and never computes.
+#[cfg(feature = "history")]
+fn activity_data(
+    sum: Option<&tickover::history::query::PanelSummary>,
+    range: tickover::history::query::PanelRange,
+    plugins: &[PluginManifest],
+    scanning: bool,
+) -> ActivityData {
+    use tickover::history::query::{PanelRange, PanelState, PanelSummary};
+    let empty = PanelSummary::default();
+    let sum = sum.unwrap_or(&empty);
+    let delta_tail = match range {
+        PanelRange::Day => "vs 7d avg",
+        PanelRange::Week => "vs prev 7d",
+        PanelRange::Month => "vs prev 30d",
+    };
+    let range_name = match range {
+        PanelRange::Day => "the last 24h",
+        PanelRange::Week => "the last 7 days",
+        PanelRange::Month => "the last 30 days",
+    };
+    let (first_run, empty_range) = match sum.state {
+        PanelState::FirstRun => (true, false),
+        PanelState::EmptyRange => (false, true),
+        PanelState::Data => (false, false),
+    };
+    let caption = if empty_range {
+        format!("tokens in {range_name}")
+    } else {
+        "tokens".to_string()
+    };
+    let (empty_line1, empty_line2, last_when, last_where) = match sum.state {
+        PanelState::FirstRun => (
+            "No local history yet.".to_string(),
+            "Quota tracking already works above. Token history appears after \
+             your first CLI session — tickover reads it from log files on \
+             this machine and never uploads anything."
+                .to_string(),
+            String::new(),
+            String::new(),
+        ),
+        PanelState::EmptyRange => {
+            let (when, wher) = sum
+                .last_seen
+                .as_ref()
+                .map(|(t, p)| (t.format("%b %-d %H:%M").to_string(), p.clone()))
+                .unwrap_or_default();
+            (
+                if when.is_empty() {
+                    "Quiet stretch.".to_string()
+                } else {
+                    "Quiet day. Last session was".to_string()
+                },
+                String::new(),
+                when,
+                wher,
+            )
+        }
+        PanelState::Data => Default::default(),
+    };
+    // Partial coverage (design §6-B): the uncounted providers are named in
+    // the legend's right side, a warn-icon note says why, and the token bar
+    // keeps a dashed slot where their share would sit.
+    let missing_names: Vec<String> = sum
+        .not_counted
+        .iter()
+        .map(|id| {
+            plugins
+                .iter()
+                .find(|m| &m.id == id)
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| id.clone())
+        })
+        .collect();
+    let partial = !missing_names.is_empty();
+    let not_counted = if partial {
+        format!("{} not counted", missing_names.join(", "))
+    } else {
+        String::new()
+    };
+    let note = if partial {
+        format!(
+            "{} publish{} no local token history — totals here exclude {}.",
+            missing_names.join(", "),
+            if missing_names.len() == 1 { "es" } else { "" },
+            if missing_names.len() == 1 {
+                "it"
+            } else {
+                "them"
+            },
+        )
+    } else {
+        String::new()
+    };
+    // The dashed slot's width is the share of *providers* not counted —
+    // a real number (how many enabled providers publish no history), not
+    // an invented token share. Segment weights rescale so the bar still
+    // totals one: counted providers keep `counted/total` of it.
+    let counted_providers = plugins
+        .iter()
+        .filter(|m| m.history.is_some() && plugin_enabled(m))
+        .count();
+    let total_providers = (counted_providers + sum.not_counted.len()).max(1) as f32;
+    let seg_scale = counted_providers as f32 / total_providers;
+    let missing_share = if partial {
+        sum.not_counted.len() as f32 / total_providers
+    } else {
+        0.0
+    };
+    let footer_left = match sum.state {
+        PanelState::EmptyRange => format!("streak ended at {}d", sum.streak_ended),
+        _ => format!("{}-day streak · {} sessions", sum.streak_days, sum.sessions),
+    };
+    // The card's own reason to exist: at least one enabled provider that can
+    // actually publish local history. Read here, not assumed by a caller
+    // that stopped calling this at all once the set went empty — that left
+    // whatever `ActivityData` this call last produced on screen, headline
+    // and all, for a provider the set no longer contains.
+    let visible = plugins
+        .iter()
+        .any(|m| m.history.is_some() && plugin_enabled(m));
+    ActivityData {
+        visible,
+        first_run,
+        scanning,
+        empty_range,
+        headline: ss(stats_cli::fmt_tokens(sum.headline)),
+        caption: ss(caption),
+        delta: ss(sum
+            .delta
+            .map(|d| format!("{:+.0}%", d * 100.0))
+            .unwrap_or_default()),
+        delta_good: sum.delta.map(|d| d >= 0.0).unwrap_or(true),
+        delta_tail: ss(delta_tail),
+        spark: ModelRc::new(VecModel::from(
+            sum.spark
+                .iter()
+                .enumerate()
+                .map(|(i, h)| SparkBar {
+                    h: *h,
+                    current: i + 1 == sum.spark.len(),
+                })
+                .collect::<Vec<_>>(),
+        )),
+        seg_cache_read: sum.segments[0] * seg_scale,
+        seg_cache_write: sum.segments[1] * seg_scale,
+        seg_input: sum.segments[2] * seg_scale,
+        seg_output: sum.segments[3] * seg_scale,
+        has_cache_write: sum.segments[1] > 0.0,
+        missing_share,
+        legend_cached: ss(sum
+            .cache_hit_pct
+            .map(|p| format!("cached {p:.0}%"))
+            .unwrap_or_default()),
+        legend_in: ss(format!("in {}", stats_cli::fmt_tokens(sum.in_tokens))),
+        legend_out: ss(format!("out {}", stats_cli::fmt_tokens(sum.out_tokens))),
+        // A trailing `*` is the only room this row has: no caption line
+        // of its own, and no tooltip is wired to it. The same shorthand
+        // the CLI and the report use for the same condition.
+        legend_cost: ss(sum
+            .est_cost
+            .map(|c| {
+                if sum.est_cost_partial {
+                    format!("est. ${c:.2}*")
+                } else {
+                    format!("est. ${c:.2}")
+                }
+            })
+            .unwrap_or_default()),
+        // The bright figure — the Slint row adds the dim "counted" word.
+        legend_counted: ss(if partial {
+            stats_cli::fmt_tokens(sum.headline)
+        } else {
+            String::new()
+        }),
+        not_counted: ss(not_counted),
+        note: ss(note),
+        projects: ModelRc::new(VecModel::from(
+            sum.projects
+                .iter()
+                .map(|(name, share, tokens)| ActivityProject {
+                    name: ss(name.clone()),
+                    share: *share,
+                    value: ss(stats_cli::fmt_tokens(*tokens)),
+                })
+                .collect::<Vec<_>>(),
+        )),
+        footer_left: ss(footer_left),
+        empty_line1: ss(empty_line1),
+        empty_line2: ss(empty_line2),
+        last_when: ss(last_when),
+        last_where: ss(last_where),
+    }
+}
+
+#[cfg(all(test, feature = "history"))]
+mod activity_data_tests {
+    use super::*;
+
+    /// A manifest with a `[history]` section and nothing else the card
+    /// needs — order and enabled state are what these tests vary. `id`
+    /// doubles as `menu_label`, capped at 16 characters, so callers pass a
+    /// short one.
+    fn history_manifest_toml(id: &str) -> String {
+        format!(
+            r#"
+            id         = "{id}"
+            name       = "{id}"
+            menu_label = "{id}"
+            order      = 1
+            engine     = "log-file"
+            requires_reader = ["reading-history"]
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [logfile]
+            root = "~/.x"
+            glob = "*.jsonl"
+            container_key = "rate_limits"
+            [history]
+            format = "codex-rollouts"
+            root   = "~/.x"
+            glob   = "*.jsonl"
+            "#
+        )
+    }
+
+    fn history_manifest(id: &str) -> PluginManifest {
+        PluginManifest::from_str(&history_manifest_toml(id))
+            .expect("valid manifest with a [history] section")
+    }
+
+    /// The same shape, minus `[history]` — a quota-only provider (Copilot,
+    /// in the shipped set).
+    fn quota_only_manifest(id: &str) -> PluginManifest {
+        let toml = format!(
+            r#"
+            id         = "{id}"
+            name       = "{id}"
+            menu_label = "{id}"
+            order      = 1
+            engine     = "log-file"
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [logfile]
+            root = "~/.x"
+            glob = "*.jsonl"
+            container_key = "rate_limits"
+            "#
+        );
+        PluginManifest::from_str(&toml).expect("valid manifest with no [history] section")
+    }
+
+    /// The empty `PanelSummary` [`activity_data`] falls back to when `sum`
+    /// is `None` — every test below asks about `visible` alone, never the
+    /// figures a real store would fill in.
+    fn no_summary() -> Option<&'static tickover::history::query::PanelSummary> {
+        None
+    }
+
+    /// No manifest publishes history at all: the card the comment at its own
+    /// head promises stays hidden must actually be hidden, not whatever the
+    /// caller last set it to.
+    #[test]
+    fn no_history_publishing_provider_is_not_visible() {
+        let plugins = Vec::new();
+        let data = activity_data(
+            no_summary(),
+            tickover::history::query::PanelRange::Day,
+            &plugins,
+            false,
+        );
+        assert!(
+            !data.visible,
+            "an empty provider set has nothing to publish — the card must be hidden"
+        );
+    }
+
+    /// A provider with no `[history]` section (Copilot, say) is the same as
+    /// none at all for this purpose: quota-only manifests never make the
+    /// card visible.
+    #[test]
+    fn a_quota_only_provider_does_not_make_the_card_visible() {
+        let plugins = vec![quota_only_manifest("quota-only")];
+        let data = activity_data(
+            no_summary(),
+            tickover::history::query::PanelRange::Day,
+            &plugins,
+            false,
+        );
+        assert!(
+            !data.visible,
+            "a manifest with no [history] must not show the card"
+        );
+    }
+
+    /// Disabling the plugin that owns the only `[history]` section hides the
+    /// card — the empty set is what `plugin_enabled` reads once the config
+    /// override lands, not merely the manifest going away.
+    #[test]
+    fn disabling_the_last_history_provider_hides_the_card() {
+        let id = "activity-hist";
+        let m = history_manifest(id);
+        let plugins = vec![m];
+
+        config::set_plugin_enabled(id, true);
+        let shown = activity_data(
+            no_summary(),
+            tickover::history::query::PanelRange::Day,
+            &plugins,
+            false,
+        );
+        assert!(
+            shown.visible,
+            "an enabled [history] provider must show the card"
+        );
+
+        config::set_plugin_enabled(id, false);
+        let hidden = activity_data(
+            no_summary(),
+            tickover::history::query::PanelRange::Day,
+            &plugins,
+            false,
+        );
+        assert!(
+            !hidden.visible,
+            "disabling the only [history] provider must hide the card"
+        );
+
+        config::set_plugin_enabled(id, true);
+        let shown_again = activity_data(
+            no_summary(),
+            tickover::history::query::PanelRange::Day,
+            &plugins,
+            false,
+        );
+        assert!(
+            shown_again.visible,
+            "re-enabling it must show the card again"
+        );
+
+        config::remove_plugin_keys(id);
+    }
+
+    /// The legend's cost figure has no caption line of its own and no
+    /// tooltip wired to it — a trailing `*` is the only way this row can
+    /// say the estimate left a model out, and nothing else guards it.
+    #[test]
+    fn legend_cost_carries_a_marker_when_the_estimate_is_partial() {
+        let sum = tickover::history::query::PanelSummary {
+            est_cost: Some(4.5),
+            est_cost_partial: true,
+            ..Default::default()
+        };
+        let data = activity_data(
+            Some(&sum),
+            tickover::history::query::PanelRange::Day,
+            &[],
+            false,
+        );
+        assert_eq!(data.legend_cost.as_str(), "est. $4.50*");
+    }
+
+    #[test]
+    fn legend_cost_carries_no_marker_when_the_estimate_is_complete() {
+        let sum = tickover::history::query::PanelSummary {
+            est_cost: Some(4.5),
+            est_cost_partial: false,
+            ..Default::default()
+        };
+        let data = activity_data(
+            Some(&sum),
+            tickover::history::query::PanelRange::Day,
+            &[],
+            false,
+        );
+        assert_eq!(data.legend_cost.as_str(), "est. $4.50");
+    }
+}
+
+#[cfg(all(test, feature = "history"))]
+mod scan_sync_tests {
+    use super::*;
+
+    /// The regression: a scan whose worker thread never sent a store — no
+    /// history directory yet, a lock that could not be taken, a commit
+    /// failure, a panic mid-scan — cleared `busy` but left the card's own
+    /// "scanning…" state stuck, because nothing besides the channel receive
+    /// used to call `sync_activity`.
+    #[test]
+    fn a_scan_that_never_sends_a_store_still_needs_a_resync() {
+        assert!(
+            scan_ended_without_a_store(true, false),
+            "card still says scanning, busy already cleared: must resync"
+        );
+        assert!(
+            !scan_ended_without_a_store(true, true),
+            "still actually busy: the scan hasn't ended yet"
+        );
+        assert!(
+            !scan_ended_without_a_store(false, false),
+            "the card already agrees: nothing to reconcile"
+        );
+        assert!(
+            !scan_ended_without_a_store(false, true),
+            "busy again (a fresh scan) while the card still said so: not this case"
+        );
+    }
+}
+
+/// The plugin id a report row's history lookups key on — the owning
+/// manifest's id, never the reading's own: a multi-surface provider's history
+/// is filed once, under its plugin id, and a reading id like `claude-cli` has
+/// never been a key into it. Split out from [`open_history_report`] so a
+/// two-surface fixture can pin the answer without a live store.
+#[cfg(feature = "history")]
+fn report_row_id(plugins: &[PluginManifest], r: &ProviderReading) -> String {
+    owning_manifest(plugins, &r.id)
+        .map(|m| m.id.clone())
+        .unwrap_or_else(|| r.id.clone())
+}
+
+/// The window a provider's RIGHT NOW card is about: the 5-hour one, or the
+/// weekly one while no 5-hour figure is reported, so a provider between
+/// sessions keeps its card instead of dropping out of the report.
+#[cfg(feature = "history")]
+fn report_window(r: &ProviderReading) -> Option<&Window> {
+    [r.primary_window(), r.secondary_window()]
+        .into_iter()
+        .flatten()
+        .find(|w| w.used_percent.is_some())
+}
+
+/// "Full report ↗": render the HTML report from the in-memory snapshot and
+/// hand it to the browser. Runs on the callback — `compute` is a single
+/// pass over buckets the store already holds, so no worker is worth the
+/// plumbing. A failed write is a diag line, not a panel error.
+#[cfg(feature = "history")]
+fn open_history_report(ctx: &Ctx) {
+    let store = ctx.history.borrow();
+    let Some(store) = store.as_ref() else { return };
+    let plugins = ctx.plugins.borrow();
+    let enabled: std::collections::HashSet<String> = plugins
+        .iter()
+        .filter(|m| plugin_enabled(m))
+        .map(|m| m.id.clone())
+        .collect();
+    let stats =
+        tickover::history::query::compute(store, tickover::history::query::ALL_DAYS, &enabled);
+    let now = now_unix();
+    // The panel's live readings become the report's RIGHT NOW cards — same
+    // primary window, same projection math the quota blocks already drew,
+    // keyed the same way: by the owning plugin's id ([`report_row_id`]), so a
+    // multi-surface provider's burn figure is found under the id its history
+    // was actually filed under, not one of its reading ids.
+    let quota: Vec<tickover::history::report::QuotaNow> = readings(&plugins, &ctx.cache.borrow())
+        .iter()
+        .filter_map(|r| {
+            let w = report_window(r)?;
+            let used = w.used_percent?;
+            let id = report_row_id(&plugins, r);
+            let proj = quota_projection(&ctx.history, &ctx.projection_cache, &id, w, used, now);
+            let weekly = w
+                .period_minutes
+                .map_or(w.role == Role::Secondary, |m| m > 720);
+            let name = window_title(w);
+            let (_, rel, at, ..) =
+                window_view(now, used, w.resets_at, w.period_minutes, weekly, &name);
+            let reset_hint = if rel.is_empty() {
+                at.clone()
+            } else if at.is_empty() {
+                rel
+            } else {
+                format!("{rel} · {at}")
+            };
+            // Only once the hatch itself drew (so the report never states a
+            // burn rate for a window the panel's own floor already refused),
+            // and from the very lookup `quota_projection` just made:
+            // `cached_window_tokens` answers a hit straight from the cache,
+            // so this never asks the store a second time.
+            let burn_per_hour = proj.as_ref().and_then(|_| {
+                let start = window_hatch_start(w)?;
+                let elapsed_h = now.saturating_sub(start).max(1) as f64 / 3600.0;
+                cached_window_tokens(&ctx.projection_cache, (id.clone(), start), || {
+                    tickover::history::query::window_tokens(store, &id, start)
+                })
+                .map(|tokens| (tokens as f64 / elapsed_h).round() as u64)
+            });
+            Some(tickover::history::report::QuotaNow {
+                provider: id,
+                label: name,
+                used_pct: used,
+                projected_pct: proj.map(|p| p.0 as f64),
+                reset_hint,
+                burn_per_hour,
+            })
+        })
+        .collect();
+    let sources = tickover::history::declared_sources(&plugins);
+    let cost_on = config::history_cost_estimate();
+    let data = tickover::history::report_data::build(store, &stats, &enabled, cost_on);
+    match tickover::history::report::write(&stats, None, cost_on, &quota, &sources, &data) {
+        Ok(path) => stats_cli::open_in_browser(&path),
+        Err(e) => diag::line(format!("history: report write failed: {e}")),
+    }
+}
+#[cfg(not(feature = "history"))]
+fn open_history_report(_: &Ctx) {}
+
+/// The projection closure `window_rows` consults per window — returns
+/// `(projected_pct, tone, burn_line)` or `None` when the window's own bounds
+/// and timing give the pace nothing honest to draw (closed, barely open, or
+/// nothing spent yet — see `quota_pace`); local history only ever changes
+/// what `burn_line` says, never whether one is drawn at all. The `+ 'a` bound
+/// keeps a borrowed closure legal — a bare `dyn Fn` alias defaults to
+/// `'static` and only `'static` closures pass.
+type ProjectionFn<'a> = dyn Fn(&Window, f64) -> Option<(f32, i32, String)> + 'a;
 
 /// Build one `WindowData` row from a reading window and the percentage it
 /// reported. The window's `role` decides the tooltip name and clock format
@@ -5336,7 +7338,29 @@ fn not_started_row(label: &str, role: Role, period_minutes: u64) -> WindowData {
 /// that reported one becomes a row at all — the caller establishes that, and
 /// taking it as an argument keeps this from carrying a second, unreachable
 /// shape for the case it has already excluded.
-fn window_data(now: u64, w: &Window, used: f64) -> WindowData {
+/// Whether a reported window is an unstarted floating-reset placeholder: `0%`
+/// consumed with `resets_at` sitting roughly one full period from `now`
+/// (providers like Antigravity advance `resetTime = now + period` until the
+/// first request starts the window). Showing a fake countdown for an unstarted
+/// window misleads the panel, so render it in the compact `not started` form.
+fn is_unstarted_floating_window(
+    now: u64,
+    used: f64,
+    resets_at: Option<u64>,
+    period_minutes: Option<u64>,
+) -> bool {
+    if used != 0.0 {
+        return false;
+    }
+    let (Some(reset), Some(mins)) = (resets_at, period_minutes.filter(|m| *m > 0)) else {
+        return false;
+    };
+    let period = mins.saturating_mul(60);
+    let slack = (period / 10).min(120);
+    reset >= now.saturating_add(period.saturating_sub(slack))
+}
+
+fn window_data(now: u64, w: &Window, used: f64, proj: Option<(f32, i32, String)>) -> WindowData {
     // Whether the reset clock carries a date. A week away needs one; five
     // hours away does not. Decided by length when the window states one —
     // the same rule `window_title`/`window_title_of` already use to choose
@@ -5349,10 +7373,24 @@ fn window_data(now: u64, w: &Window, used: f64) -> WindowData {
     // never declares `period_minutes` is exactly the case a date matters
     // most for, and `role == Extra` had no better answer than the role
     // either.
+    let name = window_title(w);
+    if is_unstarted_floating_window(now, used, w.resets_at, w.period_minutes) {
+        return WindowData {
+            label: ss(&name),
+            pct: 0.0,
+            not_started: true,
+            reset_rel: ss(""),
+            reset_rel_kind: ResetRelKind::Unknown,
+            reset_at: ss(""),
+            tooltip: ss(""),
+            proj_pct: 0.0,
+            proj_tone: 1,
+            burn_line: ss(""),
+        };
+    }
     let weekly = w
         .period_minutes
         .map_or(w.role == Role::Secondary, |m| m > 720);
-    let name = window_title(w);
     let (kind, rel, at, tooltip, _, _) =
         window_view(now, used, w.resets_at, w.period_minutes, weekly, &name);
     WindowData {
@@ -5363,6 +7401,9 @@ fn window_data(now: u64, w: &Window, used: f64) -> WindowData {
         reset_rel_kind: kind,
         reset_at: ss(at),
         tooltip: ss(tooltip),
+        proj_pct: proj.as_ref().map(|p| p.0).unwrap_or(0.0),
+        proj_tone: proj.as_ref().map(|p| p.1).unwrap_or(1),
+        burn_line: ss(proj.as_ref().map(|p| p.2.as_str()).unwrap_or("")),
     }
 }
 
@@ -5514,12 +7555,23 @@ fn format_amount(a: &BalanceAmount) -> String {
     }
 }
 
+/// `10u64.pow(exponent)` below never wraps to zero and hands
+/// `format_money_minor` a `scale` to divide by that turns out to be none:
+/// [`engine_http::MONEY_EXPONENT_MAX`] is the only bound this app ever puts
+/// on `exponent`, so checked here, at the constant, is the only place a
+/// widened bound could reopen the divide-by-zero this function's own doc
+/// otherwise only asserts in prose.
+const _: () = assert!(10u64.checked_pow(engine_http::MONEY_EXPONENT_MAX).is_some());
+
 /// `minor` at `exponent` digits of scale, as a plain decimal string —
 /// integer arithmetic throughout, because `minor as f64 / 10f64.powi(e)`
 /// loses precision exactly where money can least afford it, and
 /// `minor.abs()` panics on `i64::MIN`. `exponent == 0` (a currency with no
 /// minor unit) prints no decimal point at all: there is nothing after it to
-/// show.
+/// show. Never divides by a `scale` of zero: [`engine_http::MONEY_EXPONENT_MAX`]
+/// is the only bound anything in this app puts on `exponent` before it
+/// reaches here, and the `const` assertion right above this function checks
+/// that bound keeps `10u64.pow` from wrapping.
 fn format_money_minor(minor: i64, exponent: u32) -> String {
     let sign = if minor < 0 { "-" } else { "" };
     let scale = 10u64.pow(exponent);
@@ -5605,17 +7657,38 @@ fn quote_command_arg(arg: &str) -> String {
 /// while running something else is how a third-party manifest would get a
 /// command executed without ever saying so.
 fn ping_command_line(ping: &manifest::PingConfig) -> String {
+    command_line(&ping.bin, &ping.args)
+}
+
+/// Every command the plugin's one ping toggle can run — `[ping]`, then each
+/// `[[window_ping]]` in manifest order — joined with `"; "`. The toggle runs
+/// all of them, so its label names all of them: a label naming only the
+/// first would be the checkbox-says-one-thing case [`ping_command_line`]
+/// exists to rule out.
+fn ping_commands_label(m: &PluginManifest) -> String {
+    m.ping
+        .iter()
+        .map(ping_command_line)
+        .chain(
+            m.window_ping
+                .iter()
+                .map(|wp| command_line(&wp.bin, &wp.args)),
+        )
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn command_line(bin: &str, args: &[String]) -> String {
     // `bin` is quoted by the same rule as the args: the checkbox shows a
     // command line, and a `bin` with whitespace in it would read as the
     // first of the args. (The validator refuses a path separator in `bin`,
     // but whitespace in a bare program name it does not — and quoting is
     // display-only either way, so quoting it always is the safe read.)
-    let bin = quote_command_arg(&ping.bin);
-    if ping.args.is_empty() {
+    let bin = quote_command_arg(bin);
+    if args.is_empty() {
         bin
     } else {
-        let args = ping
-            .args
+        let args = args
             .iter()
             .map(|a| quote_command_arg(a))
             .collect::<Vec<_>>()
@@ -5657,8 +7730,8 @@ fn plugin_row(m: &PluginManifest) -> PluginRow {
         menu_label: ss(&m.menu_label),
         engine: ss(engine_label(m.engine)),
         enabled: plugin_enabled(m),
-        has_ping: m.ping.is_some(),
-        ping_command: ss(m.ping.as_ref().map(ping_command_line).unwrap_or_default()),
+        has_ping: m.ping.is_some() || !m.window_ping.is_empty(),
+        ping_command: ss(ping_commands_label(m)),
         ping_enabled: config::plugin_ping(&m.id),
         surfaces: ModelRc::from(Rc::new(VecModel::from(surfaces))),
         options: ModelRc::from(Rc::new(VecModel::from(options))),
@@ -6049,9 +8122,12 @@ fn sync_tray_indicator_from(
     if last_key.get() == Some(key) {
         return;
     }
-    // The figures move once a minute even when the widget's own rounded
-    // numbers have not, so this is set on every key change rather than only
-    // alongside an icon that actually changed.
+    // Set once here, ahead of the three branches below, rather than once in
+    // each: whichever of them runs — a redrawn icon, the fallback text
+    // title, or the disabled/no-data glyph — the tooltip needs the same
+    // figures either way, and `key` already folds this string in on its own
+    // (see `tray_indicator_key`'s own doc), so a change here that never
+    // moves the widget's own rendered bits still has to reach the tray.
     let _ = tray.set_tooltip(Some(&tooltip));
 
     if let Some((rows, dark)) = widget {
@@ -6100,9 +8176,11 @@ fn sync_tray_indicator_from(
 /// single `u64` rather than a `String`: a leading discriminant, mirroring
 /// what a derived `Hash` impl on an enum would produce, tells the
 /// disabled/empty/rendered shapes apart before [`menubar::cache_key`]'s own
-/// bits (only present for the rendered shape) get mixed in, then the
-/// tooltip — which changes on its own cadence (once a minute) independent of
-/// the widget.
+/// bits (only present for the rendered shape) get mixed in, then `tooltip`
+/// itself. Hashed unconditionally rather than folded in only alongside
+/// `cache_key`: the two disabled/no-data shapes below never hash
+/// `cache_key` at all, so for either of them `tooltip` is the only thing
+/// that can still tell two ticks apart.
 fn tray_indicator_key(
     widget: &Option<(Vec<menubar::ProviderRow>, bool)>,
     enabled: bool,
@@ -6344,24 +8422,36 @@ fn panel_target_visibility(became_active: bool, clicks: usize, visible: bool) ->
     base != (toggles % 2 == 1)
 }
 
-/// Fit the provider list's height budget to the monitor the window is on.
+/// Fit the provider list's height budget to the monitor the panel will sit
+/// on — the anchor's, not the window's: on a cross-screen move the window is
+/// still *leaving* its old monitor when this runs.
 ///
-/// The cap cannot live in the UI as a constant: 620px sized for a 768px
-/// display still overflows that same display at 125% scaling, and once the
-/// window extends past the screen the Flickable believes its whole viewport is
+/// The cap cannot live in the UI as a constant: sized for one display it
+/// still overflows the same display at another scaling, and once the window
+/// extends past the screen the Flickable believes its whole viewport is
 /// visible, so the overflow cannot even be scrolled to. Measured per show —
-/// the window can move between monitors.
-fn sync_providers_cap(app: &AppWindow) {
-    use slint::winit_030::{winit, WinitWindowAccessor};
+/// the window can move between monitors, and the ACTIVITY strip can appear
+/// or hide while the panel is open.
+fn sync_providers_cap(app: &AppWindow, anchor: &Anchor) {
     let mut cap = 620.0_f32;
-    app.window().with_winit_window(|w: &winit::window::Window| {
-        if let Some(monitor) = w.current_monitor() {
-            let logical_h = monitor.size().height as f64 / monitor.scale_factor();
-            // Leave room for the panel chrome around the list (~80) plus the
-            // menu bar / taskbar and the anchor gap the popover hangs from.
-            cap = ((logical_h - 200.0) as f32).clamp(240.0, 620.0);
-        }
-    });
+    // The anchor's own monitor first — placement is about to move the window
+    // there — else the monitor the window is on, else the primary.
+    let logical_h = target_monitor(app, sanitize_anchor(app, *anchor.borrow()))
+        .map(|((_, _, _, h), scale)| h / scale);
+    if let Some(logical_h) = logical_h {
+        // Leave room for the chrome around the list (~100: paddings, header,
+        // hairline) plus the menu bar / taskbar and the anchor gap the
+        // popover hangs off (~50). The ACTIVITY strip sits below the list
+        // and is not part of the cap, so a visible one takes its own ~240
+        // off the list's budget — otherwise the strip pushes the card's
+        // bottom edge off the screen.
+        let activity = if app.get_activity().visible {
+            240.0
+        } else {
+            0.0
+        };
+        cap = ((logical_h - 150.0 - activity) as f32).clamp(160.0, 620.0);
+    }
     app.set_providers_cap(cap);
 }
 
@@ -6390,29 +8480,57 @@ fn popover_moves(dock_mode: bool, placed_before: bool, shown: Shown) -> bool {
     !dock_mode || !placed_before || shown == Shown::ByTrayClick
 }
 
-/// Returns whether this presentation placed the window — the reopen tick's
-/// activation-open needs to know: only a presentation that actually moved
-/// the panel can have left it somewhere its click's anchor would not have
-/// put it, and only that case is worth re-anchoring when the click arrives.
+/// Show the panel and place it if this presentation's cause is one that
+/// places windows (see [`position_popover`] for the rules, and for the
+/// deferred placement a still-unrealized window takes).
 fn present_popover(
     app: &AppWindow,
     anchor: &Anchor,
     shown_at: &Rc<Cell<Instant>>,
+    pending: &Rc<Cell<Option<PendingPosition>>>,
     shown: Shown,
-) -> bool {
+) {
+    // A settling re-arm belongs to the presentation that landed it — this
+    // presentation owns the slot now. A non-settling deferral is a
+    // presentation still waiting on its first size: leave it for
+    // `position_popover_impl`'s click-priority merge to arbitrate, or an
+    // ambient show racing into the realize gap would destroy an unanswered
+    // `ByTrayClick` request — the anchor the whole replay exists for.
+    if matches!(pending.get(), Some(PendingPosition { settling: true, .. })) {
+        pending.set(None);
+    }
     // A new popover presentation always starts on the gauges, not a stale modal.
     app.set_settings_open(false);
     // Nor a stale tooltip. A bubble raised by hovering a bar has no leave
     // event coming once the panel is dismissed out from under the pointer, so
     // without this it is what greets the next presentation.
     app.set_tip(BarTip::default());
+    // Cap before placing: it is measured on the anchor's monitor, and the
+    // height the placement math then reads is the cap-applied one — syncing
+    // after would leave a just-shrunk card floating off a taskbar anchor.
+    sync_providers_cap(app, anchor);
+    // Position while still hidden: a hidden winit window keeps its old spot
+    // and takes `set_position` fine, so showing first would flash the panel
+    // where it last was and visibly jump to the anchor. A window that does
+    // not exist yet (size 0×0) still defers through `pending` — its first
+    // placement lands on a `Resized` replay like before.
+    let moved = position_popover(app, anchor, pending, shown);
     let _ = app.window().show();
-    let moved = position_popover(app, anchor, shown);
-    // Only after show + position: Slint creates the winit window lazily, so
-    // measuring before `show()` is a no-op on the first presentation, and
-    // measuring before `position_popover` reads the monitor the window is
-    // *leaving* when the anchor moved to another screen.
-    sync_providers_cap(app);
+    // Showing discards the backend's record of a pending repaint, and the
+    // model refresh that preceded it has already spent the one change
+    // notification the renderer sends per frame it draws. Measured: a window
+    // re-shown after `hide()` then stops repainting — the model keeps
+    // advancing, the frame on screen does not — until something asks for a
+    // frame. Ask here, so the first frame is the refreshed one.
+    app.window().request_redraw();
+    // "Leave a parked window parked" is only a courtesy while the parking
+    // spot is reachable — a dock-mode window last left on a monitor that has
+    // since gone away (or under a resolution change) is a window nobody can
+    // reach. A show that did not move it recovers that: back onto a screen
+    // it goes, anchor or no.
+    if !moved && window_off_screen(app) {
+        position_popover_forced(app, anchor, pending, shown);
+    }
     shown_at.set(Instant::now());
 
     use slint::winit_030::{winit, WinitWindowAccessor};
@@ -6430,13 +8548,94 @@ fn present_popover(
         w.focus_window();
     });
     platform::activate_app();
-    moved
 }
 
 /// A screen the popover has to stay inside: `(x, y, width, height)` in
 /// physical pixels, the same space the tray event's rect and `set_position`
 /// already speak.
 type ScreenRect = (f64, f64, f64, f64);
+
+/// A deferred placement is a request made by a presentation that found the
+/// window still 0×0; its `Resized` reply lands within a frame or two. One
+/// that is still unanswered after this long belongs to a window that was
+/// never realized at all — replaying it on whatever resize next comes along
+/// would move a parked window for a cause nobody remembers. The exception a
+/// stale request still gets: a window nothing has ever placed. *Settling*
+/// requests are exempt: they belong to a window that is already visible and
+/// still converging, so they live until the presentation ends (hide, drag,
+/// or the next `present_popover`) rather than on a clock.
+const PENDING_POSITION_TTL: Duration = Duration::from_secs(2);
+
+/// One deferred placement request. `settling` distinguishes the two kinds:
+/// a fresh request a still-0×0 window could not yet place, versus one a
+/// landed placement re-armed so the `Resized` the cap sync and platform
+/// layout still owe re-places against the real size. Settling replays
+/// bypass the dock-mode parking courtesy — they are the same presentation
+/// converging, not a new one.
+#[derive(Clone, Copy)]
+struct PendingPosition {
+    at: Instant,
+    shown: Shown,
+    settling: bool,
+}
+
+/// Replay the placement a presentation deferred while the window was 0×0 —
+/// called from the `Resized` hook, and once more a turn later when the hook
+/// ran ahead of the backend's own size update. Also where the *settling*
+/// re-arms land: each landed placement leaves the request armed one more
+/// window so the `Resized` produced by the cap sync and the platform's own
+/// layout re-places against whatever size actually materialized.
+fn replay_pending_position(ctx: &Ctx) {
+    use slint::winit_030::WinitWindowAccessor;
+    let Some(PendingPosition {
+        at,
+        shown,
+        settling,
+    }) = ctx.pending_position.take()
+    else {
+        return;
+    };
+    let Some(app) = ctx.weak.upgrade() else {
+        return;
+    };
+    // Hidden between request and replay: that presentation ended before the
+    // window existed — moving it now would also lie about PLACED. A
+    // non-settling deferral past the TTL is stale — unless the window was
+    // never placed at all, where the WM-default spot it sits on is the very
+    // bug this replay exists to undo. A settling request belongs to the
+    // still-visible window it is converging — late resizes (a slow first
+    // fetch growing the card, an activity-strip toggle) are exactly what it
+    // exists for, so while the window stays visible it stays owed; hide,
+    // drag, and the next presentation all clear it.
+    let usable = app.window().is_visible()
+        && (settling || at.elapsed() <= PENDING_POSITION_TTL || !popover_placed());
+    if !usable {
+        return;
+    }
+    // Cap first, on the anchor's monitor: the height the placement reads is
+    // the cap-applied one.
+    sync_providers_cap(&app, &ctx.anchor);
+    // A settling request already landed once — it replays to re-place
+    // against the size the cap and platform layout actually produced, so it
+    // bypasses the parking courtesy that would refuse it as a repeat.
+    let mut landed = if settling {
+        position_popover_forced(&app, &ctx.anchor, &ctx.pending_position, shown)
+    } else {
+        position_popover(&app, &ctx.anchor, &ctx.pending_position, shown)
+    };
+    // The same recovery present_popover owes a refused move — a parked
+    // window on a monitor that is gone does not become reachable just
+    // because its real size arrived late.
+    if !landed && window_off_screen(&app) {
+        landed = position_popover_forced(&app, &ctx.anchor, &ctx.pending_position, shown);
+    }
+    // The presentation's focus call raced the realization too — repeat it
+    // once, on the first landing only: settle replays refocusing on every
+    // resize would fight the user for the key window.
+    if landed && !settling {
+        app.window().with_winit_window(|w| w.focus_window());
+    }
+}
 
 /// Gap between the status item and the card hanging off it.
 const POPOVER_GAP: f64 = 6.0;
@@ -6514,18 +8713,89 @@ fn clamp_onto(pos: f64, len: f64, screen_pos: f64, screen_len: f64, margin: f64)
     pos.clamp(lo, (screen_pos + screen_len - len - margin).max(lo))
 }
 
-/// The screen the status item sits on.
-///
-/// Deliberately not `current_monitor()`: that answers where the *window* is,
-/// which on every show after the first is the screen the popover is about to
-/// leave when the tray lives on another one. The item's own centre picks the
-/// right screen directly. `None` when winit can name no monitor at all, which
-/// [`position_popover`] reads as "don't constrain".
-fn anchor_screen(app: &AppWindow, anchor: Option<(f64, f64, f64, f64)>) -> Option<ScreenRect> {
+/// Whether `(cx, cy)` — physical pixels — lands inside a screen rect.
+fn rect_contains((x, y, w, h): ScreenRect, (cx, cy): (f64, f64)) -> bool {
+    cx >= x && cx < x + w && cy >= y && cy < y + h
+}
+
+/// Every monitor's `(rect, scale_factor)`, in the same physical-pixel space
+/// as the tray event's rect. Empty while the winit window is still
+/// unrealized — [`sync_providers_cap`] reaches that state before `show()`
+/// and takes the default cap for it — or on a platform that cannot name
+/// monitors at all.
+fn monitors(app: &AppWindow) -> Vec<(ScreenRect, f64)> {
     use slint::winit_030::{winit, WinitWindowAccessor};
-    fn rect(m: &winit::monitor::MonitorHandle) -> ScreenRect {
+    let mut out = Vec::new();
+    app.window().with_winit_window(|w: &winit::window::Window| {
+        out = w
+            .available_monitors()
+            .map(|m| {
+                let (p, s) = (m.position(), m.size());
+                (
+                    (p.x as f64, p.y as f64, s.width as f64, s.height as f64),
+                    m.scale_factor(),
+                )
+            })
+            .collect();
+    });
+    out
+}
+
+/// Drop a status-item rect that names no real screen location.
+///
+/// The macOS status item reports `(0, screen_height)` — its window's frame
+/// before the bar has laid it out — for a moment after creation, and a click
+/// landing in that window anchors the card to a point *below* every monitor:
+/// `popover_origin` then picks the "above" side and the panel opens at the
+/// bottom-left of the screen, exactly the misplaced spot reported. An anchor
+/// whose centre is inside no monitor is not an anchor at all — better the
+/// anchorless fallback position than a corner case off a phantom rect. That
+/// is also the answer while no monitor is enumerable yet: keeping an
+/// unverifiable rect would re-admit the phantom.
+fn sanitize_anchor(
+    app: &AppWindow,
+    anchor: Option<(f64, f64, f64, f64)>,
+) -> Option<(f64, f64, f64, f64)> {
+    let (ax, ay, aw, ah) = anchor?;
+    let mons = monitors(app);
+    let rects: Vec<ScreenRect> = mons.iter().map(|m| m.0).collect();
+    if anchor_on_a_monitor((ax, ay, aw, ah), &rects) {
+        anchor
+    } else {
+        None
+    }
+}
+
+/// The centre test [`sanitize_anchor`] runs: an anchor counts only while its
+/// centre lands inside some known monitor's rect.
+fn anchor_on_a_monitor((ax, ay, aw, ah): (f64, f64, f64, f64), mons: &[ScreenRect]) -> bool {
+    let centre = (ax + aw / 2.0, ay + ah / 2.0);
+    mons.iter().any(|m| rect_contains(*m, centre))
+}
+
+/// The monitor the popover will sit on, as `(rect, scale_factor)` — the
+/// same physical-pixel space [`monitors`] reports in.
+///
+/// Deliberately not `current_monitor()` first: that answers where the
+/// *window* is, which on every show after the first is the screen the
+/// popover is about to leave when the tray lives on another one. The
+/// item's own centre picks the right screen directly; `current`/`primary`
+/// is only the fallback for an anchorless present. `None` when winit can
+/// name no monitor at all, which [`position_popover`] reads as "don't
+/// constrain". Returning the scale too lets callers measure — and scale
+/// the gap/margin constants — against the monitor being placed *onto*,
+/// not the one being left.
+fn target_monitor(
+    app: &AppWindow,
+    anchor: Option<(f64, f64, f64, f64)>,
+) -> Option<(ScreenRect, f64)> {
+    use slint::winit_030::{winit, WinitWindowAccessor};
+    fn pair(m: &winit::monitor::MonitorHandle) -> (ScreenRect, f64) {
         let (p, s) = (m.position(), m.size());
-        (p.x as f64, p.y as f64, s.width as f64, s.height as f64)
+        (
+            (p.x as f64, p.y as f64, s.width as f64, s.height as f64),
+            m.scale_factor(),
+        )
     }
     let mut found = None;
     app.window().with_winit_window(|w: &winit::window::Window| {
@@ -6534,16 +8804,16 @@ fn anchor_screen(app: &AppWindow, anchor: Option<(f64, f64, f64, f64)>) -> Optio
             found = w
                 .available_monitors()
                 .find(|m| {
-                    let (x, y, mw, mh) = rect(m);
+                    let ((x, y, mw, mh), _) = pair(m);
                     cx >= x && cx < x + mw && cy >= y && cy < y + mh
                 })
-                .map(|m| rect(&m));
+                .map(|m| pair(&m));
         }
         if found.is_none() {
             found = w
                 .current_monitor()
                 .or_else(|| w.primary_monitor())
-                .map(|m| rect(&m));
+                .map(|m| pair(&m));
         }
     });
     found
@@ -6552,27 +8822,234 @@ fn anchor_screen(app: &AppWindow, anchor: Option<(f64, f64, f64, f64)>) -> Optio
 /// Returns whether the window was actually moved — `popover_moves` can say
 /// no, and only the caller who asked for a placement (or compensates for
 /// one that landed on a stale anchor) needs the answer.
-fn position_popover(app: &AppWindow, anchor: &Anchor, shown: Shown) -> bool {
-    // Recorded whatever the mode, so that switching into dock mode mid-session
-    // does not count the window as never placed.
-    thread_local! {
-        static PLACED: Cell<bool> = const { Cell::new(false) };
+///
+/// A presentation can arrive before winit has realized the window:
+/// `window().size()` then reads 0×0, `available_monitors()` is empty, and
+/// `set_position` lands on a frame that does not exist yet — the window
+/// ends up wherever the window manager defaults to rather than where this
+/// computed. That case is deferred: `pending` takes the request and the
+/// first `Resized` event replays it once the size is real.
+fn position_popover(
+    app: &AppWindow,
+    anchor: &Anchor,
+    pending: &Rc<Cell<Option<PendingPosition>>>,
+    shown: Shown,
+) -> bool {
+    position_popover_impl(app, anchor, pending, shown, false)
+}
+
+/// [`position_popover`] without the dock-mode parking courtesy — for a show
+/// that found the parked window entirely off-screen.
+fn position_popover_forced(
+    app: &AppWindow,
+    anchor: &Anchor,
+    pending: &Rc<Cell<Option<PendingPosition>>>,
+    shown: Shown,
+) -> bool {
+    position_popover_impl(app, anchor, pending, shown, true)
+}
+
+thread_local! {
+    /// Whether a placement has actually landed this run — read by the
+    /// dock-mode parking courtesy in [`popover_moves`] callers and by the
+    /// deferred-placement replay, for which a never-placed window overrides
+    /// the stale-request TTL (an unplaced panel parked at a window-manager
+    /// default is exactly the bug the deferral exists to undo).
+    static POPOVER_PLACED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// macOS: winit's `Window::is_maximized()` reaches `is_zoomed()`, which —
+/// because `isZoomed` does not answer for borderless windows — *temporarily
+/// swaps the window's styleMask to `Titled | Resizable`* and then restores
+/// it (winit#4071, still open upstream). Slint's `window_state_event` calls
+/// `is_maximized()` on every `Resized`, and content growth resizes this
+/// window whenever usage data lands. While the mask is titled the frame
+/// keeps the *content* pinned and grows a title-bar's height upward; if
+/// that frame would dip under the menu bar, `constrainFrameRect` clamps it —
+/// and when the mask is restored the window keeps the pushed-down position.
+/// Net effect, repeated per resize: the popover visibly jumps ~30px down
+/// some time after it opened, which is exactly the reported bug.
+///
+/// The probe always writes the same verbatim mask — `Titled | Resizable` —
+/// and a borderless popover is never legitimately zoomed, so the fix is
+/// surgical: a `class_addMethod` override of `setStyleMask:` on `WinitWindow`
+/// itself, swallowing exactly that mask while the window is borderless. The
+/// probe then reads `isZoomed` on the still-borderless window (false — the
+/// correct answer), restores the current mask (a harmless no-op write), and
+/// nothing ever moves. A class-level override — not an `object_setClass`
+/// instance swizzle — so AppKit's own isa-swizzling (KVO notification
+/// subclasses) is left alone; an instance reclass on an AppKit-swizzled
+/// window collapsed this window to 0×0 and crashed appearance lookups.
+#[cfg(target_os = "macos")]
+mod mask_shield {
+    use objc::runtime::{class_addMethod, Class, Object, Sel};
+    use objc::{msg_send, sel, sel_impl};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// `NSUInteger` — the ObjC `styleMask`/`setStyleMask:` argument type.
+    type ULong = usize;
+    /// `NSWindowStyleMaskTitled | NSWindowStyleMaskResizable` — the exact
+    /// mask winit's `is_zoomed` installs as its probe.
+    const ZOOM_PROBE: ULong = 0x1 | 0x8;
+    const TITLED: ULong = 0x1;
+
+    /// `NSWindow`'s own `setStyleMask:` IMP, captured at install so the shim
+    /// can forward every mask it does not swallow.
+    static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+    /// Set only after the method is actually on the class — a caller that
+    /// arrives before winit has registered `WinitWindow` retries next pass
+    /// instead of latching "done" on a no-op.
+    static DONE: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn shielded_set_style_mask(this: &mut Object, _cmd: Sel, mask: ULong) {
+        let current: ULong = unsafe { msg_send![this, styleMask] };
+        if mask == ZOOM_PROBE && current & TITLED == 0 {
+            // Borderless window, verbatim probe mask: only `is_zoomed` ever
+            // writes this. Swallow it — a borderless window cannot be zoomed,
+            // so dropping the probe cannot change the answer it was read for.
+            // `winit::WindowDelegate::set_style_mask` still runs its
+            // `makeFirstResponder` on the view afterwards — which is where
+            // Slint's canvas belongs anyway, so nothing is lost there.
+            return;
+        }
+        let orig: extern "C" fn(&mut Object, Sel, ULong) =
+            unsafe { std::mem::transmute(ORIGINAL.load(Ordering::Relaxed)) };
+        orig(this, _cmd, mask);
     }
-    let placed_before = PLACED.with(|placed| placed.replace(true));
-    if !popover_moves(platform::dock_mode(), placed_before, shown) {
+
+    extern "C" {
+        fn method_getTypeEncoding(m: *const objc::runtime::Method) -> *const i8;
+        fn method_setImplementation(
+            m: *mut objc::runtime::Method,
+            imp: objc::runtime::Imp,
+        ) -> objc::runtime::Imp;
+    }
+
+    /// Add the `setStyleMask:` shim as an override on `WinitWindow` itself —
+    /// a class-level `class_addMethod`, not an instance `object_setClass`,
+    /// so AppKit's own isa-swizzling (KVO notifications and friends) is left
+    /// alone. Idempotent: one class, one method, per process.
+    ///
+    /// One latent edge is accepted and documented: `set_decorations(true)`
+    /// on a window carrying `Resizable` but not `Miniaturizable` computes the
+    /// same `0x9` mask this shim swallows. Nothing in this app ever re-enables
+    /// decorations — the popover is frameless by design — so the overlap is
+    /// unreachable; if that ever changes, the guard needs a caller check, not
+    /// a value check.
+    pub fn install() {
+        if DONE.load(Ordering::SeqCst) {
+            return;
+        }
+        unsafe {
+            // The class is registered by winit at window creation, so this
+            // only succeeds once a window exists — DONE is therefore set only
+            // after the method really landed, and a too-early call retries.
+            let Some(cls) = Class::get("WinitWindow") else {
+                return;
+            };
+            let sel = sel!(setStyleMask:);
+            let Some(m) = cls.instance_method(sel) else {
+                return;
+            };
+            let orig = m.implementation() as usize;
+            if orig == 0 {
+                return;
+            }
+            ORIGINAL.store(orig, Ordering::SeqCst);
+            let shim: objc::runtime::Imp = std::mem::transmute(
+                shielded_set_style_mask as extern "C" fn(&mut Object, Sel, ULong),
+            );
+            // The type string is copied off the live method rather than
+            // hand-spelled (`v@:Q` vs `v@:L` for NSUInteger) — whatever Apple
+            // declared is what the override advertises.
+            let types = method_getTypeEncoding(m as *const _ as *mut _);
+            if class_addMethod(cls as *const Class as *mut Class, sel, shim, types)
+                == objc::runtime::NO
+            {
+                // `addMethod` refuses when the class already implements the
+                // selector itself — e.g. a future winit fixing #4071 on
+                // `WinitWindow`. Replacing that IMP keeps the override scoped
+                // to winit's class, and `ORIGINAL` captured above is exactly
+                // the impl being replaced, so the shim still chains correctly.
+                let replaced = method_setImplementation(m as *const _ as *mut _, shim);
+                if replaced as usize == 0 {
+                    return;
+                }
+                ORIGINAL.store(replaced as usize, Ordering::SeqCst);
+            }
+            DONE.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod mask_shield {
+    pub fn install() {}
+}
+
+fn popover_placed() -> bool {
+    POPOVER_PLACED.with(|placed| placed.get())
+}
+
+fn position_popover_impl(
+    app: &AppWindow,
+    anchor: &Anchor,
+    pending: &Rc<Cell<Option<PendingPosition>>>,
+    shown: Shown,
+    force: bool,
+) -> bool {
+    // Recorded whatever the mode, so that switching into dock mode mid-session
+    // does not count the window as never placed. Read without setting: a
+    // deferred placement must not consume the flag, or the replay that lands
+    // it would see the window as already placed and refuse to move it in
+    // dock mode.
+    let placed_before = popover_placed();
+    if !force && !popover_moves(platform::dock_mode(), placed_before, shown) {
         return false;
     }
-    let scale = app.window().scale_factor() as f64;
     let size = app.window().size();
-    let anchor = *anchor.borrow();
-    // No monitor to be had: fall back to a screen so large that the *far*
-    // edge of `clamp_onto`'s range never bites — not fully unconstrained,
-    // since the near edge still pins anything below `POPOVER_MARGIN` (an
-    // anchor at or past `x = 0`/`y = 0`, which a real monitor with a negative
-    // origin in a multi-monitor layout could legitimately want) up to that
-    // margin. Good enough for "winit can name no monitor at all", a state
-    // this app cannot otherwise reason about anyway.
-    let screen = anchor_screen(app, anchor).unwrap_or((0.0, 0.0, f64::MAX, f64::MAX));
+    if size.width == 0 || size.height == 0 {
+        // A click already waiting for its window outranks an ambient cause —
+        // a reopen tick landing in the realize gap must not overwrite the
+        // `ByTrayClick` whose anchor is the whole reason the replay exists.
+        // Only a click still *waiting* on a size counts — a settled one is
+        // no longer owed the slot.
+        let click_waiting = matches!(
+            pending.get(),
+            Some(PendingPosition {
+                shown: Shown::ByTrayClick,
+                settling: false,
+                ..
+            })
+        );
+        if !(click_waiting && shown == Shown::ByAnythingElse) {
+            pending.set(Some(PendingPosition {
+                at: Instant::now(),
+                shown,
+                settling: false,
+            }));
+        }
+        return false;
+    }
+    POPOVER_PLACED.with(|placed| placed.set(true));
+    let anchor = sanitize_anchor(app, *anchor.borrow());
+    // Screen and scale both come from the monitor being placed *onto* —
+    // on a cross-screen move `window().scale_factor()` would still answer
+    // for the monitor the window is leaving. No monitor to be had: fall
+    // back to a screen so large that the *far* edge of `clamp_onto`'s
+    // range never bites — not fully unconstrained, since the near edge
+    // still pins anything below `POPOVER_MARGIN` (an anchor at or past
+    // `x = 0`/`y = 0`, which a real monitor with a negative origin in a
+    // multi-monitor layout could legitimately want) up to that margin.
+    // Good enough for "winit can name no monitor at all", a state this
+    // app cannot otherwise reason about anyway.
+    let (screen, scale) =
+        target_monitor(app, anchor).unwrap_or(((0.0, 0.0, f64::MAX, f64::MAX), 1.0));
+    // Shield the window before any placement near the menu bar: the next
+    // content resize would otherwise let winit's `is_zoomed` probe flash a
+    // titlebar on the borderless window and `constrainFrameRect` would push
+    // it down mid-toggle — the delayed downward jump. See `mask_shield`.
+    mask_shield::install();
     let (x, y) = popover_origin(
         anchor,
         (size.width as f64, size.height as f64),
@@ -6581,7 +9058,89 @@ fn position_popover(app: &AppWindow, anchor: &Anchor, shown: Shown) -> bool {
     );
     app.window()
         .set_position(PhysicalPosition::new(x as i32, y as i32));
+    // Keep the request armed as *settling*: the cap sync and the platform's
+    // own layout flush their resizes asynchronously, and content that only
+    // arrives after the first fetch can keep growing the card — so the size
+    // this placement used may not be final. Each later `Resized` replays it
+    // forced: the parking courtesy would read it as a new presentation when
+    // it is the same one converging. It stays owed while the window is
+    // visible — a hidden, dragged, or re-presented window clears it, which
+    // is also what protects a dock-mode window the user parked: it only
+    // ever got there by a drag, and the drag drops the request.
+    pending.set(Some(PendingPosition {
+        at: Instant::now(),
+        shown,
+        settling: true,
+    }));
     true
+}
+
+/// Whether the window's frame intersects no monitor — the parked-window
+/// recovery check. A 0×0 or monitorless answer is not a verdict: the first
+/// says the window is not realized yet (a pending placement covers it), the
+/// second that there is nothing to check against. Two deliberate
+/// simplifications: monitor *full* rects, not work areas — a window parked
+/// entirely under the Dock is still judged reachable (the user can see and
+/// grab enough of it); and `position()`/`size()` both speak physical
+/// pixels, the space the monitor rects already use. Framelessness keeps
+/// outer frame and client area equal, which is what makes the two getters
+/// commensurate.
+fn window_off_screen(app: &AppWindow) -> bool {
+    let size = app.window().size();
+    if size.width == 0 || size.height == 0 {
+        return false;
+    }
+    let mons = monitors(app);
+    if mons.is_empty() {
+        return false;
+    }
+    let pos = app.window().position();
+    let frame: ScreenRect = (
+        pos.x as f64,
+        pos.y as f64,
+        size.width as f64,
+        size.height as f64,
+    );
+    !mons.iter().any(|m| rects_overlap(m.0, frame))
+}
+
+/// Whether the window already sits where this anchor would put it — the
+/// popover hanging off the status item, not a window parked somewhere else
+/// (the launch open's fallback spot, or a dock-mode window the user dragged
+/// aside). A status-item click reads "the panel, here": only an
+/// already-anchored panel toggles closed. Unanswerable cases — no valid
+/// anchor, no monitors, no size — call it anchored, so the click keeps its
+/// ordinary toggle.
+fn window_at_anchor(app: &AppWindow, anchor: &Anchor) -> bool {
+    let Some(anchor) = sanitize_anchor(app, *anchor.borrow()) else {
+        return true;
+    };
+    let Some((screen, scale)) = target_monitor(app, Some(anchor)) else {
+        return true;
+    };
+    let size = app.window().size();
+    if size.width == 0 || size.height == 0 {
+        return true;
+    }
+    let (tx, ty) = popover_origin(
+        Some(anchor),
+        (size.width as f64, size.height as f64),
+        screen,
+        scale,
+    );
+    let pos = app.window().position();
+    // Modest slack: a live status item drifts a few px as the bar reflows and
+    // scale rounding adds a couple more — but wide enough to forgive a real
+    // displacement would also forgive the ~26px menu-bar push this check
+    // exists to notice, so it stays below that.
+    const ANCHOR_SLACK: f64 = 20.0;
+    (pos.x as f64 - tx).abs() <= ANCHOR_SLACK && (pos.y as f64 - ty).abs() <= ANCHOR_SLACK
+}
+
+/// Whether two rects share any area — the off-screen test's unit: a window
+/// that meets a monitor at an edge only (`==` on a side) does not overlap it.
+fn rects_overlap((ax, ay, aw, ah): ScreenRect, (bx, by, bw, bh): ScreenRect) -> bool {
+    ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by
 }
 
 /// The directories a provider CLI is looked for in — and, just as importantly,
@@ -6752,14 +9311,28 @@ fn create_ping_workdir(dir: &std::path::Path) -> std::io::Result<()> {
 /// runs is exactly the "an AGENTS.md left there is read" gap a fresh one per
 /// run closes.
 fn ping_cwd() -> Option<std::path::PathBuf> {
+    ping_cwd_from(
+        &std::env::temp_dir(),
+        &seed::plugins_dir().with_file_name("ping-workdir"),
+    )
+}
+
+/// The pure-parents half of [`ping_cwd`] — which two directories it tries
+/// under is a parameter rather than `std::env::temp_dir()`/`seed::plugins_dir()`
+/// read here directly, so a test can name a parent of its own and never risk
+/// the fallback branch reaching the real `seed::plugins_dir()` (under the
+/// real `$HOME`) the way calling [`ping_cwd`] itself would if its *first*
+/// attempt ever happened to fail on the machine running the test.
+fn ping_cwd_from(
+    primary_parent: &std::path::Path,
+    fallback_parent: &std::path::Path,
+) -> Option<std::path::PathBuf> {
     let name = unique_ping_workdir_name();
-    let primary = std::env::temp_dir().join(&name);
+    let primary = primary_parent.join(&name);
     if create_ping_workdir(&primary).is_ok() {
         return Some(primary);
     }
-    let fallback = seed::plugins_dir()
-        .with_file_name("ping-workdir")
-        .join(&name);
+    let fallback = fallback_parent.join(&name);
     match create_ping_workdir(&fallback) {
         Ok(()) => {
             diag::line(format!(
@@ -7598,18 +10171,18 @@ static PING_BIN_MISSING: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(N
 /// spending the window's one ping on a run that never happened, silencing
 /// it until the window ends: a binary that reappears mid-window still gets
 /// pinged before it does, not only at the next one.
-fn ping_binary(plugin_id: &str, ping: &manifest::PingConfig) -> Option<std::path::PathBuf> {
-    let key = (plugin_id.to_string(), ping.bin.clone());
+fn ping_binary(plugin_id: &str, bin_name: &str) -> Option<std::path::PathBuf> {
+    let key = (plugin_id.to_string(), bin_name.to_string());
     let mut guard = PING_BIN_MISSING.lock().unwrap_or_else(|e| e.into_inner());
     let missing = guard.get_or_insert_with(HashSet::new);
-    match find_bin(&ping.bin) {
+    match find_bin(bin_name) {
         Some(bin) => {
             missing.remove(&key);
             Some(bin)
         }
         None => {
             if note_missing(missing, key) {
-                diag::line(format!("auto-ping: {} binary not found", ping.bin));
+                diag::line(format!("auto-ping: {bin_name} binary not found"));
             }
             None
         }
@@ -7666,7 +10239,7 @@ fn run_renewal_ping(
     renewal: TokenRenewal,
     now: u64,
 ) -> bool {
-    let Some(bin) = ping_binary(plugin_id, ping) else {
+    let Some(bin) = ping_binary(plugin_id, &ping.bin) else {
         return false;
     };
     let (previous, credited) = credit_renewal(&surface_key, renewal);
@@ -7702,6 +10275,24 @@ fn pinged_at_while(plugin_id: &str, now: u64, attempt: impl FnOnce() -> bool) ->
     let ran = attempt();
     if !ran {
         config::set_plugin_pinged_at(plugin_id, before);
+    }
+    ran
+}
+
+/// [`pinged_at_while`] for one `[[window_ping]]` window's own record
+/// (`config::plugin_window_pinged_at`) — the same borrow-then-restore, for
+/// the same reason.
+fn window_pinged_at_while(
+    plugin_id: &str,
+    window: &str,
+    now: u64,
+    attempt: impl FnOnce() -> bool,
+) -> bool {
+    let before = config::plugin_window_pinged_at(plugin_id, window);
+    config::set_plugin_window_pinged_at(plugin_id, window, now);
+    let ran = attempt();
+    if !ran {
+        config::set_plugin_window_pinged_at(plugin_id, window, before);
     }
     ran
 }
@@ -7940,6 +10531,7 @@ fn fold_registry_diff(
                         "the installed {stem}.toml cannot be read — {msg}. \
                          Remove or fix that file to install this plugin.",
                         stem = entry.id,
+                        msg = sanitize_trust_item(msg),
                     ));
                 }
                 diff.new_rows.push(row);
@@ -7958,17 +10550,45 @@ fn fold_registry_diff(
 /// `InstallStatus::Available` with no error — [`set_registry_row_status`] is
 /// what moves it to installing/failed once the user actually clicks Install.
 ///
-/// `name`/`description` come from `index.toml` on whatever host serves this
-/// registry, not from the manifest being installed — the same untrusted class
-/// [`tickover::plugin::sanitize_provider_text`] exists for. Any length cap
-/// belongs to `RegistryIndex::validate` at load time, not here; this is only
-/// the control/bidi stripping every other sink of response-fed text gets.
+/// `name`/`description`/`version` come from `index.toml` on whatever host
+/// serves this registry, not from the manifest being installed — a registry
+/// entry is remote input, the same untrusted class
+/// [`tickover::plugin::sanitize_provider_text`] exists for, and every field
+/// gets its control/bidi stripping here, not only the two
+/// `RegistryIndex::validate` happened to check first.
+///
+/// `name` and `version` go through `sanitize_provider_text` itself, capped
+/// at [`tickover::plugin::PROVIDER_TEXT_MAX_CHARS`] (64) — the same 64
+/// `validate` already enforces via
+/// [`registry::REGISTRY_NAME_MAX_CHARS`]/[`registry::REGISTRY_VERSION_MAX_CHARS`].
+/// On validated input that cap never actually fires, so the sanitiser only
+/// ever repeats a check `validate`'s own `refuse_control_chars` already
+/// made: nothing control, invisible or directional is left to strip, and
+/// with the string already under the cap, nothing is left to cut either —
+/// in particular, it cannot turn a non-empty `version` into `""`. That
+/// matters past this row too: [`apply_update_badge`] sanitises
+/// `available_version` the same way, and `""` there would hide the whole
+/// update sub-row behind `if p.available-version != ""` in `ui/app.slint`.
+/// That agreement is not left to this comment alone: `registry` asserts
+/// both caps against `PROVIDER_TEXT_MAX_CHARS` at compile time, so a
+/// widened validator cap left unmatched here fails the build instead of
+/// quietly handing this sink text longer than the cap it was sized for.
+///
+/// `description` does not share that identity: `validate` lets it run to
+/// `registry::REGISTRY_DESCRIPTION_MAX_CHARS` (256), four times
+/// `PROVIDER_TEXT_MAX_CHARS`'s 64, since it is a one-line summary rather
+/// than a caption. [`registry::sanitize_description`] applies the same
+/// control/bidi stripping at that field's own cap instead of
+/// `sanitize_provider_text`'s, ending in `…` rather than cutting silently on
+/// whatever is past it — reachable only through a caller that skips
+/// `validate`, since `validate` itself never lets a description this sees
+/// run past its own cap in the first place.
 fn registry_entry_row(entry: &RegistryEntry) -> RegistryPluginRow {
     RegistryPluginRow {
         id: ss(&entry.id),
         name: ss(tickover::plugin::sanitize_provider_text(&entry.name)),
-        version: ss(&entry.version),
-        description: ss(tickover::plugin::sanitize_provider_text(
+        version: ss(tickover::plugin::sanitize_provider_text(&entry.version)),
+        description: ss(registry::sanitize_description(
             entry.description.as_deref().unwrap_or_default(),
         )),
         status: InstallStatus::Available,
@@ -8097,8 +10717,7 @@ fn apply_registry_check(
                 let Some(mut row) = plugin_model.row_data(i) else {
                     continue;
                 };
-                row.available_version = ss(available);
-                row.has_local_edits = *has_local_edits;
+                apply_update_badge(&mut row, available, *has_local_edits);
                 plugin_model.set_row_data(i, row);
             }
 
@@ -8116,6 +10735,20 @@ fn apply_registry_check(
             }
         }
     }
+}
+
+/// Write one `fold_registry_diff` update entry's badge onto an already-built
+/// `PluginRow` — pulled out of `apply_registry_check`'s loop so it can be
+/// pinned by a test without an `AppWindow`, the way `registry_entry_row`
+/// pins the not-yet-installed row's own sinks.
+///
+/// `available` is `entry.version` off the registry index — remote input the
+/// same way the not-yet-installed row's `name`/`description`/`version` are —
+/// and this row's Chip draws it beside `current_version` with no width bound
+/// of its own.
+fn apply_update_badge(row: &mut PluginRow, available: &str, has_local_edits: bool) {
+    row.available_version = ss(tickover::plugin::sanitize_provider_text(available));
+    row.has_local_edits = has_local_edits;
 }
 
 /// The `registry-summary` text for `RegistryStatus::Results` — the fixed
@@ -8448,6 +11081,46 @@ fn update_target_unchanged(recorded_sha256: Option<&str>, current_sha256: &str) 
     recorded_sha256.is_none_or(|recorded| recorded.eq_ignore_ascii_case(current_sha256))
 }
 
+/// Sanitise `message` with `sanitize_trust_item` — not `sanitize_provider_text`,
+/// since a failure this reaches is a sentence, not a caption, and the
+/// label-sized cap would cut one mid-word with nothing to say so — then mark
+/// `entry_id`'s row `Failed` with it on whichever model `kind` names.
+/// [`handle_install_outcome`] reaches this from two unrelated places that
+/// both fold in text this app didn't author itself: a validator refusal
+/// quoting a manifest's own offending text, and an `install_write`/
+/// `update_write` error — an `io::Error` folded in with `.to_string()` on
+/// most paths, but "plugin id ... is not a valid filename" or "no installed
+/// manifest file found for id ..." on the two that fail before any I/O is
+/// attempted. Neither place is any more this app's own text than the other,
+/// so both get the same cap and the same control/bidi strip before either
+/// row shows them.
+/// Always returns `false`, matching [`handle_install_outcome`]'s own "no
+/// manifest was written" contract for every path through it that isn't a
+/// landed write.
+fn fail_pending_row(
+    kind: PendingKind,
+    entry_id: &str,
+    plugins: &Plugins,
+    plugin_model: &PluginRows,
+    registry_model: &RegistryRows,
+    message: &str,
+) -> bool {
+    let message = sanitize_trust_item(message);
+    match kind {
+        PendingKind::Install => {
+            set_registry_row_status(registry_model, entry_id, InstallStatus::Failed, &message)
+        }
+        PendingKind::Update => set_plugin_update_status(
+            plugin_model,
+            plugins,
+            entry_id,
+            UpdateStatus::Failed,
+            &message,
+        ),
+    }
+    false
+}
+
 /// Apply one install/update's fetch+verify result: run the trust dialog when
 /// `analyze_trust` requires it, write the verified bytes to disk, record
 /// provenance in the lockfile, and (for an install) drop the plugin off
@@ -8468,19 +11141,13 @@ fn handle_install_outcome(
     let (raw_bytes, manifest, sha_hex, base_url) = match outcome {
         InstallOutcome::Failed(err) => {
             diag::line(format!("{kind:?} \"{}\": {err}", entry.id));
-            match kind {
-                PendingKind::Install => {
-                    set_registry_row_status(registry_model, &entry.id, InstallStatus::Failed, &err)
-                }
-                PendingKind::Update => set_plugin_update_status(
-                    plugin_model,
-                    plugins,
-                    &entry.id,
-                    UpdateStatus::Failed,
-                    &err,
-                ),
-            }
-            return false;
+            // `err` can be a validator refusal (`PluginManifest::validate`'s
+            // own messages embed the manifest's offending text verbatim —
+            // a `client.bins` entry, a service name, a path) — untrusted the
+            // same way `registry_entry_row`'s `name`/`description` are.
+            // `fail_pending_row` is the sanitiser for this and one other
+            // path below that folds in text this app didn't author either.
+            return fail_pending_row(kind, &entry.id, plugins, plugin_model, registry_model, &err);
         }
         InstallOutcome::Ready {
             raw_bytes,
@@ -8551,15 +11218,10 @@ fn handle_install_outcome(
             "{kind:?} \"{}\": could not write manifest: {e}",
             entry.id
         ));
-        match kind {
-            PendingKind::Install => {
-                set_registry_row_status(registry_model, &entry.id, InstallStatus::Failed, &e)
-            }
-            PendingKind::Update => {
-                set_plugin_update_status(plugin_model, plugins, &entry.id, UpdateStatus::Failed, &e)
-            }
-        }
-        return false;
+        // `install_write`/`update_write` fold an `io::Error` in with
+        // `.to_string()` — no more this app's own text than a validator's
+        // refusal is, and `fail_pending_row` is the same sanitiser for both.
+        return fail_pending_row(kind, &entry.id, plugins, plugin_model, registry_model, &e);
     }
 
     lock.set(
@@ -8642,18 +11304,18 @@ fn join_with_and(parts: &[String]) -> String {
 }
 
 /// The most characters one manifest-supplied item may contribute to a trust
-/// dialog line before [`sanitize_trust_item`] cuts it short with `…` — a
-/// dialog line is meant to be read, not grown to whatever length a hostile
-/// manifest cares to spell out. Counted in `char`s, not bytes, so the cut
-/// point never lands inside a multi-byte character.
+/// dialog line or a plugin-manager row before [`sanitize_trust_item`] cuts it
+/// short with `…` — a dialog line or a row is meant to be read, not grown to
+/// whatever length a hostile manifest cares to spell out. Counted in `char`s,
+/// not bytes, so the cut point never lands inside a multi-byte character.
 const TRUST_ITEM_MAX_CHARS: usize = 120;
 
-/// Sanitise one manifest-supplied string before it reaches a trust dialog on
-/// either platform. [`applescript_escape`] only keeps a string from breaking
-/// out of the AppleScript literal it's interpolated into — it runs on macOS
-/// alone, and it has no opinion on a character that quotes fine but still
-/// rewrites how the line *looks*. This is that opinion, shared by both
-/// platforms:
+/// Sanitise one manifest-supplied string before it reaches a trust dialog or
+/// a plugin-manager row on either platform. [`applescript_escape`] only keeps
+/// a string from breaking out of the AppleScript literal it's interpolated
+/// into — it runs on macOS alone, and it has no opinion on a character that
+/// quotes fine but still rewrites how the line *looks*. This is that
+/// opinion, shared by both platforms:
 /// * C0 controls and DEL (`applescript_escape` already turns these into a
 ///   space for its own reason; the Windows `MessageBoxW` arm never calls
 ///   that function at all, so without this they'd reach it raw);
@@ -8681,7 +11343,13 @@ const TRUST_ITEM_MAX_CHARS: usize = 120;
 /// each host, and the plugin id itself — never to the assembled `short`/
 /// `detailed` strings afterwards: those are deliberately `\n`-separated
 /// labelled lines, and collapsing whitespace across the whole message would
-/// destroy that layout along with whatever it was sanitising.
+/// destroy that layout along with whatever it was sanitising. `handle_install_outcome`
+/// applies it a second way: a validator refusal quotes the manifest's own
+/// offending text, at whatever length that text happens to be, before the
+/// row that shows it caps its own width — a sentence, where every other call
+/// site sanitises a single short item, which is why this reaches for the
+/// longer cap rather than [`tickover::plugin::sanitize_provider_text`]'s
+/// label-sized one.
 fn sanitize_trust_item(s: &str) -> String {
     let mut collapsed = String::with_capacity(s.len());
     // Starts `true` so a leading run of whitespace never gets a space of its
@@ -9409,6 +12077,66 @@ mod popover_placement_tests {
         let (x, y) = popover_origin(None, CARD, screen, 1.0);
         assert_eq!((x, y), (-1920.0 + 240.0, 48.0));
     }
+
+    use super::{anchor_on_a_monitor, rect_contains, rects_overlap};
+
+    // The status item reports `(0, screen_height)` for a moment after the
+    // tray is created — its frame before the menu bar has laid it out. A
+    // click drained in that window used to anchor the card to a point below
+    // every monitor, and `popover_origin`'s "above" side then parked it at
+    // the bottom-left of the screen.
+    #[test]
+    fn a_status_items_not_yet_laid_out_rect_is_not_an_anchor() {
+        let mons = [SCREEN];
+        // The transient rect macOS reported on the machine this was found on.
+        let transient = (0.0, 1440.0, 149.0, 30.0);
+        assert!(
+            !anchor_on_a_monitor(transient, &mons),
+            "below the screen's bottom edge — no monitor holds its centre"
+        );
+        // The same item once laid out: top of the screen, clearly inside.
+        let laid_out = (745.0, 0.0, 149.0, 30.0);
+        assert!(anchor_on_a_monitor(laid_out, &mons));
+        // Containment is inclusive at the top and exclusive past the bottom
+        // edge — a rect flush with the last row is still an anchor.
+        let last_row = (0.0, 1410.0, 149.0, 30.0);
+        assert!(anchor_on_a_monitor(last_row, &mons));
+    }
+
+    #[test]
+    fn an_anchor_counts_on_any_monitor_not_just_the_main_one() {
+        let left = (-1920.0, 0.0, 1920.0, 1080.0);
+        let mons = [SCREEN, left];
+        let item = (-40.0, 1040.0, 40.0, 40.0);
+        assert!(anchor_on_a_monitor(item, &mons));
+        assert!(!anchor_on_a_monitor(item, &[SCREEN]));
+    }
+
+    #[test]
+    fn rect_contains_is_inclusive_at_the_origin_and_exclusive_past_the_edge() {
+        assert!(rect_contains(SCREEN, (0.0, 0.0)));
+        assert!(rect_contains(SCREEN, (2559.0, 1439.0)));
+        assert!(!rect_contains(SCREEN, (2560.0, 0.0)));
+        assert!(!rect_contains(SCREEN, (0.0, 1440.0)));
+        assert!(!rect_contains(SCREEN, (-1.0, 700.0)));
+    }
+
+    #[test]
+    fn rects_overlap_only_when_they_share_area() {
+        let window = (240.0, 62.0, 420.0, 925.0);
+        assert!(rects_overlap(SCREEN, window));
+        // Parked entirely on the other monitor: no overlap with the main one.
+        let left = (-1920.0, 0.0, 1920.0, 1080.0);
+        assert!(!rects_overlap(left, window));
+        // Touching an edge is not overlapping it.
+        let flush_below = (0.0, 1440.0, 420.0, 100.0);
+        assert!(!rects_overlap(SCREEN, flush_below));
+        let flush_right = (2560.0, 0.0, 100.0, 100.0);
+        assert!(!rects_overlap(SCREEN, flush_right));
+        // A sliver across the boundary is still on the screen.
+        let straddling = (2500.0, 700.0, 420.0, 100.0);
+        assert!(rects_overlap(SCREEN, straddling));
+    }
 }
 
 #[cfg(test)]
@@ -9429,8 +12157,10 @@ mod title_tests {
     /// Test-only uniform-gate resolver: every non-opt-in surface always, every
     /// opt-in one iff `opt_in_enabled`. Production's [`active_surface_ids`]
     /// reads each opt-in surface's state independently from `config`; this
-    /// pins them all to one bool so the `readings_with`/`active_surface_ids`
-    /// tests stay pure (no on-disk config).
+    /// pins them all to one bool so the `readings_with` fixtures below stay
+    /// pure (no on-disk config) — `active_surface_ids` itself is exercised
+    /// directly, against real `config`, by
+    /// `active_surface_ids_reads_the_opt_in_gate_from_config` further down.
     fn active_surface_ids_with(m: &PluginManifest, opt_in_enabled: bool) -> Vec<String> {
         m.surface
             .iter()
@@ -9520,11 +12250,21 @@ mod title_tests {
             window_title_of("Credits used", Role::Extra, Some(10_080)),
             "Credits used"
         );
+        assert_eq!(window_title_of("WK", Role::Extra, Some(10_080)), "WK");
         assert_eq!(
-            window_title_of("Credits used", Role::Primary, Some(10_080)),
+            window_title_of("WK", Role::Primary, Some(10_080)),
             "Weekly limit",
-            "the same label and length as Primary is captioned by the length instead — \
-             the reason a credit-spend window is not declared Primary"
+            "a short chip on Primary/Secondary is captioned by the length"
+        );
+        // Descriptive Primary/Secondary labels stay verbatim so providers with
+        // multiple groups can name which group a quota belongs to.
+        assert_eq!(
+            window_title_of("Gemini · 5-hour", Role::Primary, Some(300)),
+            "Gemini · 5-hour"
+        );
+        assert_eq!(
+            window_title_of("Gemini · Weekly", Role::Secondary, Some(10_080)),
+            "Gemini · Weekly"
         );
     }
 
@@ -9536,7 +12276,7 @@ mod title_tests {
         // regardless of length, so the caption and the clock underneath it
         // told two different stories.
         let w = win("5H", Role::Primary, 50.0, 3 * 86400, 10_080);
-        let data = window_data(NOW, &w, 50.0);
+        let data = window_data(NOW, &w, 50.0, None);
         assert_eq!(data.label, "Weekly limit");
         assert!(
             data.reset_at.contains(' '),
@@ -9558,7 +12298,7 @@ mod title_tests {
             resets_at: Some(NOW + 3 * 86400),
             period_minutes: None,
         };
-        let data = window_data(NOW, &w, 50.0);
+        let data = window_data(NOW, &w, 50.0, None);
         assert!(
             data.reset_at.contains(' '),
             "a Secondary window with no stated length must still fall back to a dated clock: {:?}",
@@ -9572,12 +12312,43 @@ mod title_tests {
         // a `Primary` window at its ordinary 5-hour length keeps the bare
         // time it always had.
         let w = win("5H", Role::Primary, 50.0, 3 * 3600, 300);
-        let data = window_data(NOW, &w, 50.0);
+        let data = window_data(NOW, &w, 50.0, None);
         assert!(
             !data.reset_at.contains(' '),
             "a same-day reset needs no date: {:?}",
             data.reset_at
         );
+    }
+
+    #[test]
+    fn unstarted_floating_window_renders_without_fake_countdown() {
+        // 0% used with reset roughly a full period ahead (within 120s) is an
+        // unstarted placeholder whose reset moves with the clock.
+        for delta in [18_000, 18_000 - 60] {
+            let w = win("Claude & GPT · 5-hour", Role::Extra, 0.0, delta, 300);
+            let data = window_data(NOW, &w, 0.0, None);
+            assert!(data.not_started, "delta {delta} must mark not_started");
+            assert_eq!(data.reset_rel, "");
+            assert_eq!(data.reset_at, "");
+        }
+
+        // Any spend > 0%, an already-ticking 0% window further from reset, or a
+        // missing reset keeps the normal bar rendering.
+        let active = win("Claude & GPT · 5-hour", Role::Extra, 0.017, 18_000 - 5, 300);
+        assert!(!window_data(NOW, &active, 0.017, None).not_started);
+
+        let ticking_zero = win("Claude & GPT · 5-hour", Role::Extra, 0.0, 18_000 - 600, 300);
+        assert!(!window_data(NOW, &ticking_zero, 0.0, None).not_started);
+
+        let no_reset = Window {
+            key: "w0:".to_string(),
+            label: "5H".into(),
+            role: Role::Primary,
+            used_percent: Some(0.0),
+            resets_at: None,
+            period_minutes: Some(300),
+        };
+        assert!(!window_data(NOW, &no_reset, 0.0, None).not_started);
     }
 
     /// Direct `ProviderReading` fixture, mirroring what a log-file-engine
@@ -9961,9 +12732,29 @@ mod title_tests {
 
     #[test]
     fn header_status_is_not_live_without_a_fresh_provider() {
-        assert_eq!(header_status(false, false), ("reading…", false));
-        assert_eq!(header_status(false, true), ("no data", false));
-        assert_eq!(header_status(true, true), ("LIVE", true));
+        assert_eq!(header_status(false, false, false), ("reading…", false));
+        assert_eq!(header_status(false, true, false), ("no data", false));
+        assert_eq!(header_status(true, true, false), ("LIVE", true));
+    }
+
+    /// The third answer: every provider signed out, or every plugin
+    /// disabled, still leaves `has_provider_reading` false — `readings()`
+    /// drops a "no credentials" row so completely that it reads exactly
+    /// like nothing having been fetched yet. Without `all_enabled_have_reported`
+    /// the header cannot tell the two apart, and says "reading…" forever for
+    /// a machine that will never have anything else to say.
+    #[test]
+    fn header_status_says_no_data_once_every_enabled_plugin_has_reported_with_nothing_to_show() {
+        assert_eq!(
+            header_status(false, false, true),
+            ("no data", false),
+            "a completed pass with nothing live must not read as still fetching"
+        );
+        assert_eq!(
+            header_status(false, false, false),
+            ("reading…", false),
+            "genuinely nothing fetched yet is unchanged"
+        );
     }
 
     // ── merge (`readings()`) ─────────────────────────────────────────────
@@ -10356,6 +13147,223 @@ mod title_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A seed that cannot write must not settle `codex`/`claude` as "the user
+    /// deleted it": both ship `deliver_if_absent = false` (an install without
+    /// them is assumed to have removed them on purpose — see
+    /// `seed::BUILTIN_UPGRADES`), so `upgrade_builtin_manifests` reads the
+    /// still-empty `dir` the seed step left behind as exactly that, settles
+    /// the marker, and neither headline provider ever gets a second launch to
+    /// try again. Unix-only: a read-only directory is the least contrived way
+    /// to make the seed step's own write fail without touching `seed.rs`.
+    #[test]
+    #[cfg(unix)]
+    fn a_seed_write_failure_does_not_settle_the_built_ins_that_never_redeliver() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-seed-write-failure-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert!(
+            truly_fresh_install(),
+            "a scratch config with no markers at all is what a fresh install looks like"
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+            .expect("deny writes into the plugins directory");
+
+        seed_and_upgrade_builtins(&dir);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions for the assertions and cleanup below");
+
+        for id in ["codex", "claude"] {
+            assert!(
+                config::builtin_migrated(id).is_none(),
+                "{id} must stay undecided after a launch that could not write it \
+                 — settling it here reads exactly like the user having deleted it"
+            );
+            assert!(
+                !dir.join(format!("{id}.toml")).exists(),
+                "{id}.toml must not exist — the write that would have created it failed"
+            );
+        }
+
+        // The next launch, disk trouble gone: both reach the machine as if
+        // this were still the fresh install it always was.
+        seed_and_upgrade_builtins(&dir);
+        for id in ["codex", "claude"] {
+            assert!(
+                dir.join(format!("{id}.toml")).exists(),
+                "{id}.toml must reach the machine once the disk is writable again"
+            );
+            assert!(
+                config::builtin_migrated(id).is_some(),
+                "{id} is settled once it actually reaches disk"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The narrower failure the test above does not reach: one obstructed
+    /// name in a directory that is otherwise perfectly writable must not
+    /// cost the other four built-ins their delivery. Planting a directory
+    /// (rather than `chmod`ing the whole plugins folder, as the test above
+    /// does) is also what makes this cross-platform: `grok` ships
+    /// `deliver_if_absent = true`, so clearing the obstruction later lets it
+    /// self-heal through the ordinary upgrade pass, with no second seed
+    /// attempt needed — this install stops being `truly_fresh_install` the
+    /// moment the other four settle.
+    #[test]
+    fn a_seed_write_failure_for_one_name_does_not_block_the_other_four() {
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-seed-one-blocked-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert!(
+            truly_fresh_install(),
+            "a scratch config with no markers at all is what a fresh install looks like"
+        );
+        // `has_any_toml` does not count a directory (it is not a file), so
+        // planting one here still leaves this read as "nothing seeded yet".
+        std::fs::create_dir_all(dir.join("grok.toml")).expect("plant a directory in its place");
+
+        seed_and_upgrade_builtins(&dir);
+
+        let grok = seed::BUILTIN_UPGRADES
+            .iter()
+            .find(|u| u.id == "grok")
+            .expect("grok ships as a built-in");
+        assert!(
+            config::builtin_migrated("grok").is_none(),
+            "the obstructed name must stay undecided, not settled as though deleted"
+        );
+        for upgrade in seed::BUILTIN_UPGRADES {
+            if upgrade.id == "grok" {
+                continue;
+            }
+            assert!(
+                dir.join(upgrade.file).is_file(),
+                "{} must still be delivered even though grok.toml was blocked",
+                upgrade.file
+            );
+            assert_eq!(
+                config::builtin_migrated(upgrade.id).as_deref(),
+                Some(upgrade.to_version),
+                "{} must be settled even though a sibling name failed",
+                upgrade.id
+            );
+        }
+
+        // Retried on the next launch, obstruction still in place: still
+        // undecided, not settled the wrong way and not forgotten either.
+        seed_and_upgrade_builtins(&dir);
+        assert!(
+            config::builtin_migrated("grok").is_none(),
+            "still undecided a launch later, while the obstruction remains"
+        );
+
+        // Clear it: the very next launch's upgrade pass delivers `grok` the
+        // same way it would reach an install that never had it at all.
+        std::fs::remove_dir_all(dir.join("grok.toml")).expect("clear the obstruction");
+        seed_and_upgrade_builtins(&dir);
+        assert!(
+            dir.join("grok.toml").is_file(),
+            "grok.toml must reach the machine once the obstruction is gone"
+        );
+        assert_eq!(
+            config::builtin_migrated("grok").as_deref(),
+            Some(grok.to_version),
+            "grok is settled once it actually reaches disk"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same obstruction, but at a name that ships
+    /// `deliver_if_absent = false` (`claude`) — and, unlike the `grok` case
+    /// above, this one does not end in a full recovery once the obstruction
+    /// is gone. The other four settling on the obstructed launch is what
+    /// ends `truly_fresh_install`, so no later launch ever calls
+    /// `seed_if_empty` again to retry `claude` specifically; once the
+    /// directory is removed, `upgrade_builtin` reads a plain `Absent` there
+    /// — indistinguishable from the user having deleted a delivered copy —
+    /// and `deliver_if_absent = false` means that settles for good, with the
+    /// file never actually written. Pinned here rather than left to be
+    /// rediscovered: closing it needs `truly_fresh_install`'s all-or-nothing
+    /// marker to track names rather than the whole install, which is a
+    /// larger change than this one name's seed step.
+    #[test]
+    fn a_seed_write_failure_for_a_never_redelivered_name_does_not_block_the_other_four() {
+        let dir = std::env::temp_dir().join(format!(
+            "tickover-seed-one-blocked-never-redelivered-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert!(
+            truly_fresh_install(),
+            "a scratch config with no markers at all is what a fresh install looks like"
+        );
+        std::fs::create_dir_all(dir.join("claude.toml")).expect("plant a directory in its place");
+
+        seed_and_upgrade_builtins(&dir);
+
+        assert!(
+            config::builtin_migrated("claude").is_none(),
+            "the obstructed name must stay undecided, not settled as though deleted"
+        );
+        for upgrade in seed::BUILTIN_UPGRADES {
+            if upgrade.id == "claude" {
+                continue;
+            }
+            assert!(
+                dir.join(upgrade.file).is_file(),
+                "{} must still be delivered even though claude.toml was blocked",
+                upgrade.file
+            );
+            assert_eq!(
+                config::builtin_migrated(upgrade.id).as_deref(),
+                Some(upgrade.to_version),
+                "{} must be settled even though a sibling name failed",
+                upgrade.id
+            );
+        }
+
+        // Retried on the next launch, obstruction still in place.
+        seed_and_upgrade_builtins(&dir);
+        assert!(
+            config::builtin_migrated("claude").is_none(),
+            "still undecided a launch later, while the obstruction remains"
+        );
+        assert!(
+            !dir.join("claude.toml").is_file(),
+            "still just the planted directory — nothing this call may not make"
+        );
+
+        // Clearing the obstruction here does not self-heal `claude` the way
+        // it does `grok` above: this install stopped being
+        // `truly_fresh_install` the moment the other four settled, so this
+        // launch's upgrade pass, not another seed attempt, is what sees the
+        // now-empty path — and reads it exactly like a deliberate deletion.
+        std::fs::remove_dir_all(dir.join("claude.toml")).expect("clear the obstruction");
+        seed_and_upgrade_builtins(&dir);
+        assert!(
+            !dir.join("claude.toml").is_file(),
+            "never written — `deliver_if_absent = false` never promotes `Absent`"
+        );
+        assert!(
+            config::builtin_migrated("claude").is_some(),
+            "settled anyway: indistinguishable, from this path alone, from the user \
+             having deleted a copy that was actually delivered"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Every built-in whose file is missing from `dir` is named in `logged`,
     /// and **no** built-in whose file is there is.
     fn logged_exactly_for(dir: &std::path::Path, logged: &[String]) {
@@ -10601,6 +13609,52 @@ mod title_tests {
         assert!(!out.iter().find(|r| r.id == "beta").unwrap().bare_when_sole);
     }
 
+    /// A plugin with no cache entry at all — never fetched, not merely
+    /// filtered out of `readings()` — is what keeps this `false`; every
+    /// enabled plugin needs its own entry, whatever that entry contains.
+    #[test]
+    fn every_enabled_plugin_has_reported_needs_a_cache_entry_for_each_one() {
+        let plugins = vec![stub_manifest("alpha", 10), stub_manifest("beta", 20)];
+        let mut cache = HashMap::new();
+        cache.insert("alpha".to_string(), vec![stub_reading("alpha")]);
+
+        assert!(
+            !every_enabled_plugin_has_reported(&plugins, &cache, |_| true),
+            "beta has no cache entry yet"
+        );
+
+        cache.insert("beta".to_string(), Vec::new());
+        assert!(
+            every_enabled_plugin_has_reported(&plugins, &cache, |_| true),
+            "an empty Vec is still a reported fetch — the row was just filtered out of it"
+        );
+    }
+
+    /// A disabled plugin is never waited on — the cache slot it never fills
+    /// must not hold the answer back for the providers that are enabled.
+    #[test]
+    fn every_enabled_plugin_has_reported_skips_disabled_plugins() {
+        let plugins = vec![stub_manifest("alpha", 10), stub_manifest("beta", 20)];
+        let mut cache = HashMap::new();
+        cache.insert("alpha".to_string(), vec![stub_reading("alpha")]);
+
+        assert!(
+            every_enabled_plugin_has_reported(&plugins, &cache, |m| m.id == "alpha"),
+            "beta is disabled — its missing cache entry must not count against the answer"
+        );
+    }
+
+    /// No enabled plugin at all is vacuously "everyone has reported" —
+    /// exactly the state a fresh header must not read as still fetching.
+    #[test]
+    fn every_enabled_plugin_has_reported_is_true_with_no_enabled_plugin() {
+        let plugins = vec![stub_manifest("alpha", 10)];
+        let cache = HashMap::new();
+        assert!(every_enabled_plugin_has_reported(&plugins, &cache, |_| {
+            false
+        }));
+    }
+
     // ── dynamic sub-account rows (log-file multi-account) ─────────────────
 
     #[test]
@@ -10689,6 +13743,35 @@ mod title_tests {
         assert_eq!(
             active_surface_ids_with(&m, true),
             vec!["cli".to_string(), "desktop".to_string()]
+        );
+    }
+
+    /// The rule the test above pins through a stand-in — here it is asked of
+    /// production [`active_surface_ids`] itself, reading the real
+    /// `config::plugin_surface_enabled` rather than a test-supplied bool.
+    /// `claude_like_two_surface_manifest`'s `("claude", "desktop")` pair
+    /// happens to be the one surface `config` bridges to a legacy key
+    /// (`monitor_desktop`) rather than the generic `plugin.<id>.surface.<id>`
+    /// one — deliberately kept rather than swapped for an unbridged
+    /// id/surface pair, since the bridge is exactly the kind of indirection
+    /// this test would otherwise never touch. `config`'s own per-thread test
+    /// fallback (see `config::path`) keeps this off the real config file;
+    /// both states are set explicitly below rather than relying on either
+    /// one being config's unset default.
+    #[test]
+    fn active_surface_ids_reads_the_opt_in_gate_from_config() {
+        let m = claude_like_two_surface_manifest();
+        config::set_plugin_surface_enabled(&m.id, "desktop", false);
+        assert_eq!(
+            active_surface_ids(&m),
+            vec!["cli".to_string()],
+            "the opt-in surface stays out until config turns it on"
+        );
+        config::set_plugin_surface_enabled(&m.id, "desktop", true);
+        assert_eq!(
+            active_surface_ids(&m),
+            vec!["cli".to_string(), "desktop".to_string()],
+            "config turning it on must be what changes the answer"
         );
     }
 
@@ -10804,6 +13887,24 @@ mod title_tests {
             owning_manifest(&plugins, "claude-desktop").map(|m| m.id.as_str()),
             Some("claude"),
             "the plugin's other surface is unaffected"
+        );
+    }
+
+    // ── report_row_id ───────────────────────────────────────────────────────
+
+    /// The bug this function exists to close: a two-surface provider's
+    /// history is filed once, under its plugin id, and a report row built
+    /// from the `cli` surface's reading id must still land on that same key.
+    #[cfg(feature = "history")]
+    #[test]
+    fn report_row_id_resolves_a_two_surface_readings_plugin_id() {
+        let plugins = vec![claude_like_two_surface_manifest()];
+        let r = claude_surface_reading("cli");
+        assert_eq!(r.id, "claude-cli", "the collision this test is about");
+        assert_eq!(
+            report_row_id(&plugins, &r),
+            "claude",
+            "the report must key history lookups on the plugin id, never the reading id"
         );
     }
 
@@ -11097,6 +14198,145 @@ mod title_tests {
         }
     }
 
+    fn shipped_antigravity() -> PluginManifest {
+        PluginManifest::from_str(include_str!("../plugins/antigravity.toml"))
+            .expect("the shipped Antigravity manifest is valid")
+    }
+
+    fn antigravity_window(key: &str, used: f64, in_secs: u64) -> Window {
+        Window {
+            key: key.to_string(),
+            label: key.to_string(),
+            role: Role::Extra,
+            used_percent: Some(used),
+            resets_at: Some(NOW + in_secs),
+            period_minutes: Some(300),
+        }
+    }
+
+    /// Antigravity pings both 5-hour windows, each with its own group's
+    /// model, and only through `[[window_ping]]` — a build that predates
+    /// that table must see no ping here at all (see the manifest's own
+    /// comment), so a `[ping]` creeping back in is a regression this catches.
+    #[test]
+    fn the_shipped_antigravity_manifest_pings_both_five_hour_windows_and_nothing_else() {
+        let m = shipped_antigravity();
+        assert!(
+            m.ping.is_none(),
+            "an older build must find no `[ping]` here"
+        );
+        let targets: Vec<(&str, &str)> = m
+            .window_ping
+            .iter()
+            .map(|wp| {
+                (
+                    wp.window.as_str(),
+                    wp.args.last().map_or("", String::as_str),
+                )
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                ("gemini-5h", "gemini-3.8-flash-low"),
+                ("3p-5h", "gpt-oss-120b-medium")
+            ]
+        );
+        assert_eq!(
+            ping_commands_label(&m),
+            "agy -p hello --model gemini-3.8-flash-low; agy -p hello --model gpt-oss-120b-medium",
+            "the one toggle runs both commands, so its label names both"
+        );
+    }
+
+    /// Each `[[window_ping]]` reads its own window off the reading, by the
+    /// key its declared id builds — not the primary one `ping_window` reads —
+    /// and an unstarted Antigravity window (0%, reset one period out) is due
+    /// for its ping while a running one is not.
+    #[test]
+    fn named_ping_window_reads_the_window_its_id_names() {
+        let m = shipped_antigravity();
+        let reading = reading_with(
+            vec![
+                antigravity_window("gemini-5h:", 4.0, 3 * 3600),
+                antigravity_window("3p-5h:", 0.0, 5 * 3600),
+            ],
+            None,
+        );
+        let gemini = named_ping_window(&m, Some(&reading), "gemini-5h", None).unwrap();
+        assert_eq!(gemini.used_percent, Some(4.0));
+        let third_party = named_ping_window(&m, Some(&reading), "3p-5h", None).unwrap();
+        assert_eq!(third_party.used_percent, Some(0.0));
+        assert_eq!(third_party.resets_at, Some(NOW + 5 * 3600));
+
+        let due =
+            |w: &PingWindow| ping_due(w.used_percent, w.resets_at, w.period_minutes, 0, 0, NOW);
+        assert!(
+            due(&third_party),
+            "the unstarted 3P window is owed its ping"
+        );
+        assert!(!due(&gemini), "the running Gemini window is left alone");
+    }
+
+    /// No figure is not a reason to ping: an errored reading, a window the
+    /// manifest does not declare, and no reading at all each answer `None`,
+    /// as `ping_window` does. A window the reading simply omits still has a
+    /// length to project from — its declared `assumed` period.
+    #[test]
+    fn named_ping_window_answers_nothing_it_cannot_read() {
+        let m = shipped_antigravity();
+        let failed = reading_with(Vec::new(), Some("HTTP 503"));
+        assert!(named_ping_window(&m, Some(&failed), "3p-5h", None).is_none());
+        assert!(named_ping_window(&m, None, "3p-5h", None).is_none());
+        let silent = reading_with(Vec::new(), None);
+        assert!(named_ping_window(&m, Some(&silent), "no-such-window", None).is_none());
+        let omitted = named_ping_window(&m, Some(&silent), "3p-5h", None).unwrap();
+        assert_eq!(omitted.used_percent, None);
+        assert_eq!(omitted.resets_at, None);
+        assert_eq!(
+            omitted.period_minutes,
+            Some(300),
+            "the declared `assumed` length"
+        );
+    }
+
+    /// Antigravity omits an exhausted bucket from its proto3 response rather
+    /// than reporting `remainingFraction: 0`, so `named_ping_window` returns an
+    /// absent reading (`used_percent: None`, `resets_at: None`) with the
+    /// manifest's `assumed` period. While the last stated reset in the
+    /// seen-window registry is still in the future, `ping_due` must leave that
+    /// exhausted window alone; once the boundary passes without a ping inside
+    /// it, the ping becomes due.
+    #[test]
+    fn named_ping_window_does_not_ping_exhausted_vanished_gemini_window_before_reset() {
+        let m = shipped_antigravity();
+        let reading = reading_with(Vec::new(), None);
+        let window = named_ping_window(&m, Some(&reading), "gemini-5h", None).unwrap();
+        let future_reset = NOW + 3600;
+        assert!(
+            !ping_due(
+                window.used_percent,
+                window.resets_at,
+                window.period_minutes,
+                future_reset,
+                0,
+                NOW,
+            ),
+            "exhausted window still before its remembered reset must not ping"
+        );
+        assert!(
+            ping_due(
+                window.used_percent,
+                window.resets_at,
+                window.period_minutes,
+                future_reset,
+                0,
+                future_reset,
+            ),
+            "once that remembered reset passes, the ping becomes due"
+        );
+    }
+
     /// The loop above `ping_due`, which its own tests cannot see: they are pure
     /// functions over scalars and would keep passing over a loop that never
     /// reaches them. Which is what nearly happened — the loop used to find its
@@ -11371,7 +14611,7 @@ mod title_tests {
             at: NOW - 600,
             period_minutes: Some(300),
         };
-        let rows = window_rows(Some(&m), &reading, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(Some(&m), &reading, NOW, &seen_only("w0:", seen), &NO_PROJ);
 
         assert_eq!(
             labels(&rows),
@@ -11903,6 +15143,45 @@ mod title_tests {
         );
     }
 
+    /// Antigravity's shape for a window nobody has started: 0% used and a
+    /// reset exactly one period from *now*, moving forward with every
+    /// reading. Read as stated, that window always "began just now", so a
+    /// ping that did not start it (a retired `--model`, which `agy` refuses
+    /// with exit 1) looked owed again the moment the ten-minute floor
+    /// passed — a process every ten minutes for as long as the toggle
+    /// stayed on. It must wait a period instead, the same retry a silent
+    /// Codex window gets.
+    #[test]
+    fn ping_due_retries_a_floating_reset_a_period_later_not_every_floor() {
+        let floating = |now: u64| Some(now + 5 * 3600);
+        assert!(
+            ping_due(Some(0.0), floating(NOW), FIVE_H, 0, 0, NOW),
+            "never pinged: an unstarted window is owed its ping"
+        );
+        let pinged = NOW - 11 * 60; // a ping that started nothing
+        assert!(
+            !ping_due(Some(0.0), floating(NOW), FIVE_H, 0, pinged, NOW),
+            "eleven minutes after a ping that achieved nothing"
+        );
+        let later = pinged + 5 * 3600;
+        assert!(
+            ping_due(Some(0.0), floating(later), FIVE_H, 0, pinged, later),
+            "a period later the retry is owed"
+        );
+    }
+
+    /// Even when the system clock is smaller than one full window period, a
+    /// never-pinged floating reset (`pinged_at == 0`) must still fire rather
+    /// than matching `now.saturating_sub(0) < period`.
+    #[test]
+    fn ping_due_fires_on_floating_reset_when_never_pinged_even_at_small_clock() {
+        let now = 1_000;
+        assert!(
+            ping_due(Some(0.0), Some(now + 5 * 3600), FIVE_H, 0, 0, now),
+            "pinged_at == 0 means never pinged, regardless of clock magnitude"
+        );
+    }
+
     // ── seen-window registry ──────────────────────────────────────────────
 
     /// A Codex-shaped manifest with both subscription windows and a per-model
@@ -11967,6 +15246,10 @@ mod title_tests {
         move |asked| (asked == key).then_some(seen)
     }
 
+    /// The tests here predate the quota×history projection and exercise
+    /// rows/hysteresis, not burn math — they all want "no projection".
+    const NO_PROJ: &ProjectionFn<'static> = &|_, _| None;
+
     fn labels(rows: &[(String, WindowData)]) -> Vec<String> {
         rows.iter().map(|(_, w)| w.label.to_string()).collect()
     }
@@ -11989,7 +15272,13 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &weekly_only, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(
+            Some(&m),
+            &weekly_only,
+            NOW,
+            &seen_only("w0:", seen),
+            &NO_PROJ,
+        );
 
         assert_eq!(
             labels(&rows),
@@ -12031,7 +15320,7 @@ mod title_tests {
                 at: NOW - elapsed,
                 period_minutes: Some(300),
             };
-            window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", seen))
+            window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", seen), &NO_PROJ)
         };
 
         assert_eq!(
@@ -12066,7 +15355,7 @@ mod title_tests {
                 at: NOW - elapsed,
                 period_minutes: Some(10_080),
             };
-            window_rows(Some(&m), &nothing, NOW, &seen_only("w1:", seen))
+            window_rows(Some(&m), &nothing, NOW, &seen_only("w1:", seen), &NO_PROJ)
         };
 
         assert_eq!(labels(&rows_at(0)), vec!["Weekly limit"]);
@@ -12107,7 +15396,31 @@ mod title_tests {
             at: NOW + 600,
             period_minutes: Some(300),
         };
-        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", seen)).is_empty());
+        // Pinned against the real key generator: `seen_only` below only ever
+        // answers `"w0:"`, so a `window_key` shape that moved would make
+        // `window_rows` ask under a different string, get `None` back either
+        // way, and pass the `is_empty()` below without the TTL logic under
+        // test ever running.
+        assert_eq!(tickover::plugin::window_key(&m.windows[0], 0), "w0:");
+        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", seen), &NO_PROJ).is_empty());
+    }
+
+    #[cfg(feature = "history")]
+    #[test]
+    fn a_report_card_falls_back_to_the_weekly_window() {
+        let weekly = win("WK", Role::Secondary, 82.0, 3 * 86400, 10_080);
+        let both = reading_with(
+            vec![weekly.clone(), win("5H", Role::Primary, 7.0, 3600, 300)],
+            None,
+        );
+        assert_eq!(report_window(&both).unwrap().label, "5H");
+        let only_weekly = reading_with(vec![weekly.clone()], None);
+        assert_eq!(report_window(&only_weekly).unwrap().label, "WK");
+        let mut no_figure = win("5H", Role::Primary, 7.0, 3600, 300);
+        no_figure.used_percent = None;
+        let empty_primary = reading_with(vec![no_figure, weekly], None);
+        assert_eq!(report_window(&empty_primary).unwrap().label, "WK");
+        assert!(report_window(&reading_with(Vec::new(), None)).is_none());
     }
 
     /// A reading we could not take is not evidence that a window is empty. The
@@ -12123,7 +15436,10 @@ mod title_tests {
             at: NOW - 600,
             period_minutes: Some(300),
         };
-        assert!(window_rows(Some(&m), &broken, NOW, &seen_only("w0:", seen)).is_empty());
+        // See `a_window_that_has_not_ended_yet_gets_no_not_started_row` for
+        // why this pins the key `seen_only` below is keyed on.
+        assert_eq!(tickover::plugin::window_key(&m.windows[0], 0), "w0:");
+        assert!(window_rows(Some(&m), &broken, NOW, &seen_only("w0:", seen), &NO_PROJ).is_empty());
     }
 
     /// A window nobody ever saw is not a window we can say anything about —
@@ -12133,7 +15449,7 @@ mod title_tests {
     fn a_window_never_seen_gets_no_row() {
         let m = two_window_manifest();
         let nothing = reading_with(Vec::new(), None);
-        assert!(window_rows(Some(&m), &nothing, NOW, &|_| None).is_empty());
+        assert!(window_rows(Some(&m), &nothing, NOW, &|_| None, &NO_PROJ).is_empty());
     }
 
     /// Graceful degradation on the first launch after an upgrade: the
@@ -12145,16 +15461,33 @@ mod title_tests {
     fn a_remembered_window_with_no_remembered_length_gets_no_row() {
         let m = two_window_manifest();
         let nothing = reading_with(Vec::new(), None);
+        // See `a_window_that_has_not_ended_yet_gets_no_not_started_row` for
+        // why this pins the key `seen_only` below is keyed on.
+        assert_eq!(tickover::plugin::window_key(&m.windows[0], 0), "w0:");
         let no_length = config::SeenWindow {
             at: NOW - 600,
             period_minutes: None,
         };
-        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", no_length)).is_empty());
+        assert!(window_rows(
+            Some(&m),
+            &nothing,
+            NOW,
+            &seen_only("w0:", no_length),
+            &NO_PROJ
+        )
+        .is_empty());
         let zero_length = config::SeenWindow {
             at: NOW - 600,
             period_minutes: Some(0),
         };
-        assert!(window_rows(Some(&m), &nothing, NOW, &seen_only("w0:", zero_length)).is_empty());
+        assert!(window_rows(
+            Some(&m),
+            &nothing,
+            NOW,
+            &seen_only("w0:", zero_length),
+            &NO_PROJ
+        )
+        .is_empty());
     }
 
     /// A window the provider *is* reporting is drawn from what it reported.
@@ -12169,7 +15502,7 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &live, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(Some(&m), &live, NOW, &seen_only("w0:", seen), &NO_PROJ);
         assert_eq!(labels(&rows), vec!["5-hour limit"]);
         assert!(!rows[0].1.not_started);
         assert_eq!(rows[0].1.pct, 12.0);
@@ -12193,7 +15526,7 @@ mod title_tests {
             None,
         );
 
-        let rows = window_rows(Some(&m), &scrambled, NOW, &|_| None);
+        let rows = window_rows(Some(&m), &scrambled, NOW, &|_| None, &NO_PROJ);
         assert_eq!(
             labels(&rows),
             vec!["5-hour limit", "Weekly limit", "GPT-5.3-Codex-Spark"],
@@ -12230,7 +15563,13 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &figureless, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(
+            Some(&m),
+            &figureless,
+            NOW,
+            &seen_only("w0:", seen),
+            &NO_PROJ,
+        );
         assert!(
             rows.is_empty(),
             "no row to draw, and no claim that the window is empty: {:?}",
@@ -12260,7 +15599,7 @@ mod title_tests {
             })
         };
 
-        let rows = window_rows(Some(&m), &nothing, NOW, &seen);
+        let rows = window_rows(Some(&m), &nothing, NOW, &seen, &NO_PROJ);
         assert_eq!(
             labels(&rows),
             vec!["5-hour limit", "Weekly limit"],
@@ -12301,7 +15640,7 @@ mod title_tests {
             _ => None,
         };
 
-        let rows = window_rows(Some(&m), &extra_only, NOW, &seen);
+        let rows = window_rows(Some(&m), &extra_only, NOW, &seen, &NO_PROJ);
         assert_eq!(
             labels(&rows),
             vec!["5-hour limit", "Weekly limit", "GPT-5.3-Codex-Spark"],
@@ -12322,7 +15661,7 @@ mod title_tests {
             at: NOW - 600,
             period_minutes: Some(300),
         };
-        let rows = window_rows(None, &live, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(None, &live, NOW, &seen_only("w0:", seen), &NO_PROJ);
         assert_eq!(labels(&rows), vec!["Weekly limit"]);
     }
 
@@ -12340,7 +15679,7 @@ mod title_tests {
             period_minutes: Some(300),
         };
 
-        let rows = window_rows(Some(&m), &empty, NOW, &seen_only("w0:", seen));
+        let rows = window_rows(Some(&m), &empty, NOW, &seen_only("w0:", seen), &NO_PROJ);
         assert!(
             rows.iter()
                 .any(|(_, w)| w.label == "5-hour limit" && w.not_started),
@@ -12913,19 +16252,30 @@ mod title_tests {
         };
 
         let live = reading_with(vec![win("5H", Role::Primary, 42.0, 600, 300)], None);
-        let before = window_rows(Some(&m), &live, NOW, &|_| None);
+        let before = window_rows(Some(&m), &live, NOW, &|_| None, &NO_PROJ);
         let model = reconcile_window_model(&mut models, "codex", before);
         let was = model.row_data(0).expect("one row");
         assert!(!was.not_started);
         assert_ne!(was.reset_rel, "");
+        let inner_before = Rc::as_ptr(&models.get("codex").expect("model stored").model);
 
         let gone = reading_with(Vec::new(), None);
-        let after = window_rows(Some(&m), &gone, NOW, &seen_only("w0:", seen));
+        let after = window_rows(Some(&m), &gone, NOW, &seen_only("w0:", seen), &NO_PROJ);
         let model = reconcile_window_model(&mut models, "codex", after);
         assert_eq!(
             model.row_count(),
             1,
-            "same count: the in-place path is the one under test"
+            "the key sequence is unchanged: one row before and after"
+        );
+        // The count alone does not tell in-place from rebuilt — a rebuild
+        // that happened to land on the same length would pass it too. The
+        // `Rc` pointer does: only the in-place branch of
+        // `reconcile_window_model` returns the same allocation the previous
+        // call stored.
+        let inner_after = Rc::as_ptr(&models.get("codex").expect("model stored").model);
+        assert_eq!(
+            inner_before, inner_after,
+            "the in-place path is the one under test"
         );
 
         let now_row = model.row_data(0).expect("still one row");
@@ -12969,6 +16319,9 @@ mod title_tests {
                     reset_rel_kind: ResetRelKind::Unknown,
                     reset_at: ss(""),
                     tooltip: ss(""),
+                    proj_pct: 0.0,
+                    proj_tone: 1,
+                    burn_line: ss(""),
                 },
             )
         };
@@ -13114,18 +16467,25 @@ mod title_tests {
         let m = stub_manifest("stalled", 10);
         let fetching: Fetching = Rc::new(RefCell::new(HashMap::new()));
         let original_generation = 42;
+        let started = Instant::now();
         fetching.borrow_mut().insert(
             m.id.clone(),
             InFlight {
                 generation: original_generation,
-                started: Instant::now() - FETCH_PATIENCE - Duration::from_secs(1),
+                started,
                 stall_logged: false,
             },
         );
+        // Built by adding to `started`, never by subtracting from
+        // `Instant::now()` — see `spawn_plugin_fetch`'s own doc for why: a
+        // fresh process with well under `FETCH_PATIENCE` of uptime would
+        // panic on that subtraction, where adding to an instant already on
+        // the clock never can.
+        let now = started + FETCH_PATIENCE + Duration::from_secs(1);
         let (tx, _rx) = mpsc::channel();
         let _ = diag::take_recorded();
 
-        spawn_plugin_fetch(&m, vec![], BTreeMap::new(), &tx, &fetching);
+        spawn_plugin_fetch(&m, vec![], BTreeMap::new(), &tx, &fetching, now);
 
         let after_first = fetching
             .borrow()
@@ -13149,7 +16509,7 @@ mod title_tests {
         );
 
         // A second tick, still stalled: no second line, no new generation.
-        spawn_plugin_fetch(&m, vec![], BTreeMap::new(), &tx, &fetching);
+        spawn_plugin_fetch(&m, vec![], BTreeMap::new(), &tx, &fetching, now);
         let after_second = fetching
             .borrow()
             .get(&m.id)
@@ -13191,7 +16551,7 @@ mod title_tests {
     /// `cfg(unix)`, since a Windows shell would need a different script).
     /// `process_group(0)` mirrors what `spawn_hello` sets on the real ping
     /// command — without it,
-    /// `run_with_deadline_kills_a_command_that_outlives_it_and_its_child`
+    /// `run_with_deadline_kills_a_command_that_outlives_it_and_its_grandchild`
     /// below would prove nothing about `kill_process_tree` reaching a
     /// grandchild, since there would be no group for it to join.
     #[cfg(unix)]
@@ -13466,9 +16826,16 @@ mod title_tests {
     /// `if let Some`, on `home_dir()`: a test environment with no resolvable
     /// home is the one case this property can't even be asked about, and
     /// silently skipping the assertion is how the same mistake happens twice.
+    ///
+    /// Goes through [`ping_cwd_from`] with a temp-dir parent for both
+    /// attempts, not [`ping_cwd`] itself: that function's *fallback* parent
+    /// is `seed::plugins_dir()`, under the real `$HOME` on this machine, and
+    /// calling it directly would only avoid reaching that branch for as long
+    /// as the OS temp directory keeps accepting the primary attempt.
     #[test]
     fn ping_cwd_is_never_the_home_directory() {
-        let cwd = ping_cwd().expect("one of the two attempts succeeds in a test environment");
+        let parent = std::env::temp_dir();
+        let cwd = ping_cwd_from(&parent, &parent).expect("a writable parent always succeeds");
         assert!(cwd.exists(), "the returned directory must already exist");
         let home = dirs::home_dir().expect("a test environment has a resolvable home directory");
         assert!(
@@ -13486,8 +16853,9 @@ mod title_tests {
     /// entirely) could have left a file in.
     #[test]
     fn ping_cwd_creates_a_distinct_directory_on_every_call() {
-        let first = ping_cwd().expect("first call creates a directory");
-        let second = ping_cwd().expect("second call creates a directory");
+        let parent = std::env::temp_dir();
+        let first = ping_cwd_from(&parent, &parent).expect("first call creates a directory");
+        let second = ping_cwd_from(&parent, &parent).expect("second call creates a directory");
         assert_ne!(
             first, second,
             "reusing one directory across runs is the gap a fresh one per run closes"
@@ -13504,9 +16872,39 @@ mod title_tests {
     #[cfg(unix)]
     fn ping_cwd_creates_the_directory_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let cwd = ping_cwd().expect("a directory is created");
+        let parent = std::env::temp_dir();
+        let cwd = ping_cwd_from(&parent, &parent).expect("a directory is created");
         let mode = std::fs::metadata(&cwd).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "got mode {mode:o}");
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// The branch neither test above ever reaches: a primary parent that
+    /// cannot be created into (here, a *file* standing where a directory
+    /// would go — `create_ping_workdir`'s `DirBuilder::create` fails on
+    /// that the same way it would on a permission-denied real temp dir)
+    /// falls back to the second parent, itself still a temp directory, never
+    /// `seed::plugins_dir()`.
+    #[test]
+    fn ping_cwd_falls_back_when_the_primary_parent_cannot_be_created_into() {
+        let unwritable_parent = std::env::temp_dir().join(format!(
+            "tickover-ping-cwd-unwritable-parent-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::write(&unwritable_parent, b"a file, not a directory")
+            .expect("create the file standing in the primary parent's way");
+        let fallback_parent = std::env::temp_dir();
+
+        let cwd = ping_cwd_from(&unwritable_parent, &fallback_parent)
+            .expect("the fallback parent still succeeds");
+        assert!(
+            cwd.starts_with(&fallback_parent),
+            "must have fallen back, not somehow created under the unwritable parent: {}",
+            cwd.display()
+        );
+
+        std::fs::remove_file(&unwritable_parent).ok();
         std::fs::remove_dir_all(&cwd).ok();
     }
 
@@ -13894,6 +17292,27 @@ mod title_tests {
         assert!(
             !should_refresh_panel(false, false),
             "hidden and nothing forcing it: the one case a refresh is skipped"
+        );
+    }
+
+    /// The regression: a second launch's note used to read as nothing to do
+    /// once the window was already visible, even though "visible" never
+    /// meant "on top" — dock mode, another app in front, the same
+    /// window the note was trying to reach. The note is consumed either
+    /// way; what changed is what happens with it.
+    #[test]
+    fn show_request_action_raises_a_visible_window_instead_of_dropping_the_request() {
+        assert_eq!(show_request_action(false, false), ShowRequestAction::None);
+        assert_eq!(show_request_action(false, true), ShowRequestAction::None);
+        assert_eq!(
+            show_request_action(true, false),
+            ShowRequestAction::Present,
+            "hidden: the ordinary present-and-place sequence"
+        );
+        assert_eq!(
+            show_request_action(true, true),
+            ShowRequestAction::Raise,
+            "visible but possibly buried: raise it, don't drop the request"
         );
     }
 
@@ -14612,7 +18031,7 @@ mod title_tests {
             args: Vec::new(),
             renews_token: true,
         };
-        assert_eq!(ping_binary(&plugin_id, &ping), None);
+        assert_eq!(ping_binary(&plugin_id, &ping.bin), None);
     }
 
     /// A missing `[ping]` binary is caught by `ping_binary` before
@@ -14880,15 +18299,16 @@ mod title_tests {
             "the flip starts clean: {state:?}"
         );
 
-        // Same-host respawn (a verdict aged past the TTL) keeps `last` —
-        // it is ignored anyway, and dropping it would only widen the window
-        // in which nothing is known.
-        let at = Instant::now();
+        // Same-host respawn keeps `last` whatever its age — `ping_probe_stamp`
+        // never reads the timestamp at all, only `ping_probe_decision` does,
+        // so any instant here proves the same thing; dropping `last` on a
+        // same-host respawn would only widen the window in which nothing is
+        // known.
         let mut same = PingProbe {
             host: "example.com".to_string(),
             in_flight: false,
             started: None,
-            last: Some((at - PING_PROBE_TTL - Duration::from_secs(1), true)),
+            last: Some((Instant::now(), true)),
         };
         ping_probe_stamp(&mut same, "example.com");
         assert!(
@@ -15407,6 +18827,69 @@ mod title_tests {
         assert_eq!(found, None);
     }
 
+    /// Two files declaring the same id must resolve to the one
+    /// `plugin::manifest::load_dir` actually keeps — lowest `order`, ties
+    /// broken by path, the same rule `dedup_plugin_ids` relies on to call the
+    /// loser a duplicate. Directory-listing order is neither, and is not even
+    /// alphabetical on every filesystem this runs on, so pinning a single
+    /// pair of names only ever proves the point on a filesystem whose
+    /// `read_dir` happens to disagree with the correct answer: one that
+    /// hands entries back in name order already puts the low-`order` file
+    /// first even to a scan that never sorts at all. Two pairs, with the
+    /// low-`order` file at opposite ends of the alphabet in each, closes
+    /// that gap — whichever way this filesystem's `read_dir` orders the two
+    /// names, at least one pair puts the correct answer somewhere other
+    /// than "whichever entry the scan meets first".
+    #[test]
+    fn find_plugin_manifest_path_resolves_a_duplicate_id_the_way_the_loader_would() {
+        for (low_name, high_name) in [
+            ("aaa-shadowed.toml", "zzz-winner.toml"),
+            ("zzz-shadowed.toml", "aaa-winner.toml"),
+        ] {
+            let dir = temp_plugins_dir("duplicate-id");
+            let wins = dir.join(low_name);
+            let loses = dir.join(high_name);
+            std::fs::write(&wins, stub_manifest_toml("dup", 1)).expect("write fixture");
+            std::fs::write(&loses, stub_manifest_toml("dup", 9)).expect("write fixture");
+
+            let found = find_plugin_manifest_path(&dir, "dup");
+            std::fs::remove_dir_all(&dir).ok();
+
+            assert_eq!(
+                found,
+                Some(wins),
+                "the lowest-`order` file ({low_name}) wins a duplicate id, not whichever \
+                 the scan meets first"
+            );
+        }
+    }
+
+    /// A metadata read that fails for a reason other than absence — here, a
+    /// directory whose search permission was pulled out from under it — must
+    /// answer "not free", the same as a removal that failed outright a few
+    /// lines below it. Answering "free" is what let Remove wipe a plugin's
+    /// settings while its manifest was still sitting there, unreadable
+    /// rather than gone.
+    #[test]
+    #[cfg(unix)]
+    fn remove_unparsable_remnant_treats_an_unreadable_metadata_as_not_free() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_plugins_dir("remnant-metadata-error");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o600))
+            .expect("deny traversal into the directory");
+
+        let free = remove_unparsable_remnant(&dir, "acme");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions so cleanup can remove the directory");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            !free,
+            "a metadata error that is not NotFound must not read as an empty slot"
+        );
+    }
+
     // ── Registry: check-updates / install / update ────────────────────────
     // Every test here is hermetic — `registry::fetch_text`/`fetch_bytes`
     // (the module's two network calls) are never invoked; fixtures are built
@@ -15479,6 +18962,25 @@ mod title_tests {
         );
         let m = PluginManifest::from_str(&toml).expect("valid manifest with a version field");
         assert_eq!(plugin_row(&m).current_version.as_str(), "2.3.4");
+    }
+
+    /// `available` reaches this row the same way a not-yet-installed entry's
+    /// `name`/`description`/`version` reach `registry_entry_row`'s — off
+    /// whatever host serves `index.toml` — so a bidi override in it must
+    /// never land on an already-installed plugin's update badge raw either.
+    #[test]
+    fn apply_update_badge_sanitizes_the_registry_declared_available_version() {
+        let m = stub_manifest("acme", 1);
+        let mut row = plugin_row(&m);
+
+        apply_update_badge(&mut row, "1.1.0\u{202E}", true);
+
+        assert_eq!(
+            row.available_version.as_str(),
+            tickover::plugin::sanitize_provider_text("1.1.0\u{202E}")
+        );
+        assert!(!row.available_version.contains('\u{202E}'));
+        assert!(row.has_local_edits);
     }
 
     /// An argument containing whitespace, joined onto the others by a
@@ -15581,13 +19083,22 @@ mod title_tests {
         assert_eq!(diff.new_rows[0].error.as_str(), "");
     }
 
-    /// `name`/`description` come off whatever host serves the registry's
-    /// `index.toml` — this build's own, or a third-party one the user pointed
-    /// it at — so a control character or a bidi override in either must never
-    /// reach the plugin-manager row raw.
+    /// `name`/`description`/`version` come off whatever host serves the
+    /// registry's `index.toml` — this build's own, or a third-party one the
+    /// user pointed it at — so a control character or a bidi override in any
+    /// of the three must never reach the plugin-manager row raw. Built
+    /// straight from a `RegistryEntry`, bypassing `RegistryIndex::validate`
+    /// the way a caller only ever reaches this function after it: pinning
+    /// that the row itself still refuses to trust it, should validation ever
+    /// have a gap.
     #[test]
-    fn registry_entry_row_sanitizes_name_and_description() {
-        let mut entry = make_registry_entry("acme", "Acme\nProvider\u{202E}", "1.0.0", "deadbeef");
+    fn registry_entry_row_sanitizes_name_description_and_version() {
+        let mut entry = make_registry_entry(
+            "acme",
+            "Acme\nProvider\u{202E}",
+            "1.0.0\u{202E}",
+            "deadbeef",
+        );
         entry.description = Some("reads\u{200B}your\ncredentials".to_string());
 
         let row = registry_entry_row(&entry);
@@ -15599,8 +19110,205 @@ mod title_tests {
             row.description.as_str(),
             tickover::plugin::sanitize_provider_text("reads\u{200B}your\ncredentials")
         );
+        assert_eq!(
+            row.version.as_str(),
+            tickover::plugin::sanitize_provider_text("1.0.0\u{202E}")
+        );
         assert!(!row.name.contains('\n') && !row.name.contains('\u{202E}'));
         assert!(!row.description.contains('\n') && !row.description.contains('\u{200B}'));
+        assert!(!row.version.contains('\u{202E}'));
+    }
+
+    /// `RegistryIndex::validate` lets a description run to
+    /// `registry::REGISTRY_DESCRIPTION_MAX_CHARS` (256) — well past
+    /// `tickover::plugin::PROVIDER_TEXT_MAX_CHARS`'s 64. Built at the length
+    /// the longest description this repo ships happens to be, rather than
+    /// read off `plugins/index.toml` itself, so this pins the sink's own cap
+    /// instead of whatever that file says today.
+    #[test]
+    fn registry_entry_row_keeps_a_shipped_length_description_whole() {
+        let longest_shipped: String = "x".repeat(83);
+        let mut entry = make_registry_entry("acme", "Acme", "1.0.0", "deadbeef");
+        entry.description = Some(longest_shipped.clone());
+
+        let row = registry_entry_row(&entry);
+        assert_eq!(row.description.as_str(), longest_shipped.as_str());
+    }
+
+    /// Past its own cap, the row's description ends in `…` rather than
+    /// being cut silently the way `tickover::plugin::sanitize_provider_text`
+    /// cuts a caption — reachable here only because this test, like the one
+    /// above, builds the `RegistryEntry` directly rather than through
+    /// `RegistryIndex::validate`, which never lets a description run this
+    /// long in the first place.
+    #[test]
+    fn registry_entry_row_ellipsises_a_description_past_its_own_cap() {
+        let over_cap = "x".repeat(registry::REGISTRY_DESCRIPTION_MAX_CHARS + 1);
+        let mut entry = make_registry_entry("acme", "Acme", "1.0.0", "deadbeef");
+        entry.description = Some(over_cap);
+
+        let row = registry_entry_row(&entry);
+        assert!(row.description.chars().count() <= registry::REGISTRY_DESCRIPTION_MAX_CHARS);
+        assert!(row.description.ends_with('…'), "{}", row.description);
+    }
+
+    /// A validator refusal embeds the manifest's own offending text (a
+    /// `client.bins` entry, a `path_env_join` value, a service name — see
+    /// `PluginManifest::validate`'s own messages) — untrusted the same way
+    /// a registry's `name`/`description` are, and the row above already
+    /// routes those through a sanitiser. This one must too, or a control
+    /// character/bidi override in a rejected manifest's own text reaches
+    /// the plugin-manager row raw. `sanitize_trust_item`, not
+    /// `sanitize_provider_text`: a refusal is a sentence, not a label, and
+    /// the label-sized cap would cut one mid-word with nothing to say so —
+    /// see the two tests below.
+    #[test]
+    fn handle_install_outcome_sanitizes_a_validator_refusal_before_it_reaches_the_row() {
+        let entry = make_registry_entry("acme", "Acme", "1.0.0", "deadbeef");
+        let registry_model: RegistryRows = Rc::new(VecModel::from(vec![RegistryPluginRow {
+            id: ss("acme"),
+            name: ss("Acme"),
+            version: ss("1.0.0"),
+            description: ss(""),
+            status: InstallStatus::Installing,
+            error: ss(""),
+        }]));
+        let plugin_model: PluginRows = Rc::new(VecModel::from(Vec::<PluginRow>::new()));
+        let plugins: Plugins = Rc::new(RefCell::new(Vec::new()));
+
+        let raw = "surface \"default\": a `keychain` auth step's `client.bins` entry \
+                   \"\u{202E}evil\u{202E}\" must be a bare program name, not a path";
+        let wrote = handle_install_outcome(
+            PendingKind::Install,
+            entry,
+            InstallOutcome::Failed(raw.to_string()),
+            &plugins,
+            &plugin_model,
+            &registry_model,
+        );
+        assert!(!wrote, "a failed fetch/verify never writes a manifest");
+
+        let row = registry_model.row_data(0).expect("row still present");
+        assert_eq!(row.status, InstallStatus::Failed);
+        assert_eq!(row.error.as_str(), sanitize_trust_item(raw));
+        assert!(!row.error.contains('\u{202E}'));
+    }
+
+    /// `install_write`/`update_write` can fail with an `io::Error` folded in
+    /// with `.to_string()`, or with a string of their own before any I/O is
+    /// attempted (this one: `update_write`'s "no installed manifest file
+    /// found for id") — a path or id spelled out in the message either way,
+    /// no more this app's own text than a validator's refusal is —
+    /// `fail_pending_row` is the same sanitiser [`handle_install_outcome`]
+    /// routes both through. Pinned directly against `fail_pending_row`
+    /// rather than through `handle_install_outcome` itself: reaching this
+    /// branch that way means going through `seed::plugins_dir()`, the real
+    /// config directory this app writes to, which this test never touches.
+    #[test]
+    fn fail_pending_row_sanitizes_a_write_failure_before_it_reaches_the_row() {
+        let m = stub_manifest("acme", 1);
+        let plugin_model: PluginRows = Rc::new(VecModel::from(vec![plugin_row(&m)]));
+        let plugins: Plugins = Rc::new(RefCell::new(vec![m]));
+        let registry_model: RegistryRows = Rc::new(VecModel::from(Vec::<RegistryPluginRow>::new()));
+
+        let raw = "no installed manifest file found for id \"acme\u{202E}\"";
+        let wrote = fail_pending_row(
+            PendingKind::Update,
+            "acme",
+            &plugins,
+            &plugin_model,
+            &registry_model,
+            raw,
+        );
+        assert!(!wrote, "a write failure never counts as a landed write");
+
+        let row = plugin_model.row_data(0).expect("row still present");
+        assert_eq!(row.update_status, UpdateStatus::Failed);
+        assert_eq!(row.update_error.as_str(), sanitize_trust_item(raw));
+        assert!(!row.update_error.contains('\u{202E}'));
+    }
+
+    /// The case the cap raise is for: `registry::verify_and_prepare`'s own
+    /// sha256-mismatch message is composed by this app, never quoted from a
+    /// manifest, and `expected_sha_hex` is shortened here so the whole
+    /// message sits under [`TRUST_ITEM_MAX_CHARS`] — nothing this short
+    /// should ever be touched at all.
+    #[test]
+    fn handle_install_outcome_leaves_an_app_authored_refusal_under_the_cap_intact() {
+        let entry = make_registry_entry("acme", "Acme", "1.0.0", "deadbeef");
+        let registry_model: RegistryRows = Rc::new(VecModel::from(vec![RegistryPluginRow {
+            id: ss("acme"),
+            name: ss("Acme"),
+            version: ss("1.0.0"),
+            description: ss(""),
+            status: InstallStatus::Installing,
+            error: ss(""),
+        }]));
+        let plugin_model: PluginRows = Rc::new(VecModel::from(Vec::<PluginRow>::new()));
+        let plugins: Plugins = Rc::new(RefCell::new(Vec::new()));
+
+        let refusal = registry::verify_and_prepare(b"downloaded bytes", "x").unwrap_err();
+        assert!(refusal.chars().count() <= TRUST_ITEM_MAX_CHARS, "{refusal}");
+        handle_install_outcome(
+            PendingKind::Install,
+            entry,
+            InstallOutcome::Failed(refusal.clone()),
+            &plugins,
+            &plugin_model,
+            &registry_model,
+        );
+        let row = registry_model.row_data(0).expect("row still present");
+        assert_eq!(row.error.as_str(), refusal);
+    }
+
+    /// The defect the cap raise closes, at the length two full sha256
+    /// hashes actually run to: at the 64-character label cap this message
+    /// used to end inside the *first* hash, silently. At
+    /// [`TRUST_ITEM_MAX_CHARS`] that hash, and the field name around it,
+    /// survive whole, and the cut that still has to happen is marked rather
+    /// than silent.
+    #[test]
+    fn handle_install_outcome_marks_a_refusal_past_the_cap_with_an_ellipsis() {
+        let entry = make_registry_entry("acme", "Acme", "1.0.0", "deadbeef");
+        let registry_model: RegistryRows = Rc::new(VecModel::from(vec![RegistryPluginRow {
+            id: ss("acme"),
+            name: ss("Acme"),
+            version: ss("1.0.0"),
+            description: ss(""),
+            status: InstallStatus::Installing,
+            error: ss(""),
+        }]));
+        let plugin_model: PluginRows = Rc::new(VecModel::from(Vec::<PluginRow>::new()));
+        let plugins: Plugins = Rc::new(RefCell::new(Vec::new()));
+
+        let expected_sha_hex = registry::sha256_hex(b"correct-content");
+        let refusal =
+            registry::verify_and_prepare(b"totally-wrong-content", &expected_sha_hex).unwrap_err();
+        assert!(refusal.chars().count() > TRUST_ITEM_MAX_CHARS, "{refusal}");
+        handle_install_outcome(
+            PendingKind::Install,
+            entry,
+            InstallOutcome::Failed(refusal.clone()),
+            &plugins,
+            &plugin_model,
+            &registry_model,
+        );
+        let row = registry_model.row_data(0).expect("row still present");
+        assert!(row.error.ends_with('…'), "{}", row.error);
+        let leading: String = refusal.chars().take(TRUST_ITEM_MAX_CHARS).collect();
+        assert!(
+            leading.contains(&expected_sha_hex),
+            "the wider cap must keep the expected hash whole: {leading}"
+        );
+        assert_eq!(
+            row.error
+                .chars()
+                .take(TRUST_ITEM_MAX_CHARS)
+                .collect::<String>(),
+            leading,
+            "leading content must survive the cut"
+        );
+        assert_eq!(row.error.chars().count(), TRUST_ITEM_MAX_CHARS + 1);
     }
 
     #[test]
@@ -15634,6 +19342,43 @@ mod title_tests {
             has_local_edits,
             "the installed file diverged from its recorded origin"
         );
+    }
+
+    /// `broken`'s message comes straight from [`manifest::load_dir`], which
+    /// quotes the unparsable file's own bytes back in its error — a bidi
+    /// override or a run past [`TRUST_ITEM_MAX_CHARS`] must not reach this
+    /// row any more than a validator refusal does on the sibling path
+    /// [`handle_install_outcome`] routes through `fail_pending_row`.
+    #[test]
+    fn fold_registry_diff_sanitizes_an_unparsable_manifest_s_message_before_it_reaches_the_row() {
+        let index = RegistryIndex {
+            schema_version: 1,
+            plugins: vec![make_registry_entry(
+                "brandnew",
+                "Brand New",
+                "0.3.0",
+                &registry::sha256_hex(b"brandnew-bytes"),
+            )],
+        };
+        let lockfile = registry::RegistryLockState::default();
+        let raw_msg = format!(
+            "expected a table, found a string\u{202E}{}",
+            "x".repeat(TRUST_ITEM_MAX_CHARS)
+        );
+        let broken = vec![("brandnew".to_string(), raw_msg.clone())];
+
+        let diff = fold_registry_diff(&index, &[], &lockfile, &broken);
+
+        assert_eq!(diff.new_rows.len(), 1);
+        let row = &diff.new_rows[0];
+        assert_eq!(row.status, InstallStatus::Failed);
+        let expected = format!(
+            "the installed brandnew.toml cannot be read — {}. \
+             Remove or fix that file to install this plugin.",
+            sanitize_trust_item(&raw_msg),
+        );
+        assert_eq!(row.error.as_str(), expected);
+        assert!(!row.error.contains('\u{202E}'));
     }
 
     #[test]
@@ -16333,24 +20078,59 @@ mod title_tests {
         );
     }
 
-    /// With no `TICKOVER_DEMO_ACCOUNT` set (the ordinary case, and the only
-    /// one safe to exercise here — the override is resolved once per process
-    /// into a `OnceLock`, so no test can flip it back and forth), the address
-    /// passed in comes back unchanged.
+    /// `display_account` itself is not exercised here: its `OnceLock` is
+    /// resolved once for the whole process from whatever the real
+    /// environment says, so a test built on it would pass or fail depending
+    /// on which other test happened to ask first — and on whether the
+    /// developer running the suite has `TICKOVER_DEMO_ACCOUNT` exported the
+    /// way `docs/DEVELOPMENT.md` tells them to for screenshots. The rule
+    /// itself lives in `display_account_with`, which takes the resolved
+    /// environment as a plain argument instead of caching it, so it is what
+    /// gets tested — with no demo account, the address passed in comes back
+    /// unchanged either way.
     #[test]
-    fn display_account_passes_the_real_address_through_with_no_demo_override() {
-        assert_eq!(display_account("person@example.com"), "person@example.com");
-        assert_eq!(display_account(""), "", "an empty account stays empty");
+    fn display_account_with_passes_the_real_address_through_with_no_demo_override() {
+        assert_eq!(
+            display_account_with(None, "person@example.com"),
+            "person@example.com"
+        );
+        assert_eq!(
+            display_account_with(None, ""),
+            "",
+            "an empty account stays empty"
+        );
     }
 
-    /// [`tray_indicator_key`] changes exactly when something it is a proxy
-    /// for changed — the widget's own [`menubar::cache_key`], the
-    /// disabled/empty/rendered shape, or the tooltip's own minute-by-minute
-    /// text — and stays put otherwise, so `sync_tray_indicator_from`'s "same
-    /// key, no work" shortcut neither redraws on nothing nor misses a real
-    /// change.
+    /// A demo account set in the environment replaces a real, non-empty
+    /// address, but never invents one where the underlying reading has
+    /// none — an empty account is "no reading yet", not something a
+    /// screenshot stand should paper over with a fake identity.
     #[test]
-    fn tray_indicator_key_changes_with_the_widget_or_the_tooltip_and_only_then() {
+    fn display_account_with_a_demo_override_replaces_a_real_address_but_not_an_empty_one() {
+        assert_eq!(
+            display_account_with(Some("demo@example.com"), "person@example.com"),
+            "demo@example.com"
+        );
+        assert_eq!(
+            display_account_with(Some("demo@example.com"), ""),
+            "",
+            "nothing to replace when there is no account reading yet"
+        );
+    }
+
+    /// [`tray_indicator_key`] changes when something it is a proxy for
+    /// changed — the widget's own [`menubar::cache_key`], the
+    /// disabled/empty/rendered shape, or the tooltip's own minute-by-minute
+    /// text — so `sync_tray_indicator_from`'s "same key, no work" shortcut
+    /// neither redraws on nothing nor misses a real change.
+    ///
+    /// Covers those three inputs only, not all of them: the key also folds
+    /// in `tray_badge_px()` on Windows, read live from `GetSystemMetrics`
+    /// with no parameter this test could vary deterministically, so that
+    /// axis is untested here — a DPI change on that platform is trusted to
+    /// move the key on the strength of the source, not a test double.
+    #[test]
+    fn tray_indicator_key_changes_with_the_widget_or_the_tooltip() {
         let row = |used_percent: f64| menubar::ProviderRow {
             label: "Cx".to_string(),
             five_hour: Some(menubar::WindowStat {

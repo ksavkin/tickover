@@ -4,13 +4,22 @@ Native menu-bar (macOS) / system-tray (Windows) indicator of AI-assistant usage 
 
 ## Build / test / run
 - Build: `cargo build --release` (`rust-toolchain.toml` pins stable; an older system rustc — e.g. 1.76 — will NOT compile this, so always go through `cargo` in the project dir). On Windows the MSVC toolchain is required — Visual Studio Build Tools with the "Desktop development with C++" workload, or a full Visual Studio install — because that is what the default `x86_64-pc-windows-msvc` target links with; without it `cargo build` fails at the link step, not at compile time. The Windows binary is `target\release\tickover.exe`.
-- **`[profile.release]` deliberately keeps unwinding** (no `panic = "abort"`, see Cargo.toml's own comment there): `main.rs`'s `FetchGuard`/`RegistryGuard` turn a panic on a background fetch/install thread into an empty or failed result sent on `drop`, which `"abort"` would skip by ending the process at the panic site instead. The cost is a larger stripped binary — about 8.5 MB on macOS arm64 instead of about 6.8 MB.
+- **The `history` feature (on by default) is the local usage-history
+  subsystem** — provider transcript/log scanning, the `stats` CLI, and the
+  panel's Activity section — and it pulls in exactly one dependency,
+  `rusqlite` (bundled, for Antigravity's SQLite conversations). `cargo build
+  --release --no-default-features` drops SQLite and the whole subsystem for
+  a quota-only binary; `cargo test --no-default-features` (under the same
+  substituted `HOME` as below) skips `tests/history_e2e.rs`, which is gated
+  `#![cfg(feature = "history")]` and does not run in that configuration.
+- **`[profile.release]` deliberately keeps unwinding** (no `panic = "abort"`, see Cargo.toml's own comment there): `main.rs`'s `FetchGuard`/`RegistryGuard` turn a panic on a background fetch/install thread into an empty or failed result sent on `drop`, which `"abort"` would skip by ending the process at the panic site instead. The cost is a larger stripped binary: about 8.5 MB on macOS arm64 against about 6.8 MB, measured when the choice was made — the binary has grown to about 10.6 MB since, and the comparison has not been taken again on it.
 - Test: **only under a substituted `HOME`** — otherwise the suite reads and writes the real one:
   ```bash
   REAL_HOME="$HOME"; FH=$(mktemp -d)
   HOME="$FH" CARGO_HOME="$REAL_HOME/.cargo" RUSTUP_HOME="$REAL_HOME/.rustup" cargo test
   ```
   `seed::plugins_dir()` and `config::dir()` take no override, and a few tests read `dirs::home_dir()` directly (`engine_logfile`, `plugin::mod`). This is not a precaution against something hypothetical: a run under the real `HOME` wrote `plugin.copilot.builtin_migrated` into the live `config.json` while the manifests it was seeding went to a temp dir, and that marker — "this install has already had its say about that version" — would have kept the built-in Copilot manifest from ever being delivered, silently. `config::path()` has been sandboxed under `cfg(test)` since; the folder around it has not. `.github/workflows/ci.yml` and `release.yml` run `cargo test` with no substitution of their own, and that is fine there and only there: a GitHub-hosted runner's `HOME` is a fresh, disposable VM home with nothing real underneath it, unlike a laptop running this on the side.
+- `tests/report_js.rs` runs the report's `report.js` under `node` and holds its sums against `query::compute`. Without `node` on `PATH` those tests skip with a message, except under `CI`, where they fail: that file is the only check on the browser's arithmetic.
 - Docs, two gates, both needed: `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --locked` documents the **lib** crate; `cargo rustdoc --locked --bin tickover -- --document-private-items -D warnings` documents the **bin** crate. They are not redundant — the lib and the bin share the crate name `tickover`, so cargo drops the bin from a plain `cargo doc` run with nothing louder than a filename-collision warning, and the first command alone never once looks at `src/main.rs`. Both run on the macOS CI job, right after clippy.
 - **`tray-icon` is pinned to `0.22`**, which pins muda 0.17 / objc2 0.6 in turn — that is the set that matches Slint 1.13's winit backend. Upgrading `tray-icon` past `0.22` on its own pulls in a newer objc2 and aborts at startup with a duplicate ObjC class `MudaMenuItem`.
 - Headless screenshots: `TICKOVER_SNAPSHOT=/tmp/out.png ./target/release/tickover` (add `TICKOVER_SNAPSHOT_SETTINGS=1` for the settings sheet). Menu-bar pill: `cargo run --release --example widget_probe` → `target/widget-{dark,light}.png`.

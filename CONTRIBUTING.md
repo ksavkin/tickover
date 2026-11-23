@@ -21,11 +21,26 @@ Two rules decide most questions before they are asked:
 
 - **The app never prints a figure the provider did not state.** A percentage
   computed from something else is out, and so is a number scraped from a web
-  page or estimated from local logs. The one licensed conversion is
-  complementing a stated *remaining* fraction into the consumed percent a
-  window holds — a change of units, reversible, information-preserving.
-- **A mechanism with no consumer is not shipped.** If a manifest key would have
-  nothing to read on any account anyone here can see, it waits.
+  page. Two conversions are licensed: complementing a stated *remaining*
+  fraction into the consumed percent a window holds — a change of units,
+  reversible, information-preserving — and an API-equivalent dollar cost
+  computed from locally counted tokens against a bundled list-price snapshot
+  (`assets/prices.json`, read by `src/history/pricing.rs`), on unless
+  switched off, always labelled as what the tokens would cost at API prices
+  and never presented as a bill. Statements about a window's
+  *future* are licensed on a narrower condition: the hatched projection band
+  and its `~63%`, the `caps ~18:40` it becomes, the `pace +22 pp` tooltip and
+  the `burn 41.2K/h` beside them come from figures the provider did state (the
+  used percent, the reset time, the window's period) or from this app's own
+  token count; they are drawn hatched and prefixed with `~` so they cannot be
+  read as a measurement, and they never replace the headline figure or the
+  solid fill, which stay exactly what the provider reported.
+- **A mechanism with no consumer is not shipped — with one named
+  exception.** If a manifest key would have nothing to read on any account
+  anyone here can see, it waits. `config::set_history_cost_estimate` ships
+  ahead of the settings-sheet toggle that will call it: the same
+  `#[allow(dead_code)]` that lets it compile says, at the definition, that
+  nothing calls it yet.
 
 ## Building and running
 
@@ -93,3 +108,21 @@ Read `SECURITY.md` first. A change that widens what a manifest can reach — a
 new credential store, a new place a token may be substituted into, a relaxation
 of `allowed_hosts` — is a trust-model change and should say so in its commit
 message, whatever its size.
+
+## History extractors
+
+The `[history]` formats in `src/history/formats/` are clean-room work: they
+were derived from watching what the CLIs write on disk, not from reading
+provider source. `docs/history-formats.md` carries the wire details so a new
+extractor — or a fix to an old one — can be argued from the file format
+itself.
+
+Two invariants are not negotiable:
+
+- **A provider's corpus is read-only.** No extractor writes into it; the
+  SQLite format opens `mode=ro` for exactly this reason. A
+  locked or busy file yields nothing this tick rather than blocking.
+- **Usage metadata only.** An extractor emits timestamps, project names,
+  model names, and token counts — never prompt or message text. The
+  sentinel test in `tests/history_e2e.rs` fails the build if any of that
+  ever reaches the store or the report.

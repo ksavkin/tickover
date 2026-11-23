@@ -100,16 +100,18 @@ pub enum ResolveError {
     /// that sets `no_credentials_message` can say "not signed in" here too,
     /// by type rather than by matching this message's text — see
     /// `plugin::engine_http::fetch_surface`. A store that is not a JSON object
-    /// stays [`ResolveError::PresentErr`]: that is damage, not a sign-out.
+    /// stays [`ResolveError::PresentErr`]: that is damage, not a sign-out. So
+    /// does a `credentials-map` with more than one matching entry: its tokens
+    /// are there, only which one to use is unknown.
     NoToken(String),
     Empty(ResolveEmpty),
 }
 
 /// A step's failure, as [`run_step`] hands it to [`resolve_token`]. Only
-/// the steps that read a JSON blob through [`token_from_blob`] can produce
-/// [`StepError::NoToken`]; every other step's `String` error converts into
-/// [`StepError::Broken`] through `From`, so `?` keeps working unchanged
-/// inside them.
+/// the steps that read a JSON blob through [`token_from_blob`], and
+/// [`credentials_map_step`], can produce [`StepError::NoToken`]; every other
+/// step's `String` error converts into [`StepError::Broken`] through `From`,
+/// so `?` keeps working unchanged inside them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StepError {
     Broken(String),
@@ -197,7 +199,7 @@ fn run_step(
         AuthType::Env => Ok(env_step(step)?),
         AuthType::ElectronSafeStorage => Ok(electron_safe_storage_step(step)?),
         AuthType::WinCredential => win_credential_step(step, lapsed_expiry),
-        AuthType::CredentialsMap => Ok(credentials_map_step(step, lapsed_expiry)?),
+        AuthType::CredentialsMap => credentials_map_step(step, lapsed_expiry),
         AuthType::RejectWhen => Ok(reject_when_step(step)?),
         AuthType::OauthRefresh => Ok(oauth_refresh_step(step, allowed_hosts, provider)?),
     }
@@ -245,15 +247,17 @@ fn reject_when_step(step: &AuthStep) -> Result<Option<String>, String> {
 /// Whether a dotted path resolves to a value that is actually *there* — a
 /// JSON `null` counts as absent, which is how `~/.codex/auth.json` spells "no
 /// API key" (`"OPENAI_API_KEY": null`) while the key is present.
+///
+/// Goes through the shared [`super::json_path_get`] — the same reader every
+/// other path on a manifest resolves with, `[[windows.source]]` and
+/// `[account] json_path` included — rather than a private split on `.` of
+/// its own: a selector this rule's own `path`/`unless_json_path` can spell
+/// (`limits[kind=weekly_scoped]`, an array index) is exactly the syntax a
+/// bare `cur.get(seg)` walk cannot follow, so a manifest that needed one here
+/// would have had this rule silently never fire — a rule whose whole purpose
+/// is to refuse.
 fn json_path_present(root: &Value, path: &str) -> bool {
-    let mut cur = root;
-    for seg in path.split('.') {
-        match cur.get(seg) {
-            Some(next) => cur = next,
-            None => return false,
-        }
-    }
-    !cur.is_null()
+    super::json_path_get(root, path).is_some_and(|v| !v.is_null())
 }
 
 // ── Host allowlist ────────────────────────────────────────────────────────
@@ -313,6 +317,24 @@ fn credentials_file_step(
     if !file.is_file() {
         return Ok(None); // surface not present on this machine
     }
+    // Named ahead of `read_regular_file`'s own cap so the refusal names it:
+    // that function returns the same bare `None` whether a file is too large
+    // or changed kind between this check and the open (the TOCTOU its own
+    // doc describes), and the `is_file()` check just above has already
+    // excluded everything else "not a readable regular file" would
+    // otherwise be honest about — a file too big for the cap is neither
+    // missing nor the wrong kind, and deserves its own sentence rather than
+    // the one written for those.
+    if let Ok(meta) = std::fs::metadata(&file) {
+        if meta.len() > super::SMALL_FILE_MAX_BYTES {
+            return Err(format!(
+                "{} is larger than the {}-byte cap this app reads credentials files up to",
+                file.display(),
+                super::SMALL_FILE_MAX_BYTES
+            )
+            .into());
+        }
+    }
     // Regular and bounded: a credentials path comes from a manifest, and a
     // fetch thread blocked reading a FIFO never reports back at all.
     let text = super::read_regular_file(&file, super::SMALL_FILE_MAX_BYTES)
@@ -356,7 +378,7 @@ fn credentials_file_step(
 fn credentials_map_step(
     step: &AuthStep,
     lapsed_expiry: &mut Option<u64>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, StepError> {
     let path = require_str("credentials-map", "path", step.path.as_deref())?;
     let key_prefix = require_str("credentials-map", "key_prefix", step.key_prefix.as_deref())?;
     let token_json_path = require_str(
@@ -382,23 +404,24 @@ fn credentials_map_step(
     // shadowed by whichever entry the map happens to iterate first.
     let mut matches = object.iter().filter(|(key, _)| key.starts_with(key_prefix));
     let Some((_, entry)) = matches.next() else {
-        return Err(format!(
+        return Err(StepError::NoToken(format!(
             "no entry with a key starting with `{key_prefix}` in {}",
             file.display()
-        ));
+        )));
     };
     if matches.next().is_some() {
         return Err(format!(
             "more than one entry in {} has a key starting with `{key_prefix}` — cannot tell \
              which account's token to use",
             file.display()
-        ));
+        )
+        .into());
     }
     let Some(token) = extract_token_at(entry, token_json_path) else {
-        return Err(format!(
+        return Err(StepError::NoToken(format!(
             "no token at `{token_json_path}` in the entry matching `{key_prefix}` in {}",
             file.display()
-        ));
+        )));
     };
     if let Some(expiry_path) = step.expiry_json_path.as_deref() {
         if let Some(expires_at) = stale_expiry_at(entry, expiry_path, now_unix()) {
@@ -511,7 +534,7 @@ fn keychain_step(
 /// handled so an item written by any version this app might meet unwraps to the
 /// same JSON — matching the library's own read path
 /// (`keyring_darwin.go`), rather than the current write format alone.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn unwrap_go_keyring(raw: &str) -> Result<String, String> {
     const BASE64_PREFIX: &str = "go-keyring-base64:";
     const HEX_PREFIX: &str = "go-keyring-encoded:";
@@ -815,7 +838,7 @@ fn expiry_seconds(value: &Value) -> Option<i64> {
 /// multi-byte character in a corrupt payload would crash the credential path
 /// (which must return `Err`, never panic) instead of being rejected. Any
 /// non-ASCII byte simply fails `is_ascii_hexdigit` and yields `None`.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     if !bytes.len().is_multiple_of(2) {
@@ -1352,12 +1375,87 @@ const REFRESH_BACKOFF_SECS: i64 = 300;
 /// [`REFRESH_CACHE`]'s own doc) — a `Hit` needs no client at all, and a
 /// `Backoff` resolves one only to compare it against the entry's own
 /// `client_id`.
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+fn extract_store_refresh(raw: &str, token_json_path: &str, source: &str) -> Result<String, String> {
+    let json = unwrap_go_keyring(raw)?;
+    extract_token(&json, token_json_path)
+        .ok_or_else(|| format!("no refresh token at `{token_json_path}` in {source}"))
+}
+
+fn resolve_refresh_token(step: &AuthStep, token_json_path: &str) -> Result<Option<String>, String> {
+    let mut last_err: Option<String> = None;
+
+    #[cfg(target_os = "macos")]
+    if let Some(service) = step.refresh_service.as_deref() {
+        match keychain_password(service) {
+            Ok(Some(raw)) => {
+                match extract_store_refresh(
+                    &raw,
+                    token_json_path,
+                    &format!("Keychain item '{service}'"),
+                ) {
+                    Ok(tok) => return Ok(Some(tok)),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(targets) = step.refresh_targets.as_deref() {
+        for target in targets {
+            if let Some(raw) = win_credential(target) {
+                match extract_store_refresh(
+                    &raw,
+                    token_json_path,
+                    &format!("credential '{target}'"),
+                ) {
+                    Ok(tok) => return Ok(Some(tok)),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+        }
+    }
+
+    if let Some(path) = step.path.as_deref() {
+        let file = super::expand_home(path);
+        if file.is_file() {
+            match super::read_regular_file(&file, super::SMALL_FILE_MAX_BYTES) {
+                Some(text) => {
+                    if let Some(tok) = extract_token(&text, token_json_path) {
+                        return Ok(Some(tok));
+                    }
+                    last_err = Some(format!(
+                        "no refresh token at `{token_json_path}` in {}",
+                        file.display()
+                    ));
+                }
+                None => {
+                    last_err = Some(format!("{} is not a readable regular file", file.display()));
+                }
+            }
+        }
+    }
+
+    match last_err {
+        Some(err) => Err(err),
+        None => Ok(None),
+    }
+}
+
 fn oauth_refresh_step(
     step: &AuthStep,
     allowed_hosts: &[String],
     provider: &str,
 ) -> Result<Option<String>, String> {
-    let path = require_str("oauth-refresh", "path", step.path.as_deref())?;
+    if step.path.is_none()
+        && step.refresh_service.is_none()
+        && step.refresh_targets.as_ref().is_none_or(|t| t.is_empty())
+    {
+        require_str("oauth-refresh", "path", None)?;
+    }
     let token_json_path = require_str(
         "oauth-refresh",
         "token_json_path",
@@ -1375,26 +1473,12 @@ fn oauth_refresh_step(
         ));
     }
 
-    // The refresh-token file next, now that the request this step would
-    // eventually make is known to be allowed at all: someone who has never
-    // signed in to this surface has nothing at `path` — the common case for
-    // most people this manifest reaches — but that check comes *after* the
-    // allow-list precisely so a manifest whose `token_url` was never going
-    // to be permitted does not even get to read a file that might not be
-    // there, before a `client` table's discovery scan (hundreds of
-    // megabytes) is reached either.
-    let file = super::expand_home(path);
-    if !file.is_file() {
+    // Read the refresh token after `token_url` and `allowed_hosts` pass, and
+    // before resolving the client pair (`[surface.auth.client]` discovery scans
+    // hundreds of megabytes, so an unsigned-in machine exits Absent right here).
+    let Some(refresh_token) = resolve_refresh_token(step, token_json_path)? else {
         return Ok(None); // not signed in here, or never has been
-    }
-    let text = super::read_regular_file(&file, super::SMALL_FILE_MAX_BYTES)
-        .ok_or_else(|| format!("{} is not a readable regular file", file.display()))?;
-    let refresh_token = extract_token(&text, token_json_path).ok_or_else(|| {
-        format!(
-            "no refresh token at `{token_json_path}` in {}",
-            file.display()
-        )
-    })?;
+    };
 
     // The installed-app pair, resolved only where it is actually needed
     // below (a cache `Hit` never calls this). Without a `client` table this
@@ -1516,47 +1600,19 @@ fn oauth_refresh_step(
         }
     };
 
-    // A failed exchange, and a 200 that carried no usable token, both back
-    // off, so a stuck endpoint is not hit on every tick with no exchange
-    // ever succeeding. The message is stored alongside it, so a later
-    // `Backoff` hit that is not retried can report exactly this failure
-    // rather than a placeholder that only says one happened.
-    let store_backoff = |message: String| {
-        refresh_cache_store(
-            key,
-            CacheEntry::Failed {
-                retry_after_unix: now.saturating_add(REFRESH_BACKOFF_SECS),
-                client_id: client_id.clone(),
-                secret_hash: secret_hash(&client_secret),
-                message,
-            },
-        );
-    };
-    let response = match oauth_refresh_request(
-        token_url,
+    let can_probe_discovered = step
+        .client
+        .as_ref()
+        .is_some_and(|client| client_env_pair(client).is_none());
+    let (access_token, expires_in) = resolve_access_token_with_fallback(
+        key,
         &client_id,
         &client_secret,
-        &refresh_token,
-        provider,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            store_backoff(e.clone());
-            on_exchange_error(step, &e);
-            return Err(e);
-        }
-    };
-    let (access_token, expires_in) = match extract_access_token(&response) {
-        Some(v) => v,
-        None => {
-            // A 200 with no token (or one too short-lived to cache usefully) is
-            // still a reason to back off — otherwise a stuck endpoint is hit
-            // every tick with no exchange ever succeeding.
-            let message = "token refresh response carried no usable access_token".to_string();
-            store_backoff(message.clone());
-            return Err(message);
-        }
-    };
+        step,
+        can_probe_discovered,
+        CLIENT_DISCOVERY_LIMITS,
+        |cid, csec| oauth_refresh_request(token_url, cid, csec, &refresh_token, provider),
+    )?;
     // A 60s margin, same as the keychain step's, so the cached token is
     // retired before a request would 401 on it. `saturating_*` so a
     // hostile/huge `expires_in` cannot overflow the clock — belt and braces
@@ -1565,6 +1621,12 @@ fn oauth_refresh_step(
     // (see that constant's own doc). `extract_access_token` already
     // rejected anything `<= 60`, so `expires_at` is always ahead of `now`
     // here.
+    //
+    // `now`, from before the exchange, deliberately — unlike a failure's own
+    // backoff (see `resolve_access_token`'s doc), retiring a fresh token a
+    // few seconds earlier than its declared life is the safe direction: it
+    // only shortens how long the cache serves it, never lets a request go
+    // out on one already dead.
     let expires_at = now.saturating_add(expires_in).saturating_sub(60);
     refresh_cache_store(
         key,
@@ -1576,8 +1638,167 @@ fn oauth_refresh_step(
     Ok(Some(access_token))
 }
 
+/// Runs the token exchange and turns its outcome into the access token
+/// [`oauth_refresh_step`] wants, or the backoff a failure earns. `exchange`
+/// stands in for [`oauth_refresh_request`] — a free function, not inlined
+/// into `oauth_refresh_step`, for the same reason [`on_exchange_error`] just
+/// below is its own function: it is directly testable against a stubbed
+/// exchange rather than a live one, this crate having no HTTPS test-server
+/// infrastructure.
+///
+/// A failed exchange, and a 200 that carried no usable token, both back off,
+/// so a stuck endpoint is not hit on every tick with no exchange ever
+/// succeeding. The message is stored alongside it, so a later `Backoff` hit
+/// that is not retried can report exactly this failure rather than a
+/// placeholder that only says one happened.
+///
+/// The backoff is stamped from a fresh [`cache_now`] read taken here, once
+/// `exchange` has actually returned — never from a `now` captured before it
+/// ran: `exchange` can spend real time, up to its own timeout, getting an
+/// answer, and a stamp taken earlier would silently spend that whole span
+/// out of [`REFRESH_BACKOFF_SECS`], so a slow-but-failing endpoint would be
+/// retried sooner than the backoff promises, by however long the exchange
+/// took. [`client_discovery_evict`] and [`discover_client_within`]'s own
+/// backoff stamp read the clock the same way, at the point of failure,
+/// rather than reusing a reading from before the work they are timing.
+#[cfg(test)]
+fn resolve_access_token(
+    key: u64,
+    client_id: &str,
+    client_secret: &str,
+    step: &AuthStep,
+    exchange: impl FnOnce() -> Result<Value, String>,
+) -> Result<(String, i64), String> {
+    let mut exchange = Some(exchange);
+    resolve_access_token_with_fallback(
+        key,
+        client_id,
+        client_secret,
+        step,
+        false,
+        CLIENT_DISCOVERY_LIMITS,
+        |_, _| (exchange.take().expect("single exchange attempt"))(),
+    )
+}
+
+/// Runs the token exchange and — when `can_probe_discovered` is `true` and
+/// `exchange` rejects the initial discovered pair with `invalid_client` or
+/// `unauthorized_client` — falls back across up to
+/// [`CLIENT_DISCOVERY_MAX_PROBE_PAIRS`] alternate ID/secret pairs collected from
+/// `step.client`'s candidate binaries, caching any winning pair in
+/// [`CLIENT_DISCOVERY_FOUND`].
+fn resolve_access_token_with_fallback(
+    key: u64,
+    client_id: &str,
+    client_secret: &str,
+    step: &AuthStep,
+    can_probe_discovered: bool,
+    limits: ScanLimits,
+    mut exchange: impl FnMut(&str, &str) -> Result<Value, String>,
+) -> Result<(String, i64), String> {
+    let store_backoff = |message: String| {
+        // Always stamp backoff against the initial pair returned by
+        // `resolve_pair()`, because `CLIENT_DISCOVERY_FOUND` still holds that
+        // pair when probing fails without finding a replacement.
+        refresh_cache_store(
+            key,
+            CacheEntry::Failed {
+                retry_after_unix: cache_now().saturating_add(REFRESH_BACKOFF_SECS),
+                client_id: client_id.to_string(),
+                secret_hash: secret_hash(client_secret),
+                message,
+            },
+        );
+    };
+    let finish_response = |response: &Value| -> Result<(String, i64), String> {
+        match extract_access_token(response) {
+            Some(pair) => Ok(pair),
+            None => {
+                // A 200 with no token (or one too short-lived to cache usefully) is
+                // still a reason to back off — otherwise a stuck endpoint is hit
+                // every tick with no exchange ever succeeding.
+                let message = "token refresh response carried no usable access_token".to_string();
+                store_backoff(message.clone());
+                Err(message)
+            }
+        }
+    };
+
+    let first_err = match exchange(client_id, client_secret) {
+        Ok(r) => return finish_response(&r),
+        Err(e) => e,
+    };
+
+    if can_probe_discovered && is_client_mismatch_error(&first_err) {
+        if let Some(client) = step.client.as_ref() {
+            let sets = discover_client_match_sets(client, limits);
+            let config_key = client_config_key(client);
+            let mut tried = std::collections::HashSet::new();
+            tried.insert((client_id.to_string(), client_secret.to_string()));
+            let mut rejected_ids = std::collections::HashSet::new();
+            if is_unauthorized_client(&first_err) {
+                rejected_ids.insert(client_id.to_string());
+            }
+            let mut attempts = 0usize;
+            let mut last_mismatch = first_err;
+
+            'probe: for set in &sets {
+                for id in &set.ids {
+                    if rejected_ids.contains(id.as_str()) {
+                        continue;
+                    }
+                    for secret in &set.secrets {
+                        if !tried.insert((id.clone(), secret.clone())) {
+                            continue;
+                        }
+                        if attempts >= CLIENT_DISCOVERY_MAX_PROBE_PAIRS {
+                            break 'probe;
+                        }
+                        attempts += 1;
+                        match exchange(id, secret) {
+                            Ok(resp) => {
+                                let pair = finish_response(&resp)?;
+                                client_discovery_found_replace(
+                                    config_key,
+                                    set.path.clone(),
+                                    id.clone(),
+                                    secret.clone(),
+                                    set.len,
+                                    set.mtime,
+                                );
+                                return Ok(pair);
+                            }
+                            Err(e) if is_invalid_client(&e) => {
+                                last_mismatch = e;
+                            }
+                            Err(e) if is_unauthorized_client(&e) => {
+                                last_mismatch = e;
+                                rejected_ids.insert(id.clone());
+                                break;
+                            }
+                            Err(e) => {
+                                store_backoff(e.clone());
+                                on_exchange_error(step, &e);
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            store_backoff(last_mismatch.clone());
+            on_exchange_error(step, &last_mismatch);
+            return Err(last_mismatch);
+        }
+    }
+
+    store_backoff(first_err.clone());
+    on_exchange_error(step, &first_err);
+    Err(first_err)
+}
+
 /// Reacts to a failed exchange the one way that matters beyond the caller's
-/// own backoff: `is_invalid_client(err)` means the *pair itself* is wrong,
+/// own backoff: [`is_client_mismatch_error`] means the *pair itself* is wrong,
 /// not merely that this attempt failed — a discovered pair cached from
 /// before the client was reinstalled with a new secret, say. Evicting here
 /// means the stale pair is never replayed again — but not that the very
@@ -1599,7 +1820,7 @@ fn oauth_refresh_step(
 /// before it would ever reach here, which rules out a plain-HTTP local stub.
 fn on_exchange_error(step: &AuthStep, err: &str) {
     if let Some(client) = &step.client {
-        if is_invalid_client(err) {
+        if is_client_mismatch_error(err) {
             client_discovery_evict(client);
         }
     }
@@ -1756,6 +1977,32 @@ fn client_discovery_found_store(
         );
 }
 
+/// Replaces any cached discovery pair for `config_key` with the winning pair
+/// confirmed at `path`, without touching [`CLIENT_DISCOVERY_MISS`].
+fn client_discovery_found_replace(
+    config_key: u64,
+    path: PathBuf,
+    id: String,
+    secret: String,
+    len: u64,
+    mtime: std::time::SystemTime,
+) {
+    let mut guard = CLIENT_DISCOVERY_FOUND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    map.retain(|(k, _), _| *k != config_key);
+    map.insert(
+        (config_key, path),
+        ClientFound {
+            id,
+            secret,
+            len,
+            mtime,
+        },
+    );
+}
+
 /// The other half of the discovery cache: "nothing in `client.files`/
 /// `client.bins` right now", one entry per discovery *config* (there is no
 /// file to key a miss by — nothing matched). Retried at most once every
@@ -1806,6 +2053,12 @@ const CLIENT_DISCOVERY_MAX_SCAN_BYTES: u64 = 512 * 1024 * 1024;
 /// several large candidates cannot multiply the per-file cap by however many
 /// it lists.
 const CLIENT_DISCOVERY_PASS_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+/// Maximum distinct client IDs and secrets collected per candidate binary
+/// during fallback probing when a binary bundles multiple OAuth clients.
+const CLIENT_DISCOVERY_MAX_MULTI_MATCHES: usize = 8;
+/// Maximum total fallback token-exchange attempts across all candidate
+/// binaries during a single [`resolve_access_token_with_fallback`] invocation.
+const CLIENT_DISCOVERY_MAX_PROBE_PAIRS: usize = 24;
 
 /// The two byte limits a discovery pass runs under, pulled out of the pair
 /// of constants above into one value so [`discover_client_within`] can be
@@ -2155,15 +2408,7 @@ fn discover_client_within(
     // and hand `discover_client` a "found" empty id/secret; `?` reports
     // nothing found instead, the same as any other candidate that doesn't
     // carry the shape.
-    let id_pattern = compile_scan_pattern(client.id_pattern.as_deref()?)?;
-    let secret_pattern = compile_scan_pattern(client.secret_pattern.as_deref()?)?;
-
-    let candidates: Vec<PathBuf> = client
-        .files
-        .iter()
-        .map(|f| super::expand_home(f))
-        .chain(bin_candidates(&client.bins))
-        .collect();
+    let (id_pattern, secret_pattern, candidates) = prepare_scan_inputs(client)?;
 
     let mut budget: u64 = limits.pass_budget;
     let mut had_error = false;
@@ -2385,8 +2630,8 @@ fn compile_scan_pattern(pattern: &str) -> Option<ScanPattern> {
 
 /// One pattern's match attempt against the bytes read so far — factored out
 /// of [`scan_candidate`]'s loop because the id and secret halves were
-/// otherwise identical apart from which `Option<String>` they wrote into and
-/// which word appeared in the `debug_assert!`.
+/// otherwise identical apart from which pattern they matched against and
+/// which `Option<String>` they wrote into.
 ///
 /// `eof` is most of the reason this exists rather than being a one-line
 /// `if let`: `pattern.re.find(carry)` on a still-growing buffer can return a
@@ -2549,33 +2794,50 @@ fn accept_settled_match(
 /// `read_regular_file` follows the same technique for the identical race.
 /// Symlinks are followed on purpose here, same as there: a `bins` candidate
 /// is routinely one.
-fn scan_candidate(
-    path: &Path,
-    id_pattern: &ScanPattern,
-    secret_pattern: &ScanPattern,
-    budget: &mut u64,
-    per_file_cap: u64,
-) -> ScanOutcome {
-    use std::io::Read;
+/// Compiles both discovery regexes and resolves `client.files`/`client.bins`
+/// into ordered candidate paths.
+fn prepare_scan_inputs(
+    client: &AuthClientDiscovery,
+) -> Option<(ScanPattern, ScanPattern, Vec<PathBuf>)> {
+    let id_pattern = compile_scan_pattern(client.id_pattern.as_deref()?)?;
+    let secret_pattern = compile_scan_pattern(client.secret_pattern.as_deref()?)?;
+    let candidates: Vec<PathBuf> = client
+        .files
+        .iter()
+        .map(|f| super::expand_home(f))
+        .chain(bin_candidates(&client.bins))
+        .collect();
+    Some((id_pattern, secret_pattern, candidates))
+}
 
+/// Result of opening a discovery candidate with [`open_candidate_file`].
+enum CandidateOpen {
+    File(std::fs::File, u64, std::time::SystemTime),
+    NotFound,
+    Error(String),
+}
+
+/// Safely opens a regular file candidate without blocking on FIFOs and returns
+/// its handle alongside `(file_len, mtime)` from handle-level `metadata()`.
+fn open_candidate_file(path: &Path) -> CandidateOpen {
     match std::fs::metadata(path) {
         Ok(meta) if meta.file_type().is_file() => {}
-        Ok(_) => return ScanOutcome::NotFound,
+        Ok(_) => return CandidateOpen::NotFound,
         // "Doesn't exist" is a candidate that was never installed — the same
         // fact an absent `files` entry always was, still a miss. Anything
         // else (permission denied, a path through a non-directory, an I/O
         // error from the filesystem itself) is not that: it says nothing
         // about whether the client is installed, and must not earn the
         // miss-cache backoff a genuine "not here" does.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ScanOutcome::NotFound,
-        Err(e) => return ScanOutcome::Error(e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CandidateOpen::NotFound,
+        Err(e) => return CandidateOpen::Error(e.to_string()),
     }
     let mut open_options = std::fs::OpenOptions::new();
     open_options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        // The actual FIFO-hang guard (see the doc comment above): opening
+        // The actual FIFO-hang guard (see `scan_candidate`'s doc): opening
         // read-only with `O_NONBLOCK` set returns immediately no matter what
         // is at `path` right now, rather than blocking until a writer
         // connects — a FIFO opened this way still succeeds (POSIX), so the
@@ -2585,40 +2847,41 @@ fn scan_candidate(
         // there is nothing for a later `fcntl` to buy back.
         open_options.custom_flags(libc::O_NONBLOCK);
     }
-    let mut file = match open_options.open(path) {
+    let file = match open_options.open(path) {
         Ok(f) => f,
         // A candidate removed between the `metadata` check above and this
         // `open` is the same fact that check already reports for one that
         // never existed — `NotFound`, not an error worth a backoff or a
         // diagnostic line over an ordinary uninstall-in-progress race.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ScanOutcome::NotFound,
-        Err(e) => return ScanOutcome::Error(e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CandidateOpen::NotFound,
+        Err(e) => return CandidateOpen::Error(e.to_string()),
     };
-    // The handle's own length, not merely its type: used below to tell a
-    // budget/cap cutoff that happens to land exactly at `file_len` — not a
-    // cutoff at all, since every byte the candidate holds was read; it gets
-    // the same EOF settle pass a natural `read` returning `0` would, and can
-    // still come back `Found` — apart from one that lands short of it (some
-    // of the file was never looked at — a real `Truncated`). A file that
-    // grows or shrinks mid-scan can still fool this, the same TOCTOU every
-    // length-based check here already accepts — and this trusts the
-    // metadata's reported length outright rather than re-measuring it; a
-    // `files`/`bins` candidate is always a regular file by the time this
-    // line runs (the match above just confirmed it), so there is no
-    // `/proc`-style entry with an unreliable stat in the shapes this scans.
-    // `mtime` travels alongside `file_len` for the same reason: both come
-    // from this one handle-level `stat`, taken before any of the reads
-    // below, so a `Found` result can report the exact identity of what was
-    // actually scanned — see `ScanOutcome::Found`'s own doc — rather than
-    // `client_discovery_found_store` re-`stat`ing the path afterward and
-    // risking a *different* file's identity if it changed in between.
-    let (file_len, mtime) = match file.metadata() {
+    // The handle's own length and `mtime` come from this single handle-level
+    // `stat` so any cached `ClientFound` records the exact identity of what was
+    // actually read.
+    match file.metadata() {
         Ok(meta) if meta.file_type().is_file() => match meta.modified() {
-            Ok(mtime) => (meta.len(), mtime),
-            Err(e) => return ScanOutcome::Error(e.to_string()),
+            Ok(mtime) => CandidateOpen::File(file, meta.len(), mtime),
+            Err(e) => CandidateOpen::Error(e.to_string()),
         },
-        Ok(_) => return ScanOutcome::NotFound,
-        Err(e) => return ScanOutcome::Error(e.to_string()),
+        Ok(_) => CandidateOpen::NotFound,
+        Err(e) => CandidateOpen::Error(e.to_string()),
+    }
+}
+
+fn scan_candidate(
+    path: &Path,
+    id_pattern: &ScanPattern,
+    secret_pattern: &ScanPattern,
+    budget: &mut u64,
+    per_file_cap: u64,
+) -> ScanOutcome {
+    use std::io::Read;
+
+    let (mut file, file_len, mtime) = match open_candidate_file(path) {
+        CandidateOpen::File(file, file_len, mtime) => (file, file_len, mtime),
+        CandidateOpen::NotFound => return ScanOutcome::NotFound,
+        CandidateOpen::Error(msg) => return ScanOutcome::Error(msg),
     };
 
     let mut chunk = vec![0u8; CLIENT_DISCOVERY_CHUNK_BYTES];
@@ -2760,6 +3023,174 @@ fn scan_candidate(
     } else {
         ScanOutcome::NotFound
     }
+}
+
+/// All distinct settled ID and secret matches extracted from one candidate
+/// file for multi-pair fallback probing.
+struct CandidateMatchSet {
+    path: PathBuf,
+    ids: Vec<String>,
+    secrets: Vec<String>,
+    len: u64,
+    mtime: std::time::SystemTime,
+}
+
+/// Appends newly settled matches of `pattern` in `carry` (ending at or after
+/// `min_end` to avoid re-accepting truncated prefixes inside overlap tails),
+/// bounded to [`CLIENT_DISCOVERY_MAX_MULTI_MATCHES`] distinct entries.
+fn collect_settled_matches(
+    carry: &[u8],
+    pattern: &ScanPattern,
+    eof: bool,
+    min_end: usize,
+    found: &mut Vec<String>,
+) {
+    if found.len() >= CLIENT_DISCOVERY_MAX_MULTI_MATCHES {
+        return;
+    }
+    for m in pattern.re.find_iter(carry) {
+        if m.end() < min_end {
+            continue;
+        }
+        let already_maximal = pattern.max_len.is_some_and(|max| m.len() >= max);
+        if !eof && m.end() == carry.len() && !already_maximal {
+            continue;
+        }
+        if m.len() <= super::CLIENT_PATTERN_MAX_MATCH_BYTES && !m.is_empty() {
+            let value = String::from_utf8_lossy(m.as_bytes()).into_owned();
+            if !found.contains(&value) {
+                found.push(value);
+                if found.len() >= CLIENT_DISCOVERY_MAX_MULTI_MATCHES {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Scans `path` across bounded chunks collecting up to
+/// [`CLIENT_DISCOVERY_MAX_MULTI_MATCHES`] distinct IDs and secrets; returns
+/// `None` if either list ends up empty.
+fn scan_candidate_all(
+    path: &Path,
+    id_pattern: &ScanPattern,
+    secret_pattern: &ScanPattern,
+    budget: &mut u64,
+    per_file_cap: u64,
+) -> Option<CandidateMatchSet> {
+    use std::io::Read;
+
+    let CandidateOpen::File(mut file, file_len, mtime) = open_candidate_file(path) else {
+        return None;
+    };
+    let mut chunk = vec![0u8; CLIENT_DISCOVERY_CHUNK_BYTES];
+    let mut carry: Vec<u8> = Vec::new();
+    let mut found_ids: Vec<String> = Vec::new();
+    let mut found_secrets: Vec<String> = Vec::new();
+    let mut scanned: u64 = 0;
+
+    loop {
+        if *budget == 0 {
+            if scanned >= file_len {
+                collect_settled_matches(&carry, id_pattern, true, carry.len(), &mut found_ids);
+                collect_settled_matches(
+                    &carry,
+                    secret_pattern,
+                    true,
+                    carry.len(),
+                    &mut found_secrets,
+                );
+            }
+            break;
+        }
+        let want = (chunk.len() as u64).min(*budget) as usize;
+        let n = loop {
+            match file.read(&mut chunk[..want]) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            }
+        };
+        if n == 0 {
+            collect_settled_matches(&carry, id_pattern, true, carry.len(), &mut found_ids);
+            collect_settled_matches(
+                &carry,
+                secret_pattern,
+                true,
+                carry.len(),
+                &mut found_secrets,
+            );
+            break;
+        }
+        *budget = budget.saturating_sub(n as u64);
+        let prev_len = carry.len();
+        carry.extend_from_slice(&chunk[..n]);
+        scanned = scanned.saturating_add(n as u64);
+        collect_settled_matches(&carry, id_pattern, false, prev_len, &mut found_ids);
+        collect_settled_matches(&carry, secret_pattern, false, prev_len, &mut found_secrets);
+        if found_ids.len() >= CLIENT_DISCOVERY_MAX_MULTI_MATCHES
+            && found_secrets.len() >= CLIENT_DISCOVERY_MAX_MULTI_MATCHES
+        {
+            break;
+        }
+        if carry.len() > CLIENT_DISCOVERY_OVERLAP_BYTES {
+            let drop = carry.len() - CLIENT_DISCOVERY_OVERLAP_BYTES;
+            carry.drain(..drop);
+        }
+        if scanned >= per_file_cap {
+            if scanned >= file_len {
+                collect_settled_matches(&carry, id_pattern, true, carry.len(), &mut found_ids);
+                collect_settled_matches(
+                    &carry,
+                    secret_pattern,
+                    true,
+                    carry.len(),
+                    &mut found_secrets,
+                );
+            }
+            break;
+        }
+    }
+
+    if !found_ids.is_empty() && !found_secrets.is_empty() {
+        Some(CandidateMatchSet {
+            path: path.to_path_buf(),
+            ids: found_ids,
+            secrets: found_secrets,
+            len: file_len,
+            mtime,
+        })
+    } else {
+        None
+    }
+}
+
+/// Scans every configured binary candidate in `client` under `limits` and
+/// returns all [`CandidateMatchSet`]s that carry at least one ID and secret.
+fn discover_client_match_sets(
+    client: &AuthClientDiscovery,
+    limits: ScanLimits,
+) -> Vec<CandidateMatchSet> {
+    let Some((id_pattern, secret_pattern, candidates)) = prepare_scan_inputs(client) else {
+        return Vec::new();
+    };
+    let mut budget = limits.pass_budget;
+    let mut sets = Vec::new();
+    for path in &candidates {
+        if budget == 0 {
+            break;
+        }
+        if let Some(set) = scan_candidate_all(
+            path,
+            &id_pattern,
+            &secret_pattern,
+            &mut budget,
+            limits.per_file_cap,
+        ) {
+            sets.push(set);
+        }
+    }
+    sets
 }
 
 /// The most a token-refresh response body is ever read as, in bytes — 1 MiB,
@@ -2906,6 +3337,21 @@ fn oauth_error_message(code: &str, status: u16) -> String {
 fn is_invalid_client(err: &str) -> bool {
     err.strip_prefix(OAUTH_ERROR_PREFIX)
         .is_some_and(|rest| rest.starts_with("invalid_client "))
+}
+
+/// True for the OAuth `unauthorized_client` error message produced by
+/// [`oauth_error_message`]: means the authenticated client ID itself is not
+/// permitted to refresh the stored grant, so probing other secrets with the
+/// same ID cannot succeed.
+fn is_unauthorized_client(err: &str) -> bool {
+    err.strip_prefix(OAUTH_ERROR_PREFIX)
+        .is_some_and(|rest| rest.starts_with("unauthorized_client "))
+}
+
+/// True when the token endpoint rejected the OAuth client credentials or
+/// client authorization (`invalid_client` or `unauthorized_client`).
+fn is_client_mismatch_error(err: &str) -> bool {
+    is_invalid_client(err) || is_unauthorized_client(err)
 }
 
 /// The most a refreshed token is ever cached as living, in seconds — 24
@@ -3604,6 +4050,8 @@ mod tests {
             json_path: None,
             unless_json_path: None,
             message: None,
+            refresh_service: None,
+            refresh_targets: None,
             token_url: None,
             client_id: None,
             client_secret: None,
@@ -3971,6 +4419,57 @@ mod tests {
     fn oauth_refresh_step_missing_required_field_is_error() {
         let step = auth_step(AuthType::OauthRefresh);
         assert!(oauth_refresh_step(&step, &[], "test provider").is_err());
+    }
+
+    #[test]
+    fn oauth_refresh_step_absent_when_only_store_names_absent_service_and_targets() {
+        let mut step = auth_step(AuthType::OauthRefresh);
+        step.refresh_service = Some(format!(
+            "tickover-nonexistent-refresh-service-{}",
+            std::process::id()
+        ));
+        step.refresh_targets = Some(vec![format!(
+            "tickover-nonexistent-refresh-target-{}",
+            std::process::id()
+        )]);
+        step.token_json_path = Some("token.refresh_token".to_string());
+        step.token_url = Some("https://oauth2.googleapis.com/token".to_string());
+        step.client_id = Some("test-client-id".to_string());
+        step.client_secret = Some("test-client-secret".to_string());
+        assert_eq!(
+            oauth_refresh_step(
+                &step,
+                &["oauth2.googleapis.com".to_string()],
+                "test provider"
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn extract_store_refresh_unwraps_go_keyring_base64_and_errors_when_missing() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let payload = serde_json::json!({
+            "token": {
+                "access_token": "expired-access",
+                "refresh_token": "r-store-123"
+            }
+        })
+        .to_string();
+        let wrapped = format!("go-keyring-base64:{}", STANDARD.encode(payload));
+        assert_eq!(
+            extract_store_refresh(&wrapped, "token.refresh_token", "Keychain item 'gemini'"),
+            Ok("r-store-123".to_string())
+        );
+
+        let no_refresh = format!(
+            "go-keyring-base64:{}",
+            STANDARD.encode(r#"{"token":{"access_token":"x"}}"#)
+        );
+        let err =
+            extract_store_refresh(&no_refresh, "token.refresh_token", "Keychain item 'gemini'")
+                .expect_err("payload without refresh_token must error");
+        assert!(err.contains("token.refresh_token"), "{err}");
     }
 
     #[test]
@@ -5708,6 +6207,265 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// [`resolve_access_token`] stamps its failure backoff from the moment
+    /// `exchange` actually returned, not from before it ran — the stub
+    /// exchange here sleeps first, standing in for a slow-but-failing
+    /// endpoint no local test server could otherwise simulate ( `oauth_refresh_step`
+    /// refuses anything but `https://`, which rules out a plain-HTTP stub;
+    /// see `on_exchange_error`'s own doc for why this crate has no HTTPS
+    /// test-server infrastructure at all).
+    #[test]
+    fn resolve_access_token_backs_off_from_the_moment_the_exchange_actually_failed() {
+        let key = refresh_cache_key(
+            "resolve-access-token-timing",
+            &format!("rt-{}", std::process::id()),
+        );
+        let step = auth_step(AuthType::OauthRefresh);
+        let t0 = cache_now();
+        let slept = std::time::Duration::from_secs(3);
+
+        let err = resolve_access_token(key, "client-id", "client-secret", &step, || {
+            std::thread::sleep(slept);
+            Err("exchange failed".to_string())
+        })
+        .expect_err("the stubbed exchange always fails");
+        assert_eq!(err, "exchange failed");
+
+        // A backoff stamped from `t0` (before the 3s exchange) would already
+        // have lapsed by `t0 + REFRESH_BACKOFF_SECS + 1`; one stamped after
+        // the exchange, as this must be, is still armed there. `cache_now`
+        // floors to whole seconds and its own doc warns that one second of
+        // slack can flip a boundary assertion — `+ 1` alone would be too
+        // tight against a 3s sleep, so the margin here is wide on both
+        // sides.
+        assert!(
+            matches!(
+                refresh_cache_lookup(key, t0 + REFRESH_BACKOFF_SECS + 1),
+                CacheLookup::Backoff { .. }
+            ),
+            "a slow-but-failing exchange must wait the full interval from its own \
+             failure, not from before it started"
+        );
+
+        // And it is a wait, not a stop: comfortably past `slept` plus the
+        // full backoff, the entry has lapsed.
+        assert!(
+            matches!(
+                refresh_cache_lookup(key, t0 + slept.as_secs() as i64 + REFRESH_BACKOFF_SECS + 5),
+                CacheLookup::Miss
+            ),
+            "the backoff must still lapse once its own interval has actually passed"
+        );
+    }
+
+    #[test]
+    fn scan_candidate_all_collects_multiple_distinct_ids_and_secrets_across_chunks() {
+        let id_pattern = scan_pattern(&synthetic_id_pattern());
+        let secret_pattern = scan_pattern(&synthetic_secret_pattern());
+
+        let id1 = fake_client_id("710001", "multione");
+        let id2 = fake_client_id("710002", "multitwo");
+        let sec1 = fake_secret(&"A1".repeat(14));
+        let sec2 = fake_secret(&"B2".repeat(14));
+
+        // 2 MiB + tail so matches span two `CLIENT_DISCOVERY_CHUNK_BYTES` reads
+        // with one ID straddling the first chunk boundary and duplicates of the
+        // first pair later in chunk 2.
+        let mut content = vec![b'-'; CLIENT_DISCOVERY_CHUNK_BYTES * 2 + 1024];
+        content[100..100 + id1.len()].copy_from_slice(id1.as_bytes());
+        content[500..500 + sec1.len()].copy_from_slice(sec1.as_bytes());
+        let straddle = CLIENT_DISCOVERY_CHUNK_BYTES - 10;
+        content[straddle..straddle + id2.len()].copy_from_slice(id2.as_bytes());
+        let tail_start = CLIENT_DISCOVERY_CHUNK_BYTES + 4096;
+        content[tail_start..tail_start + sec2.len()].copy_from_slice(sec2.as_bytes());
+        let dup_start = tail_start + 512;
+        content[dup_start..dup_start + id1.len()].copy_from_slice(id1.as_bytes());
+        content[dup_start + 128..dup_start + 128 + sec1.len()].copy_from_slice(sec1.as_bytes());
+
+        let dir = temp_dir("scan-candidate-all-multi");
+        let file = dir.join("client-binary");
+        std::fs::write(&file, &content).unwrap();
+
+        let mut budget = CLIENT_DISCOVERY_PASS_BUDGET_BYTES;
+        let set = scan_candidate_all(
+            &file,
+            &id_pattern,
+            &secret_pattern,
+            &mut budget,
+            CLIENT_DISCOVERY_MAX_SCAN_BYTES,
+        )
+        .expect("both multiple IDs and multiple secrets must be discovered");
+        assert_eq!(set.ids, vec![id1, id2]);
+        assert_eq!(set.secrets, vec![sec1, sec2]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_access_token_with_fallback_probes_remaining_pairs_and_caches_winner() {
+        let dir = temp_dir("fallback-probes-winner");
+        let file = dir.join("client-binary");
+        let id0 = fake_client_id("720001", "probezero");
+        let id1 = fake_client_id("720002", "probeone");
+        let sec0 = fake_secret(&"C3".repeat(14));
+        let sec1 = fake_secret(&"D4".repeat(14));
+        let sec2 = fake_secret(&"E5".repeat(14));
+        std::fs::write(&file, format!("{id0} {sec0} {id1} {sec1} {sec2}")).unwrap();
+
+        let client = AuthClientDiscovery {
+            id_env: None,
+            secret_env: None,
+            id_pattern: Some(synthetic_id_pattern()),
+            secret_pattern: Some(synthetic_secret_pattern()),
+            files: vec![file.to_string_lossy().into_owned()],
+            bins: Vec::new(),
+        };
+        let initial = discover_client(&client).expect("initial pair must resolve");
+        assert_eq!(initial, (id0.clone(), sec0.clone()));
+        let config_key = client_config_key(&client);
+
+        let step = AuthStep {
+            client: Some(client),
+            ..auth_step(AuthType::OauthRefresh)
+        };
+        let key = refresh_cache_key("fallback-winner", &format!("rt-{}", std::process::id()));
+        let mut tried = Vec::new();
+        let out = resolve_access_token_with_fallback(
+            key,
+            &id0,
+            &sec0,
+            &step,
+            true,
+            CLIENT_DISCOVERY_LIMITS,
+            |cid, csec| {
+                tried.push((cid.to_string(), csec.to_string()));
+                if cid == id0 && csec == sec0 {
+                    Err("token refresh failed: invalid_client (HTTP 401)".to_string())
+                } else if cid == id0 && csec == sec1 {
+                    Err("token refresh failed: unauthorized_client (HTTP 401)".to_string())
+                } else if cid == id1 && csec == sec0 {
+                    Err("token refresh failed: invalid_client (HTTP 401)".to_string())
+                } else if cid == id1 && csec == sec1 {
+                    Ok(serde_json::json!({ "access_token": "fresh-ok", "expires_in": 3600 }))
+                } else {
+                    panic!("unexpected pair tried: {cid} / {csec}");
+                }
+            },
+        )
+        .expect("fallback probe must find and accept the working pair");
+
+        assert_eq!(out, ("fresh-ok".to_string(), 3600));
+        // Notice `(id0, sec2)` was skipped after `(id0, sec1)` returned `unauthorized_client`.
+        assert_eq!(
+            tried,
+            vec![
+                (id0.clone(), sec0.clone()),
+                (id0.clone(), sec1.clone()),
+                (id1.clone(), sec0.clone()),
+                (id1.clone(), sec1.clone()),
+            ]
+        );
+        assert_eq!(
+            client_discovery_found_lookup(config_key, &file),
+            Some((id1, sec1)),
+            "winning fallback pair must replace the cached entry in CLIENT_DISCOVERY_FOUND"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_access_token_with_fallback_stops_immediately_on_non_mismatch_error() {
+        let dir = temp_dir("fallback-stops-non-mismatch");
+        let file = dir.join("client-binary");
+        let id0 = fake_client_id("730001", "stopzero");
+        let id1 = fake_client_id("730002", "stopone");
+        let sec0 = fake_secret(&"F6".repeat(14));
+        let sec1 = fake_secret(&"G7".repeat(14));
+        std::fs::write(&file, format!("{id0} {sec0} {id1} {sec1}")).unwrap();
+
+        let client = AuthClientDiscovery {
+            id_env: None,
+            secret_env: None,
+            id_pattern: Some(synthetic_id_pattern()),
+            secret_pattern: Some(synthetic_secret_pattern()),
+            files: vec![file.to_string_lossy().into_owned()],
+            bins: Vec::new(),
+        };
+        let step = AuthStep {
+            client: Some(client),
+            ..auth_step(AuthType::OauthRefresh)
+        };
+        let key = refresh_cache_key("fallback-stop", &format!("rt-{}", std::process::id()));
+        let mut attempts = 0usize;
+        let err = resolve_access_token_with_fallback(
+            key,
+            &id0,
+            &sec0,
+            &step,
+            true,
+            CLIENT_DISCOVERY_LIMITS,
+            |cid, csec| {
+                attempts += 1;
+                if cid == id0 && csec == sec0 {
+                    Err("token refresh failed: invalid_client (HTTP 401)".to_string())
+                } else {
+                    Err("token refresh: the saved sign-in is no longer valid — sign in to Antigravity again".to_string())
+                }
+            },
+        )
+        .expect_err("non-mismatch error must abort further probing");
+
+        assert!(err.contains("no longer valid"), "{err}");
+        assert_eq!(attempts, 2);
+        assert!(matches!(
+            refresh_cache_lookup(key, cache_now() + 1),
+            CacheLookup::Backoff { .. }
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_access_token_with_fallback_skips_probing_for_non_discovered_client() {
+        let dir = temp_dir("fallback-skip-non-discovered");
+        let file = dir.join("client-binary");
+        let id0 = fake_client_id("740001", "skipzero");
+        let id1 = fake_client_id("740002", "skipone");
+        let sec0 = fake_secret(&"H8".repeat(14));
+        let sec1 = fake_secret(&"J9".repeat(14));
+        std::fs::write(&file, format!("{id0} {sec0} {id1} {sec1}")).unwrap();
+
+        let client = AuthClientDiscovery {
+            id_env: None,
+            secret_env: None,
+            id_pattern: Some(synthetic_id_pattern()),
+            secret_pattern: Some(synthetic_secret_pattern()),
+            files: vec![file.to_string_lossy().into_owned()],
+            bins: Vec::new(),
+        };
+        let step = AuthStep {
+            client: Some(client),
+            ..auth_step(AuthType::OauthRefresh)
+        };
+        let key = refresh_cache_key("fallback-skip", &format!("rt-{}", std::process::id()));
+        let mut attempts = 0usize;
+        let err = resolve_access_token_with_fallback(
+            key,
+            &id0,
+            &sec0,
+            &step,
+            false,
+            CLIENT_DISCOVERY_LIMITS,
+            |_, _| {
+                attempts += 1;
+                Err("token refresh failed: invalid_client (HTTP 401)".to_string())
+            },
+        )
+        .expect_err("env/literal pairs must not fall back to binary scanning");
+
+        assert!(err.contains("invalid_client"), "{err}");
+        assert_eq!(attempts, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn bin_candidates_ignores_relative_path_entries() {
         let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -6089,9 +6847,9 @@ mod tests {
         // file at production's own limits, and `secret_pattern`'s `{10,}`
         // has no upper bound of its own — alphanumeric padding right after
         // the real secret would extend that match into the padding itself,
-        // well past `CLIENT_PATTERN_MAX_MATCH_BYTES`, and trip the
-        // `debug_assert` in `scan_candidate` on a match this test never
-        // meant to produce.
+        // well past `CLIENT_PATTERN_MAX_MATCH_BYTES`, and `accept_settled_match`
+        // would silently refuse a match that long rather than settle it — the
+        // secret this test means to find would never be found at all.
         let mut content = vec![b'x'; 6000];
         content.extend_from_slice(id.as_bytes());
         content.push(b' ');
@@ -7584,6 +8342,54 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `json_path_present` has to resolve everything [`super::json_path_get`]
+    /// does, `[selector]` array picks included, or a manifest that named one
+    /// here would have this rule silently never fire — a rule whose whole
+    /// purpose is to refuse.
+    #[test]
+    fn reject_when_fires_through_a_selector_the_shared_reader_resolves() {
+        let dir = temp_dir("rw-selector");
+        let file = dir.join("auth.json");
+        std::fs::write(
+            &file,
+            r#"{"limits":[{"kind":"weekly_scoped","blocked":true}]}"#,
+        )
+        .unwrap();
+        let step = AuthStep {
+            path: Some(file.to_string_lossy().into_owned()),
+            json_path: Some("limits[kind=weekly_scoped].blocked".to_string()),
+            message: Some("a weekly-scoped block has no session limits".to_string()),
+            ..auth_step(AuthType::RejectWhen)
+        };
+        assert_eq!(
+            reject_when_step(&step),
+            Err("a weekly-scoped block has no session limits".to_string())
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The one behavioral risk in routing through the shared reader: a
+    /// provider is entitled to a field literally named with brackets
+    /// (`counts[daily]`), and `json_path_get`'s selector syntax must not take
+    /// that name away from it — see its own doc.
+    #[test]
+    fn reject_when_still_resolves_a_field_literally_named_with_brackets() {
+        let dir = temp_dir("rw-literal-brackets");
+        let file = dir.join("auth.json");
+        std::fs::write(&file, r#"{"counts[daily]":"sk-x"}"#).unwrap();
+        let step = AuthStep {
+            path: Some(file.to_string_lossy().into_owned()),
+            json_path: Some("counts[daily]".to_string()),
+            message: Some("a literal bracketed field name still resolves".to_string()),
+            ..auth_step(AuthType::RejectWhen)
+        };
+        assert_eq!(
+            reject_when_step(&step),
+            Err("a literal bracketed field name still resolves".to_string())
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// `CODEX_HOME` relocates the whole auth file, so the rule has to look
     /// where `path_env`/`path_env_join` point, not only at `path` — a
     /// reject-when that checked the default location on a relocated install
@@ -7688,6 +8494,88 @@ mod tests {
     fn credentials_file_step_missing_required_field_is_error() {
         let step = auth_step(AuthType::CredentialsFile); // no path, no token_json_path
         assert!(credentials_file_step(&step, &mut None).is_err());
+    }
+
+    /// The two ways a credentials file can be refused past the `is_file()`
+    /// check must say different things: one is oversized, the other is not
+    /// a regular, readable file — and neither sentence is honest about the
+    /// other's cause.
+    #[test]
+    fn credentials_file_step_names_the_cap_for_an_oversized_file_not_the_generic_refusal() {
+        let dir = temp_dir("cf-oversized");
+        let file = dir.join("creds.json");
+        // One byte past the cap: the content itself is irrelevant, since the
+        // size check runs before anything here is ever parsed as JSON.
+        let oversized = vec![b'a'; (crate::plugin::SMALL_FILE_MAX_BYTES + 1) as usize];
+        std::fs::write(&file, &oversized).unwrap();
+        let step = AuthStep {
+            path: Some(file.to_string_lossy().into_owned()),
+            token_json_path: Some("claudeAiOauth.accessToken".to_string()),
+            ..auth_step(AuthType::CredentialsFile)
+        };
+        // `Broken`, not `NoToken`: neither file is a store emptied by a
+        // sign-out, so neither may read as "not signed in".
+        let StepError::Broken(err) =
+            credentials_file_step(&step, &mut None).expect_err("must refuse an oversized file")
+        else {
+            panic!("an oversized file is damage, not a sign-out");
+        };
+        assert!(
+            err.contains(&crate::plugin::SMALL_FILE_MAX_BYTES.to_string()),
+            "the refusal must name the cap: {err}"
+        );
+        assert!(
+            !err.contains("is not a readable regular file"),
+            "an oversized file is neither missing nor the wrong kind: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credentials_file_step_reports_a_permission_denial_distinctly_from_an_oversized_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("cf-unreadable");
+        let file = dir.join("creds.json");
+        std::fs::write(&file, r#"{"claudeAiOauth":{"accessToken":"tok-1"}}"#).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Root (and this crate's own CI, some sandboxes) ignores file
+        // permissions outright — skip rather than false-fail somewhere that
+        // isn't actually exercising the denial this test is about.
+        if std::fs::File::open(&file).is_ok() {
+            eprintln!(
+                "skip: credentials_file_step_reports_a_permission_denial_distinctly_from_an_oversized_file \
+                 — running as root (or a sandbox that ignores file permissions)"
+            );
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).ok();
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        let step = AuthStep {
+            path: Some(file.to_string_lossy().into_owned()),
+            token_json_path: Some("claudeAiOauth.accessToken".to_string()),
+            ..auth_step(AuthType::CredentialsFile)
+        };
+        // `Broken`, not `NoToken`: neither file is a store emptied by a
+        // sign-out, so neither may read as "not signed in".
+        let StepError::Broken(err) =
+            credentials_file_step(&step, &mut None).expect_err("must refuse an unreadable file")
+        else {
+            panic!("an unreadable file is damage, not a sign-out");
+        };
+        assert!(
+            err.contains("is not a readable regular file"),
+            "a permission-denied open keeps the generic refusal: {err}"
+        );
+        assert!(
+            !err.contains(&crate::plugin::SMALL_FILE_MAX_BYTES.to_string()),
+            "a permission denial is not the size refusal: {err}"
+        );
+
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -8052,13 +8940,25 @@ mod tests {
     }
 
     #[test]
-    fn credentials_map_step_present_err_when_no_entry_matches_the_prefix() {
+    fn credentials_map_step_no_token_when_no_entry_matches_the_prefix() {
         let dir = temp_dir("cm-no-match");
         let step =
             credentials_map_step_for(&dir, r#"{"https://other.example::abc":{"key":"tok"}}"#);
         let err = credentials_map_step(&step, &mut None)
             .expect_err("a store that exists but names no matching entry must not be Absent");
-        assert!(err.contains("https://auth.x.ai::"), "{err}");
+        assert!(matches!(err, StepError::NoToken(_)), "{err:?}");
+        assert!(err.message().contains("https://auth.x.ai::"), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `{}` is what a signed-out CLI leaves behind, the same store emptied
+    /// that the no-match test above reaches through a stranger's entry.
+    #[test]
+    fn credentials_map_step_no_token_when_the_store_is_an_empty_object() {
+        let dir = temp_dir("cm-empty-object");
+        let step = credentials_map_step_for(&dir, "{}");
+        let err = credentials_map_step(&step, &mut None).expect_err("{} holds no token");
+        assert!(matches!(err, StepError::NoToken(_)), "{err:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -8076,7 +8976,8 @@ mod tests {
         );
         let err = credentials_map_step(&step, &mut None)
             .expect_err("ambiguous match must be a Present-err");
-        assert!(err.contains("more than one"), "{err}");
+        assert!(matches!(err, StepError::Broken(_)), "{err:?}");
+        assert!(err.message().contains("more than one"), "{err:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -8084,7 +8985,8 @@ mod tests {
     fn credentials_map_step_present_err_when_root_is_not_an_object() {
         let dir = temp_dir("cm-not-object");
         let step = credentials_map_step_for(&dir, r#"["not", "an", "object"]"#);
-        assert!(credentials_map_step(&step, &mut None).is_err());
+        let err = credentials_map_step(&step, &mut None).expect_err("an array is damage");
+        assert!(matches!(err, StepError::Broken(_)), "{err:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -8092,20 +8994,22 @@ mod tests {
     fn credentials_map_step_present_err_when_json_broken() {
         let dir = temp_dir("cm-broken");
         let step = credentials_map_step_for(&dir, "not json");
-        assert!(credentials_map_step(&step, &mut None).is_err());
+        let err = credentials_map_step(&step, &mut None).expect_err("bad JSON is damage");
+        assert!(matches!(err, StepError::Broken(_)), "{err:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn credentials_map_step_present_err_when_matched_entry_has_no_token() {
+    fn credentials_map_step_no_token_when_matched_entry_has_no_token() {
         let dir = temp_dir("cm-no-token");
         let step = credentials_map_step_for(
             &dir,
             r#"{"https://auth.x.ai::11111111-1111-1111-1111-111111111111":{"other":"x"}}"#,
         );
         let err = credentials_map_step(&step, &mut None)
-            .expect_err("a matched entry without the token field is Present-err");
-        assert!(err.contains('`'), "{err}"); // names the token_json_path
+            .expect_err("a matched entry without the token field is not Absent");
+        assert!(matches!(err, StepError::NoToken(_)), "{err:?}");
+        assert!(err.message().contains('`'), "{err:?}"); // names the token_json_path
         std::fs::remove_dir_all(&dir).ok();
     }
 

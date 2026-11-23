@@ -83,7 +83,11 @@ pub struct RegistryEntry {
     /// parse time: no control, invisible or directional characters, and at
     /// most [`REGISTRY_NAME_MAX_CHARS`].
     pub name: String,
-    /// Publisher-declared version (compared with [`version_cmp`]).
+    /// Publisher-declared version (compared with [`version_cmp`]) — same two
+    /// checks as [`Self::name`] and bounded the same way, since it reaches
+    /// the install/update row exactly like them. An index entry is remote
+    /// input the moment its host is compromised; nothing about `version`
+    /// made it any less so than the fields either side of it.
     pub version: String,
     /// Optional one-line description shown before install — same two
     /// checks as [`Self::name`], bounded instead by
@@ -135,6 +139,8 @@ impl RegistryIndex {
             if p.version.trim().is_empty() {
                 return Err(format!("plugin \"{}\": `version` must not be empty", p.id));
             }
+            refuse_control_chars(&p.id, "version", &p.version)?;
+            refuse_too_long(&p.id, "version", &p.version, REGISTRY_VERSION_MAX_CHARS)?;
             if let Some(description) = &p.description {
                 refuse_control_chars(&p.id, "description", description)?;
                 refuse_too_long(
@@ -162,16 +168,48 @@ impl RegistryIndex {
 
 /// [`RegistryEntry::name`]'s cap — plenty for any real provider's display
 /// name, and short enough that a hostile index can't hand the install/update
-/// UI a caption built to overflow it. A constant of its own rather than
-/// reusing `crate::plugin::PROVIDER_TEXT_MAX_CHARS`: that one bounds a
-/// provider *response* string this app sanitises at every render because it
-/// changes without notice, where registry text is validated once, here, at
-/// index-parse time.
-const REGISTRY_NAME_MAX_CHARS: usize = 64;
+/// UI a caption built to overflow it. A definition of its own, not a reuse
+/// of `crate::plugin::PROVIDER_TEXT_MAX_CHARS`: that one bounds a provider
+/// *response* string this app sanitises at every render because it changes
+/// without notice, where registry text is validated once, here, at
+/// index-parse time — a different reason to land on the same number, not
+/// the same reason written twice. `pub`, and checked against
+/// `PROVIDER_TEXT_MAX_CHARS` immediately below the three of these: `src/
+/// main.rs`'s `registry_entry_row` sanitises a validated `name` with
+/// `crate::plugin::sanitize_provider_text` rather than a registry-sized
+/// sanitiser of its own, on the strength of the two numbers staying equal.
+pub const REGISTRY_NAME_MAX_CHARS: usize = 64;
 
 /// [`RegistryEntry::description`]'s cap — a one-line summary shown before
-/// install, not a changelog.
-const REGISTRY_DESCRIPTION_MAX_CHARS: usize = 256;
+/// install, not a changelog. `pub` for a second reason beyond the one
+/// [`REGISTRY_NAME_MAX_CHARS`] and [`REGISTRY_VERSION_MAX_CHARS`] are:
+/// [`sanitize_description`] and the row it feeds need this exact number
+/// too, and a caller reaching for it from outside this module gets the one
+/// `validate` enforces rather than a second definition that could drift
+/// from it.
+pub const REGISTRY_DESCRIPTION_MAX_CHARS: usize = 256;
+
+/// [`RegistryEntry::version`]'s cap — no real semver string (with a
+/// prerelease and build metadata included) comes close, and a hostile index
+/// gets no more mileage out of this field than it does out of `name`. `pub`
+/// for the same reason `name`'s own cap is.
+pub const REGISTRY_VERSION_MAX_CHARS: usize = 64;
+
+/// `src/main.rs`'s `registry_entry_row` and `apply_update_badge` sanitise a
+/// validated `name`/`version` with [`crate::plugin::sanitize_provider_text`]
+/// rather than a registry-sized sanitiser of their own — sound only because
+/// [`RegistryIndex::validate`] never lets either field run longer than
+/// [`REGISTRY_NAME_MAX_CHARS`]/[`REGISTRY_VERSION_MAX_CHARS`], and
+/// `sanitize_provider_text`'s own cap is never tighter than that. Checked
+/// here at compile time rather than left for a comment to keep true: a
+/// widened registry cap left unmatched here fails the build instead of
+/// quietly handing that sink text longer than the cap it was sized for —
+/// the exact defect [`sanitize_description`] exists to close for
+/// `description`, which this keeps from reopening for the other two.
+const _: () = assert!(
+    REGISTRY_NAME_MAX_CHARS == crate::plugin::PROVIDER_TEXT_MAX_CHARS
+        && REGISTRY_VERSION_MAX_CHARS == crate::plugin::PROVIDER_TEXT_MAX_CHARS
+);
 
 /// The most `[[plugin]]` entries an index may list. No real registry
 /// approaches this (this repo ships a handful) — it exists purely so a 10
@@ -218,6 +256,62 @@ fn refuse_too_long(id: &str, field: &str, value: &str, max_chars: usize) -> Resu
         ));
     }
     Ok(())
+}
+
+/// Make a [`RegistryEntry::description`] safe to put on the install/update
+/// row, at this field's own cap rather than
+/// [`crate::plugin::PROVIDER_TEXT_MAX_CHARS`]'s 64 —
+/// [`RegistryIndex::validate`] already lets a description run to
+/// [`REGISTRY_DESCRIPTION_MAX_CHARS`], four times that, since it is a
+/// one-line summary rather than a caption, and truncating one at the
+/// caption-sized cap would silently shorten text `validate` accepted whole.
+/// Strips the same control and invisible/directional characters
+/// [`crate::plugin::sanitize_provider_text`] does, and for the same reason:
+/// on a description that already passed `validate`'s own
+/// `refuse_control_chars`, there is nothing left to strip and nothing past
+/// this cap to cut, so the result is the input unchanged, trimmed. Ends in
+/// `…` instead of cutting silently on whatever *is* past the cap — reachable
+/// only through a caller that skips `validate`, since `validate` itself
+/// never lets a description this sees run longer than the cap in the first
+/// place.
+pub fn sanitize_description(text: &str) -> String {
+    let mut out: String = text
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control() && !super::is_invisible_or_directional(*c))
+        .collect();
+    // Trimmed again for whatever the strip above exposed, before the cap
+    // below decides whether there is still something to mark as cut. Both
+    // functions trim once before the filter runs, then filter, then trim
+    // again — trailing, then leading — outside that chain, and both cap the
+    // result at their own limit; only the order of that second trim and the
+    // cap differs. [`crate::plugin::sanitize_provider_text`] caps inside the
+    // chain, right after its own filter, so its outside-the-chain trim
+    // cleans up whatever the cap exposed as well as whatever the filter did;
+    // this one has no cap yet when its own outside-the-chain trim runs, so
+    // that pair only ever cleans up what the filter exposed, and the cap
+    // comes afterwards, trimming a third time on whatever the cut itself
+    // exposes.
+    out.truncate(out.trim_end().len());
+    let leading = out.len() - out.trim_start().len();
+    out.drain(..leading);
+
+    if out.chars().count() <= REGISTRY_DESCRIPTION_MAX_CHARS {
+        return out;
+    }
+    // One fewer than the cap, so the `…` appended after it leaves the whole
+    // result at no more than the cap rather than one over it — not always
+    // exactly the cap: the cut can expose a whole run of trailing
+    // whitespace, not just the one character sitting right at the
+    // boundary, and the trim below removes all of it before `…` goes on,
+    // landing however many characters that run was under the cap.
+    let mut cut: String = out
+        .chars()
+        .take(REGISTRY_DESCRIPTION_MAX_CHARS - 1)
+        .collect();
+    cut.truncate(cut.trim_end().len());
+    cut.push('…');
+    cut
 }
 
 /// Same charset rule as [`PluginManifest::validate`]'s `id` check — the
@@ -1252,6 +1346,22 @@ fn logfile_scope(lf: &LogFileConfig) -> String {
     format!("{root}/{}", lf.glob)
 }
 
+/// [`logfile_scope`] for `[history]` — the same `root`/`root_env`/
+/// `root_env_join`/`glob` shape, disclosed the same way. A history root
+/// names a tree the app reads *every byte of over time* (rather than the
+/// newest handful of files a quota glob touches), which is if anything
+/// more worth naming plainly, not less.
+fn history_scope(h: &crate::plugin::manifest::HistoryConfig) -> String {
+    let root = match &h.root_env {
+        Some(env_name) => match &h.root_env_join {
+            Some(join) => format!("${env_name}/{join}"),
+            None => format!("${env_name}"),
+        },
+        None => h.root.clone(),
+    };
+    format!("{root}/{}", h.glob)
+}
+
 /// [`TrustDisclosure::credential_sources`] entries for one `[[surface.auth]]`
 /// step — see that field's own doc for the full rationale, including why
 /// `credentials-file`/`credentials-map`/`reject-when`/`oauth-refresh` return
@@ -1288,10 +1398,15 @@ fn credential_source_labels(step: &AuthStep) -> Vec<String> {
                 });
             }
         }
-        AuthType::CredentialsFile
-        | AuthType::CredentialsMap
-        | AuthType::RejectWhen
-        | AuthType::OauthRefresh => {}
+        AuthType::OauthRefresh => {
+            if let Some(service) = &step.refresh_service {
+                labels.push(format!("keychain \"{service}\""));
+            }
+            for target in step.refresh_targets.iter().flatten() {
+                labels.push(format!("credential manager \"{target}\""));
+            }
+        }
+        AuthType::CredentialsFile | AuthType::CredentialsMap | AuthType::RejectWhen => {}
     }
     labels
 }
@@ -1350,6 +1465,18 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
         let scope = logfile_scope(lf);
         if !local_files.contains(&scope) {
             local_files.push(scope);
+        }
+    }
+    if let Some(h) = &m.history {
+        let scope = history_scope(h);
+        if !local_files.contains(&scope) {
+            local_files.push(scope);
+        }
+        for extra in &h.extra_roots {
+            let scope = format!("{extra}/{}", h.glob);
+            if !local_files.contains(&scope) {
+                local_files.push(scope);
+            }
         }
     }
     // `jwt-file`'s own token file — the same gap a credential-file auth
@@ -1471,6 +1598,20 @@ pub fn analyze_trust(m: &PluginManifest, trusted_hosts: &[&str]) -> TrustDisclos
         }
         line
     });
+    // `[[window_ping]]` commands run under the same toggle, after the same
+    // kind of reset, so they belong in the same clause: each named, after
+    // `[ping]`'s own, joined the way the Settings toggle's label joins them.
+    let window_pings = m.window_ping.iter().map(|wp| {
+        if wp.args.is_empty() {
+            wp.bin.clone()
+        } else {
+            format!("{} {}", wp.bin, wp.args.join(" "))
+        }
+    });
+    let ping = ping
+        .into_iter()
+        .chain(window_pings)
+        .reduce(|a, b| format!("{a}; {b}"));
 
     let untrusted_hosts: Vec<String> = dest_hosts
         .iter()
@@ -1957,6 +2098,101 @@ mod tests {
         assert!(
             err.contains("control, invisible or directional characters"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// `version` reaches the install/update row the same way `name` and
+    /// `description` do, so it needs the same class of refusal — a
+    /// hostile index cannot smuggle a bidi override through the one field
+    /// the other two checks left alone.
+    #[test]
+    fn rejects_a_bidi_override_in_a_version() {
+        let idx = entry_with("version", "1.0.0\u{202E}");
+        let err = RegistryIndex::from_str(&idx)
+            .expect_err("a bidi override in a version must be rejected");
+        assert!(
+            err.contains("control, invisible or directional characters"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Same reasoning as the charset check above, for length: `version` is
+    /// bounded the same way `name` is, so a hostile index cannot use it to
+    /// overflow the row either.
+    #[test]
+    fn rejects_a_version_over_the_length_cap() {
+        let idx = entry_with("version", &"1".repeat(REGISTRY_VERSION_MAX_CHARS + 1));
+        let err = RegistryIndex::from_str(&idx).expect_err("an overlong version must be rejected");
+        assert!(err.contains("version"), "unexpected error: {err}");
+    }
+
+    // ── sanitize_description ─────────────────────────────────────────────
+
+    /// `RegistryIndex::validate` lets a description run to
+    /// `REGISTRY_DESCRIPTION_MAX_CHARS`, four times
+    /// `crate::plugin::PROVIDER_TEXT_MAX_CHARS`'s 64 — a validated
+    /// shipped-length description must reach the screen whole, not arrive
+    /// cut mid-word at the caption-sized cap. Built here at the length the
+    /// longest description this repo ships happens to be, rather than read
+    /// off `plugins/index.toml` itself, so this pins the cap this function
+    /// enforces rather than whatever that file happens to say today.
+    #[test]
+    fn sanitize_description_keeps_a_shipped_length_description_whole() {
+        let longest_shipped: String = "x".repeat(83);
+        assert_eq!(sanitize_description(&longest_shipped), longest_shipped);
+    }
+
+    /// Past its own cap, this ends in `…` rather than cutting silently the
+    /// way `crate::plugin::sanitize_provider_text` does for a caption — a
+    /// description is prose, and a cut with nothing to mark it reads as the
+    /// whole sentence.
+    #[test]
+    fn sanitize_description_ellipsises_rather_than_silently_cutting_past_the_cap() {
+        let over_cap = "x".repeat(REGISTRY_DESCRIPTION_MAX_CHARS + 1);
+        let sanitized = sanitize_description(&over_cap);
+        assert_eq!(sanitized.chars().count(), REGISTRY_DESCRIPTION_MAX_CHARS);
+        assert!(sanitized.ends_with('…'), "{sanitized}");
+        assert_ne!(
+            sanitized,
+            "x".repeat(REGISTRY_DESCRIPTION_MAX_CHARS),
+            "a silent cut with no ellipsis must not pass for this"
+        );
+    }
+
+    /// The same control/bidi class [`crate::plugin::sanitize_provider_text`]
+    /// strips reaches this sanitiser too — the field is optional and this
+    /// runs on whatever `Option::unwrap_or_default` produces for `None`,
+    /// the same as every other sink of registry text.
+    #[test]
+    fn sanitize_description_strips_control_and_bidi_characters() {
+        assert_eq!(
+            sanitize_description("reads\u{200B}your\ncredentials\u{202E}"),
+            "readsyourcredentials"
+        );
+    }
+
+    /// The cap this ends up landing on is "no more than", not "exactly":
+    /// the cut can expose a whole run of trailing whitespace, not just the
+    /// one character sitting right at the boundary, and
+    /// `cut.truncate(cut.trim_end().len())` removes the entire run before
+    /// `…` goes on — five spaces land the result five characters under the
+    /// cap, not one.
+    #[test]
+    fn sanitize_description_can_land_several_characters_under_the_cap_when_the_cut_exposes_a_run_of_whitespace(
+    ) {
+        let run_of_spaces = 5;
+        let kept = REGISTRY_DESCRIPTION_MAX_CHARS - 1 - run_of_spaces;
+        let padded = format!(
+            "{}{}{}",
+            "x".repeat(kept),
+            " ".repeat(run_of_spaces),
+            "y".repeat(10)
+        );
+        let sanitized = sanitize_description(&padded);
+        assert_eq!(sanitized, format!("{}…", "x".repeat(kept)));
+        assert_eq!(
+            sanitized.chars().count(),
+            REGISTRY_DESCRIPTION_MAX_CHARS - run_of_spaces
         );
     }
 
@@ -2593,13 +2829,26 @@ mod tests {
         let path_line = matches!(auth_type, "credentials-file" | "credentials-map")
             .then(|| "path = \"~/.x/creds.json\"")
             .unwrap_or_default();
-        // `macos_keychain_key` is `electron-safe-storage`'s own field
-        // (`auth::electron_safe_storage_step`) — `validate` now refuses it on
-        // any other step kind, same as `expiry_json_path` already was, so
-        // this can no longer be wired in unconditionally like `service`/`var`/
-        // `config_path`/`blob_json_path`, none of which `validate` checks.
+        // `macos_keychain_key`/`service`/`var`/`config_path`/`blob_json_path`
+        // are each a single step kind's own field
+        // (`auth::electron_safe_storage_step`/`keychain_step`/`env_step`) —
+        // `validate` now refuses every one of them on any other step kind,
+        // the same as `expiry_json_path` already was, so none of these can
+        // be wired in unconditionally any more.
         let macos_keychain_key_line = matches!(auth_type, "electron-safe-storage")
             .then(|| "macos_keychain_key = \"key\"")
+            .unwrap_or_default();
+        let service_line = matches!(auth_type, "keychain")
+            .then(|| "service = \"svc\"")
+            .unwrap_or_default();
+        let var_line = matches!(auth_type, "env")
+            .then(|| "var = \"SOME_VAR\"")
+            .unwrap_or_default();
+        let config_path_line = matches!(auth_type, "electron-safe-storage")
+            .then(|| "config_path = \"~/.x/config.json\"")
+            .unwrap_or_default();
+        let blob_json_path_line = matches!(auth_type, "electron-safe-storage")
+            .then(|| "blob_json_path = \"blob\"")
             .unwrap_or_default();
         let toml = format!(
             r#"
@@ -2628,10 +2877,10 @@ mod tests {
             type = "{auth_type}"
             {path_line}
             token_json_path = "access_token"
-            service = "svc"
-            var = "SOME_VAR"
-            config_path = "~/.x/config.json"
-            blob_json_path = "blob"
+            {service_line}
+            {var_line}
+            {config_path_line}
+            {blob_json_path_line}
             {macos_keychain_key_line}
             "#
         );
@@ -2717,6 +2966,64 @@ mod tests {
         );
     }
 
+    /// A `[[window_ping]]` runs a command exactly as `[ping]` does, so it is
+    /// disclosed exactly as `[ping]` is — named in the dialog, and enough on
+    /// its own to require approval. A manifest that pings only through it
+    /// (Antigravity's shape) must not install in silence.
+    #[test]
+    fn window_pings_are_disclosed_and_need_approval_like_ping() {
+        let base = r#"
+            id         = "x"
+            name       = "X"
+            menu_label = "X"
+            order      = 1
+            engine     = "log-file"
+            requires_reader = ["window-identity"]
+            [[windows]]
+            id    = "five"
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [[windows]]
+            id    = "other"
+            label = "O5"
+            role  = "extra"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "q"
+            resets_at_path = "s"
+            [logfile]
+            root = "~/.x"
+            glob = "*.jsonl"
+            container_key = "rate_limits"
+            [[window_ping]]
+            window = "five"
+            bin    = "agy"
+            args   = ["-p", "hello"]
+            [[window_ping]]
+            window = "other"
+            bin    = "agy"
+            args   = ["-p", "hi"]
+        "#;
+        let m = PluginManifest::from_str(base).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert_eq!(disclosure.ping.as_deref(), Some("agy -p hello; agy -p hi"));
+        // `requires_approval` reads that same `ping` value (a log-file
+        // manifest needs approval for its local files anyway, so this
+        // assertion alone could not tell the two causes apart).
+        assert!(
+            disclosure.requires_approval,
+            "a command that runs needs approval whichever table names it"
+        );
+    }
+
     #[test]
     fn a_manifest_whose_only_auth_step_reads_a_credential_map_still_needs_approval() {
         // The gap this closes: nothing else in `analyze_trust` would have
@@ -2761,6 +3068,55 @@ mod tests {
             "reading a credential out of a map is reading a credential"
         );
         assert_eq!(disclosure.auth_types, vec![AuthType::CredentialsMap]);
+    }
+
+    /// `[history]` names a tree this app reads over time — disclosed like
+    /// `[logfile]`'s scope is, `root_env` spelled as `$VAR` when set.
+    #[test]
+    fn a_history_root_is_disclosed_as_a_local_file_scope() {
+        let toml = r#"
+            id         = "x"
+            name       = "X"
+            menu_label = "X"
+            order      = 1
+            engine     = "log-file"
+            requires_reader = ["reading-history"]
+            [[windows]]
+            label = "5H"
+            role  = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [logfile]
+            root = "~/.x/quota"
+            glob = "*.jsonl"
+            container_key = "k"
+            [history]
+            format = "codex-rollouts"
+            root = "~/.x/sessions"
+            glob = "**/*.jsonl"
+            root_env = "X_HOME"
+            root_env_join = "sessions"
+        "#;
+        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert!(
+            disclosure
+                .local_files
+                .contains(&"$X_HOME/sessions/**/*.jsonl".to_string()),
+            "history scope disclosed as the env-override spelling: {:?}",
+            disclosure.local_files
+        );
+        assert!(
+            disclosure
+                .local_files
+                .contains(&"~/.x/quota/*.jsonl".to_string()),
+            "the logfile scope is still disclosed beside it: {:?}",
+            disclosure.local_files
+        );
     }
 
     #[test]
@@ -2949,6 +3305,77 @@ mod tests {
         assert!(
             disclosure.requires_approval,
             "reading a local file, however it's named, needs approval"
+        );
+    }
+
+    #[test]
+    fn oauth_refresh_store_and_history_extra_roots_are_disclosed() {
+        let toml = r#"
+            id = "sample"
+            name = "Sample"
+            menu_label = "Sa"
+            order = 1
+            engine = "http-api"
+            requires_reader = ["oauth-refresh", "oauth-refresh-store", "reading-history", "history-extra-roots"]
+            [[windows]]
+            label = "5H"
+            role = "primary"
+            [windows.period]
+            mode = "assumed"
+            assumed = 300
+            [windows.source]
+            used_percent_path = "p"
+            resets_at_path = "r"
+            [http]
+            [[http.request]]
+            url = "https://example.com/usage"
+            [[surface]]
+            id = "default"
+            label = "Default"
+            allowed_hosts = ["example.com", "oauth2.googleapis.com"]
+            [[surface.auth]]
+            type = "oauth-refresh"
+            refresh_service = "gemini"
+            refresh_targets = ["gemini:antigravity"]
+            token_json_path = "token.refresh_token"
+            token_url = "https://oauth2.googleapis.com/token"
+            client_id = "cid"
+            client_secret = "csec"
+            [history]
+            format = "antigravity-sqlite"
+            root = "~/.gemini/antigravity-cli/conversations"
+            extra_roots = ["~/.gemini/antigravity/conversations"]
+            glob = "*.db"
+        "#;
+        let m = PluginManifest::from_str(toml).expect("valid manifest");
+        let disclosure = analyze_trust(&m, TRUSTED_HOSTS);
+        assert!(
+            disclosure
+                .credential_sources
+                .contains(&"keychain \"gemini\"".to_string()),
+            "{:?}",
+            disclosure.credential_sources
+        );
+        assert!(
+            disclosure
+                .credential_sources
+                .contains(&"credential manager \"gemini:antigravity\"".to_string()),
+            "{:?}",
+            disclosure.credential_sources
+        );
+        assert!(
+            disclosure
+                .local_files
+                .contains(&"~/.gemini/antigravity-cli/conversations/*.db".to_string()),
+            "{:?}",
+            disclosure.local_files
+        );
+        assert!(
+            disclosure
+                .local_files
+                .contains(&"~/.gemini/antigravity/conversations/*.db".to_string()),
+            "{:?}",
+            disclosure.local_files
         );
     }
 

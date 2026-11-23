@@ -153,16 +153,38 @@ fn default_surface_in_menu_bar(m: &PluginManifest) -> bool {
 /// archived ones), which could make mtime-based freshness pick the wrong
 /// one.
 fn resolve_root(lf: &LogFileConfig, options: &BTreeMap<String, bool>) -> PathBuf {
-    if let Some(env_name) = &lf.root_env {
+    resolve_root_fields(&lf.root, &lf.root_env, &lf.root_env_join, options)
+}
+
+/// `root`/`root_env`/`root_env_join` resolution shared by `[logfile]` and
+/// `[history]` — both describe a provider-owned directory tree the app
+/// only reads.
+///
+/// An env value that is empty, whitespace-only or relative reads exactly as
+/// if the variable were unset, falling back to `root` — the same rule
+/// [`crate::plugin::resolve_env_overridden_path`] applies to a manifest's
+/// other env-relocatable paths (see its own doc for why), applied here too:
+/// a scan root must never be read relative to this process's own working
+/// directory, which is what an exported-but-empty variable would otherwise
+/// do (`PathBuf::from("").join(…)` resolves against the CWD).
+pub(crate) fn resolve_root_fields(
+    root: &str,
+    root_env: &Option<String>,
+    root_env_join: &Option<String>,
+    options: &BTreeMap<String, bool>,
+) -> PathBuf {
+    if let Some(env_name) = root_env {
         if let Some(v) = std::env::var_os(env_name) {
             let base = PathBuf::from(v);
-            return match &lf.root_env_join {
-                Some(sub) => base.join(crate::plugin::substitute_options(sub, options)),
-                None => base,
-            };
+            if base.is_absolute() {
+                return match root_env_join {
+                    Some(sub) => base.join(crate::plugin::substitute_options(sub, options)),
+                    None => base,
+                };
+            }
         }
     }
-    crate::plugin::expand_home(&crate::plugin::substitute_options(&lf.root, options))
+    crate::plugin::expand_home(&crate::plugin::substitute_options(root, options))
 }
 
 /// The root-injectable core of the engine — everything [`fetch`] does except
@@ -845,10 +867,13 @@ fn latest_reading(
 /// about the provider's own data directory, not data it trusts to be small,
 /// and a mistyped one (or an env var pointed at something far wider) could
 /// hand this walk a home directory instead of a session tree. `LOG_WALK_MAX_ENTRIES`
-/// caps how many directory entries a single collection visits before it stops
-/// and reports whatever it already found; a session tree this engine has ever
-/// been measured against (`fetch`'s doc: 3975 files) is nowhere near the cap,
-/// so this only ever bites a manifest that got its root wrong.
+/// caps how many entries [`collect_log_files`] takes off the walk after
+/// `filter_map(Result::ok)` has already dropped the unreadable ones — so it
+/// bounds successfully-read entries, not every directory entry the walk
+/// itself visits, before it stops and reports whatever it already found; a
+/// session tree this engine has ever been measured against (`fetch`'s doc:
+/// 3975 files) is nowhere near the cap, so this only ever bites a manifest
+/// that got its root wrong.
 const LOG_WALK_MAX_ENTRIES: usize = 200_000;
 
 /// All files under `root` whose basename matches `glob` — including a
@@ -1010,7 +1035,7 @@ pub fn take_pending_diagnostics() -> Vec<String> {
 /// at least the whole string back, so the `unwrap_or` below never actually
 /// falls through — kept because the type still asks for it, not because the
 /// `None` arm is reachable.
-fn glob_matches(glob: &str, name: &str) -> bool {
+pub(crate) fn glob_matches(glob: &str, name: &str) -> bool {
     let separators: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
     let name_pattern = glob.rsplit(separators).next().unwrap_or(glob);
     match_wildcard(name_pattern, name)
@@ -1355,6 +1380,9 @@ mod tests {
 
     use crate::plugin::manifest::{PeriodConfig, PeriodUnit, SourceConfig};
 
+    /// A path `Path::is_absolute` accepts on the platform running the tests.
+    const ABSOLUTE_ROOT: &str = if cfg!(windows) { r"C:\tmp\x" } else { "/tmp/x" };
+
     /// Guards every test below that calls `std::env::set_var`/`remove_var`:
     /// real process environment is process-wide state `cargo test`'s default
     /// parallelism does not otherwise serialize, and each test's own
@@ -1365,6 +1393,16 @@ mod tests {
     /// panicking while holding this lock must not poison it for every test
     /// queued behind it.
     static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Guards every test that drains [`take_pending_diagnostics`] —
+    /// `PENDING_DIAGNOSTICS` is one process-wide queue shared by every test
+    /// in this module, not one per plugin id. A unique id stops a test from
+    /// *misreading* another's line but not from *stealing* it: two tests
+    /// draining at once each walk away with part of what was queued, and the
+    /// one that queued a line a moment earlier finds an empty vec. The
+    /// sibling modules carry the same lock for the same reason. Poison
+    /// discipline as above: `.unwrap_or_else(|e| e.into_inner())`.
+    static DIAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The invariant is stated as a property of **every path that builds a
     /// reading**, not of `ProviderReading::fail`: a test that calls `fail` and
@@ -1637,6 +1675,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unopenable_matched_file_queues_a_read_error_diagnostic() {
+        let _diag_guard = DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir("open-error");
         let path = write_file(
@@ -1739,6 +1778,7 @@ mod tests {
 
     #[test]
     fn cap_to_newest_files_keeps_the_newest_and_reports_the_drop_once() {
+        let _diag_guard = DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::time::SystemTime::now();
         // Already newest-first by construction (index 0 is `base` itself,
         // increasing index moves further into the past) — `cap_to_newest_files`
@@ -1781,6 +1821,7 @@ mod tests {
 
     #[test]
     fn cap_to_newest_files_is_a_no_op_under_the_cap() {
+        let _diag_guard = DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let files = vec![(PathBuf::from("a"), std::time::SystemTime::now(), 0u64)];
         let capped = cap_to_newest_files(files.clone(), "under-cap-plugin");
         assert_eq!(capped, files);
@@ -1789,6 +1830,7 @@ mod tests {
 
     #[test]
     fn latest_reading_stops_once_its_byte_budget_is_spent() {
+        let _diag_guard = DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Filler files sized just over `TAIL_BYTES`, so each costs exactly
         // `TAIL_BYTES` against the budget regardless of the (sparse, near-
         // free to create) size actually claimed on disk. Enough of them to
@@ -2955,7 +2997,11 @@ mod tests {
     /// a hostile value cannot inflate threefold in `%XX` escapes.
     #[test]
     fn a_secondary_reading_id_is_sanitised_and_encoded_before_becoming_a_config_key() {
-        let m = codex_like_manifest("/nonexistent", "/nonexistent", "/nonexistent");
+        let m = codex_like_manifest(
+            "TICKOVER_TEST_NONEXISTENT_ROOT_ENV",
+            "/nonexistent",
+            "/nonexistent",
+        );
         let lf = m.logfile.as_ref().unwrap();
         let raw = RawReading {
             primary: Some(slot(10.0, Some(300))),
@@ -3152,7 +3198,7 @@ mod tests {
     fn resolve_root_joins_root_env_join_onto_the_env_override() {
         let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let env_name = "TICKOVER_TEST_ENGINE_LOGFILE_ROOT_JOIN";
-        std::env::set_var(env_name, "/tmp/x");
+        std::env::set_var(env_name, ABSOLUTE_ROOT);
         let lf = LogFileConfig {
             root_env: Some(env_name.to_string()),
             root_env_join: Some("sessions".to_string()),
@@ -3169,7 +3215,7 @@ mod tests {
         };
         assert_eq!(
             resolve_root(&lf, &no_options()),
-            PathBuf::from("/tmp/x/sessions")
+            PathBuf::from(ABSOLUTE_ROOT).join("sessions")
         );
         std::env::remove_var(env_name);
     }
@@ -3178,7 +3224,7 @@ mod tests {
     fn resolve_root_substitutes_option_placeholders_in_root_env_join() {
         let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let env_name = "TICKOVER_TEST_ENGINE_LOGFILE_ROOT_OPTION_JOIN";
-        std::env::set_var(env_name, "/tmp/x");
+        std::env::set_var(env_name, ABSOLUTE_ROOT);
         let lf = LogFileConfig {
             root_env: Some(env_name.to_string()),
             root_env_join: Some("{option.subdir}".to_string()),
@@ -3195,10 +3241,16 @@ mod tests {
         };
         let mut opts = BTreeMap::new();
         opts.insert("subdir".to_string(), true);
-        assert_eq!(resolve_root(&lf, &opts), PathBuf::from("/tmp/x/true"));
+        assert_eq!(
+            resolve_root(&lf, &opts),
+            PathBuf::from(ABSOLUTE_ROOT).join("true")
+        );
 
         opts.insert("subdir".to_string(), false);
-        assert_eq!(resolve_root(&lf, &opts), PathBuf::from("/tmp/x/false"));
+        assert_eq!(
+            resolve_root(&lf, &opts),
+            PathBuf::from(ABSOLUTE_ROOT).join("false")
+        );
         std::env::remove_var(env_name);
     }
 
@@ -3249,6 +3301,50 @@ mod tests {
         // No suffix appended onto the plain `root` fallback.
         let expected = dirs::home_dir().unwrap().join(".codex").join("sessions");
         assert_eq!(resolve_root(&lf, &no_options()), expected);
+    }
+
+    /// An exported-but-empty, whitespace-only or relative override must read
+    /// as though the variable were never set at all — the same rule
+    /// `resolve_env_overridden_path` gives a manifest's other env-relocatable
+    /// paths. Before this, an empty value in particular (`PathBuf::from("")`)
+    /// made the scan root relative to whatever this process's own working
+    /// directory happened to be.
+    #[test]
+    fn resolve_root_treats_an_empty_whitespace_or_relative_override_as_unset() {
+        let _env_guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env_name = "TICKOVER_TEST_ENGINE_LOGFILE_ROOT_NOT_ABSOLUTE";
+        let lf = LogFileConfig {
+            root_env: Some(env_name.to_string()),
+            root_env_join: None,
+            root: "~/.codex/sessions".to_string(),
+            glob: "rollout-*.jsonl".to_string(),
+            format: LogFileFormat::Jsonl,
+            select: LogFileSelect::Last,
+            container_key: "rate_limits".to_string(),
+            classify_threshold_minutes: 720,
+            detect_bin: None,
+            not_installed_message: None,
+            no_data_message: None,
+            account_match: None,
+        };
+        let expected = dirs::home_dir().unwrap().join(".codex").join("sessions");
+
+        for not_absolute in ["", "   ", "relative/sessions"] {
+            std::env::set_var(env_name, not_absolute);
+            assert_eq!(
+                resolve_root(&lf, &no_options()),
+                expected,
+                "{not_absolute:?} must fall back to the declared root, not be read verbatim"
+            );
+        }
+
+        // An absolute value is still honoured exactly as before.
+        std::env::set_var(env_name, ABSOLUTE_ROOT);
+        assert_eq!(
+            resolve_root(&lf, &no_options()),
+            PathBuf::from(ABSOLUTE_ROOT)
+        );
+        std::env::remove_var(env_name);
     }
 
     // ── installed vs no-data messaging ───────────────────────────────────

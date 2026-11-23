@@ -82,6 +82,7 @@ credential source and calling whatever host it declares. See
 | `[[surface]]` | array of tables | no | one synthesized `"default"` surface | see [`[[surface]]`](#surface) |
 | `[[option]]` | array of tables | no | empty | boolean toggles the manifest declares for the settings sheet, substituted into requests as `{option.<key>}` — see [`[[option]]`](#option) |
 | `[ping]` | table | no | absent = no auto-ping | see [`[ping]`](#ping) |
+| `[[window_ping]]` | array of tables | no | empty | per-window auto-ping commands, keyed by `[[windows]] id` — see [`[[window_ping]]`](#window_ping) |
 
 Values for enum-typed fields (`engine`, `role`, `from`, `transform`, `type`,
 `mode`, `resets_at_format`) are lower-case, hyphenated (`"log-file"`,
@@ -227,6 +228,7 @@ Two rules keep the key lists true:
 | `credentials-file-path-env` | **yes** | `[[surface.auth]]` `path_env` / `path_env_join` on a `credentials-file` or `reject-when` step — an env var override for where the credentials file lives, mirroring `[logfile] root_env`/`root_env_join` |
 | `http-value-path-env` | **yes** | `[[http.value]]` `path_env` / `path_env_join` — the same env var override, for the file a named value is read from (Codex's `chatgpt-account-id` lives under `$CODEX_HOME`) |
 | `keychain-service-env` | **yes** | `[[surface.auth]]` `service_env` / `service_env_suffix` on a `keychain` step — re-keys `service` from an env var's value, mirroring `credentials-file-path-env` for the Keychain item name Claude's CLI also renames under `CLAUDE_CONFIG_DIR` |
+| `reading-history` | **yes** | `[history]` — the provider publishes a local usage log the scanner can read (see [`[history]`](#history)); a manifest without it is quota-only |
 
 `window-severity` is listed without being implemented, and that is the useful
 state, not an oversight: the name ships ahead of the semantics so the build
@@ -282,7 +284,7 @@ manifest fails validation with 2+. A manifest may declare at most 32
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `id` | string | no (default empty) | stable identity of this window — the `<entry>` half of its `Window::key`, matched across fetches (and, for an enumerating entry, the base a per-element row's key is built from); at most 64 bytes of lowercase ASCII letters, digits and hyphens, starting with a letter or digit. Empty means the entry's position stands in (`wN`) — and a caption is deliberately *not* used as identity, since a label is expected to change freely. Not a `config.json` key: the seen-window registry keys by *role* (`"primary"`/`"secondary"`) and never records an `Extra`-role window at all. Needs `requires_reader = ["window-identity"]` |
-| `label` | string | yes | short row label shown in the popup (`"5H"`, `"WK"`); at most 120 characters — a row caption drawn on a card with `wrap: word-wrap`, not a paragraph |
+| `label` | string | yes | short row label shown in the popup (`"5H"`, `"WK"`); at most 120 characters — a row caption drawn on a card, elided when it does not fit rather than wrapped, not a paragraph |
 | `role` | `"primary"` \| `"secondary"` \| `"extra"` | yes | UI slot this window fills; primary drives the auto-ping and the pill's first mini-bar. `extra` fills neither slot: it is a row in the panel and nothing else — see below |
 | `required` | bool | no (default `false`) | whether this provider *always* reports this window, so its absence is the provider's error rather than a fact about the account — see [Presence](#presence-a-window-that-isnt-there). Needs `requires_reader = ["window-presence"]` |
 | `for_each`, `for_each_where`, `element_id_path` | strings | no | one row per element of an array in the response, instead of one row per entry — see [Enumerating entries](#enumerating-entries--for_each-http-api-only) |
@@ -354,8 +356,9 @@ saying "no usage reported yet", which is true.
 
 So mark a window `required` only where the provider genuinely always sends it,
 and expect no safety net where you don't. Neither of Codex's windows is
-marked. Both of Claude's are — Anthropic sends both for every account, so a
-response with half of them has changed shape.
+marked. Claude's weekly window is: a response without it has changed shape. Its
+5-hour window is not, because a live account has been measured answering with
+`five_hour` null beside a filled-in weekly window.
 
 #### The seen-window registry: a row that doesn't blink out
 
@@ -735,7 +738,7 @@ Required when `engine = "log-file"`.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `root_env` | string | — (optional) | name of an env var that, if set in the process environment, overrides where the engine searches (mirrors the existing `CODEX_HOME` override) |
+| `root_env` | string | — (optional) | name of an env var that, if set in the process environment, overrides where the engine searches (mirrors the existing `CODEX_HOME` override). The name itself is validated only by exclusion — non-empty, no `=`, no NUL byte — never by shell-identifier shape, so a literal value like Windows' `ProgramFiles(x86)` is accepted; every other `_env` field below carries the same rule |
 | `root_env_join` | string | — (optional) | subdirectory appended onto `root_env`'s value when it is set (`"sessions"` so `$CODEX_HOME` resolves to `$CODEX_HOME/sessions`); ignored otherwise. Must be a relative path with no `..` component — it is joined onto the env var's value, never used in its place |
 | `root` | string | — (required) | root directory to search; `~` and `{config_dir}` expand (see [Path expansion](#path-expansion)); no `..` component |
 | `glob` | string | — (required) | glob, relative to `root`, matching the provider's log files (e.g. `"**/rollout-*.jsonl"`) |
@@ -798,7 +801,7 @@ speaks for is named in `~/.codex/auth.json`, not in the URL.
 | `name` | string | placeholder name; ASCII letters, digits and underscores, unique within the manifest |
 | `type` | `"json-file"` | where to read it from |
 | `path` | string | file to read (`~` / `{config_dir}` expanded) |
-| `path_env` | string | env var that, if set to an absolute path, overrides `path`'s directory — the same rule `[[surface.auth]]` `path_env` carries, including the empty/relative fallback to `path`. Needs `requires_reader = ["http-value-path-env"]` |
+| `path_env` | string | env var that, if set to an absolute path, overrides `path`'s directory — the same rule `[[surface.auth]]` `path_env` carries, including the empty/relative fallback to `path` and the name-validation rule stated at `[logfile] root_env` above. Needs `requires_reader = ["http-value-path-env"]` |
 | `path_env_join` | string | filename appended onto the `path_env` override, if set; ignored under the same conditions as the auth-step variant. Must be relative with no `..` component |
 | `json_path` | string | dotted JSON path to a non-empty string inside that file |
 
@@ -852,15 +855,15 @@ needs and ignores the rest.
 |---|---|---|---|
 | `type` | `"credentials-file"` \| `"credentials-map"` \| `"keychain"` \| `"env"` \| `"electron-safe-storage"` \| `"win-credential"` \| `"reject-when"` \| `"oauth-refresh"` | all | which credential store this step reads from (`reject-when` reads none, `oauth-refresh` reads one and spends it — see below) |
 | `path` | string | `credentials-file`, `credentials-map`, `reject-when`, `oauth-refresh` | path to the JSON file |
-| `path_env` | string | `credentials-file`, `reject-when` — refused on any other step kind | env var that, if set to an absolute path, overrides `path`'s directory — the credential variant of `[logfile] root_env`, additionally ignoring an env value that is empty or relative and falling back to `path` as if the variable were unset. `reject-when` honours it because a provider that relocates its config dir puts the whole directory there, not just the token file. Needs `requires_reader = ["credentials-file-path-env"]` |
+| `path_env` | string | `credentials-file`, `reject-when` — refused on any other step kind | env var that, if set to an absolute path, overrides `path`'s directory — the credential variant of `[logfile] root_env`, additionally ignoring an env value that is empty or relative and falling back to `path` as if the variable were unset. `reject-when` honours it because a provider that relocates its config dir puts the whole directory there, not just the token file. The variable's own name is validated the same way as `[logfile] root_env`'s — by exclusion, not identifier shape. Needs `requires_reader = ["credentials-file-path-env"]` |
 | `path_env_join` | string | `credentials-file`, `reject-when` | filename appended onto the `path_env` override, if set (e.g. `".credentials.json"` so `$CLAUDE_CONFIG_DIR` resolves to `$CLAUDE_CONFIG_DIR/.credentials.json`); ignored when `path_env` is unset, the env var itself isn't, or its value is empty or not absolute. Must be relative with no `..` component — mirrors `[logfile] root_env_join` exactly |
 | `token_json_path` | string | `credentials-file`, `credentials-map`, `keychain`, `win-credential`, `oauth-refresh`; optional on `electron-safe-storage` (default `"claudeAiOauth.accessToken\|access_token"`) | `\|`-separated fallback JSON paths to the token (e.g. `"claudeAiOauth.accessToken\|access_token"` — try camelCase, then snake_case). For `credentials-map` it is read inside the *matched entry*; for `oauth-refresh` it names the **refresh** token |
 | `key_prefix` | string | `credentials-map` | prefix the entry's key in the top-level object at `path` must start with. Needs `requires_reader = ["credentials-map"]` |
 | `service` | string | `keychain` | Keychain service name to query |
-| `service_env` | string | `keychain` — refused on any other step kind | env var that, if set and non-empty, re-keys `service`: the value is Unicode-NFC-normalised, hashed with sha256, and the first N hex characters (per `service_env_suffix`) are appended after a `-`, mirroring the credential variant of `[logfile] root_env`. Empty is treated as unset. Needs `requires_reader = ["keychain-service-env"]` |
+| `service_env` | string | `keychain` — refused on any other step kind | env var that, if set and non-empty, re-keys `service`: the value is Unicode-NFC-normalised, hashed with sha256, and the first N hex characters (per `service_env_suffix`) are appended after a `-`, mirroring the credential variant of `[logfile] root_env`. Empty is treated as unset; the variable's own name is validated the same way as `[logfile] root_env`'s — by exclusion, not identifier shape. Needs `requires_reader = ["keychain-service-env"]` |
 | `service_env_suffix` | string | `keychain`, and only beside `service_env` | how many leading hex characters of the sha256 to append; the only supported value is `"sha256:8"` |
 | `expiry_json_path` | string | `keychain`, `credentials-file`, `win-credential`, `credentials-map` — refused on any other step kind (the error names the step's own index and kind) | JSON path to an expiry beside the token (for `credentials-map`, inside the *matched entry*) — an RFC3339 string, or a JSON number/numeric string read as epoch seconds or milliseconds (told apart by magnitude); a lapsed one makes the step **Absent** instead of handing back a stale token. Needs `requires_reader = ["keychain-expiry"]` |
-| `var` | string | `env` | environment variable name holding the token |
+| `var` | string | `env` | environment variable name holding the token — validated the same way as `[logfile] root_env`'s name, by exclusion rather than identifier shape |
 | `config_path` | string | `electron-safe-storage` | path to the Electron config/state file holding the encrypted blob |
 | `blob_json_path` | string | `electron-safe-storage` | `\|`-separated fallback JSON paths to the blob inside `config_path` |
 | `macos_keychain_key` | string | `electron-safe-storage` (macOS only) | Keychain service name holding the Safe Storage password; ignored on Windows, where the blob is decrypted via DPAPI instead — no manifest field needed there |
@@ -869,6 +872,8 @@ needs and ignores the rest.
 | `unless_json_path` | string | `reject-when` | when this path also resolves, the rejection stands down and the chain continues |
 | `message` | string | `reject-when` | the sentence shown on the row instead of windows |
 | `token_url` | string | `oauth-refresh` | where to send the token exchange; must be `https` and must be inside this surface's `allowed_hosts`. Needs `requires_reader = ["oauth-refresh"]` |
+| `refresh_service` | string | `oauth-refresh` | macOS Keychain service holding the refresh-token payload (unwraps `go-keyring` markers), checked ahead of `path`. Needs `requires_reader = ["oauth-refresh-store"]` |
+| `refresh_targets` | array of strings | `oauth-refresh` | Windows Credential Manager target names holding the refresh-token payload (unwraps `go-keyring` markers), checked ahead of `path`. Needs `requires_reader = ["oauth-refresh-store"]` |
 | `client_id` | string | `oauth-refresh` | the OAuth *installed application* client id, spelled out literally. Still supported for a manifest that would rather ship the pair directly than discover it (see `client` below); an `oauth-refresh` step needs one or the other, and may not set both |
 | `client_secret` | string | `oauth-refresh` | the matching installed-app secret. Public by construction — an installed-app secret shipped inside a distributed binary cannot be kept from anyone willing to extract it, which is why OAuth2 treats such clients as public — but still never logged or put in an error string here |
 | `client` | table | `oauth-refresh` | read `client_id`/`client_secret` from the installed client's own binaries at run time instead of shipping them — see [`[surface.auth.client]`](#surfaceauthclient) below. Needs `requires_reader = ["oauth-client-discovery"]`; may not be set alongside the literal `client_id`/`client_secret` above |
@@ -932,8 +937,8 @@ an order silently.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `id_env` | string | no | environment variable naming the client id; must match `^[A-Za-z_][A-Za-z0-9_]*$` |
-| `secret_env` | string | no | environment variable naming the client secret; same charset |
+| `id_env` | string | no | environment variable naming the client id — validated only by exclusion: non-empty, no `=`, no NUL byte, not restricted to identifier shape |
+| `secret_env` | string | no | environment variable naming the client secret; same rule |
 | `id_pattern` | string | **yes** | regular expression (`regex` crate syntax, compiled as `regex::bytes::Regex` — the engine the scan actually uses) matched against a candidate file's bytes; the first match is the client id |
 | `secret_pattern` | string | **yes** | same, for the client secret |
 | `files` | array of strings | no\* | absolute paths (`~` expanded), with no `..` component, to scan first, in order — at most 16 |
@@ -1032,10 +1037,21 @@ modification time on every lookup, not by a clock — a found entry has no
 expiry of its own, so a client reinstalled with a new secret at the same
 path is rescanned because its length/modification time changed, not because
 some interval passed; without that check it would be served indefinitely,
-for as long as the file at that path keeps the same identity. It is also
-evicted outright on an `invalid_client` response from the token exchange, so
-a rotated pair is retried on the very next attempt rather than replayed
-until its identity happens to change some other way. Eviction clears the
+for as long as the file at that path keeps the same identity. When a **discovered**
+pair fails the exchange with `invalid_client` or `unauthorized_client` (common
+when an installed binary embeds several Google OAuth clients and the first
+secret matched does not belong to the first matching client id), the exchange
+probes alternate pairs from the candidate binaries before giving up: collecting
+up to 8 distinct `id_pattern` matches and 8 distinct `secret_pattern` matches
+per candidate file within the same chunk/pass budgets and trying up to 24
+pairs total (skipping remaining secrets for an id that answered
+`unauthorized_client`, and aborting immediately on any non-mismatch error such
+as `invalid_grant`). When a fallback pair succeeds, it replaces the cached
+entry for that config and path so subsequent ticks reuse it without
+rescanning. If probing finds no working pair (or for non-discovered pairs),
+`invalid_client` or `unauthorized_client` evicts the cached entry outright, so
+a rotated pair is retried on the next attempt (after backoff) rather than
+replayed until the file's identity changes some other way. Eviction clears the
 found pair and the miss backoff, but
 **not** the once-per-process "not found"/"half-set env" notifications — those
 are about a *config* an operator has already been told about, not about the
@@ -1105,6 +1121,60 @@ bidirectional override (U+200E/F, U+202A–E, U+2066–9, or the Unicode line/
 paragraph separators U+2028/9) — refused at load, for the same reason: one of
 these can rewrite a trust dialog, a log line, or the panel around it without
 a single visible character looking wrong.
+
+### `[[window_ping]]`
+
+Optional array of per-window commands, for providers with more than one
+5-hour window or whose windows need separate commands to start (Antigravity's
+Gemini and third-party groups count only their own models). Shares the
+plugin's single auto-ping toggle and host check with `[ping]`, with an
+independent `plugin.<id>.pinged_at.<window>` timestamp per entry — see
+[Per-window pings (`[[window_ping]]`)](#per-window-pings-window_ping) below.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `window` | string | — (required) | `id` of a non-enumerating (`for_each`-free) `[[windows]]` entry in the same manifest; each `window` may appear in at most one `[[window_ping]]`, and may not name the `primary` window when `[ping]` is also declared |
+| `bin` | string | — (required) | bare program name, validated identically to `[ping] bin` |
+| `args` | array of strings | empty | command arguments, validated identically to `[ping] args` (at most 32, non-empty, each at most 256 bytes, no control or bidi characters) |
+
+Declared as a top-level table of its own rather than under `[ping]`, with no
+`requires_reader` capability: an older build ignores unknown top-level tables
+and keeps reading quotas as before, instead of refusing the manifest outright
+or running `[ping]` on an unstarted window's moving reset every ten minutes.
+
+### `[history]`
+
+Optional. Declares that the provider writes a local usage log the history
+scanner can read — the Activity card, `tickover stats`, and the HTML report
+draw on it. A manifest without the section simply has no history: the
+provider's quota blocks render normally with a `quota only` badge, and the
+Activity card names it under "not counted" rather than implying its zero
+means something. Requires `requires_reader = ["reading-history"]`.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `format` | `"claude-transcripts"` \| `"codex-rollouts"` \| `"grok-unified"` \| `"antigravity-sqlite"` | — (required) | which extractor parses the matched files. There is no default: every format's correctness rules differ (dedup keys, cumulative counters, sub-agent filtering), and guessing one is how double-counted histories are born. An unknown value is refused at load, like an unknown `engine` — a new format ships as an app release |
+| `root` | string | — (required) | root directory the scanner walks; `~` and `{config_dir}` expand (see [Path expansion](#path-expansion)); no `..` component |
+| `extra_roots` | array of strings | `[]` | additional root directories scanned alongside `root` using the same `format` and `glob` (`root_env` applies only to `root`); `~` and `{config_dir}` expand, no `..`. Needs `requires_reader = ["history-extra-roots"]` |
+| `glob` | string | — (required) | glob, relative to `root`, matching history files — `"**/*.jsonl"` for the JSONL formats, `"*.db"` for `antigravity-sqlite` |
+| `root_env` | string | — (optional) | env var that overrides where the scanner searches — same semantics, and the same by-exclusion name validation, as `[logfile] root_env` (Claude's `CLAUDE_CONFIG_DIR` relocates the transcripts root) |
+| `root_env_join` | string | — (optional) | subdirectory appended onto `root_env`'s value when set — same rules as `[logfile] root_env_join`: refused without `root_env`, relative, no `..` |
+
+The scanner (`src/history/scanner.rs`) treats the matched corpus as strictly
+read-only — it never writes into a provider's directory, and
+`antigravity-sqlite` opens each database with `mode=ro`. Work is
+incremental and bounded: per-file cursors resume appends, a rewritten file is
+detected by a prefix-digest change and its derived records are replaced, a
+wall-clock budget ends a pass early (the next tick resumes where it stopped),
+and a per-file byte cap plus a tracked-file ceiling keep a runaway log from
+stalling the panel. Files that fail to parse count toward a `skipped` total
+the UI surfaces as drift, never silently.
+
+What an extractor is allowed to emit is deliberately narrow — timestamp,
+provider, project, session, model, and token-class counts. Message bodies,
+prompts, and file contents never leave the format module; the privacy test
+(`tests/history_e2e.rs`) scans the persisted store and the rendered report
+for a sentinel prompt to keep that true.
 
 ### Path expansion
 
@@ -1555,6 +1625,39 @@ outage spends neither the shared floor nor one of the attempts counted here
 renewal is due exactly as it was once that check reports the host reachable
 again.
 
+### Per-window pings (`[[window_ping]]`)
+
+A manifest with multiple independent 5-hour windows — or windows started by
+different commands — declares one `[[window_ping]]` per target window instead
+of (or alongside, for non-primary windows) `[ping]`. Each entry names its
+target by `[[windows]] id`, never by array position:
+
+- **Validation (`manifest::validate`).** `window` must match a declared
+  non-empty `[[windows]] id` whose entry has no `for_each`, may appear at most
+  once across `[[window_ping]]`, and may not name the `primary` window when
+  `[ping]` is also present. `bin` and `args` go through the exact same
+  `validate_ping_command` and control-character checks as `[ping]`.
+- **No `requires_reader` capability.** Because older readers ignore unknown
+  top-level tables, placing per-window commands in `[[window_ping]]` instead of
+  adding fields under `[ping]` means an older build simply sees no ping rather
+  than failing to load the manifest or running `[ping]` without the
+  floating-reset rule below.
+- **State and UI.** Every `[[window_ping]]` shares the plugin's auto-ping
+  toggle in Settings — whose label joins `[ping]` and every `[[window_ping]]`
+  command with `"; "` — and the install-time trust dialog (`analyze_trust`)
+  discloses all of them the same way. Each window keeps its own timestamp in
+  `config.json` under `plugin.<id>.pinged_at.<window>` (cleared with the rest
+  of the plugin's keys on uninstall), so starting one window neither spends nor
+  delays another's ping.
+- **Floating-reset retry rule (`ping_due`).** An unstarted Antigravity window
+  reports `0%` used with a stated reset (`resets_at = Some`) one full period
+  from *now*, advancing with every reading. Without an extra guard, a failed
+  ping (such as a retired `--model` exiting 1) would look older than a newly
+  computed start the moment the 10-minute floor passed. When `pinged_at > 0`
+  and a stated reset's computed `start` lands inside `PING_MIN_INTERVAL_SECS`
+  of `now`, `ping_due` waits one full `period` after `pinged_at` before
+  retrying.
+
 ### Where the ping's command runs
 
 Not in the home directory. These CLIs read the directory they start in —
@@ -1699,11 +1802,10 @@ installing the plugin and, for an `opt_in` surface, ticking one checkbox:
   `refresh_secs` schedule starting right after the app launches — there is no
   "click to fetch" step standing between installing/enabling a hostile
   manifest and its first outbound request.
-- **Run an arbitrary local command on a timer**, via `[ping]`'s `bin`/`args` —
-  gated by the auto-ping toggle (`auto_ping_codex` / `auto_ping_claude` in
-  `src/config.rs`), which defaults to **off**, so this one does require the
-  user to opt in explicitly; once on, `bin` can be anything, not only the
-  provider's own CLI.
+- **Run an arbitrary local command on a timer**, via `[ping]` or
+  `[[window_ping]]` (`bin`/`args`) — gated by the plugin's auto-ping toggle,
+  which defaults to **off**, so this one does require the user to opt in
+  explicitly; once on, `bin` can be anything, not only the provider's own CLI.
 
 None of this is a bug to fix in this app — it's what "the manifest folder is
 the only source of truth for which providers exist" (above) necessarily
@@ -1748,15 +1850,16 @@ honestly, send my credential somewhere I'd expect", not "can this manifest be
 tricked into sending it somewhere it doesn't intend to". A manifest that
 intends to exfiltrate reads exactly as consistent as one that doesn't.
 
-### `[ping]` executes an arbitrary local binary
+### `[ping]` and `[[window_ping]]` execute an arbitrary local binary
 
-It's meant for a provider's own CLI (`codex exec hello`, `claude -p hello`),
-but the manifest format doesn't restrict `bin`/`args` beyond that convention
-— treat a plugin's `[ping]` section with the same scrutiny you'd give any
-script you're about to let run automatically on a timer. It's gated by the
-auto-ping toggle, off by default (see [Trust model](#trust-model) above), but
-turning that toggle on for an untrusted manifest is exactly as risky as
-running any other command that manifest could name.
+They are meant for a provider's own CLI (`codex exec hello`, `claude -p hello`,
+`agy -p hello`), but the manifest format doesn't restrict `bin`/`args` beyond
+that convention — treat a plugin's `[ping]` or `[[window_ping]]` sections with
+the same scrutiny you'd give any script you're about to let run automatically
+on a timer. They share the per-plugin auto-ping toggle, off by default (see
+[Trust model](#trust-model) above), and turning that toggle on for an untrusted
+manifest is exactly as risky as running any other command that manifest could
+name.
 
 `renews_token` is a second trigger for the same command — a lapsed auth chain
 or an HTTP 401, not only a resting window — bounded by the same ten-minute
@@ -1781,9 +1884,10 @@ resolved, which is the manifest author's choice, not this app's (see
 [Trust model](#trust-model)).
 
 The manifest format has no code-execution surface of its own beyond
-`[ping]` — everything else is declarative JSON-path reads through a fixed,
-reviewed set of engines and credential-store readers. "Declarative" bounds
-*how* a manifest can act, not *what* it's allowed to target.
+`[ping]` and `[[window_ping]]` — everything else is declarative JSON-path reads
+through a fixed, reviewed set of engines and credential-store readers.
+"Declarative" bounds *how* a manifest can act, not *what* it's allowed to
+target.
 
 The pair `[surface.auth.client]` discovers is a secret in exactly this same
 sense, kept to the same rule: never logged, never written anywhere. It lives
@@ -1836,8 +1940,8 @@ order        = 10
 # a window by identity rather than by position; `[status]` needs one that
 # reads the quota's own standing. See docs/PLUGIN-ARCHITECTURE.md, "Reader
 # capabilities".
-requires_reader = ["window-presence", "window-identity", "reading-status", "reading-balances", "credentials-file-path-env", "http-value-path-env"]
-version      = "2.5.3"
+requires_reader = ["window-presence", "window-identity", "reading-status", "reading-balances", "credentials-file-path-env", "http-value-path-env", "reading-history"]
+version      = "2.6.0"
 engine       = "http-api"
 # One request a minute, matching Claude. The log-file reader polled every 15s
 # because re-reading a local file is free; four requests a minute at somebody
@@ -2102,6 +2206,16 @@ token_json_path = "tokens.access_token"
 [ping]
 bin  = "codex"
 args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "hello"]
+
+# Token usage history: rollout JSONL under `~/.codex/sessions/` (and the
+# same files under `archived_sessions/`). `CODEX_HOME` relocates the whole
+# tree, same as it does `auth.json` above. `token_count` events are
+# cumulative per session; the extractor diffs them.
+[history]
+format        = "codex-rollouts"
+root          = "~/.codex"
+glob          = "rollout-*.jsonl"
+root_env      = "CODEX_HOME"
 ```
 
 ### When an upgrade replaces an installed manifest
@@ -2148,8 +2262,8 @@ order        = 20
 # keychain step below honour the same variable, for the Keychain item name
 # the CLI renames under it — see docs/PLUGIN-ARCHITECTURE.md, "Reader
 # capabilities".
-requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry", "reading-balances", "balance-conditional", "credentials-file-path-env", "keychain-service-env"]
-version      = "1.4.7"
+requires_reader = ["window-presence", "window-identity", "for-each-windows", "keychain-expiry", "reading-balances", "balance-conditional", "credentials-file-path-env", "keychain-service-env", "reading-history"]
+version      = "1.5.2"
 engine       = "http-api"
 # Re-fetched every 60 s.
 refresh_secs = 60
@@ -2157,16 +2271,18 @@ refresh_secs = 60
 # Claude reports no window lengths of its own, so the nominal periods (5h =
 # 300 min, weekly = 10080 min) are assumed here. This is the mirror image of
 # Codex, whose windows carry their own `limit_window_seconds`.
-# Both windows are `required`: Anthropic reports both for every account, so a
-# response missing one has changed shape under us. That is worth saying out
-# loud — the alternative is a panel drawing whichever half still parsed, where
-# a missing row is indistinguishable from a quota nothing has been spent
+# Only the weekly window is `required`. A live account has been measured with
+# `five_hour` null, `seven_day` filled in and no session element in `limits[]`,
+# so a missing 5-hour window is a state of the account. Refusing it would hide
+# the weekly figure that did arrive and stop the auto-ping along with it. A
+# response with no weekly window has changed shape under us, and that is worth
+# saying out loud — the alternative is a panel drawing whatever still parsed,
+# where a missing row is indistinguishable from a quota nothing has been spent
 # against.
 [[windows]]
 id       = "claude-5h"
 label    = "5H"
 role     = "primary"
-required = true
 [windows.period]
 mode    = "assumed"
 assumed = 300
@@ -2392,6 +2508,17 @@ bin  = "claude"
 args = ["-p", "hello", "--model", "haiku"]
 # The CLI renews its own token only when it runs.
 renews_token = true
+
+# Token usage history: the CLI writes one JSONL transcript per session under
+# `~/.claude/projects/<encoded-cwd>/`. `CLAUDE_CONFIG_DIR` relocates the
+# whole `~/.claude` tree — the same override the credentials-file step above
+# honours — so `root_env` + `root_env_join` land on `$CLAUDE_CONFIG_DIR/projects`.
+[history]
+format        = "claude-transcripts"
+root          = "~/.claude/projects"
+glob          = "*.jsonl"
+root_env      = "CLAUDE_CONFIG_DIR"
+root_env_join = "projects"
 ```
 
 ## Registry
@@ -2457,9 +2584,9 @@ Per `[[plugin]]` entry:
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `id` | string | yes | same charset rule as a manifest's own `id` (`^[A-Za-z0-9_-]+$`, see [Top-level fields](#top-level-fields)) — it becomes the installed manifest's `<id>.toml` filename stem |
-| `name` | string | yes | display name; must not be blank |
-| `version` | string | yes | must not be blank; compared with `version_cmp` (see [Installed-vs-registry state machine](#installed-vs-registry-state-machine)) |
-| `description` | string | no | one-line description shown before install |
+| `name` | string | yes | display name; must not be blank, at most 64 characters |
+| `version` | string | yes | must not be blank, at most 64 characters; compared with `version_cmp` (see [Installed-vs-registry state machine](#installed-vs-registry-state-machine)) |
+| `description` | string | no | one-line description shown before install, at most 256 characters |
 | `manifest` | string | yes | path to the manifest file, **relative to the index's own directory** — never a full URL (resolved by `resolve_manifest_url`, see [Install / update process](#install--update-process)) |
 | `sha256` | string | yes | expected sha256 of the manifest file's raw bytes — exactly 64 **lowercase** hex characters |
 
@@ -2475,6 +2602,13 @@ trusted:
 - `id`: non-blank, restricted to `[A-Za-z0-9_-]+` — same rule, and the
   same reason, as a manifest's own `id`: it becomes a filename.
 - `name` / `version`: non-blank.
+- `name` and `version` are capped at 64 characters, `description` at 256 —
+  a field over its own cap refuses the whole index, the same as a
+  malformed one.
+- `name`, `version`, `description` and `manifest` must not contain a
+  control character or an invisible/directional one (a bidi override, a
+  zero-width character) — a single occurrence in any of the four refuses
+  the whole index too.
 - `sha256`: exactly 64 characters, every one a lowercase hex digit;
   uppercase is **rejected outright, not normalized**, keeping every
   stored/compared hash in one canonical form.
@@ -2767,9 +2901,9 @@ written to disk, the caller runs `analyze_trust` on the parsed
 | `auth_types` | every distinct `[[surface.auth]].type` used by any surface, across every surface, in first-seen order — every auth-source type the manifest declares, not just the ones that trigger the mandatory gate below |
 | `dest_hosts` | every distinct destination host the manifest could reach: every `[[http.request]].url` host, `[account].url`'s host when `type = "http"`, and every `oauth-refresh` step's `token_url` host — each URL's `{option.<key>}` placeholders substituted at the manifest's own `[[option]]` defaults *before* the host is read off, so a host spelled `{option.beta}.example` discloses the destination it actually resolves to, not the placeholder text — case-insensitively de-duplicated, in first-seen order |
 | `untrusted_hosts` | the subset of `dest_hosts` outside the caller's `trusted_hosts` set — disclosure only, see below for why it doesn't gate `requires_approval` |
-| `local_files` | every local file, or file-*shaped* source, the manifest reads: an auth step's own credential file (`credentials-file`/`credentials-map`/`reject-when`/`oauth-refresh`'s `path`), `[[http.value]] path`, `[http.version] files`, an `oauth-refresh` step's `[surface.auth.client]` discovery (`files`, `bins` labelled by name rather than a path, `id_env`/`secret_env` labelled as an environment variable, `id_pattern`/`secret_pattern` labelled and length-capped), an `electron-safe-storage` step's `config_path`, `engine = "log-file"`'s own `root`/`glob` read scope (one `"<root>/<glob>"` entry, `root` shown literally — `~` included, unexpanded — unless `root_env` is set, in which case it's `"$<root_env>"`, joined with `root_env_join` when the manifest sets one), and `[account] path` (a `jwt-file` lookup's own token file) |
-| `credential_sources` | every `env`/`keychain`/`win-credential`/`electron-safe-storage` auth step's *own* source, named specifically — `"env $VAR"`, `"keychain \"service\""`, one `"credential manager \"target\""` per target tried, `"electron safe storage <config_path> (key \"...\")"` — rather than just the step *kind* `auth_types` already carries; `credentials-file`/`credentials-map` don't repeat here since their file is already in `local_files` |
-| `ping` | the command this manifest runs after a window resets, if it declares one — with a trailing note that it also runs when its token has expired or is no longer accepted, when `renews_token` is set (see [Renewing a lapsed token](#renewing-a-lapsed-token)) |
+| `local_files` | every local file, or file-*shaped* source, the manifest reads: an auth step's own credential file (`credentials-file`/`credentials-map`/`reject-when`/`oauth-refresh`'s `path`), `[[http.value]] path`, `[http.version] files`, an `oauth-refresh` step's `[surface.auth.client]` discovery (`files`, `bins` labelled by name rather than a path, `id_env`/`secret_env` labelled as an environment variable, `id_pattern`/`secret_pattern` labelled and length-capped), an `electron-safe-storage` step's `config_path`, `engine = "log-file"`'s own `root`/`glob` read scope and `[history]` (`root`/`glob` plus any `extra_roots`), and `[account] path` (a `jwt-file` lookup's own token file) |
+| `credential_sources` | every `env`/`keychain`/`win-credential`/`electron-safe-storage` auth step's *own* source, and any `oauth-refresh` step's `refresh_service` / `refresh_targets`, named specifically — `"env $VAR"`, `"keychain \"service\""`, `"credential manager \"target\""`, `"electron safe storage <config_path> (key \"...\")"` — rather than just the step *kind* `auth_types` already carries; file-only steps (`credentials-file`/`credentials-map`) don't repeat here since their file is already in `local_files` |
+| `ping` | the commands this manifest runs after a window resets (`[ping]`, then each `[[window_ping]]` joined with `"; "`), if it declares any — with a trailing note on `[ping]` that it also runs when its token has expired or is no longer accepted, when `renews_token` is set (see [Renewing a lapsed token](#renewing-a-lapsed-token)) |
 | `requires_approval` | see below |
 
 **Mandatory approval gate.** `requires_approval` is `true` when *any* of the
@@ -2784,8 +2918,8 @@ following hold:
    A plain `env` step is excluded from "store-backed" here: a var is
    something the user set themselves, not a store this manifest goes
    digging in (it can still trip condition 4 below, just not this one).
-2. It declares `[ping]` — an arbitrary local command is worth stopping for
-   whatever the engine.
+2. It declares `[ping]` or `[[window_ping]]` — an arbitrary local command is
+   worth stopping for whatever the engine.
 3. `local_files` is non-empty — a manifest reading a local file of its own
    choosing (including `engine = "log-file"`'s own read scope) is the same
    "something on this machine leaves it, or a manifest picks what a request

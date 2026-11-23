@@ -35,6 +35,40 @@ what it does with them — and what it refuses to do.
   allow-list is refused outright there, rather than read as "no restriction".
   The OAuth client id and secret the exchange needs are not shipped with
   this app; see the gap list below for where they come from.
+- **It also reads a local usage log, for every provider that keeps one —
+  read-only, the same as the credential stores above.** Claude's session
+  transcripts (`~/.claude/projects/**/*.jsonl`), Codex's rollout and
+  archived-session files (`~/.codex/sessions/**/rollout-*.jsonl`,
+  `~/.codex/archived_sessions/`), Grok's unified log
+  (`~/.grok/logs/unified.jsonl`), and Antigravity's conversation database
+  (`~/.gemini/antigravity-cli/conversations/*.db`, opened `mode=ro`) are all
+  files the provider's own CLI already wrote; Copilot keeps no such log and
+  is skipped. What an extractor is allowed to carry out of a line it reads
+  is fixed by the record type it returns (`src/history/formats/`,
+  `UsageRecord`): a timestamp, a project basename, a model name, a session
+  id (kept for per-session display, not as a lookup key), a dedup key used
+  only to drop a re-read duplicate, and the counted token classes — never
+  the prompt or the response that earned them. `tests/history_e2e.rs`
+  plants a marker string inside a fixture prompt and fails the build if it
+  is ever found in the store, the report, or anywhere past the extractor.
+- **What that reading produces is aggregated into its own store, never a
+  provider's.** `<config>/tickover/history/` holds `state.json` (per-file
+  scan progress) and `days.jsonl` (append-only hourly usage buckets) —
+  written owner-only (`0600`) on macOS; Windows has no code-level
+  equivalent for either and gets whatever default permissions the user's
+  own profile folder already carries. The same directory also holds a
+  `lock` file used only to keep the tray app's scan and `tickover stats`'s
+  from interleaving; it carries no data of its own and gets no explicit
+  permissions on either platform. `tickover stats --report`, and the
+  panel's own "Full report" pill, write one file more: a self-contained
+  HTML page under `<config>/tickover/reports/usage-<timestamp>.html`, the
+  same owner-only `0600` on macOS. Nothing here is pruned automatically —
+  each report is a separate file from the run that wrote it. Everything in
+  it is drawn from the aggregate above, so it inherits the same guarantee:
+  no prompt or message text, because none ever reached the store it reads
+  from. [`docs/PROVIDERS.md`](docs/PROVIDERS.md#local-usage-history) has
+  the per-provider table; this is the privacy account of that same
+  mechanism.
 
 ## What leaves the machine
 
@@ -102,25 +136,27 @@ throttle gate behind it, forever.
 
 ### A request this app makes something *else* make
 
-`[ping]` is the sixth way traffic leaves because of this app, and it is not an
-HTTP call of its own: it runs a local command the manifest names, shortly after
-that provider's window resets — and, for a manifest that also sets
-`renews_token`, again the moment a surface whose auth chain declares a token
-expiry finds that token lapsed or refused outright — and that command talks
-to its own provider. The shipped example is `codex exec … hello` — a real
-prompt, spending a little real quota, which is why it exists and why it is
-**off until you switch it on** per plugin. Once on, it is unattended: it
-fires on a window reset or a lapsed token, not on a click. What it sends is
-between that CLI and its provider; this app neither sees nor logs it.
+`[ping]` and `[[window_ping]]` are the sixth way traffic leaves because of
+this app, and they are not HTTP calls of its own: they run a local command
+the manifest names, shortly after that provider's window resets — and, for a
+manifest whose `[ping]` also sets `renews_token`, again the moment a surface
+whose auth chain declares a token expiry finds that token lapsed or refused
+outright — and that command talks to its own provider. The shipped example is
+`codex exec … hello` — a real prompt, spending a little real quota, which is
+why it exists and why it is **off until you switch it on** per plugin. Once
+on, it is unattended: it fires on a window reset or a lapsed token, not on a
+click. What it sends is between that CLI and its provider; this app neither
+sees nor logs it.
 
-Antigravity's manifest declares no `[ping]` at all, deliberately. Google has
-confirmed banning accounts for third-party tools and proxies driving
-Antigravity's underlying quota, with the ban reported to cascade to Gemini
-CLI / Code Assist on the same account — see this
+Antigravity's manifest declares `[[window_ping]]` for its two 5-hour windows,
+**off by default** like every plugin's ping. Be aware before switching it on
+that Google has confirmed banning accounts for third-party tools and proxies
+driving Antigravity's underlying quota, with the ban reported to cascade to
+Gemini CLI / Code Assist on the same account — see this
 [gemini-cli discussion](https://github.com/google-gemini/gemini-cli/discussions/20632) —
 a risk none of the bounds above (the toggle, the floor, the confirmation
-dialog) actually removes, since they all assume the provider tolerates being
-pinged at all.
+dialog) remove, since they all only pace local execution rather than changing
+provider-side policy.
 
 ### Neither list contains
 
@@ -142,26 +178,28 @@ They are not a sandbox against a hostile author. A manifest you did not read is
 a program you did not read.
 
 **And one part of it is a program in the ordinary sense.** A manifest may
-declare `[ping]` — a binary and its arguments — which this app runs shortly
-after that provider's window resets, to start a fresh one, and which a
-manifest that also sets `renews_token` runs again the moment a surface's
-own token has lapsed or been refused outright. That is an arbitrary local
-command with your user's privileges. Four things bound it: the toggle is
-**off unless you turn it on**, per plugin, in Settings; the window trigger
-never fires before the window it targets has actually started, and neither
-trigger fires more than once every ten minutes regardless of what a
-manifest's own numbers claim, nor at all while the provider's own host does
-not resolve — a renewal is bound tighter still: once per distinct token per
-surface when the run succeeds, ten minutes apart for the first three
-attempts that keep failing, backing off to an hour apart after that rather
-than ever running unattended more often — which is what stops a
-misconfigured or malicious manifest from turning this into a loop; it runs
-in a directory created fresh for that one command, normally under the OS
-temp directory and removed once the command exits, so there is nothing
-already on disk for it to read; and a manifest that declares `[ping]` at
-all cannot be installed from a registry without the confirmation dialog,
-which shows the exact command line — appending " — also run when its token
-has expired or is no longer accepted" when that ping renews a token.
+declare `[ping]` or `[[window_ping]]` — a binary and its arguments — which
+this app runs shortly after that provider's window resets, to start a fresh
+one, and which a manifest whose `[ping]` also sets `renews_token` runs again
+the moment a surface's own token has lapsed or been refused outright. That is
+an arbitrary local command with your user's privileges. Four things bound it:
+the toggle is **off unless you turn it on**, per plugin, in Settings; the
+window trigger never fires before the window it targets has actually started,
+and neither trigger fires more than once every ten minutes regardless of what
+a manifest's own numbers claim (a stated reset that moves forward with the
+clock waits a full window period before retrying), nor at all while the
+provider's own host does not resolve — a renewal is bound tighter still: once
+per distinct token per surface when the run succeeds, ten minutes apart for
+the first three attempts that keep failing, backing off to an hour apart
+after that rather than ever running unattended more often — which is what
+stops a misconfigured or malicious manifest from turning this into a loop; it
+runs in a directory created fresh for that one command, normally under the
+OS temp directory and removed once the command exits, so there is nothing
+already on disk for it to read; and a manifest that declares `[ping]` or
+`[[window_ping]]` at all cannot be installed from a registry without the
+confirmation dialog, which shows the exact command lines — appending " — also
+run when its token has expired or is no longer accepted" when `[ping]`
+renews a token.
 
 The manifests that ship with the app (`plugins/*.toml`) are versioned in
 this repository, and are seeded rather than installed — they never go
@@ -184,7 +222,8 @@ sections "Auth chain semantics" and "Security".
   a file you chose yourself is exactly as third-party as one the registry
   would have downloaded, and nothing here special-cases it. It fires on any
   of four things (`registry::analyze_trust`): reading a secret
-  out of an OS/app store while calling an endpoint, declaring `[ping]`,
+  out of an OS/app store while calling an endpoint, declaring `[ping]` or
+  `[[window_ping]]`,
   reading local files of its own choosing into a request, or naming a
   specific `env`/keychain/Credential Manager/Electron Safe Storage source to
   read a credential from — whatever the engine, so a `log-file` manifest
@@ -194,7 +233,7 @@ sections "Auth chain semantics" and "Security".
   `{option.…}` text when it names a real destination), the files (including
   a `log-file` manifest's own read scope and a `jwt-file` account lookup's
   token file, not just a credential store's own path), the specific
-  credential source named above, and the ping command line — and then a
+  credential source named above, and the ping command lines — and then a
   person decides, which is the part no code here can do for them.
 - **The Windows Credential Manager and DPAPI steps are unexercised against a
   real credential.** On Windows 11 (x86_64, MSVC) Antigravity's Credential

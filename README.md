@@ -2,15 +2,16 @@
 
 Your AI coding-assistant quota windows, kept running back to back. When a
 provider's 5-hour window has reset and is sitting empty, Tickover — once you
-switch it on for that provider; Codex and Claude today — sends one tiny
-prompt so the new window starts counting now, not at your first real
+switch it on for that provider; Codex, Claude, and Antigravity today — sends
+one tiny prompt so the new window starts counting now, not at your first real
 request hours later. It also meters what is left: the 5-hour and weekly
-windows of Codex, Claude and Antigravity, Grok's weekly credit usage, the
-balances of Grok, GitHub Copilot and Codex credits, in the macOS menu bar or
-the Windows system tray, with a countdown that ticks every second.
+windows of Codex, Claude and Antigravity, Grok's credit usage for its
+current billing period, the balances of Grok, GitHub Copilot and Codex
+credits, in the macOS menu bar or the Windows system tray, with a countdown
+that ticks every second.
 
-Rust + [Slint](https://slint.dev). One small native binary (about 8 MB per
-architecture), no runtime, no account to create, no telemetry. **Every
+Rust + [Slint](https://slint.dev). One small native binary (about 11 MB on
+Apple silicon), no runtime, no account to create, no telemetry. **Every
 provider is a TOML file**, not a module: when an endpoint changes shape, the
 fix is an edit, not a release.
 
@@ -53,11 +54,12 @@ to set up.
 
 A 5-hour window starts at your first request, not at the reset. Reset at
 03:00, first prompt at 09:00: six hours of quota went nowhere. Tickover
-watches each provider's primary window and, when it sees it sitting
-**empty** — reset, nothing used — runs one small command: `codex exec …
-hello`, `claude -p hello --model haiku`. That window starts counting now —
-and because a window starts at the first request, a weekly window that had
-reset starts with it.
+watches each provider's primary window — or each named 5-hour window under
+`[[window_ping]]` — and, when it sees it sitting **empty** — reset, nothing
+used — runs one small command: `codex exec … hello`, `claude -p hello --model
+haiku`, or `agy -p hello --model …`. That window starts counting now — and
+because a window starts at the first request, a weekly window that had reset
+starts with it.
 
 The test is "empty", not "the reset just happened", so a machine asleep at
 the boundary pings when it wakes instead of losing the window for good — but
@@ -69,7 +71,10 @@ that one run — normally under the OS temp directory, removed once the
 command exits — so there is nothing there for a prompt to pick up, with the
 Codex sandbox read-only and the usual CLI directories *appended* to `PATH`.
 Off by default, a switch per provider; costs a few tokens per window. The
-Codex and Claude manifests declare one today.
+Codex and Claude manifests declare `[ping]`, and Antigravity declares
+per-window `[[window_ping]]` entries for both of its 5-hour windows (read the
+Google account-ban warning in [`docs/PROVIDERS.md`](docs/PROVIDERS.md#auto-ping)
+before enabling Antigravity's toggle).
 
 A manifest can also set `[ping] renews_token = true` — Claude's does — which
 arms a second trigger for that same command: a surface whose auth chain
@@ -97,11 +102,29 @@ say the same thing (mint below 70 %, amber from 70 %, red from 90 %). The
 white tick is how much of the window has elapsed; hovering the bar shows the
 gap between the two in percent points in its tooltip — `pace +22 pp` is
 burning 22 points ahead of the clock. The countdown is recomputed every
-second from the absolute reset time, so it survives sleep. Extra rows carry
-limits a provider reports beside its main windows (Claude's per-model weekly
-caps, Codex's model-specific windows); balances carry calendar-period
-figures (Grok's credit and spend, Codex's credits, Copilot's premium
-requests); a notice above the rows says when a provider reports the account
+second from the absolute reset time, so it survives sleep.
+
+A window that reports its own period also carries a **projection**: a
+hatched band reaching from the used fill to where the present pace lands by
+the reset. It is drawn from the clock alone — the used percentage times the
+period over the time elapsed — so a build without local history draws the
+same band. It stays away until the window has run for ten minutes or a tenth
+of its period, whichever is longer: a pace read off the first few minutes of
+a five-hour window is noise wearing a percentage sign. The caption at the
+right of the reset line names it — `→ ~63%` on its own,
+`burn 41.2K/h → ~63%` once local history has counted tokens for that window,
+and
+`caps ~18:40`, the clock time the pace crosses 100 % and never later than
+the reset itself, in place of both once it projects a full window. The band
+takes the bar's three colours on its own thresholds: mint, amber from 90 %
+projected, red once it projects a cap.
+
+Extra rows carry limits a provider reports beside its main windows
+(Claude's per-model weekly caps, Codex's model-specific windows) and never
+a burn figure — the tokens counted locally are the account's, not that one
+model's; balances carry calendar-period figures (Grok's credit and spend,
+Codex's credits, Copilot's premium requests); a notice above the rows says
+when a provider reports the account
 blocked. Optionally the reading is drawn in the tray itself — a pill in the
 macOS menu bar, bars inside the icon on Windows. That widget has room for two
 providers; with more configured, it shows the first two by order and the
@@ -116,8 +139,9 @@ popover still lists all of them.
   VS Code, and the desktop app as an opt-in), per-model weekly limits;
   reuses `~/.claude/.credentials.json`, else the macOS Keychain item, or on
   Windows the same file, the only store the CLI writes there.
-- **Grok** — credits used in the current weekly usage period, plus prepaid
-  credit and pay-as-you-go spend; `~/.grok/auth.json`.
+- **Grok** — credits used in the current usage period (its own stated
+  bounds, a week when none is given), plus prepaid credit and pay-as-you-go
+  spend; `~/.grok/auth.json`.
 - **Antigravity** — 5-hour and weekly allowances for Gemini and third-party
   models; the Keychain item its CLI writes (Windows Credential Manager on
   Windows), refreshed through its own OAuth flow.
@@ -127,6 +151,20 @@ popover still lists all of them.
 Every endpoint is the provider's own, undocumented and unofficial, and each
 manifest pins its host. Endpoints, cadences and the rough edges:
 [`docs/PROVIDERS.md`](docs/PROVIDERS.md).
+
+## Local usage history
+
+Four of the five — every provider but Copilot — also write a local log of
+what they have actually used: Claude's and Codex's own session transcripts,
+Grok's unified log, Antigravity's conversation database. Tickover turns
+that into the panel's Activity card (today, this week, this month, a
+cache-hit rate, your top projects) and into `tickover stats` on the command
+line, which adds `--json` for scripts and `--report` for a self-contained
+HTML page with a period picker. Nothing but a timestamp, a project name, a model name and token
+counts is ever kept from what it reads — never a prompt or a response; see
+[`docs/PROVIDERS.md`](docs/PROVIDERS.md#local-usage-history) for the
+per-provider table and [`SECURITY.md`](SECURITY.md) for what that guarantee
+rests on.
 
 ## Providers are plugins
 
@@ -165,7 +203,7 @@ reporting, nothing on a timer against a host this project controls.
 
 ## Engineering notes
 
-About 60,000 lines of Rust, roughly half of it tests — some 970 test
+About 78,000 lines of Rust, roughly half of it tests — some 1,200 test
 functions — one tree for both desktops.
 Six things worth a look:
 
@@ -205,6 +243,7 @@ The guided tour is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 [Dock mode](docs/DOCK-MODE.md) ·
 [Design](docs/DESIGN.md) ·
 [Development](docs/DEVELOPMENT.md) ·
+[History formats](docs/history-formats.md) ·
 [Releasing](docs/RELEASING.md) ·
 [Contributing](CONTRIBUTING.md) ·
 [Security](SECURITY.md)
@@ -234,7 +273,13 @@ Tests run under a substituted `HOME` — the invocation and the reason are in
 - **A provider you are not signed into is hidden, not announced** — except
   Codex and Claude's CLI, the two shipped manifests that set a message for it.
 - **The panel is dark only**; the tray pill follows the system theme. No
-  notifications, no cost accounting, no Linux.
+  notifications, no Linux.
+- **Cost is an API-equivalent, never a bill.** The dollar figure in
+  `tickover stats`, the panel's Activity card and the HTML report is what
+  the same tokens would cost at published API list prices, from a price
+  snapshot built into the app; a model it has no exact price for shows `—`.
+  On a subscription it is not what you paid. One settings-file key hides it
+  — see [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md#cost-figures).
 
 ## License
 

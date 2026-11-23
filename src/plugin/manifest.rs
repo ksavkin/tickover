@@ -44,6 +44,11 @@
 //! glob          = "**/rollout-*.jsonl"
 //! container_key = "rate_limits"
 //!
+//! [history]                        # optional; needs `reading-history`
+//! format        = "codex-rollouts" # see HistoryFormat
+//! root          = "~/.codex/sessions"
+//! glob          = "**/*.jsonl"
+//!
 //! [http]                           # required when engine = "http-api"
 //! [[http.request]]
 //! url = "https://api.anthropic.com/api/oauth/usage"
@@ -144,6 +149,17 @@ pub struct PluginManifest {
     /// `[http]` — required when `engine = "http-api"`.
     pub http: Option<HttpConfig>,
 
+    /// `[history]` — where this provider's local usage *history* lives,
+    /// independent of the quota reading `engine`/`[logfile]`/`[http]`
+    /// describe. Absent is a real answer: the provider simply has no local
+    /// token history this app knows how to read (Copilot ships that way),
+    /// and the UI marks it "quota only" rather than inventing a zero.
+    ///
+    /// Needs `requires_reader = ["reading-history"]` — an older build
+    /// ignores the section entirely, which is exactly the silent-misread
+    /// the capability gate exists to refuse.
+    pub history: Option<HistoryConfig>,
+
     /// `[[surface]]` — the surfaces (accounts/installs) this provider can be
     /// read from. Defaults to a single opt-out "default" surface with no
     /// auth chain when omitted entirely — see [`PluginManifest::from_str`].
@@ -162,6 +178,15 @@ pub struct PluginManifest {
 
     /// `[ping]` — optional auto-ping command run after a window resets.
     pub ping: Option<PingConfig>,
+
+    /// `[[window_ping]]` — auto-ping commands that each start one named
+    /// window, for a provider with more than one 5-hour window, or whose
+    /// windows need different commands to start (Antigravity's Gemini and
+    /// third-party groups each count only their own models). See
+    /// [`WindowPingConfig`] for why this is a table of its own rather than
+    /// more fields under `[ping]`.
+    #[serde(default)]
+    pub window_ping: Vec<WindowPingConfig>,
 
     /// `[[option]]` — declarative bool options the plugin exposes to its own
     /// engine substitution (`{option.<key>}` in a header, URL or log-file
@@ -216,10 +241,11 @@ const NAME_MAX_CHARS: usize = 64;
 const MENU_LABEL_MAX_CHARS: usize = 16;
 
 /// Cap on `windows[].label`, `balances[].label`, `surface[].label` and
-/// `option[].label` — a row caption drawn on a card with `wrap: word-wrap`
-/// (`ui/app.slint`), not a paragraph. Between [`MENU_LABEL_MAX_CHARS`] (a
-/// pill, sized to a couple of characters) and [`NAME_MAX_CHARS`] (a section
-/// header, 64): a row caption sits beside a figure rather than above a whole
+/// `option[].label` — a row caption elided rather than wrapped where it's
+/// drawn (`ui/widgets.slint`'s `QuotaBlock` and `ToggleRow`, `ui/app.slint`'s
+/// `BalanceRow`), not a paragraph. Between [`MENU_LABEL_MAX_CHARS`] (a pill,
+/// sized to a couple of characters) and [`NAME_MAX_CHARS`] (a section header,
+/// 64): a row caption sits beside a figure rather than above a whole
 /// section, so it gets more room than the pill and less than the header —
 /// wide enough for a legitimate label in any of the four places while
 /// bounding how far a hostile one can grow the card it lands in.
@@ -247,6 +273,7 @@ const SURFACES_MAX_COUNT: usize = 8;
 const CLIENT_FILES_MAX_COUNT: usize = 16;
 const CLIENT_BINS_MAX_COUNT: usize = 8;
 const SOURCE_CONTAINERS_MAX_COUNT: usize = 8;
+const HISTORY_EXTRA_ROOTS_MAX_COUNT: usize = 16;
 
 fn default_true() -> bool {
     true
@@ -351,6 +378,7 @@ impl PluginManifest {
         // own fn rather than stretching either neighbour's name to cover it).
         self.validate_identity()?;
         self.validate_engine_sections()?;
+        self.validate_history()?;
         self.validate_windows()?;
         self.validate_balances()?;
         self.validate_window_period_mode()?;
@@ -592,6 +620,20 @@ impl PluginManifest {
             if lf.root_env.as_deref().is_some_and(|e| e.trim().is_empty()) {
                 return Err("`[logfile] root_env` names no environment variable".to_string());
             }
+            // A name containing an `=` or a null byte is not "unset" the way
+            // a blank one is — `std::env::var_os` can simply never return a
+            // value for it — but it reads as configured to a manifest
+            // author, the same silent-no-op the blank check above closes.
+            // Same rule `client.id_env`/`client.secret_env` already carry
+            // (`is_valid_env_var_name`'s own doc).
+            if let Some(name) = &lf.root_env {
+                if !is_valid_env_var_name(name) {
+                    return Err(format!(
+                        "`[logfile] root_env = \"{name}\"` is not a valid environment variable \
+                         name — it must not be empty, contain `=`, or contain a null byte"
+                    ));
+                }
+            }
             // `root_env_join` is joined onto the env var's *value*
             // (`$CODEX_HOME` → `$CODEX_HOME/sessions`), never onto `root`
             // itself — it is a subdirectory name, not a path of its own, so
@@ -730,6 +772,13 @@ impl PluginManifest {
             }
             option_templates.push(("`[logfile] glob`".to_string(), lf.glob.as_str()));
         }
+        if let Some(h) = &self.history {
+            option_templates.push(("`[history] root`".to_string(), h.root.as_str()));
+            if let Some(join) = &h.root_env_join {
+                option_templates.push(("`[history] root_env_join`".to_string(), join.as_str()));
+            }
+            option_templates.push(("`[history] glob`".to_string(), h.glob.as_str()));
+        }
         if let Some(url) = &self.account.url {
             option_templates.push(("`[account] url`".to_string(), url.as_str()));
         }
@@ -744,6 +793,79 @@ impl PluginManifest {
                  before its name is ever read, so the field would be used verbatim, \
                  braces and all, instead of resolving"
             ));
+        }
+        Ok(())
+    }
+
+    /// `[history]` — the same checks `[logfile]` gets for the same fields:
+    /// non-blank `root`/`glob`, a named `root_env`, and a `root_env_join`
+    /// that is a relative subdirectory of the override with no `..`. The
+    /// capability side (`reading-history` declared) is enforced by the
+    /// raw-TOML gate in [`PluginManifest::from_str`], not here — this fn
+    /// answers "is the section usable", not "was it allowed".
+    fn validate_history(&self) -> Result<(), String> {
+        let Some(h) = &self.history else {
+            return Ok(());
+        };
+        for (field, empty) in [
+            ("root", h.root.trim().is_empty()),
+            ("glob", h.glob.trim().is_empty()),
+            (
+                "extra_roots",
+                h.extra_roots.iter().any(|r| r.trim().is_empty()),
+            ),
+        ] {
+            if empty {
+                return Err(format!("`[history] {field}` must not be empty"));
+            }
+        }
+        if h.extra_roots.len() > HISTORY_EXTRA_ROOTS_MAX_COUNT {
+            return Err(format!(
+                "`[history] extra_roots` names {} entries — at most {HISTORY_EXTRA_ROOTS_MAX_COUNT}",
+                h.extra_roots.len()
+            ));
+        }
+        if h.root_env.as_deref().is_some_and(|e| e.trim().is_empty()) {
+            return Err("`[history] root_env` names no environment variable".to_string());
+        }
+        // Same charset check `[logfile] root_env` gets, for the same reason:
+        // a name outside it can never be set, so a manifest naming one is a
+        // silent no-op the environment can never fill.
+        if let Some(name) = &h.root_env {
+            if !is_valid_env_var_name(name) {
+                return Err(format!(
+                    "`[history] root_env = \"{name}\"` is not a valid environment variable name \
+                     — it must not be empty, contain `=`, or contain a null byte"
+                ));
+            }
+        }
+        if h.root_env.is_none() && h.root_env_join.is_some() {
+            return Err(
+                "`[history] root_env_join` needs `root_env` — it joins onto the variable's \
+                 value, and without one it is never read"
+                    .to_string(),
+            );
+        }
+        if let Some(join) = &h.root_env_join {
+            if join.trim().is_empty() {
+                return Err(
+                    "`[history] root_env_join` must not be empty — an empty join resolves \
+                     to the directory `root_env` names, not a file in it"
+                        .to_string(),
+                );
+            }
+            if is_absolute_on_any_platform(Path::new(join)) {
+                return Err(format!(
+                    "`[history] root_env_join = \"{join}\"` must be a relative subdirectory \
+                     — it is appended to `root_env`'s value, not used in its place"
+                ));
+            }
+            if has_dotdot_component(join) {
+                return Err(format!(
+                    "`[history] root_env_join = \"{join}\"` must not contain a `..` component \
+                     — it would search outside the directory `root_env` named"
+                ));
+            }
         }
         Ok(())
     }
@@ -1516,6 +1638,25 @@ impl PluginManifest {
                         w.label
                     ));
                 }
+                // The floor above stops a much-too-small number; this stops
+                // the opposite mistake reaching the same arithmetic. A
+                // `from_field`/`from_bounds` length read off a response is
+                // already held to this ceiling
+                // (`crate::plugin::time::plausible_period_minutes`,
+                // `container_period_minutes`'s own two call sites) before it
+                // ever becomes a window's length — `assumed` is a length too,
+                // manifest-author-picked rather than provider-stated, and
+                // reaches the identical `* 60` `main.rs` does for both
+                // (`ping_due`, `seen_at_is_plausible`). Nothing measures an
+                // `assumed` value the way a response is measured, so it gets
+                // the same fail-safe rather than a looser one.
+                if !crate::plugin::time::plausible_period_minutes(assumed) {
+                    return Err(format!(
+                        "windows[label = \"{}\"]: period.assumed = {assumed} minutes is longer \
+                         than a `from_field`/`from_bounds` length would ever be trusted to be",
+                        w.label
+                    ));
+                }
             }
         }
 
@@ -1863,6 +2004,16 @@ impl PluginManifest {
                         v.name
                     ));
                 }
+                if let Some(name) = &v.path_env {
+                    if !is_valid_env_var_name(name) {
+                        return Err(format!(
+                            "`[[http.value]] name = \"{}\"` `path_env = \"{name}\"` is not a \
+                             valid environment variable name — it must not be empty, contain \
+                             `=`, or contain a null byte",
+                            v.name
+                        ));
+                    }
+                }
                 // `path_env_join` is appended to `path_env`'s *value* — with
                 // no `path_env` there is nothing to join onto, so it would
                 // load clean and never once be read.
@@ -1975,7 +2126,12 @@ impl PluginManifest {
                         ("message", step.message.is_none()),
                     ],
                     AuthType::OauthRefresh => &[
-                        ("path", step.path.is_none()),
+                        (
+                            "path",
+                            step.path.is_none()
+                                && step.refresh_service.is_none()
+                                && step.refresh_targets.as_ref().is_none_or(|t| t.is_empty()),
+                        ),
                         ("token_json_path", step.token_json_path.is_none()),
                         ("token_url", step.token_url.is_none()),
                         // The pair is required, but not from these two fields
@@ -2108,7 +2264,18 @@ impl PluginManifest {
                         ],
                         AuthType::OauthRefresh => {
                             let mut blank = vec![
-                                ("path", is_blank(&step.path)),
+                                ("path", is_present_but_blank(&step.path)),
+                                (
+                                    "refresh_service",
+                                    is_present_but_blank(&step.refresh_service),
+                                ),
+                                (
+                                    "refresh_targets",
+                                    step.refresh_targets.as_deref().is_some_and(|targets| {
+                                        targets.is_empty()
+                                            || targets.iter().any(|t| t.trim().is_empty())
+                                    }),
+                                ),
                                 ("token_json_path", is_blank(&step.token_json_path)),
                                 ("token_url", is_blank(&step.token_url)),
                                 ("client_id", is_present_but_blank(&step.client_id)),
@@ -2420,7 +2587,8 @@ impl PluginManifest {
                             if !is_valid_env_var_name(name) {
                                 return Err(format!(
                                     "surface \"{}\": a `{}` auth step's `{field}` = \"{name}\" is not \
-                                     a valid environment variable name",
+                                     a valid environment variable name — it must not be empty, \
+                                     contain `=`, or contain a null byte",
                                     surface.id,
                                     auth_type_name(step.kind)
                                 ));
@@ -2522,6 +2690,118 @@ impl PluginManifest {
                         auth_type_name(step.kind)
                     ));
                 }
+                // Every field below is read by exactly one step kind
+                // (`auth::credentials_map_step`/`keychain_step`/
+                // `electron_safe_storage_step`/`win_credential_step`/
+                // `reject_when_step`/`oauth_refresh_step`, each its own
+                // `require_str`/`require_vec` call), same silent-no-op
+                // reasoning as `expiry_json_path`/`macos_keychain_key`/
+                // `unless_json_path` above: present on any other kind, it
+                // loads clean and is never consulted.
+                if step.key_prefix.is_some() && step.kind != AuthType::CredentialsMap {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `key_prefix`, which only \
+                         `credentials-map` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.service.is_some() && step.kind != AuthType::Keychain {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `service`, which only \
+                         `keychain` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.config_path.is_some() && step.kind != AuthType::ElectronSafeStorage {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `config_path`, which only \
+                         `electron-safe-storage` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.blob_json_path.is_some() && step.kind != AuthType::ElectronSafeStorage {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `blob_json_path`, which only \
+                         `electron-safe-storage` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.targets.is_some() && step.kind != AuthType::WinCredential {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `targets`, which only \
+                         `win-credential` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.json_path.is_some() && step.kind != AuthType::RejectWhen {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `json_path`, which only \
+                         `reject-when` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.message.is_some() && step.kind != AuthType::RejectWhen {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `message`, which only \
+                         `reject-when` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.token_url.is_some() && step.kind != AuthType::OauthRefresh {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `token_url`, which only \
+                         `oauth-refresh` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.refresh_service.is_some() && step.kind != AuthType::OauthRefresh {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `refresh_service`, which only \
+                         `oauth-refresh` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.refresh_targets.is_some() && step.kind != AuthType::OauthRefresh {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `refresh_targets`, which only \
+                         `oauth-refresh` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.client_id.is_some() && step.kind != AuthType::OauthRefresh {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `client_id`, which only \
+                         `oauth-refresh` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.client_secret.is_some() && step.kind != AuthType::OauthRefresh {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `client_secret`, which only \
+                         `oauth-refresh` steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
+                if step.var.is_some() && step.kind != AuthType::Env {
+                    return Err(format!(
+                        "surface \"{}\": auth step {i} (`{}`) sets `var`, which only `env` \
+                         steps honour",
+                        surface.id,
+                        auth_type_name(step.kind)
+                    ));
+                }
                 // `path_env`/`path_env_join` are honoured by
                 // `credentials-file` and `reject-when` steps (both resolve
                 // `path` through `auth::resolve_credentials_file_path` →
@@ -2553,6 +2833,17 @@ impl PluginManifest {
                         surface.id,
                         auth_type_name(step.kind)
                     ));
+                }
+                if let Some(name) = &step.path_env {
+                    if !is_valid_env_var_name(name) {
+                        return Err(format!(
+                            "surface \"{}\": auth step {i} (`{}`) `path_env = \"{name}\"` is not \
+                             a valid environment variable name — it must not be empty, contain \
+                             `=`, or contain a null byte",
+                            surface.id,
+                            auth_type_name(step.kind)
+                        ));
+                    }
                 }
                 // Same shape as `[logfile] root_env_join`, and the same
                 // reason: it is joined onto `path_env`'s *value*
@@ -2632,6 +2923,17 @@ impl PluginManifest {
                         auth_type_name(step.kind)
                     ));
                 }
+                if let Some(name) = &step.service_env {
+                    if !is_valid_env_var_name(name) {
+                        return Err(format!(
+                            "surface \"{}\": auth step {i} (`{}`) `service_env = \"{name}\"` is \
+                             not a valid environment variable name — it must not be empty, \
+                             contain `=`, or contain a null byte",
+                            surface.id,
+                            auth_type_name(step.kind)
+                        ));
+                    }
+                }
                 // `service_env_suffix` names the recipe for turning
                 // `service_env`'s value into a suffix; without a variable to
                 // hash, it loads clean and is never consulted — the same
@@ -2670,6 +2972,24 @@ impl PluginManifest {
                              — the only supported recipe is `\"sha256:8\"`",
                             surface.id,
                             auth_type_name(step.kind)
+                        ));
+                    }
+                }
+                // `var` is `env_step`'s own field — the variable
+                // `std::env::var` reads the token out of directly, not an
+                // override name like `path_env`/`service_env` above. By this
+                // point it is `Some` and non-blank on an `env` step (the
+                // `missing`/`blank` checks earlier in this fn already
+                // returned otherwise), so this only ever runs against text a
+                // manifest actually wrote.
+                if step.kind == AuthType::Env {
+                    let var = step.var.as_deref().unwrap_or_default();
+                    if !is_valid_env_var_name(var) {
+                        return Err(format!(
+                            "surface \"{}\": auth step {i} (`env`) `var = \"{var}\"` is not a \
+                             valid environment variable name — it must not be empty, contain \
+                             `=`, or contain a null byte",
+                            surface.id
                         ));
                     }
                 }
@@ -2743,47 +3063,55 @@ impl PluginManifest {
         // usual install locations — and "the plugin runs /some/absolute/thing"
         // is a worse sentence to have to put in a trust dialog than it is to
         // simply refuse.
+        //
+        // `[ping] args` reaches the install-time trust dialog verbatim
+        // (`main.rs`'s `build_trust_message` renders the command line a
+        // ping will run) before it is ever spawned as one — the bounds
+        // in `validate_ping_command` are for that dialog, not the spawn
+        // itself (`std::process::Command::arg` takes arbitrary bytes safely
+        // either way): an unbounded count or length lets a manifest push
+        // the untrusted-host warning that dialog carries clean off the
+        // bottom. `[[window_ping]]` commands reach the same dialog and get
+        // the same checks.
         if let Some(ping) = &self.ping {
-            if ping.bin.trim().is_empty() {
-                return Err("`[ping] bin` must not be empty".to_string());
-            }
-            // `:` alone is a no-op on this platform's own charset check —
-            // `contains('/')`/`contains('\\')` already refuse a Unix or
-            // Windows separator — but on Windows `C:evil` is a **prefixed
-            // relative** path (relative to whatever directory drive `C:` is
-            // current on), not the bare name it looks like beside `/`/`\`.
-            if ping.bin.contains(['/', '\\', ':']) {
+            validate_ping_command("[ping]", &ping.bin, &ping.args)?;
+        }
+        let mut pinged_windows = std::collections::HashSet::new();
+        for wp in &self.window_ping {
+            let table = format!("[[window_ping]] window = \"{}\":", wp.window);
+            validate_ping_command(&table, &wp.bin, &wp.args)?;
+            // Matched on the declared `id`, never on a position: a ping is
+            // pinned to one window, and a reordering of `[[windows]]` must not
+            // quietly point it at another.
+            let Some(target) = self
+                .windows
+                .iter()
+                .find(|w| !w.id.is_empty() && w.id == wp.window)
+            else {
                 return Err(format!(
-                    "`[ping] bin = \"{}\"` must be a bare program name, not a path",
-                    ping.bin
+                    "`[[window_ping]] window = \"{}\"` names no `[[windows]]` entry with that `id`",
+                    wp.window
+                ));
+            };
+            // An enumerating entry is many windows under one id; which of them
+            // a single command starts is not something this table can say.
+            if target.for_each.is_some() {
+                return Err(format!(
+                    "`[[window_ping]] window = \"{}\"` names an enumerating (`for_each`) window",
+                    wp.window
                 ));
             }
-            // `[ping] args` reaches the install-time trust dialog verbatim
-            // (`main.rs`'s `build_trust_message` renders the command line a
-            // ping will run) before it is ever spawned as one — the bounds
-            // below are for that dialog, not the spawn itself
-            // (`std::process::Command::arg` takes arbitrary bytes safely
-            // either way): an unbounded count or length lets a manifest push
-            // the untrusted-host warning that dialog carries clean off the
-            // bottom.
-            if ping.args.len() > PING_ARGS_MAX_COUNT {
+            if !pinged_windows.insert(wp.window.as_str()) {
                 return Err(format!(
-                    "`[ping] args` names {} entries — a ping is a short, fixed command line, and \
-                     {PING_ARGS_MAX_COUNT} is more than any real one needs",
-                    ping.args.len()
+                    "`[[window_ping]] window = \"{}\"` is declared more than once",
+                    wp.window
                 ));
             }
-            if ping.args.iter().any(|a| a.is_empty()) {
-                return Err(
-                    "`[ping] args` entries must not be empty — an empty argument says nothing in \
-                     the trust dialog and does nothing on the command line"
-                        .to_string(),
-                );
-            }
-            if let Some(bad) = ping.args.iter().find(|a| a.len() > PING_ARG_MAX_BYTES) {
+            if self.ping.is_some() && target.role == Role::Primary {
                 return Err(format!(
-                    "`[ping] args` has an entry of {} bytes — the limit is {PING_ARG_MAX_BYTES}",
-                    bad.len()
+                    "`[[window_ping]] window = \"{}\"` is the primary window, which `[ping]` \
+                     already pings",
+                    wp.window
                 ));
             }
         }
@@ -2897,6 +3225,27 @@ impl PluginManifest {
                 ));
             }
         }
+        for (n, wp) in self.window_ping.iter().enumerate() {
+            // The same command line `[ping]`'s is, reaching the same dialog;
+            // `window` becomes part of a config key and a log line.
+            control_char_fields.push((
+                format!("`[[window_ping]]` #{n} `window`"),
+                wp.window.as_str(),
+                CharClass::Wide,
+            ));
+            control_char_fields.push((
+                format!("`[[window_ping]]` #{n} `bin`"),
+                wp.bin.as_str(),
+                CharClass::Wide,
+            ));
+            for (i, arg) in wp.args.iter().enumerate() {
+                control_char_fields.push((
+                    format!("`[[window_ping]]` #{n} `args[{i}]`"),
+                    arg.as_str(),
+                    CharClass::Wide,
+                ));
+            }
+        }
         for w in &self.windows {
             control_char_fields.push((
                 format!("windows[label = \"{}\"]: `label`", w.label),
@@ -2995,10 +3344,30 @@ impl PluginManifest {
                         CharClass::Wide,
                     ));
                 }
+                if let Some(refresh_service) = &step.refresh_service {
+                    control_char_fields.push((
+                        format!(
+                            "surface \"{}\": a `{step_name}` auth step's `refresh_service`",
+                            surface.id
+                        ),
+                        refresh_service.as_str(),
+                        CharClass::Wide,
+                    ));
+                }
                 for (i, target) in step.targets.iter().flatten().enumerate() {
                     control_char_fields.push((
                         format!(
                             "surface \"{}\": a `{step_name}` auth step's `targets[{i}]`",
+                            surface.id
+                        ),
+                        target.as_str(),
+                        CharClass::Wide,
+                    ));
+                }
+                for (i, target) in step.refresh_targets.iter().flatten().enumerate() {
+                    control_char_fields.push((
+                        format!(
+                            "surface \"{}\": a `{step_name}` auth step's `refresh_targets[{i}]`",
                             surface.id
                         ),
                         target.as_str(),
@@ -3123,6 +3492,18 @@ impl PluginManifest {
         if let Some(lf) = &self.logfile {
             dotdot_fields.push(("`[logfile] root`".to_string(), lf.root.as_str()));
         }
+        // `[history] root` reaches `scanner::scan_root`'s own recursive walk
+        // exactly the way `[logfile] root` reaches `collect_log_files`'s,
+        // with no depth bound of its own — the same escape, so the same
+        // sweep. `root_env_join` needs no entry here: `validate_history`
+        // already refuses a `..` in it on its own, the same as `[logfile]
+        // root_env_join` does above.
+        if let Some(h) = &self.history {
+            dotdot_fields.push(("`[history] root`".to_string(), h.root.as_str()));
+            for (i, r) in h.extra_roots.iter().enumerate() {
+                dotdot_fields.push((format!("`[history] extra_roots[{i}]`"), r.as_str()));
+            }
+        }
         if let Some(http) = &self.http {
             for v in &http.value {
                 if let Some(path) = &v.path {
@@ -3246,7 +3627,8 @@ impl PluginManifest {
             // `[http.version] files` — read verbatim by `resolve_version`,
             // the same as `client.files` below: nothing substitutes a
             // version file's own path, so a stray `{token}` in one would be
-            // a directory name with braces in it, not a credential.
+            // a directory name with braces in it, not a credential — refused
+            // below, by name, the same as an undeclared `{option.<key>}` is.
             if let Some(version) = &http.version {
                 for (i, f) in version.files.iter().enumerate() {
                     templates.push((
@@ -3290,13 +3672,47 @@ impl PluginManifest {
                 ));
             }
         }
+        // `[history]` gets the same three, with the same classification —
+        // `history::scan_tick` substitutes `root`/`root_env_join` exactly
+        // where `engine_logfile::resolve_root` does (`resolve_root_fields`,
+        // shared by both), and `glob` exactly where `fetch`'s own
+        // `substitute_options` call does. An undeclared `{option.<key>}`
+        // here would otherwise load clean and search a directory that is a
+        // literal, unresolved placeholder.
+        if let Some(h) = &self.history {
+            templates.push((
+                "`[history] root`".to_string(),
+                h.root.as_str(),
+                Substituted::OptionsOnly,
+            ));
+            for (i, r) in h.extra_roots.iter().enumerate() {
+                templates.push((
+                    format!("`[history] extra_roots[{i}]`"),
+                    r.as_str(),
+                    Substituted::OptionsOnly,
+                ));
+            }
+            templates.push((
+                "`[history] glob`".to_string(),
+                h.glob.as_str(),
+                Substituted::OptionsOnly,
+            ));
+            if let Some(join) = &h.root_env_join {
+                templates.push((
+                    "`[history] root_env_join`".to_string(),
+                    join.as_str(),
+                    Substituted::OptionsOnly,
+                ));
+            }
+        }
         for surface in &self.surface {
             for step in &surface.auth {
                 // `token_url`/`client_id`/`client_secret` get no substitution of
                 // their own (this step's network call is not the engine's — see
                 // `auth::oauth_refresh_step`), so they belong beside
                 // `path`/`config_path` here: a stray `{token}` in `client_secret`
-                // would otherwise be sent as nine literal characters, silently.
+                // would otherwise be sent as nine literal characters, silently —
+                // refused below instead, by name.
                 for (field, text) in [
                     ("path", &step.path),
                     ("config_path", &step.config_path),
@@ -3319,7 +3735,8 @@ impl PluginManifest {
                 // `client`'s own fields, same treatment: nothing substitutes
                 // a pattern, an env var name or a file/bin candidate either,
                 // so a stray `{token}` in one of them would be read literally
-                // by `auth::discover_client` rather than rejected here.
+                // by `auth::discover_client` — refused below instead, the
+                // same as the fields just above.
                 if let Some(client) = &step.client {
                     for (field, text) in [
                         ("client.id_env", &client.id_env),
@@ -3357,11 +3774,33 @@ impl PluginManifest {
         }
         for (where_it_is, template, substituted) in templates {
             for placeholder in placeholders(template) {
+                // `{token}`/`{version}` are meaningful wherever headers/body
+                // substitute them — refusing them on a `ValuesAndOptions`
+                // field would break every shipped manifest's own
+                // `Authorization` header — but three comments above name
+                // them by hand for the `Nothing`-classified fields
+                // (`[http.version] files`, `token_url`/`client_id`/
+                // `client_secret`, `client`'s own fields) as a stray value
+                // that "would be read literally" there, never rejected —
+                // this is the rejection those comments describe. `Nothing`
+                // is the one classification substituting neither, so this
+                // is checked by exact name here rather than folded into
+                // `covers` below, which a `OptionsOnly` field (a URL, a
+                // log-file path) must not trip: those get their own,
+                // narrower sweep (`url_placeholder`) or, for `[logfile]`/
+                // `[history]`, never carry either placeholder at all.
+                if matches!(placeholder, "token" | "version") && substituted == Substituted::Nothing
+                {
+                    return Err(format!(
+                        "{where_it_is} names {{{placeholder}}}, which nothing substitutes there — \
+                         it would be used as literal text"
+                    ));
+                }
                 let kind = match () {
                     _ if placeholder.starts_with("value.") => Substituted::ValuesAndOptions,
                     _ if placeholder.starts_with("option.") => Substituted::OptionsOnly,
-                    // `{token}`, `{version}`, `{config_dir}` and anything a
-                    // future engine adds are not this rule's business.
+                    // `{config_dir}` and anything a future engine adds are
+                    // not this rule's business.
                     _ => continue,
                 };
                 if !substituted.covers(kind) {
@@ -4331,6 +4770,70 @@ pub enum LogFileSelect {
     Last,
 }
 
+// ── [history] ─────────────────────────────────────────────────────────────
+
+/// `[history]` — where a provider's local token-usage history lives.
+///
+/// This is the *history* half of what `[logfile]` is for quota: a root, a
+/// glob, and the same `root_env`/`root_env_join` override convention —
+/// `CLAUDE_CONFIG_DIR` relocates Claude's transcript tree exactly the way
+/// it relocates its credentials file. What it deliberately does **not**
+/// carry is any parsing detail: `format` names a typed extractor in
+/// `crate::history::formats`, and a manifest cannot spell out a field
+/// mapping of its own — a mapping DSL in TOML would be a mini-ETL nobody
+/// can validate. A format this build does not know is refused at load
+/// (`serde` denies the variant), not read as something else.
+///
+/// Needs `requires_reader = ["reading-history"]`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct HistoryConfig {
+    /// Which extractor parses the matched files. Required — there is no
+    /// default because every format's correctness rules differ (dedup
+    /// keys, cumulative counters, sub-agent filtering); guessing one is
+    /// how double-counted histories are born.
+    pub format: HistoryFormat,
+    /// Root directory the history scanner walks (subject to `root_env`
+    /// override and `~` expansion — see [`crate::plugin::expand_home`]).
+    pub root: String,
+    /// Additional roots scanned alongside `root` using the same `format` and
+    /// `glob` (not subject to `root_env`). Needs `requires_reader =
+    /// ["history-extra-roots"]`.
+    #[serde(default)]
+    pub extra_roots: Vec<String>,
+    /// Glob (relative to `root`) matching history files. For
+    /// `antigravity-sqlite` this matches the `*.db` conversation stores;
+    /// for the JSONL formats it matches transcript/rollout files.
+    pub glob: String,
+    /// Env var that, if set, overrides `root` — same semantics as
+    /// `[logfile] root_env`.
+    #[serde(default)]
+    pub root_env: Option<String>,
+    /// Subdirectory appended onto the `root_env` override — same rules as
+    /// `[logfile] root_env_join`: refused without `root_env`, must be a
+    /// relative path, no `..`.
+    #[serde(default)]
+    pub root_env_join: Option<String>,
+}
+
+/// The extractor a `[history]` section selects. Parsing is code — the
+/// manifest chooses *which* parser, never *how* to parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HistoryFormat {
+    /// `~/.claude/projects/**` transcripts: one JSON object per line,
+    /// `type = "assistant"` lines carry `message.usage`.
+    ClaudeTranscripts,
+    /// `~/.codex/sessions/**` rollout JSONL: `token_count` events are
+    /// cumulative per session and get diffed into deltas.
+    CodexRollouts,
+    /// `~/.grok/logs/unified.jsonl` + `sessions/*/updates.jsonl`:
+    /// `shell.turn.inference_done` events.
+    GrokUnified,
+    /// `~/.gemini/antigravity-cli/conversations/*.db`: read-only SQLite
+    /// (`mode=ro`), protobuf-encoded generation records.
+    AntigravitySqlite,
+}
+
 fn default_classify_threshold_minutes() -> u64 {
     720
 }
@@ -4685,6 +5188,17 @@ pub struct AuthStep {
     /// windows.
     pub message: Option<String>,
 
+    /// `oauth-refresh`: macOS Keychain service name checked for the refresh
+    /// token payload before falling back to `path` (unwraps `go-keyring`
+    /// markers). Needs `requires_reader = ["oauth-refresh-store"]`.
+    #[serde(default)]
+    pub refresh_service: Option<String>,
+    /// `oauth-refresh`: Windows Credential Manager targets checked for the
+    /// refresh token payload before falling back to `path` (unwraps
+    /// `go-keyring` markers). Needs `requires_reader =
+    /// ["oauth-refresh-store"]`.
+    #[serde(default)]
+    pub refresh_targets: Option<Vec<String>>,
     /// `oauth-refresh`: where to send the token exchange. Checked against this
     /// surface's `allowed_hosts` at fetch time — `auth::resolve_token` runs
     /// ahead of the engine's own `allowed_hosts` check on the main request, so
@@ -4896,15 +5410,23 @@ fn is_absolute_on_any_platform(p: &Path) -> bool {
     p.is_absolute() || s.starts_with('/') || has_drive_prefix || s.starts_with("\\\\")
 }
 
-/// [`AuthClientDiscovery::id_env`]/`secret_env`: the POSIX/Windows
-/// environment-variable charset — a leading letter or underscore, then
-/// letters, digits or underscores. `std::env::var` would simply never find
-/// anything for a name outside it, so refusing it here is a clearer answer
-/// than a silent miss at every fetch.
+/// [`AuthClientDiscovery::id_env`]/`secret_env` and the other fields that
+/// name a variable rather than hold one: what an environment variable name
+/// actually cannot be, not the conservative identifier shape
+/// (`[A-Za-z_][A-Za-z0-9_]*`) most manifests happen to write. `ProgramFiles(x86)`
+/// is a real Windows variable, parentheses and all, and this app ships a
+/// Windows build — an identifier-shaped rule would refuse a manifest for
+/// naming it, which is not a rule the format needs. `setenv`/`getenv` and
+/// `GetEnvironmentVariable` cannot resolve a name that is empty, one
+/// containing `=` (the delimiter every setter and `environ` itself splits
+/// the name from the value on), or one containing a null byte (which ends a
+/// C string, so nothing after it is reachable through either API) — so the
+/// shape here is defined by what breaks the lookup, not by what a typical
+/// name looks like. `std::env::var_os` would simply never return anything
+/// for a name outside it, so refusing it here is a clearer answer than a
+/// silent miss at every fetch.
 fn is_valid_env_var_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    !name.is_empty() && !name.contains('=') && !name.contains('\0')
 }
 
 /// Whether `text` carries a control character (`char::is_control` — ASCII
@@ -5092,6 +5614,77 @@ const PING_ARGS_MAX_COUNT: usize = 32;
 /// single entry cannot push the untrusted-host clause off the bottom of the
 /// install-time trust dialog that renders the whole command line.
 const PING_ARG_MAX_BYTES: usize = 256;
+
+/// One `[[window_ping]]` — a command that starts the window named by
+/// `window` (a `[[windows]] id`), run while that window sits empty, under the
+/// same per-plugin toggle as `[ping]` but with its own record of when it last
+/// ran (`config::plugin_window_pinged_at`).
+///
+/// A table of its own, not more fields under `[ping]`, for the build that
+/// predates it. An older reader ignores a key it does not know, so anything
+/// added under `[ping]` would leave that build running `[ping]` with none of
+/// what came with it. For Antigravity that is not merely fewer pings: an
+/// empty Antigravity window states a reset one period from *now*, moving
+/// with every reading, and only a build that knows that shape retries a
+/// failed ping a period later instead of every ten minutes. A manifest that
+/// pings through `[[window_ping]]` alone is, to an older build, a manifest
+/// with no ping at all — exactly what it was before — so no
+/// `requires_reader` entry is needed, and declaring one would only make
+/// that build refuse the whole manifest, readings included.
+///
+/// No `renews_token`: renewing a lapsed token is `[ping]`'s job, triggered
+/// by a reading rather than a window, and one command per provider does it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WindowPingConfig {
+    /// The `id` of the `[[windows]]` entry this command starts. Must name a
+    /// declared, non-enumerating window, at most one `[[window_ping]]` per
+    /// window, and never the `primary` window when `[ping]` is also declared
+    /// (that one is already `[ping]`'s).
+    pub window: String,
+    /// Bare program name, resolved exactly like `[ping] bin`.
+    pub bin: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// The checks `[ping]` and every `[[window_ping]]` share: a bare program name
+/// and a short, bounded command line (see the call site in `validate` for
+/// why each bound exists). `table` names the section in the message.
+fn validate_ping_command(table: &str, bin: &str, args: &[String]) -> Result<(), String> {
+    if bin.trim().is_empty() {
+        return Err(format!("`{table} bin` must not be empty"));
+    }
+    // `:` alone is a no-op on this platform's own charset check —
+    // `contains('/')`/`contains('\\')` already refuse a Unix or
+    // Windows separator — but on Windows `C:evil` is a **prefixed
+    // relative** path (relative to whatever directory drive `C:` is
+    // current on), not the bare name it looks like beside `/`/`\`.
+    if bin.contains(['/', '\\', ':']) {
+        return Err(format!(
+            "`{table} bin = \"{bin}\"` must be a bare program name, not a path"
+        ));
+    }
+    if args.len() > PING_ARGS_MAX_COUNT {
+        return Err(format!(
+            "`{table} args` names {} entries — a ping is a short, fixed command line, and \
+             {PING_ARGS_MAX_COUNT} is more than any real one needs",
+            args.len()
+        ));
+    }
+    if args.iter().any(|a| a.is_empty()) {
+        return Err(format!(
+            "`{table} args` entries must not be empty — an empty argument says nothing in \
+             the trust dialog and does nothing on the command line"
+        ));
+    }
+    if let Some(bad) = args.iter().find(|a| a.len() > PING_ARG_MAX_BYTES) {
+        return Err(format!(
+            "`{table} args` has an entry of {} bytes — the limit is {PING_ARG_MAX_BYTES}",
+            bad.len()
+        ));
+    }
+    Ok(())
+}
 
 // ── [[option]] ────────────────────────────────────────────────────────────
 
@@ -6133,6 +6726,28 @@ mod tests {
         assert!(err.contains("http-api"), "{err}");
     }
 
+    /// `period.assumed` gets the same ceiling `container_period_minutes`
+    /// already holds a `from_field`/`from_bounds` length to
+    /// (`crate::plugin::time::plausible_period_minutes`, ten years) — an
+    /// `assumed` value reaches the identical `* 60` arithmetic
+    /// (`main.rs`'s `ping_due`/`seen_at_is_plausible`) with nothing ever
+    /// having measured it, so the boundary is exact: the ceiling itself
+    /// still loads, one minute past it is refused.
+    #[test]
+    fn period_assumed_at_the_plausible_ceiling_is_accepted() {
+        let toml = CODEX_LIKE.replace("assumed = 10080", "assumed = 5256000");
+        PluginManifest::from_str(&toml)
+            .expect("an assumed period exactly at the ten-year ceiling is still plausible");
+    }
+
+    #[test]
+    fn period_assumed_beyond_the_plausible_ceiling_is_refused() {
+        let toml = CODEX_LIKE.replace("assumed = 10080", "assumed = 5256001");
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("an assumed period a minute past the ten-year ceiling must be refused");
+        assert!(err.contains("5256001"), "{err}");
+    }
+
     // ── [[option]] ───────────────────────────────────────────────────────
 
     /// A minimal valid manifest body shared by the `[[option]]` tests, with
@@ -6856,13 +7471,56 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_without_an_id_falls_back_to_a_position_that_cannot_collide_with_a_window() {
+    fn an_entry_without_an_id_falls_back_to_a_b_prefixed_position_not_a_w_prefixed_one() {
         let m = PluginManifest::from_str(&BALANCES_ONLY.replace("id    = \"monthly\"\n", ""))
             .expect("an id is optional");
-        // `b0`, not `w0`: a balance and a window at the same index are two
-        // different rows, and one registry key for both would file them
-        // together the first time an entry drops its `id`.
+        // `b0`, not `w0`: two anonymous entries at the same index, one from
+        // each section, fall back to different strings — see
+        // `an_explicit_window_id_can_still_collide_with_an_anonymous_balance`
+        // right below for the case this prefix does not save.
         assert_eq!(m.balances[0].entry_key(0), "b0");
+    }
+
+    /// The case `BalanceConfig::entry_key`'s own doc names as the reason the
+    /// two sections "cannot collide" is only the case above, where both
+    /// sides are anonymous and the `b`/`w` prefixes tell them apart. Nothing
+    /// stops a *declared* `id` from spelling out the other section's fallback
+    /// shape: `windows`/`balances` are validated for internal duplicates only
+    /// (`validate_windows`/`validate_balances`, each walking its own
+    /// section), never against each other, so a window that declares
+    /// `id = "b0"` reaches [`PluginManifest::validate`] clean while resolving
+    /// to the exact string an anonymous first balance already falls back to.
+    #[test]
+    fn an_explicit_window_id_can_still_collide_with_an_anonymous_balance() {
+        let toml = BALANCES_ONLY
+            .replace("id    = \"monthly\"\n", "")
+            .replace(
+                "requires_reader = [\"reading-balances\"]",
+                "requires_reader = [\"reading-balances\", \"window-identity\"]",
+            )
+            .replace(
+                "[[balances]]",
+                r#"[[windows]]
+        id    = "b0"
+        label = "5H"
+        role  = "primary"
+        [windows.period]
+        mode    = "assumed"
+        assumed = 300
+        [windows.source]
+        used_percent_path = "five_hour.utilization"
+        resets_at_path    = "five_hour.resets_at"
+
+        [[balances]]"#,
+            );
+        let m = PluginManifest::from_str(&toml).expect("no rule refuses this combination");
+        assert_eq!(m.windows[0].entry_key(0), "b0");
+        assert_eq!(m.balances[0].entry_key(0), "b0");
+        assert_eq!(
+            crate::plugin::window_key(&m.windows[0], 0),
+            crate::plugin::balance_key(&m.balances[0], 0),
+            "the declared window and the anonymous balance resolve to one registry key"
+        );
     }
 
     /// `path` is `number`/`text`'s own field — neither engine ever reads it
@@ -6997,6 +7655,41 @@ mod tests {
         assert!(err.contains("{value.account_id}"), "{err}");
     }
 
+    /// `client_secret` is `Substituted::Nothing` — this step's own network
+    /// call is not the engine's (`auth::oauth_refresh_step`), so nothing
+    /// substitutes into it. A `{token}` there is not a credential, it is
+    /// nine literal characters sent to the token endpoint verbatim. Same
+    /// rule the `token_url`/`client_id`/`client_secret`/`client.*` comment
+    /// above the sweep describes; this pins that the sweep now actually
+    /// enforces it.
+    #[test]
+    fn a_stray_token_placeholder_in_client_secret_is_refused() {
+        let toml = OAUTH_REFRESH_BASE.replace(
+            "client_secret   = \"some-client-secret\"",
+            "client_secret   = \"{token}\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a stray {token} in client_secret must be refused");
+        assert!(err.contains("{token}"), "{err}");
+        assert!(err.contains("client_secret"), "{err}");
+    }
+
+    /// `[http.version] files` is `Substituted::Nothing` too — read verbatim
+    /// by `resolve_version`, so a `{version}` in one of its own candidate
+    /// paths would be a directory name with braces in it, not the value this
+    /// section exists to read.
+    #[test]
+    fn a_stray_version_placeholder_in_an_http_version_file_is_refused() {
+        let toml = CLAUDE_LIKE.replace(
+            "\"/usr/local/lib/node_modules/@anthropic-ai/claude-code/package.json\",",
+            "\"/usr/local/lib/{version}/package.json\",",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a stray {version} in an [http.version] files entry must be refused");
+        assert!(err.contains("{version}"), "{err}");
+        assert!(err.contains("`[http.version] files[0]`"), "{err}");
+    }
+
     #[test]
     fn a_json_shaped_body_swallows_its_own_placeholder() {
         // The failure this rule exists for: the body's own leading `{`
@@ -7103,6 +7796,204 @@ mod tests {
             .expect_err("a JSON-shaped root_env_join swallows its own placeholder");
         assert!(err.contains("{option.<key>}"), "{err}");
         assert!(err.contains("`[logfile] root_env_join`"), "{err}");
+    }
+
+    /// `[history]` — the whole section parses, including the `root_env`
+    /// override convention it shares with `[logfile]`.
+    #[test]
+    fn parses_a_history_section() {
+        // `requires_reader` goes beside `engine`, up top — appended at the
+        // end it would land inside the last table and never be read.
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format        = \"codex-rollouts\"\n        \
+             root          = \"~/.codex/sessions\"\n        \
+             glob          = \"**/*.jsonl\"\n        \
+             root_env      = \"CODEX_HOME\"\n        \
+             root_env_join = \"sessions\"\n";
+        let m = PluginManifest::from_str(&toml).expect("history manifest parses");
+        let h = m.history.expect("[history] carried");
+        assert_eq!(h.format, HistoryFormat::CodexRollouts);
+        assert_eq!(h.root, "~/.codex/sessions");
+        assert_eq!(h.glob, "**/*.jsonl");
+        assert_eq!(h.root_env.as_deref(), Some("CODEX_HOME"));
+        assert_eq!(h.root_env_join.as_deref(), Some("sessions"));
+    }
+
+    /// Same shape as the `[logfile]` trio above, for `[history] root` —
+    /// `option_templates` in `validate_engine_sections` sweeps this section's
+    /// `root`/`root_env_join`/`glob` too, the same substituted fields
+    /// `[logfile]` has, and this had no test proving it.
+    #[test]
+    fn a_history_root_swallows_its_own_placeholder() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format        = \"codex-rollouts\"\n        \
+             root          = \"~/{\\\"a\\\":\\\"{option.deep}\\\"}\"\n        \
+             glob          = \"**/*.jsonl\"\n";
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a JSON-shaped root swallows its own placeholder");
+        assert!(err.contains("{option.<key>}"), "{err}");
+        assert!(err.contains("`[history] root`"), "{err}");
+    }
+
+    /// Same shape, for `[history] glob`.
+    #[test]
+    fn a_history_glob_swallows_its_own_placeholder() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format        = \"codex-rollouts\"\n        \
+             root          = \"~/.codex/sessions\"\n        \
+             glob          = \"{\\\"a\\\":\\\"{option.deep}\\\"}\"\n";
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a JSON-shaped glob swallows its own placeholder");
+        assert!(err.contains("{option.<key>}"), "{err}");
+        assert!(err.contains("`[history] glob`"), "{err}");
+    }
+
+    /// Same shape, for `[history] root_env_join`.
+    #[test]
+    fn a_history_root_env_join_swallows_its_own_placeholder() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format        = \"codex-rollouts\"\n        \
+             root          = \"~/.codex/sessions\"\n        \
+             glob          = \"**/*.jsonl\"\n        \
+             root_env      = \"CODEX_HOME\"\n        \
+             root_env_join = \"{\\\"a\\\":\\\"{option.deep}\\\"}\"\n";
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a JSON-shaped root_env_join swallows its own placeholder");
+        assert!(err.contains("{option.<key>}"), "{err}");
+        assert!(err.contains("`[history] root_env_join`"), "{err}");
+    }
+
+    /// The gate half: `[history]` keys with no `reading-history` declared is
+    /// refused by the capability check before the schema ever sees it.
+    #[test]
+    fn a_history_section_without_the_capability_is_refused() {
+        let toml = format!(
+            "{CODEX_LIKE}\n        \
+             [history]\n        \
+             format = \"codex-rollouts\"\n        \
+             root   = \"~/.codex/sessions\"\n        \
+             glob   = \"**/*.jsonl\"\n"
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("[history] without reading-history must be refused");
+        assert!(err.contains("reading-history"), "{err}");
+    }
+
+    /// A format this build does not know is refused at load — `format` is
+    /// an enum precisely so a manifest cannot spell out a parser of its own.
+    #[test]
+    fn an_unknown_history_format_is_refused() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        [history]\n        \
+             format = \"yaml-pipe-dreams\"\n        \
+             root   = \"~/.codex/sessions\"\n        \
+             glob   = \"**/*.jsonl\"\n";
+        let err =
+            PluginManifest::from_str(&toml).expect_err("an unknown history format must be refused");
+        assert!(err.contains("yaml-pipe-dreams"), "{err}");
+    }
+
+    /// `[history] root` reaches `scanner::scan_root`'s own recursive walk
+    /// exactly the way `[logfile] root` reaches `collect_log_files`'s, with
+    /// no depth bound of its own — the same `..` escape the log-file sibling
+    /// is refused for.
+    #[test]
+    fn a_history_root_with_a_dotdot_component_is_refused() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format = \"codex-rollouts\"\n        \
+             root   = \"~/.codex/../../etc\"\n        \
+             glob   = \"**/*.jsonl\"\n";
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("a `..` component in [history] root must be refused");
+        assert!(err.contains(".."), "{err}");
+        assert!(err.contains("`[history] root`"), "{err}");
+    }
+
+    /// `[history] root`/`glob`/`root_env_join` read `{option.<key>}` the
+    /// same way their `[logfile]` counterparts do (same `Substituted::
+    /// OptionsOnly` classification) — an undeclared key must be refused
+    /// exactly like it would be there, not loaded clean with the literal
+    /// placeholder still in the path.
+    #[test]
+    fn a_history_root_naming_an_undeclared_option_is_refused() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format = \"codex-rollouts\"\n        \
+             root   = \"~/.codex/{option.enabled}\"\n        \
+             glob   = \"**/*.jsonl\"\n";
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("an undeclared {option.enabled} in [history] root must be refused");
+        assert!(err.contains("{option.enabled}"), "{err}");
+        assert!(err.contains("`[history] root`"), "{err}");
+    }
+
+    #[test]
+    fn a_history_glob_naming_an_undeclared_option_is_refused() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format = \"codex-rollouts\"\n        \
+             root   = \"~/.codex/sessions\"\n        \
+             glob   = \"{option.enabled}/*.jsonl\"\n";
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("an undeclared {option.enabled} in [history] glob must be refused");
+        assert!(err.contains("{option.enabled}"), "{err}");
+        assert!(err.contains("`[history] glob`"), "{err}");
+    }
+
+    #[test]
+    fn a_history_root_env_join_naming_an_undeclared_option_is_refused() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format        = \"codex-rollouts\"\n        \
+             root          = \"~/.codex\"\n        \
+             glob          = \"**/*.jsonl\"\n        \
+             root_env      = \"CODEX_HOME\"\n        \
+             root_env_join = \"{option.enabled}\"\n";
+        let err = PluginManifest::from_str(&toml).expect_err(
+            "an undeclared {option.enabled} in [history] root_env_join must be refused",
+        );
+        assert!(err.contains("{option.enabled}"), "{err}");
+        assert!(err.contains("`[history] root_env_join`"), "{err}");
     }
 
     /// And `[account] url`, which `resolve_account_url` substitutes exactly
@@ -7515,6 +8406,181 @@ mod tests {
         );
     }
 
+    // ── Fields read by exactly one step kind, refused on the others ──────
+    // Same shape as `expiry_json_path`/`macos_keychain_key`/`unless_json_path`
+    // above: each field below is read by exactly one of
+    // `credentials_map_step`/`keychain_step`/`electron_safe_storage_step`/
+    // `win_credential_step`/`reject_when_step`/`oauth_refresh_step`/`env_step`
+    // (see the corresponding `require_str`/`require_vec` call in `auth.rs`),
+    // and every other kind used to accept it in silence.
+
+    #[test]
+    fn key_prefix_is_refused_on_a_step_kind_that_never_reads_it() {
+        // `credentials-map` declared too: without it, the backward-compat
+        // capability gate refuses `key_prefix`'s mere presence before
+        // `validate` ever runs its own kind check — a different refusal
+        // this test is not the one to pin.
+        let toml = KEYCHAIN_EXPIRY_BASE
+            .replace(
+                "expiry_json_path = \"token.expiry\"",
+                "key_prefix = \"acme::\"",
+            )
+            .replace(
+                "requires_reader = [\"keychain-expiry\"]",
+                "requires_reader = [\"keychain-expiry\", \"credentials-map\"]",
+            );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("key_prefix on a keychain step must be refused");
+        assert!(err.contains("key_prefix"), "{err}");
+        assert!(err.contains("credentials-map"), "{err}");
+    }
+
+    #[test]
+    fn service_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "type            = \"keychain\"\n        service         = \"gemini\"\n        token_json_path = \"token.access_token\"\n        expiry_json_path = \"token.expiry\"",
+            "type             = \"credentials-file\"\n        path             = \"~/.sample/auth.json\"\n        token_json_path  = \"token.access_token\"\n        service          = \"gemini\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("service on a credentials-file step must be refused");
+        assert!(err.contains("service"), "{err}");
+        assert!(err.contains("keychain"), "{err}");
+    }
+
+    #[test]
+    fn config_path_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "config_path = \"~/.sample/config.json\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("config_path on a keychain step must be refused");
+        assert!(err.contains("config_path"), "{err}");
+        assert!(err.contains("electron-safe-storage"), "{err}");
+    }
+
+    #[test]
+    fn blob_json_path_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "blob_json_path = \"blob\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("blob_json_path on a keychain step must be refused");
+        assert!(err.contains("blob_json_path"), "{err}");
+        assert!(err.contains("electron-safe-storage"), "{err}");
+    }
+
+    #[test]
+    fn targets_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "targets = [\"Sample\"]",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("targets on a keychain step must be refused");
+        assert!(err.contains("targets"), "{err}");
+        assert!(err.contains("win-credential"), "{err}");
+    }
+
+    #[test]
+    fn json_path_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "json_path = \"tokens.access_token\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("json_path on a keychain step must be refused");
+        assert!(err.contains("json_path"), "{err}");
+        assert!(err.contains("reject-when"), "{err}");
+    }
+
+    #[test]
+    fn message_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "message = \"no subscription\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("message on a keychain step must be refused");
+        assert!(err.contains("message"), "{err}");
+        assert!(err.contains("reject-when"), "{err}");
+    }
+
+    #[test]
+    fn token_url_is_refused_on_a_step_kind_that_never_reads_it() {
+        // `oauth-refresh` declared too, for the same reason `key_prefix`'s
+        // own test above declares `credentials-map`: without it the
+        // capability gate is what refuses `token_url`, not `validate`'s own
+        // kind check.
+        let toml = KEYCHAIN_EXPIRY_BASE
+            .replace(
+                "expiry_json_path = \"token.expiry\"",
+                "token_url = \"https://oauth2.example.com/token\"",
+            )
+            .replace(
+                "requires_reader = [\"keychain-expiry\"]",
+                "requires_reader = [\"keychain-expiry\", \"oauth-refresh\"]",
+            );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("token_url on a keychain step must be refused");
+        assert!(err.contains("token_url"), "{err}");
+        assert!(err.contains("oauth-refresh"), "{err}");
+    }
+
+    #[test]
+    fn client_id_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "client_id = \"sample-client-id\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("client_id on a keychain step must be refused");
+        assert!(err.contains("client_id"), "{err}");
+        assert!(err.contains("oauth-refresh"), "{err}");
+    }
+
+    #[test]
+    fn client_secret_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "client_secret = \"sample-client-secret\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("client_secret on a keychain step must be refused");
+        assert!(err.contains("client_secret"), "{err}");
+        assert!(err.contains("oauth-refresh"), "{err}");
+    }
+
+    #[test]
+    fn var_is_refused_on_a_step_kind_that_never_reads_it() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "expiry_json_path = \"token.expiry\"",
+            "var = \"SAMPLE_TOKEN\"",
+        );
+        let err =
+            PluginManifest::from_str(&toml).expect_err("var on a keychain step must be refused");
+        assert!(err.contains("`var`"), "{err}");
+        assert!(err.contains("`env`"), "{err}");
+    }
+
+    /// The one field above with no existing positive coverage elsewhere —
+    /// `service`/`targets`/`key_prefix`/`token_url`/`client_id`/`client_secret`
+    /// all already parse on their own kind in tests above this one or in
+    /// `KEYCHAIN_EXPIRY_BASE`'s own base case, and `config_path`/
+    /// `blob_json_path`/`json_path`/`message` parse in `CLAUDE_LIKE`/
+    /// the shipped `codex.toml` respectively — no shipped or existing
+    /// fixture uses `type = "env"` at all.
+    #[test]
+    fn var_is_accepted_on_an_env_step() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "type            = \"keychain\"\n        service         = \"gemini\"\n        token_json_path = \"token.access_token\"\n        expiry_json_path = \"token.expiry\"",
+            "type = \"env\"\n        var  = \"SAMPLE_TOKEN\"",
+        );
+        let m = PluginManifest::from_str(&toml).expect("var on an env step is accepted");
+        assert_eq!(m.surface[0].auth[0].var.as_deref(), Some("SAMPLE_TOKEN"));
+    }
+
     #[test]
     fn declares_token_expiry_is_true_only_for_a_surface_whose_chain_names_one() {
         let with_expiry = PluginManifest::from_str(KEYCHAIN_EXPIRY_BASE).expect("valid manifest");
@@ -7879,14 +8945,157 @@ mod tests {
     }
 
     #[test]
-    fn a_client_env_name_outside_the_variable_charset_is_refused() {
+    fn a_client_env_name_containing_an_equals_sign_is_refused() {
         let toml = OAUTH_REFRESH_CLIENT_BASE.replace(
             r#"id_env         = "SAMPLE_CLIENT_ID""#,
-            r#"id_env         = "SAMPLE-CLIENT-ID""#,
+            r#"id_env         = "SAMPLE=CLIENT=ID""#,
         );
         let err = PluginManifest::from_str(&toml)
-            .expect_err("a hyphen is not a valid environment variable name character");
+            .expect_err("an `=` is not a valid environment variable name character");
         assert!(err.contains("client.id_env"), "{err}");
+    }
+
+    /// The charset is defined by exclusion, not by an identifier shape:
+    /// `ProgramFiles(x86)` is a real Windows variable an identifier-shaped
+    /// rule (`[A-Za-z_][A-Za-z0-9_]*`) has no room for. `=` and a null byte
+    /// are the two shapes neither `std::env::set_var` nor
+    /// `GetEnvironmentVariable` can resolve, on any platform; an empty name
+    /// is refused as its own case rather than falling through to either of
+    /// those.
+    #[test]
+    fn is_valid_env_var_name_is_defined_by_exclusion_not_by_an_identifier_shape() {
+        assert!(is_valid_env_var_name("ProgramFiles(x86)"));
+        assert!(is_valid_env_var_name("CommonProgramFiles(x86)"));
+        assert!(is_valid_env_var_name("CODEX_HOME"));
+        assert!(!is_valid_env_var_name(""));
+        assert!(!is_valid_env_var_name("CODEX=HOME"));
+        assert!(!is_valid_env_var_name("CODEX\0HOME"));
+    }
+
+    /// `[logfile] root_env` names a variable `std::env::var_os` reads
+    /// verbatim — a name outside the POSIX/Windows charset (an `=` here) can
+    /// never be set, the same silent-no-op `client.id_env` is already
+    /// refused for above. An empty name is refused too (already covered by
+    /// its own "names no environment variable" check), and a plausible one
+    /// — `CODEX_HOME`, the shipped-shape value — still loads.
+    #[test]
+    fn logfile_root_env_must_be_a_plausible_environment_variable_name() {
+        let with_equals = CODEX_LIKE.replace(
+            "root_env      = \"CODEX_HOME\"",
+            "root_env      = \"CODEX=HOME\"",
+        );
+        let err = PluginManifest::from_str(&with_equals)
+            .expect_err("an `=` cannot appear in a real environment variable name");
+        assert!(err.contains("`[logfile] root_env"), "{err}");
+
+        let empty = CODEX_LIKE.replace("root_env      = \"CODEX_HOME\"", "root_env      = \"\"");
+        let err = PluginManifest::from_str(&empty)
+            .expect_err("an empty name names no environment variable");
+        assert!(err.contains("`[logfile] root_env`"), "{err}");
+
+        PluginManifest::from_str(CODEX_LIKE).expect("CODEX_HOME is a plausible name");
+    }
+
+    /// This app ships a Windows build, and `ProgramFiles(x86)` is a real
+    /// Windows environment variable a `root_env` override could plausibly
+    /// name — see `is_valid_env_var_name`'s own doc for why the charset
+    /// admits it.
+    #[test]
+    fn logfile_root_env_naming_a_windows_variable_with_parentheses_is_accepted() {
+        let toml = CODEX_LIKE.replace(
+            "root_env      = \"CODEX_HOME\"",
+            "root_env      = \"ProgramFiles(x86)\"",
+        );
+        PluginManifest::from_str(&toml)
+            .expect("a real Windows environment variable name must be accepted");
+    }
+
+    /// Same rule, `[history] root_env` — the credential-adjacent charset
+    /// check applies to every field that names an environment variable, not
+    /// only the ones `[logfile]` and auth steps carry.
+    #[test]
+    fn a_history_root_env_with_an_equals_sign_is_refused() {
+        let toml = CODEX_LIKE.replacen(
+            "engine       = \"log-file\"",
+            "engine       = \"log-file\"\n        requires_reader = [\"reading-history\"]",
+            1,
+        ) + "\n        \
+             [history]\n        \
+             format   = \"codex-rollouts\"\n        \
+             root     = \"~/.codex\"\n        \
+             glob     = \"**/*.jsonl\"\n        \
+             root_env = \"CODEX=HOME\"\n";
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("an `=` in [history] root_env must be refused");
+        assert!(err.contains("`[history] root_env"), "{err}");
+    }
+
+    /// Same rule, `[[http.value]] path_env`.
+    #[test]
+    fn an_http_value_path_env_with_an_equals_sign_is_refused() {
+        let toml = http_manifest_with(
+            "",
+            "[[http.value]]\nname = \"account_id\"\ntype = \"json-file\"\n\
+             path = \"~/.codex/auth.json\"\npath_env = \"CODEX=HOME\"\njson_path = \"tokens.account_id\"",
+            "",
+        )
+        .replacen(
+            "engine     = \"http-api\"",
+            "engine     = \"http-api\"\n            requires_reader = [\"http-value-path-env\"]",
+            1,
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("an `=` in [[http.value]] path_env must be refused");
+        assert!(err.contains("path_env"), "{err}");
+    }
+
+    /// Same rule, an auth step's `path_env` (`credentials-file`).
+    #[test]
+    fn an_auth_step_path_env_with_an_equals_sign_is_refused() {
+        let toml = KEYCHAIN_EXPIRY_BASE
+            .replace(
+                "type            = \"keychain\"\n        service         = \"gemini\"\n        token_json_path = \"token.access_token\"",
+                "type             = \"credentials-file\"\n        path             = \"~/.sample/.credentials.json\"\n        \
+                 path_env         = \"SAMPLE=CONFIG\"\n        token_json_path  = \"token.access_token\"",
+            )
+            .replace(
+                "requires_reader = [\"keychain-expiry\"]",
+                "requires_reader = [\"keychain-expiry\", \"credentials-file-path-env\"]",
+            );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("an `=` in an auth step's path_env must be refused");
+        assert!(err.contains("path_env"), "{err}");
+    }
+
+    /// Same rule, an auth step's `service_env` (`keychain` only).
+    #[test]
+    fn an_auth_step_service_env_with_an_equals_sign_is_refused() {
+        let toml = KEYCHAIN_EXPIRY_BASE
+            .replace(
+                "service         = \"gemini\"",
+                "service            = \"gemini\"\n        service_env        = \"CLAUDE=CONFIG\"\n        service_env_suffix = \"sha256:8\"",
+            )
+            .replace(
+                "requires_reader = [\"keychain-expiry\"]",
+                "requires_reader = [\"keychain-expiry\", \"keychain-service-env\"]",
+            );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("an `=` in an auth step's service_env must be refused");
+        assert!(err.contains("service_env"), "{err}");
+    }
+
+    /// Same rule, an `env` step's `var` — the field the token itself is
+    /// read out of, not an override name, but exactly as unable to name a
+    /// real variable with an `=` in it.
+    #[test]
+    fn an_env_step_var_with_an_equals_sign_is_refused() {
+        let toml = KEYCHAIN_EXPIRY_BASE.replace(
+            "type            = \"keychain\"\n        service         = \"gemini\"\n        token_json_path = \"token.access_token\"\n        expiry_json_path = \"token.expiry\"",
+            "type = \"env\"\n        var  = \"SAMPLE=TOKEN\"",
+        );
+        let err = PluginManifest::from_str(&toml)
+            .expect_err("an `=` in an env step's var must be refused");
+        assert!(err.contains("var"), "{err}");
     }
 
     #[test]

@@ -23,6 +23,10 @@ lives in one folder:
 | `instance.lock` | held by the running copy, so a second launch opens the first one's panel and exits; released however the process ends, so there is no stale file to clean up |
 | `show-panel` | the hand-off a second launch leaves for the running copy; removed as soon as it is acted on |
 | `ping-workdir/` | present only when the OS temp directory can't be used for a ping's working directory. Each ping still gets its own fresh, empty, owner-only subdirectory in here, removed once the command exits — this folder itself is not, so an empty one can persist. The normal case runs the ping from the OS's own temp directory instead, never from here |
+| `history/` | the local usage-history store, present when the `history` build feature is compiled in (the default; see [`DEVELOPMENT.md`](DEVELOPMENT.md)): `state.json` (per-file scan progress), `state-hot.json` (what changed in it since it was last written whole) and `days.jsonl` (append-only hourly usage buckets), all owner-only on macOS, plus a `lock` file the tray app and `tickover stats` share so neither's scan interleaves with the other's. `days.jsonl` is compacted once it passes 16 MB; `state.json` grows with how many provider files have ever been scanned, not with how often the app runs |
+| `prices.toml` | optional, yours to create: per-model prices that replace or add to the built-in snapshot — see [Cost figures](#cost-figures) |
+| `projects.toml` | optional, yours to create: `[aliases]` mapping raw project names or prefixes (`"wt-*"`) to a repository name on display — see [Project grouping](#project-grouping) |
+| `reports/` | one self-contained HTML file per `tickover stats --report` run, or a press of the panel's own "Full report" pill — `usage-<timestamp>.html`, owner-only on macOS. Only the newest five files named this way are kept: each new one deletes the older ones. Anything named otherwise, such as a report written with `--report=PATH` under a name of your own, is never touched |
 
 `config.json` and the manifests are plain text and safe to edit by hand
 while the app is not running. On Windows, save them as UTF-8
@@ -59,6 +63,111 @@ The refresh cadence is not a setting: it is a manifest field
 (`refresh_secs`), a minute for four of the shipped manifests and five for
 Copilot, whose allowance is monthly.
 
+## `tickover stats`
+
+A command-line face onto the same local history the panel's Activity card
+reads — run it from a terminal; it exits before any window, tray icon or
+single-instance lock is touched.
+
+| Flag | Effect |
+|---|---|
+| (none) | plain-text totals: all-time and today's/this week's tokens by class, the cache-hit rate, a streak of active days, a breakdown by provider, and the top projects by volume |
+| `--json` | the same figures as one JSON object on stdout, for scripting |
+| `--report` (alias `--html`) | writes a self-contained HTML report — the same figures, plus per-model and per-day detail — and opens it in the default browser; `--report=PATH` names the file, otherwise it lands at `<config>/tickover/reports/usage-<timestamp>.html` (see the file table above). The page has a period picker: presets or any two dates, in whole local hours of the machine that wrote the report. It needs no server; the data is inside the file |
+| `--mask` | with `--report` only: writes `project-1`, `project-2` into the file instead of project names, for a report you mean to share. The **Mask projects** box on the page hides names on screen only, and every project name is in the file itself |
+| `--help` / `-h` | usage |
+
+The cost line is the one figure that can be incomplete, and it says so rather
+than quietly leaving a model out: a mix containing a model the bundled
+price table has no row for prints `est. cost 18.00 USD (API-equivalent,
+partial — unpriced models excluded)`, the HTML report marks its headline with
+a `*` and the same caption, and `--json` carries the fact as its own field,
+`est_cost_usd_missing_models` — `true` when a model is missing a price, and
+`null` exactly when `est_cost_usd` is `null` too. A script can therefore tell
+an estimate that covers everything from one that does not, without parsing
+prose.
+
+Both the CLI and the panel's Activity card read the same on-disk store and
+can show the same figures over three ranges — 24 hours, 7 days or 30 days
+in the panel; all-time, today and this week on the command line. Neither
+exists unless the app was built with the `history` feature, on by default;
+[`DEVELOPMENT.md`](DEVELOPMENT.md) has the `--no-default-features` build
+that drops it.
+
+## Cost figures
+
+Every cost the app shows is an *API-equivalent*: what the same tokens would
+cost at the providers' published API list prices — not a bill, and on a
+subscription not what you paid. It is on by default; set
+`"history_cost_estimate_opt_in": false` in `config.json` to hide it
+everywhere.
+
+Prices come from a snapshot built into the app (`assets/prices.json`,
+regenerated by `tools/update-prices.py` from LiteLLM and models.dev at
+pinned commits; first-party list prices only, base tier). They apply to the
+whole history when it is shown, so a newer snapshot re-prices the past too;
+the report names the snapshot date beside its figures. A model is priced
+only under its exact id — after lowercasing, dropping a known routing prefix
+such as `codex/`, and, if the id itself is not listed, a trailing
+`-YYYYMMDD` / `-YYYY-MM-DD` date. Anything else shows `—` and is named in
+the report as unpriced, rather than borrowing a similar model's rate.
+
+`prices.toml` in the same folder adds or replaces prices, in USD per million
+tokens; the cache rates are optional and default to the input rate:
+
+```toml
+[models."gemini-3.8-flash-n"]
+input = 0.75
+output = 3.75
+cache_read = 0.075
+```
+
+An entry priced under a model's undated id also covers its dated ids. A
+file that cannot be read, does not parse, names a field other than these
+four or prices one id twice (`GPT-5.4` and `codex/gpt-5.4` are the same id)
+is ignored as a whole, and the report's price line says why. Edits take
+effect within a few seconds; the app need not be restarted.
+
+You can also list optional monthly subscription prices (USD/month) per
+provider under `[plans]` in `prices.toml`. Subscription prices are never
+guessed; when configured, the HTML report compares the API-equivalent total
+against the prorated plan cost for the selected period:
+
+```toml
+[plans]
+claude = 200
+codex = 200
+```
+
+## Project grouping
+
+`days.jsonl` keeps each bucket's raw project basename untouched. When queried
+for the panel's Activity card, `tickover stats` or the HTML report, transient
+directories are grouped on display:
+
+- **Auto-ping scratch directories** (`tickover-ping-*`, `codex-limits-ping-*`,
+  `ping-workdir`) roll into `Tickover auto-ping`.
+- **Worktrees under `.claude/worktrees/`** resolve back to their parent
+  repository name using the transcript path (recovering multi-hyphen names from
+  non-worktree sessions in the same store when present).
+- **Unmapped agent/worker worktrees** (`agent-*`, `w<N>-*` without a parent
+  repository path) roll into `Agent worktrees`.
+
+`projects.toml` in the same config folder lets you add manual exact or
+trailing-wildcard (`"wt-*"`) overrides under `[aliases]` — longest prefix
+wins over built-in rules, and edits take effect within a few seconds without
+restarting:
+
+```toml
+[aliases]
+"codex-limits-tray" = "tickover"
+"wt-*" = "tickover"
+```
+
+Fixed group labels (`Tickover auto-ping`, `Agent worktrees`) carry no
+repository name and stay unmasked under `--mask` or the report's *Mask
+projects* switch.
+
 ## Environment variables
 
 | Variable | Effect |
@@ -68,7 +177,8 @@ Copilot, whose allowance is monthly.
 | `TICKOVER_SNAPSHOT=out.png` | render the panel to a PNG and exit — not on Windows; add `TICKOVER_SNAPSHOT_SETTINGS=1` for the settings sheet |
 | `TICKOVER_THEME=light` / `=dark` | force the tray pill's palette instead of following the system appearance |
 | `TICKOVER_DEMO_ACCOUNT=you@example.com` | show this in place of the real account label — for screenshots; it rewrites the label only, never the reading or the token |
-| `CODEX_HOME=/path` | honoured by the `log-file` engine's `root_env`; the shipped Codex manifest no longer uses it |
+| `CODEX_HOME=/path` | relocates the CLI's whole config directory; the shipped Codex manifest reads it in four places — the credentials-file step, the `reject-when` API-key check, the `chatgpt-account-id` header value, and the history root |
+| `CLAUDE_CONFIG_DIR=/path` | relocates the CLI's whole config directory the same way; the shipped Claude manifest reads it in three places — the credentials-file step, the Keychain item name (`service_env`), and the history root |
 | `TICKOVER_ANTIGRAVITY_CLIENT_ID` / `TICKOVER_ANTIGRAVITY_CLIENT_SECRET` | override the OAuth client pair the Antigravity manifest otherwise reads from the installed Antigravity app or `agy` binary; set both or neither |
 | `SLINT_BACKEND` | Slint toolkit variable, honoured as-is — the app only defaults it to `winit` when unset; set it yourself to override the UI backend |
 

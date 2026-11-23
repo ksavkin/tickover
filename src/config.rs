@@ -1,5 +1,6 @@
 //! Tiny persisted preferences (JSON under the OS config dir). Best-effort.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -363,10 +364,22 @@ fn take_write_count() -> u64 {
 /// A plain `Mutex`, not a `RwLock`: every caller through here writes, so
 /// there is no reader-heavy case to give a second lock kind a reason to
 /// exist. Poisoning is recovered (`unwrap_or_else(|e| e.into_inner())`) the
-/// same way `plugin::throttle::STATES`'s lock is — a panic mid-write on some
-/// future background thread must not turn every later config write into a
-/// permanent failure for a process this crate's own `panic = "abort"`
-/// decision (see `Cargo.toml`) never unwinds out of anyway.
+/// same way `plugin::throttle::STATES`'s lock is — precisely *because* this
+/// crate declines `panic = "abort"` (see `Cargo.toml` for the guards that
+/// depend on unwinding), a panic on a background thread unwinds rather than
+/// ending the process, so a poisoned guard here is a real, survivable event,
+/// not a dead-process formality.
+/// Safe to recover from: every writer's own persisted `Value` is build-
+/// mutate-write-once — one `load()`, a mutation on a freshly cloned copy, one
+/// [`write_atomically`] call before releasing the guard — so a panic here can
+/// only ever discard that local, not-yet-written copy, never a value torn
+/// mid-mutation; the file on disk stays whatever the last completed write
+/// left it as. (`remove_plugin_keys` also clears its own in-memory
+/// ping-throttle entry under this guard, before any of that — independently
+/// of whether the write that follows lands at all, per its own comment, so a
+/// panic there leaves the same drift between the two a plain early return
+/// already can.) Not recovering would instead turn one such panic into every
+/// later config write panicking too, for the rest of the process's life.
 static CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Write `text` to `path` without ever leaving a half-written file behind —
@@ -384,8 +397,23 @@ static CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// it — every setter routes through here, so this is the one place that can
 /// catch a corrupt file the moment before it would be overwritten with a
 /// fresh, mostly-empty one.
-fn write_atomically(path: &std::path::Path, text: &str) {
-    let Some(dir) = path.parent() else { return };
+///
+/// Returns whether the write actually landed. A caller that only needs "did
+/// this survive a restart" can ignore it, same as every setter above already
+/// does; [`set_u64`] is the one that cannot, since [`set_plugin_pinged_at`]
+/// needs to know whether to keep this call's value in [`PINGED_AT_MEMORY`]
+/// instead of trusting the file to hold it.
+///
+/// A failure is logged once per outage, through [`CONFIG_WRITE_OK`], rather
+/// than once per call: every setter in this module writes through here,
+/// `set_plugin_pinged_at` on the one-second tick loop included, so without
+/// the dedup a full disk or a read-only home would cost one `diag::line`
+/// every single time something tried to persist a change while it stayed
+/// that way.
+fn write_atomically(path: &std::path::Path, text: &str) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
     let _ = std::fs::create_dir_all(dir);
     backup_if_corrupt(path);
     // Dropped before the write is even attempted, not only once it lands: a
@@ -396,10 +424,37 @@ fn write_atomically(path: &std::path::Path, text: &str) {
     // failure branch costs more reasoning than one avoidable reparse the next
     // time something reads it.
     invalidate_config_cache();
-    if tickover::plugin::write_via_temp(path, text.as_bytes(), |_| Ok(())).is_ok() {
-        #[cfg(test)]
-        WRITE_COUNT.with(|c| c.set(c.get() + 1));
+    let result = tickover::plugin::write_via_temp(path, text.as_bytes(), |_| Ok(()));
+    match &result {
+        Ok(()) => {
+            #[cfg(test)]
+            WRITE_COUNT.with(|c| c.set(c.get() + 1));
+        }
+        Err(e) => {
+            if CONFIG_WRITE_OK.with(std::cell::Cell::get) != Some(false) {
+                crate::diag::line(format!(
+                    "{} could not be written: {e} — changes made this run may not survive \
+                     a restart until this recovers",
+                    path.display()
+                ));
+            }
+        }
     }
+    let ok = result.is_ok();
+    CONFIG_WRITE_OK.with(|c| c.set(Some(ok)));
+    ok
+}
+
+thread_local! {
+    /// Whether the previous call to [`write_atomically`] landed — `None`
+    /// until the first one. What the dedup in that function's own doc is
+    /// keyed on: a failure logs only on the transition into it, and a
+    /// landed write clears the flag so the *next* outage still gets a line
+    /// of its own. Per-thread for the same reason the test-only
+    /// `WRITE_COUNT` above is: production only ever writes config from the
+    /// main thread, and each `#[test]` getting its own thread is what keeps
+    /// one test's outage from silencing another's.
+    static CONFIG_WRITE_OK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Drop this thread's cached config unconditionally — called from
@@ -566,6 +621,24 @@ pub fn set_menu_bar_text(v: bool) {
     set_bool("menu_bar_text", v);
 }
 
+/// Show the API-equivalent list-price cost in `stats`/panel/report. On
+/// unless the key is stored `false`: the figure is labelled as what the
+/// same tokens would cost at API prices, not a bill, and it is the one
+/// number that weighs a cache read for what it is worth instead of as a
+/// token like any other. The key keeps its old `_opt_in` name so an
+/// explicit `false` written while this defaulted off still holds.
+#[cfg_attr(not(feature = "history"), allow(dead_code))]
+pub fn history_cost_estimate() -> bool {
+    get_bool_opt("history_cost_estimate_opt_in").unwrap_or(true)
+}
+/// Bound by the settings sheet's cost-toggle; until then the setter has no
+/// caller — `allow` rather than delete because the toggle is part of the
+/// same feature landing.
+#[allow(dead_code)]
+pub fn set_history_cost_estimate(v: bool) {
+    set_bool("history_cost_estimate_opt_in", v);
+}
+
 /// Run from the Dock with an ordinary window instead of the menu bar.
 ///
 /// A full menu bar makes macOS drop the status item with no warning and no
@@ -722,7 +795,13 @@ fn get_u64(key: &str) -> u64 {
     with_config(|cfg| cfg.get(key).and_then(Value::as_u64)).unwrap_or(0)
 }
 
-fn set_u64(key: &str, v: u64) {
+/// Returns whether `key` now holds `v` for certain — `true` when nothing
+/// needed writing (it already did) or the write landed, `false` when it
+/// could not be confirmed on disk: either a write was attempted and failed,
+/// or there was no config path to write to at all. [`set_plugin_pinged_at`]
+/// is the one caller that reads this: everything else here still fires the
+/// write for its side effect alone, exactly as before.
+fn set_u64(key: &str, v: u64) -> bool {
     let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // One `load()` for both the comparison and the mutation below, not one
     // each — the value it returns is the owned copy this function goes on to
@@ -730,16 +809,16 @@ fn set_u64(key: &str, v: u64) {
     // call would see that this one hasn't already.
     let mut cfg = load();
     if cfg.get(key).and_then(Value::as_u64).unwrap_or(0) == v {
-        return;
+        return true; // already this value — nothing to persist, not a failure
     }
-    let Some(p) = path() else { return };
+    let Some(p) = path() else { return false };
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Some(obj) = cfg.as_object_mut() {
         obj.insert(key.to_string(), Value::from(v));
     }
-    write_atomically(&p, &cfg.to_string());
+    write_atomically(&p, &cfg.to_string())
 }
 
 /// One quota window as this app last saw the provider state it.
@@ -879,13 +958,69 @@ fn set_plugin_seen_window(id: &str, reset: u64) {
     set_u64(&format!("plugin.{id}.seen_window"), reset);
 }
 
+thread_local! {
+    /// Keyed by the config key it shadows. The floor the one-second tick
+    /// loop actually reads for whether a plugin's auto-ping is due, for exactly as long as this process
+    /// cannot confirm the value landed in `config.json`.
+    /// [`set_plugin_pinged_at`] fills this in whenever [`set_u64`] fails,
+    /// and empties it again the moment a later write does land — without
+    /// it, a write that kept failing (a full disk, a permission change, a
+    /// read-only home) would leave [`plugin_pinged_at`] reading whatever
+    /// was on disk *before* the ping it was just asked to record, and every
+    /// tick after that would decide the window was still unpinged — one
+    /// launched process per second, for as long as the write stayed broken.
+    /// Empty on every fresh process: a restart has nothing here to prefer
+    /// over whatever a previous run actually managed to persist, which is
+    /// the whole reason the value is persisted at all. Per-thread for the
+    /// same reason [`CONFIG_CACHE`] is: production only ever touches this
+    /// from the main thread, and each `#[test]` getting its own thread
+    /// keeps one test's floor from shadowing another's.
+    static PINGED_AT_MEMORY: std::cell::RefCell<HashMap<String, u64>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
 /// When this plugin's auto-ping last fired — `0` if it never has. See the
-/// section comment above.
+/// section comment above and [`PINGED_AT_MEMORY`]'s own doc.
 pub fn plugin_pinged_at(id: &str) -> u64 {
-    get_u64(&format!("plugin.{id}.pinged_at"))
+    pinged_at_at(&format!("plugin.{id}.pinged_at"))
 }
 pub fn set_plugin_pinged_at(id: &str, when: u64) {
-    set_u64(&format!("plugin.{id}.pinged_at"), when);
+    set_pinged_at_at(&format!("plugin.{id}.pinged_at"), when);
+}
+
+/// When this plugin's `[[window_ping]]` for `window` (a `[[windows]] id`)
+/// last fired — `0` if it never has. One record per window rather than the
+/// plugin's single [`plugin_pinged_at`]: two windows of one provider empty
+/// and fill independently, and a ping that just started one says nothing
+/// about the other. Removed with the rest of the plugin's keys
+/// ([`remove_plugin_keys`]); a window the manifest stops declaring leaves its
+/// key behind, which costs one integer and, if the window comes back, at most
+/// one ping sooner than it would otherwise have been sent.
+pub fn plugin_window_pinged_at(id: &str, window: &str) -> u64 {
+    pinged_at_at(&format!("plugin.{id}.pinged_at.{window}"))
+}
+pub fn set_plugin_window_pinged_at(id: &str, window: &str, when: u64) {
+    set_pinged_at_at(&format!("plugin.{id}.pinged_at.{window}"), when);
+}
+
+fn pinged_at_at(key: &str) -> u64 {
+    PINGED_AT_MEMORY
+        .with(|m| m.borrow().get(key).copied())
+        .unwrap_or_else(|| get_u64(key))
+}
+fn set_pinged_at_at(key: &str, when: u64) {
+    if set_u64(key, when) {
+        // Landed (or already held this value) — the file is authoritative
+        // again, and a stale shadow left standing would outlive the outage
+        // it was recorded for.
+        PINGED_AT_MEMORY.with(|m| {
+            m.borrow_mut().remove(key);
+        });
+    } else {
+        PINGED_AT_MEMORY.with(|m| {
+            m.borrow_mut().insert(key.to_string(), when);
+        });
+    }
 }
 
 // ── Built-in manifest upgrades ────────────────────────────────────────────
@@ -958,8 +1093,15 @@ pub fn set_builtin_migrated(id: &str, version: &str) {
 /// "gone" the same as "never migrated".
 pub fn remove_plugin_keys(id: &str) {
     let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(p) = path() else { return };
+    // Independent of the disk removal below: a shadow left standing here
+    // would outlive the config key it stood in for, and a reinstalled
+    // plugin under the same id would inherit a floor that was never really
+    // its own.
     let prefix = format!("plugin.{id}.");
+    PINGED_AT_MEMORY.with(|m| {
+        m.borrow_mut().retain(|k, _| !k.starts_with(&prefix));
+    });
+    let Some(p) = path() else { return };
     let keep = format!("plugin.{id}.builtin_migrated");
     let mut cfg = load();
     let Some(obj) = cfg.as_object_mut() else {
@@ -1353,6 +1495,19 @@ mod tests {
     /// worry about. Runs against a disposable temp file (`with_test_config_path`)
     /// — never the real `config.json` a running app instance may hold open.
     #[test]
+    fn cost_shows_unless_switched_off_and_an_old_false_still_holds() {
+        with_test_config_path(|| {
+            assert!(history_cost_estimate(), "an absent key shows the cost");
+            // A `false` written while this defaulted off is a choice, not
+            // a leftover, and must keep hiding it.
+            set_history_cost_estimate(false);
+            assert!(!history_cost_estimate());
+            set_history_cost_estimate(true);
+            assert!(history_cost_estimate());
+        });
+    }
+
+    #[test]
     fn plugin_option_defaults_then_reads_back_the_override() {
         with_test_config_path(|| {
             let id = "tickover-test-plugin-option-xyz";
@@ -1635,9 +1790,29 @@ mod tests {
             assert_eq!(plugin_seen_window("acme"), 1_700_000_000);
             assert_eq!(plugin_pinged_at("acme"), 1_700_000_005);
 
+            set_plugin_window_pinged_at("acme", "3p-5h", 1_700_000_009);
+            set_plugin_window_pinged_at("other", "3p-5h", 1_700_000_222);
+            assert_eq!(plugin_window_pinged_at("acme", "3p-5h"), 1_700_000_009);
+            assert_eq!(
+                plugin_pinged_at("acme"),
+                1_700_000_005,
+                "a window's record is its own, not the plugin's"
+            );
+            assert_eq!(plugin_window_pinged_at("acme", "gemini-5h"), 0);
+
             remove_plugin_keys("acme");
             assert_eq!(plugin_seen_window("acme"), 0, "removed with the plugin");
             assert_eq!(plugin_pinged_at("acme"), 0, "removed with the plugin");
+            assert_eq!(
+                plugin_window_pinged_at("acme", "3p-5h"),
+                0,
+                "removed with the plugin"
+            );
+            assert_eq!(
+                plugin_window_pinged_at("other", "3p-5h"),
+                1_700_000_222,
+                "another plugin's window record is untouched"
+            );
             assert_eq!(
                 plugin_seen_window("other"),
                 1_700_000_111,
@@ -1659,6 +1834,121 @@ mod tests {
                 0,
                 "an unchanged value must not touch the file"
             );
+        });
+    }
+
+    /// A write that fails while the tick loop is deciding whether a plugin's
+    /// auto-ping is due must not reopen the same window every second
+    /// afterward — see [`PINGED_AT_MEMORY`]'s own doc. Unix-only: a
+    /// read-only directory is the least contrived way to make the write
+    /// itself fail without touching anything outside this module.
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_write_still_holds_the_floor_the_tick_loop_reads() {
+        use std::os::unix::fs::PermissionsExt;
+        with_test_config_path(|| {
+            set_plugin_pinged_at("acme", 1_000);
+            let dir = path()
+                .expect("test config path resolves")
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+                .expect("deny writes into the config directory");
+
+            set_plugin_pinged_at("acme", 100_000);
+
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+                .expect("restore permissions so the fixture can be cleaned up");
+
+            assert_eq!(
+                plugin_pinged_at("acme"),
+                100_000,
+                "a failed write must not leave the floor at the moment before the ping \
+                 it was just asked to record"
+            );
+            // A 5-hour window ("period_minutes" 300) that started at 99_900 —
+            // before the floor above, so a loop that reads the floor
+            // correctly must see it as already pinged since.
+            assert!(
+                !crate::ping_due(
+                    None,
+                    Some(117_900),
+                    Some(300),
+                    0,
+                    plugin_pinged_at("acme"),
+                    100_001
+                ),
+                "the window must not read as due again a moment later, inside the same floor"
+            );
+        });
+    }
+
+    /// A write failure that keeps failing costs one `diag::line`, not one per
+    /// call — every setter in this module shares the same dedup
+    /// (`write_atomically`'s own), and `set_plugin_pinged_at` runs on the
+    /// one-second tick loop, so without it a broken write would log at that
+    /// same cadence for as long as it stayed broken. A later, separate
+    /// outage still gets a line of its own — recovering clears the flag —
+    /// and a write that does land persists exactly as it always did.
+    #[test]
+    #[cfg(unix)]
+    fn a_write_failure_is_logged_once_per_outage_and_recovery_still_persists() {
+        use std::os::unix::fs::PermissionsExt;
+        with_test_config_path(|| {
+            set_plugin_pinged_at("acme", 1); // seed a valid file while writable
+            let dir = path()
+                .expect("test config path resolves")
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+                .expect("deny writes into the config directory");
+
+            let _ = crate::diag::take_recorded();
+            set_plugin_pinged_at("acme", 2);
+            set_plugin_pinged_at("acme", 3);
+            set_plugin_pinged_at("acme", 4);
+            let logged = crate::diag::take_recorded();
+            assert_eq!(
+                logged
+                    .iter()
+                    .filter(|l| l.contains("could not be written"))
+                    .count(),
+                1,
+                "a write that keeps failing must log once, not once per call: {logged:?}"
+            );
+
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+                .expect("restore permissions so the next write can land");
+            set_plugin_pinged_at("acme", 5);
+            // Through `get_u64` rather than `plugin_pinged_at`: the shadow a
+            // landed write clears would answer with the same `5` even if
+            // this write had silently failed to reach the file, so only a
+            // read that bypasses it can tell "persisted" from "still just
+            // remembered".
+            assert_eq!(
+                get_u64("plugin.acme.pinged_at"),
+                5,
+                "a successful write persists it as before, on disk and not only in the shadow"
+            );
+
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+                .expect("deny writes again for a second, separate outage");
+            let _ = crate::diag::take_recorded();
+            set_plugin_pinged_at("acme", 6);
+            let logged_again = crate::diag::take_recorded();
+            assert_eq!(
+                logged_again
+                    .iter()
+                    .filter(|l| l.contains("could not be written"))
+                    .count(),
+                1,
+                "a later, separate outage logs again: {logged_again:?}"
+            );
+
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+                .expect("restore permissions so the fixture can be cleaned up");
         });
     }
 

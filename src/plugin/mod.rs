@@ -594,9 +594,22 @@ pub fn window_key(w: &WindowConfig, index: usize) -> String {
 /// Same shape, same encoding, same empty `<element>` tail — a balance bound to
 /// one quota rather than to the account was not observed live, so nothing
 /// fills that half yet, and a key with no room for it would have to be
-/// re-cut the day a provider does. The entry halves cannot collide with a
-/// window's: an entry without an id falls back to `bN` where a window falls
-/// back to `wN`, and a declared id is unique within its own section.
+/// re-cut the day a provider does. Two *anonymous* entries, one from each
+/// section, cannot collide: one falls back to `bN`, the other to `wN`. A
+/// *declared* id is only unique within its own section — `validate_windows`/
+/// `validate_balances` each walk their own list and never compare the two —
+/// so nothing stops a window from declaring `id = "b0"` and colliding with
+/// whatever balance is anonymous at index 0 (see
+/// `an_explicit_window_id_can_still_collide_with_an_anonymous_balance` in
+/// `manifest`'s own tests for the construction). Closing that would mean
+/// giving the two sections distinct prefixes even when an id is declared —
+/// a change to what's already a persisted config-key segment
+/// (`plugin.<id>.seen.<reading>.<key>`), which would orphan every installed
+/// manifest's existing seen-window/balance state under the old spelling.
+/// `tests/manifest_corpus.rs`'s
+/// `no_shipped_manifest_lets_a_window_and_a_balance_resolve_to_the_same_key`
+/// keeps every built-in clear of it; left as a known, narrow gap for a
+/// third-party manifest rather than a migration.
 pub fn balance_key(b: &manifest::BalanceConfig, index: usize) -> String {
     format!(
         "{}{KEY_ENTRY_SEPARATOR}",

@@ -13,7 +13,7 @@ reuses, and the rough edges. The manifest format itself is specified in
 | **OpenAI Codex CLI** | 5-hour and weekly windows; model-specific windows as extra rows; the account's credit balance, email and plan; a "limit reached" notice when Codex says so | `~/.codex/auth.json` — the access token and account id, sent to the same usage endpoint the CLI calls | 60 s | `chatgpt.com` (`/backend-api/wham/usage`) |
 | **Claude** | 5-hour and weekly windows per login found — Claude Code CLI / VS Code, and (opt-in) the desktop app, which may be a different account; per-model weekly limits as extra rows | `~/.claude/.credentials.json`, else the Keychain item `Claude Code-credentials` on macOS — on Windows that same file is the only store the CLI writes; the desktop app's token from Electron Safe Storage | 60 s | `api.anthropic.com` (`/api/oauth/usage`, `/api/oauth/profile` for the address) |
 | **Grok** | credits used in the current usage period, plus a prepaid credit balance and pay-as-you-go spend | the record in `~/.grok/auth.json` whose key starts with the x.ai auth host (the rest of the key is xAI's own OAuth client id — fixed, not one that varies by install — matched by prefix rather than spelled out in full) | 60 s | `cli-chat-proxy.grok.com` |
-| **Antigravity** | 5-hour and weekly allowances for Gemini and for third-party models | the access token in the Keychain item its CLI writes, or the same token from Windows Credential Manager (`gemini:antigravity`); once that has lapsed, the refresh token in `~/.gemini/antigravity-cli/antigravity-oauth-token`, exchanged with the OAuth client pair read from the installed Antigravity app or `agy` binary (never shipped with this app; `TICKOVER_ANTIGRAVITY_CLIENT_ID`/`_SECRET` override) | 60 s | `daily-cloudcode-pa.googleapis.com`; `oauth2.googleapis.com` for the token exchange |
+| **Antigravity** | 5-hour and weekly allowances for Gemini and for third-party models | the access token in the Keychain item its CLI writes (`gemini`), or Windows Credential Manager (`gemini:antigravity`); once that has lapsed, the refresh token from that same Keychain / Credential Manager entry (or legacy `~/.gemini/antigravity-cli/antigravity-oauth-token`), exchanged with the OAuth client pair read from the installed Antigravity app or `agy` binary (never shipped with this app; `TICKOVER_ANTIGRAVITY_CLIENT_ID`/`_SECRET` override) | 60 s | `daily-cloudcode-pa.googleapis.com`; `oauth2.googleapis.com` for the token exchange |
 | **GitHub Copilot** | the month's premium-request allowance and its reset; chat and completion rows on the free tier | the `github.com` entry of `~/.config/github-copilot/apps.json` | 300 s | `api.github.com` |
 
 Every one of these endpoints is the provider's own — undocumented and
@@ -25,6 +25,27 @@ setting for it: a minute is already generous for a window five hours long,
 and Copilot's allowance is monthly. Each provider is asked less often while
 it is failing, and opening the panel redraws the last reading rather than
 firing a request.
+
+## Local usage history
+
+Beside the live quota readings, four of the five providers also write a
+local usage log the app reads for the Activity card, `tickover stats`, and
+the HTML report. History is declared in the manifest as `[history]` (see
+[PLUGIN-ARCHITECTURE.md](PLUGIN-ARCHITECTURE.md#history)); the corpus is
+read-only — the scanner never writes into a provider's directory.
+
+| Provider | History source | Format |
+|---|---|---|
+| **Claude** | `~/.claude/projects/**/*.jsonl` (or `$CLAUDE_CONFIG_DIR/projects`) | one JSON object per line; `type = "assistant"` lines carry `message.usage` with input/output/cache classes |
+| **Codex** | `~/.codex`, matched by basename against `rollout-*.jsonl` anywhere under it — reaches `sessions/**/` and `archived_sessions/` alike, but only a file still named that way (`$CODEX_HOME` relocates the root) | `token_count` events whose cumulative counters are differenced per session |
+| **Grok** | `~/.grok/logs/unified.jsonl` | `shell.turn.inference_done` events carrying per-turn token counts |
+| **Antigravity** | `~/.gemini/antigravity-cli/conversations/*.db` and `~/.gemini/antigravity/conversations/*.db` | per-conversation SQLite (opened `mode=ro`); protobuf-encoded generation records |
+| **Copilot** | none | Copilot publishes no local token history — it appears under "not counted" in the Activity card and `quota only` on its row |
+
+History is stored locally and nowhere else — under the app's own config
+directory, aggregated into hourly buckets. No prompt text, message body, or
+file content is ever read out of these logs; the extractors emit only
+timestamps, project names, model names, and token counts.
 
 ## Auto-ping
 
@@ -39,15 +60,20 @@ monthly allowance, and a credit period with balances. Neither this
 ping nor a renewal one (below) is ever launched while the provider's own
 host does not resolve — the tick simply tries again once it does.
 
-Antigravity, which does have a rolling window, deliberately has no `[ping]`.
+**Antigravity** declares two `[[window_ping]]` entries — one per 5-hour
+window (`gemini-5h` with `agy -p hello --model gemini-3.8-flash-low`, and
+`3p-5h` with `agy -p hello --model gpt-oss-120b-medium`) — because each
+model group counts only its own prompts. Like every plugin's ping,
+Antigravity's toggle is **off by default** and has an important caveat:
 Google has confirmed banning accounts over third-party tools and proxies
-driving Antigravity's underlying quota, with reports of the ban cascading to
+automating Antigravity's underlying quota, with bans reported cascading to
 Gemini CLI / Code Assist on the same account — see this
 [gemini-cli discussion](https://github.com/google-gemini/gemini-cli/discussions/20632).
 [`leonidlouis/antigravity-quota-refresher`](https://github.com/leonidlouis/antigravity-quota-refresher),
-a tool built for exactly the job `[ping]` does for Codex and Claude, is marked deprecated for this reason —
-its users got banned. Nothing here second-guesses that: Antigravity stays
-read-only, however tempting an empty window is to nudge.
+a tool built specifically to refresh Antigravity quotas automatically, is
+marked deprecated for this reason after its users got banned. Antigravity
+stays read-only unless you explicitly switch its auto-ping toggle on; enable
+it only if you accept that account-ban risk.
 
 The mechanism, its bounds and where the command runs are in
 the README and in
@@ -175,4 +201,5 @@ A sixth provider is a TOML file dropped into the plugins folder — see
 [`PLUGIN-ARCHITECTURE.md`](PLUGIN-ARCHITECTURE.md) for the field reference and
 [`../CONTRIBUTING.md`](../CONTRIBUTING.md) for the two rules that decide most
 questions: the app never prints a figure the provider did not state, and a
-mechanism with no consumer is not shipped.
+mechanism with no consumer waits rather than ships — each with a named
+exception, spelled out there.

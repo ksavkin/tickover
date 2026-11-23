@@ -50,6 +50,48 @@ export struct BarTip {
 // tick and a signed pace figure competed with both, so answering "how much is
 // left" meant first sorting out which number was the answer. The tick and the
 // pace live on in the bar's hover tooltip, where they cost nothing to ignore.
+// ── Diagonal hatch fill ───────────────────────────────────────────────────
+// The design's `repeating-linear-gradient` hatches (45° for the cache-read
+// segment, 135° for quota projection) drawn as one stroked Path per stripe —
+// Slint has no repeating gradient, and Image tiling enums aren't visible to
+// user .slint files. 4px pitch, 1.6px stroke matches the spec's 2px-on-4px.
+export component HatchFill inherits Rectangle {
+    in property <color> tint;
+    // 1 = "/" rising stripes (the 45° token-class hatch), -1 = "\" falling
+    // (the 135° quota-projection hatch).
+    in property <float> dir: 1;
+    // Widest this element will ever need to draw. Defaults to its own
+    // current width, which is exactly right for every call site whose box
+    // never animates; the one that does (the quota-projection slice, whose
+    // width tracks a 700ms tween) passes its track's fixed width instead, so
+    // the repeater below is sized once per layout rather than once per
+    // frame — `clip: true` trims whatever of it falls outside the box's
+    // current, narrower width, the same as it always trimmed a static one.
+    // The trade this makes: the repeater is sized for that full, final
+    // width the whole time the box is narrower than it, not only while it
+    // tweens, so a projecting window's fill keeps roughly
+    // `pattern-width / 4 + root.vbh / 4 + 1` `Path` elements resident at
+    // rest — not the handful its own current width would call for. `clip:
+    // true` hides what falls outside the box's edge; it does not
+    // uninstantiate them.
+    in property <length> pattern-width: self.width;
+    clip: true;
+    property <float> vbw: self.width / 1px;
+    property <float> vbh: self.height / 1px;
+    for i in max(0, round(root.pattern-width / 1px / 4 + root.vbh / 4)) + 1 : Path {
+        width: root.width;
+        height: root.height;
+        viewbox-width: root.vbw;
+        viewbox-height: root.vbh;
+        fill: transparent;
+        stroke: root.tint;
+        stroke-width: 1.6px;
+        commands: root.dir > 0
+            ? "M \{i * 4.0 - root.vbh} \{root.vbh} L \{i * 4.0} 0"
+            : "M \{i * 4.0 - root.vbh} 0 L \{i * 4.0} \{root.vbh}";
+    }
+}
+
 export component QuotaBlock inherits VerticalLayout {
     in property <string> win-label;      // "5H" / "WK"
     in property <float> pct;             // used %
@@ -74,8 +116,18 @@ export component QuotaBlock inherits VerticalLayout {
 
     // Severity follows the *displayed* value, not the raw one: 89.6 shows as
     // "90%", and a 90 printed in amber contradicts the palette's own legend.
+    // The quota-projection hatch: a straight-line pace of the used
+    // percentage, drawn as a 135° stripe continuing the bar past the solid
+    // fill — measured is solid, projected is hatched, and the hatch never
+    // counts as quota.
+    in property <float> proj-pct: 0;   // where the projection lands; 0 = none
+    in property <int> proj-tone: 1;    // 1 ok / 2 warn / 3 crit
+    in property <string> burn-line: "";// "→ ~74%" / "burn 41.2K/h → ~74%" / "caps ~20:12"
+
     // The 0.4pp this shifts the bar's colour boundary by is invisible.
     property <color> accent: Theme.sev(root.used-rounded);
+    property <color> proj-color: root.proj-tone == 3 ? Theme.crit
+        : root.proj-tone == 2 ? Theme.warn : Theme.ok;
 
     spacing: 7px;
 
@@ -90,10 +142,15 @@ export component QuotaBlock inherits VerticalLayout {
     HorizontalLayout {
         spacing: 8px;
         Text {
+            // Unbounded, a manifest's full `LABEL_MAX_CHARS` allowance claims
+            // this layout's whole minimum width and leaves the "% used"
+            // figure past the fold — elided instead, the same way the
+            // provider header and registry row names are.
             text: root.win-label;
             font-size: 13px;
             color: root.not-started ? Theme.text-dim : Theme.text;
             vertical-alignment: center;
+            overflow: elide;
         }
         Rectangle { horizontal-stretch: 1; min-width: 8px; }
         // One figure, and it says what it is. The pair that used to stand here
@@ -118,7 +175,31 @@ export component QuotaBlock inherits VerticalLayout {
             background: Theme.track;
             border-width: 1px;
             border-color: Theme.hairline;
+            clip: true;
 
+            // The projection hatch goes in first so the solid fill always
+            // sits on top of it (z-order per the design): a projection that
+            // overshoots the fill is still visibly *behind* the measured part.
+            if root.proj-pct > root.pct : Rectangle {
+                x: parent.width * min(root.pct, 100) / 100;
+                y: 0;
+                height: parent.height;
+                width: parent.width * (min(root.proj-pct, 100) - min(root.pct, 100)) / 100;
+                HatchFill {
+                    width: parent.width;
+                    height: parent.height;
+                    // `parent.width` (this slice) is the animated one; the
+                    // widest it can ever grow to is the whole track's own
+                    // fixed width, which is what the repeater count is sized
+                    // against — see `HatchFill.pattern-width`'s own doc.
+                    pattern-width: track.width;
+                    dir: -1;
+                    tint: root.proj-color;
+                    opacity: 0.55;
+                }
+                animate x { duration: 700ms; easing: ease-out-quart; }
+                animate width { duration: 700ms; easing: ease-out-quart; }
+            }
             Rectangle {
                 x: 0;
                 y: 0;
@@ -176,6 +257,16 @@ export component QuotaBlock inherits VerticalLayout {
             vertical-alignment: center;
         }
         Rectangle { horizontal-stretch: 1; min-width: 4px; }
+        // Right side of the resets line: the pace the hatch above draws, as
+        // a clock reading — "→ ~74%" on its own, "burn 41.2K/h → ~74%" once
+        // local history names the rate, or "caps ~20:12" once it crosses
+        // 100%.
+        if root.burn-line != "" : Text {
+            text: root.burn-line;
+            font-size: 10px;
+            color: root.proj-tone == 1 ? Theme.text-faint : root.proj-color;
+            vertical-alignment: center;
+        }
     }
 }
 
