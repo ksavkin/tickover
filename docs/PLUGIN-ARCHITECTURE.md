@@ -1037,10 +1037,21 @@ modification time on every lookup, not by a clock — a found entry has no
 expiry of its own, so a client reinstalled with a new secret at the same
 path is rescanned because its length/modification time changed, not because
 some interval passed; without that check it would be served indefinitely,
-for as long as the file at that path keeps the same identity. It is also
-evicted outright on an `invalid_client` response from the token exchange, so
-a rotated pair is retried on the very next attempt rather than replayed
-until its identity happens to change some other way. Eviction clears the
+for as long as the file at that path keeps the same identity. When a **discovered**
+pair fails the exchange with `invalid_client` or `unauthorized_client` (common
+when an installed binary embeds several Google OAuth clients and the first
+secret matched does not belong to the first matching client id), the exchange
+probes alternate pairs from the candidate binaries before giving up: collecting
+up to 8 distinct `id_pattern` matches and 8 distinct `secret_pattern` matches
+per candidate file within the same chunk/pass budgets and trying up to 24
+pairs total (skipping remaining secrets for an id that answered
+`unauthorized_client`, and aborting immediately on any non-mismatch error such
+as `invalid_grant`). When a fallback pair succeeds, it replaces the cached
+entry for that config and path so subsequent ticks reuse it without
+rescanning. If probing finds no working pair (or for non-discovered pairs),
+`invalid_client` or `unauthorized_client` evicts the cached entry outright, so
+a rotated pair is retried on the next attempt (after backoff) rather than
+replayed until the file's identity changes some other way. Eviction clears the
 found pair and the miss backoff, but
 **not** the once-per-process "not found"/"half-set env" notifications — those
 are about a *config* an operator has already been told about, not about the

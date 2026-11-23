@@ -1600,16 +1600,19 @@ fn oauth_refresh_step(
         }
     };
 
-    let (access_token, expires_in) =
-        resolve_access_token(key, &client_id, &client_secret, step, || {
-            oauth_refresh_request(
-                token_url,
-                &client_id,
-                &client_secret,
-                &refresh_token,
-                provider,
-            )
-        })?;
+    let can_probe_discovered = step
+        .client
+        .as_ref()
+        .is_some_and(|client| client_env_pair(client).is_none());
+    let (access_token, expires_in) = resolve_access_token_with_fallback(
+        key,
+        &client_id,
+        &client_secret,
+        step,
+        can_probe_discovered,
+        CLIENT_DISCOVERY_LIMITS,
+        |cid, csec| oauth_refresh_request(token_url, cid, csec, &refresh_token, provider),
+    )?;
     // A 60s margin, same as the keychain step's, so the cached token is
     // retired before a request would 401 on it. `saturating_*` so a
     // hostile/huge `expires_in` cannot overflow the clock — belt and braces
@@ -1658,6 +1661,7 @@ fn oauth_refresh_step(
 /// took. [`client_discovery_evict`] and [`discover_client_within`]'s own
 /// backoff stamp read the clock the same way, at the point of failure,
 /// rather than reusing a reading from before the work they are timing.
+#[cfg(test)]
 fn resolve_access_token(
     key: u64,
     client_id: &str,
@@ -1665,7 +1669,37 @@ fn resolve_access_token(
     step: &AuthStep,
     exchange: impl FnOnce() -> Result<Value, String>,
 ) -> Result<(String, i64), String> {
+    let mut exchange = Some(exchange);
+    resolve_access_token_with_fallback(
+        key,
+        client_id,
+        client_secret,
+        step,
+        false,
+        CLIENT_DISCOVERY_LIMITS,
+        |_, _| (exchange.take().expect("single exchange attempt"))(),
+    )
+}
+
+/// Runs the token exchange and — when `can_probe_discovered` is `true` and
+/// `exchange` rejects the initial discovered pair with `invalid_client` or
+/// `unauthorized_client` — falls back across up to
+/// [`CLIENT_DISCOVERY_MAX_PROBE_PAIRS`] alternate ID/secret pairs collected from
+/// `step.client`'s candidate binaries, caching any winning pair in
+/// [`CLIENT_DISCOVERY_FOUND`].
+fn resolve_access_token_with_fallback(
+    key: u64,
+    client_id: &str,
+    client_secret: &str,
+    step: &AuthStep,
+    can_probe_discovered: bool,
+    limits: ScanLimits,
+    mut exchange: impl FnMut(&str, &str) -> Result<Value, String>,
+) -> Result<(String, i64), String> {
     let store_backoff = |message: String| {
+        // Always stamp backoff against the initial pair returned by
+        // `resolve_pair()`, because `CLIENT_DISCOVERY_FOUND` still holds that
+        // pair when probing fails without finding a replacement.
         refresh_cache_store(
             key,
             CacheEntry::Failed {
@@ -1676,29 +1710,95 @@ fn resolve_access_token(
             },
         );
     };
-    let response = match exchange() {
-        Ok(r) => r,
-        Err(e) => {
-            store_backoff(e.clone());
-            on_exchange_error(step, &e);
-            return Err(e);
+    let finish_response = |response: &Value| -> Result<(String, i64), String> {
+        match extract_access_token(response) {
+            Some(pair) => Ok(pair),
+            None => {
+                // A 200 with no token (or one too short-lived to cache usefully) is
+                // still a reason to back off — otherwise a stuck endpoint is hit
+                // every tick with no exchange ever succeeding.
+                let message = "token refresh response carried no usable access_token".to_string();
+                store_backoff(message.clone());
+                Err(message)
+            }
         }
     };
-    match extract_access_token(&response) {
-        Some(pair) => Ok(pair),
-        None => {
-            // A 200 with no token (or one too short-lived to cache usefully) is
-            // still a reason to back off — otherwise a stuck endpoint is hit
-            // every tick with no exchange ever succeeding.
-            let message = "token refresh response carried no usable access_token".to_string();
-            store_backoff(message.clone());
-            Err(message)
+
+    let first_err = match exchange(client_id, client_secret) {
+        Ok(r) => return finish_response(&r),
+        Err(e) => e,
+    };
+
+    if can_probe_discovered && is_client_mismatch_error(&first_err) {
+        if let Some(client) = step.client.as_ref() {
+            let sets = discover_client_match_sets(client, limits);
+            let config_key = client_config_key(client);
+            let mut tried = std::collections::HashSet::new();
+            tried.insert((client_id.to_string(), client_secret.to_string()));
+            let mut rejected_ids = std::collections::HashSet::new();
+            if is_unauthorized_client(&first_err) {
+                rejected_ids.insert(client_id.to_string());
+            }
+            let mut attempts = 0usize;
+            let mut last_mismatch = first_err;
+
+            'probe: for set in &sets {
+                for id in &set.ids {
+                    if rejected_ids.contains(id.as_str()) {
+                        continue;
+                    }
+                    for secret in &set.secrets {
+                        if !tried.insert((id.clone(), secret.clone())) {
+                            continue;
+                        }
+                        if attempts >= CLIENT_DISCOVERY_MAX_PROBE_PAIRS {
+                            break 'probe;
+                        }
+                        attempts += 1;
+                        match exchange(id, secret) {
+                            Ok(resp) => {
+                                let pair = finish_response(&resp)?;
+                                client_discovery_found_replace(
+                                    config_key,
+                                    set.path.clone(),
+                                    id.clone(),
+                                    secret.clone(),
+                                    set.len,
+                                    set.mtime,
+                                );
+                                return Ok(pair);
+                            }
+                            Err(e) if is_invalid_client(&e) => {
+                                last_mismatch = e;
+                            }
+                            Err(e) if is_unauthorized_client(&e) => {
+                                last_mismatch = e;
+                                rejected_ids.insert(id.clone());
+                                break;
+                            }
+                            Err(e) => {
+                                store_backoff(e.clone());
+                                on_exchange_error(step, &e);
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            store_backoff(last_mismatch.clone());
+            on_exchange_error(step, &last_mismatch);
+            return Err(last_mismatch);
         }
     }
+
+    store_backoff(first_err.clone());
+    on_exchange_error(step, &first_err);
+    Err(first_err)
 }
 
 /// Reacts to a failed exchange the one way that matters beyond the caller's
-/// own backoff: `is_invalid_client(err)` means the *pair itself* is wrong,
+/// own backoff: [`is_client_mismatch_error`] means the *pair itself* is wrong,
 /// not merely that this attempt failed — a discovered pair cached from
 /// before the client was reinstalled with a new secret, say. Evicting here
 /// means the stale pair is never replayed again — but not that the very
@@ -1720,7 +1820,7 @@ fn resolve_access_token(
 /// before it would ever reach here, which rules out a plain-HTTP local stub.
 fn on_exchange_error(step: &AuthStep, err: &str) {
     if let Some(client) = &step.client {
-        if is_invalid_client(err) {
+        if is_client_mismatch_error(err) {
             client_discovery_evict(client);
         }
     }
@@ -1877,6 +1977,32 @@ fn client_discovery_found_store(
         );
 }
 
+/// Replaces any cached discovery pair for `config_key` with the winning pair
+/// confirmed at `path`, without touching [`CLIENT_DISCOVERY_MISS`].
+fn client_discovery_found_replace(
+    config_key: u64,
+    path: PathBuf,
+    id: String,
+    secret: String,
+    len: u64,
+    mtime: std::time::SystemTime,
+) {
+    let mut guard = CLIENT_DISCOVERY_FOUND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    map.retain(|(k, _), _| *k != config_key);
+    map.insert(
+        (config_key, path),
+        ClientFound {
+            id,
+            secret,
+            len,
+            mtime,
+        },
+    );
+}
+
 /// The other half of the discovery cache: "nothing in `client.files`/
 /// `client.bins` right now", one entry per discovery *config* (there is no
 /// file to key a miss by — nothing matched). Retried at most once every
@@ -1927,6 +2053,12 @@ const CLIENT_DISCOVERY_MAX_SCAN_BYTES: u64 = 512 * 1024 * 1024;
 /// several large candidates cannot multiply the per-file cap by however many
 /// it lists.
 const CLIENT_DISCOVERY_PASS_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+/// Maximum distinct client IDs and secrets collected per candidate binary
+/// during fallback probing when a binary bundles multiple OAuth clients.
+const CLIENT_DISCOVERY_MAX_MULTI_MATCHES: usize = 8;
+/// Maximum total fallback token-exchange attempts across all candidate
+/// binaries during a single [`resolve_access_token_with_fallback`] invocation.
+const CLIENT_DISCOVERY_MAX_PROBE_PAIRS: usize = 24;
 
 /// The two byte limits a discovery pass runs under, pulled out of the pair
 /// of constants above into one value so [`discover_client_within`] can be
@@ -2276,15 +2408,7 @@ fn discover_client_within(
     // and hand `discover_client` a "found" empty id/secret; `?` reports
     // nothing found instead, the same as any other candidate that doesn't
     // carry the shape.
-    let id_pattern = compile_scan_pattern(client.id_pattern.as_deref()?)?;
-    let secret_pattern = compile_scan_pattern(client.secret_pattern.as_deref()?)?;
-
-    let candidates: Vec<PathBuf> = client
-        .files
-        .iter()
-        .map(|f| super::expand_home(f))
-        .chain(bin_candidates(&client.bins))
-        .collect();
+    let (id_pattern, secret_pattern, candidates) = prepare_scan_inputs(client)?;
 
     let mut budget: u64 = limits.pass_budget;
     let mut had_error = false;
@@ -2670,33 +2794,50 @@ fn accept_settled_match(
 /// `read_regular_file` follows the same technique for the identical race.
 /// Symlinks are followed on purpose here, same as there: a `bins` candidate
 /// is routinely one.
-fn scan_candidate(
-    path: &Path,
-    id_pattern: &ScanPattern,
-    secret_pattern: &ScanPattern,
-    budget: &mut u64,
-    per_file_cap: u64,
-) -> ScanOutcome {
-    use std::io::Read;
+/// Compiles both discovery regexes and resolves `client.files`/`client.bins`
+/// into ordered candidate paths.
+fn prepare_scan_inputs(
+    client: &AuthClientDiscovery,
+) -> Option<(ScanPattern, ScanPattern, Vec<PathBuf>)> {
+    let id_pattern = compile_scan_pattern(client.id_pattern.as_deref()?)?;
+    let secret_pattern = compile_scan_pattern(client.secret_pattern.as_deref()?)?;
+    let candidates: Vec<PathBuf> = client
+        .files
+        .iter()
+        .map(|f| super::expand_home(f))
+        .chain(bin_candidates(&client.bins))
+        .collect();
+    Some((id_pattern, secret_pattern, candidates))
+}
 
+/// Result of opening a discovery candidate with [`open_candidate_file`].
+enum CandidateOpen {
+    File(std::fs::File, u64, std::time::SystemTime),
+    NotFound,
+    Error(String),
+}
+
+/// Safely opens a regular file candidate without blocking on FIFOs and returns
+/// its handle alongside `(file_len, mtime)` from handle-level `metadata()`.
+fn open_candidate_file(path: &Path) -> CandidateOpen {
     match std::fs::metadata(path) {
         Ok(meta) if meta.file_type().is_file() => {}
-        Ok(_) => return ScanOutcome::NotFound,
+        Ok(_) => return CandidateOpen::NotFound,
         // "Doesn't exist" is a candidate that was never installed — the same
         // fact an absent `files` entry always was, still a miss. Anything
         // else (permission denied, a path through a non-directory, an I/O
         // error from the filesystem itself) is not that: it says nothing
         // about whether the client is installed, and must not earn the
         // miss-cache backoff a genuine "not here" does.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ScanOutcome::NotFound,
-        Err(e) => return ScanOutcome::Error(e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CandidateOpen::NotFound,
+        Err(e) => return CandidateOpen::Error(e.to_string()),
     }
     let mut open_options = std::fs::OpenOptions::new();
     open_options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        // The actual FIFO-hang guard (see the doc comment above): opening
+        // The actual FIFO-hang guard (see `scan_candidate`'s doc): opening
         // read-only with `O_NONBLOCK` set returns immediately no matter what
         // is at `path` right now, rather than blocking until a writer
         // connects — a FIFO opened this way still succeeds (POSIX), so the
@@ -2706,40 +2847,41 @@ fn scan_candidate(
         // there is nothing for a later `fcntl` to buy back.
         open_options.custom_flags(libc::O_NONBLOCK);
     }
-    let mut file = match open_options.open(path) {
+    let file = match open_options.open(path) {
         Ok(f) => f,
         // A candidate removed between the `metadata` check above and this
         // `open` is the same fact that check already reports for one that
         // never existed — `NotFound`, not an error worth a backoff or a
         // diagnostic line over an ordinary uninstall-in-progress race.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ScanOutcome::NotFound,
-        Err(e) => return ScanOutcome::Error(e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CandidateOpen::NotFound,
+        Err(e) => return CandidateOpen::Error(e.to_string()),
     };
-    // The handle's own length, not merely its type: used below to tell a
-    // budget/cap cutoff that happens to land exactly at `file_len` — not a
-    // cutoff at all, since every byte the candidate holds was read; it gets
-    // the same EOF settle pass a natural `read` returning `0` would, and can
-    // still come back `Found` — apart from one that lands short of it (some
-    // of the file was never looked at — a real `Truncated`). A file that
-    // grows or shrinks mid-scan can still fool this, the same TOCTOU every
-    // length-based check here already accepts — and this trusts the
-    // metadata's reported length outright rather than re-measuring it; a
-    // `files`/`bins` candidate is always a regular file by the time this
-    // line runs (the match above just confirmed it), so there is no
-    // `/proc`-style entry with an unreliable stat in the shapes this scans.
-    // `mtime` travels alongside `file_len` for the same reason: both come
-    // from this one handle-level `stat`, taken before any of the reads
-    // below, so a `Found` result can report the exact identity of what was
-    // actually scanned — see `ScanOutcome::Found`'s own doc — rather than
-    // `client_discovery_found_store` re-`stat`ing the path afterward and
-    // risking a *different* file's identity if it changed in between.
-    let (file_len, mtime) = match file.metadata() {
+    // The handle's own length and `mtime` come from this single handle-level
+    // `stat` so any cached `ClientFound` records the exact identity of what was
+    // actually read.
+    match file.metadata() {
         Ok(meta) if meta.file_type().is_file() => match meta.modified() {
-            Ok(mtime) => (meta.len(), mtime),
-            Err(e) => return ScanOutcome::Error(e.to_string()),
+            Ok(mtime) => CandidateOpen::File(file, meta.len(), mtime),
+            Err(e) => CandidateOpen::Error(e.to_string()),
         },
-        Ok(_) => return ScanOutcome::NotFound,
-        Err(e) => return ScanOutcome::Error(e.to_string()),
+        Ok(_) => CandidateOpen::NotFound,
+        Err(e) => CandidateOpen::Error(e.to_string()),
+    }
+}
+
+fn scan_candidate(
+    path: &Path,
+    id_pattern: &ScanPattern,
+    secret_pattern: &ScanPattern,
+    budget: &mut u64,
+    per_file_cap: u64,
+) -> ScanOutcome {
+    use std::io::Read;
+
+    let (mut file, file_len, mtime) = match open_candidate_file(path) {
+        CandidateOpen::File(file, file_len, mtime) => (file, file_len, mtime),
+        CandidateOpen::NotFound => return ScanOutcome::NotFound,
+        CandidateOpen::Error(msg) => return ScanOutcome::Error(msg),
     };
 
     let mut chunk = vec![0u8; CLIENT_DISCOVERY_CHUNK_BYTES];
@@ -2881,6 +3023,174 @@ fn scan_candidate(
     } else {
         ScanOutcome::NotFound
     }
+}
+
+/// All distinct settled ID and secret matches extracted from one candidate
+/// file for multi-pair fallback probing.
+struct CandidateMatchSet {
+    path: PathBuf,
+    ids: Vec<String>,
+    secrets: Vec<String>,
+    len: u64,
+    mtime: std::time::SystemTime,
+}
+
+/// Appends newly settled matches of `pattern` in `carry` (ending at or after
+/// `min_end` to avoid re-accepting truncated prefixes inside overlap tails),
+/// bounded to [`CLIENT_DISCOVERY_MAX_MULTI_MATCHES`] distinct entries.
+fn collect_settled_matches(
+    carry: &[u8],
+    pattern: &ScanPattern,
+    eof: bool,
+    min_end: usize,
+    found: &mut Vec<String>,
+) {
+    if found.len() >= CLIENT_DISCOVERY_MAX_MULTI_MATCHES {
+        return;
+    }
+    for m in pattern.re.find_iter(carry) {
+        if m.end() < min_end {
+            continue;
+        }
+        let already_maximal = pattern.max_len.is_some_and(|max| m.len() >= max);
+        if !eof && m.end() == carry.len() && !already_maximal {
+            continue;
+        }
+        if m.len() <= super::CLIENT_PATTERN_MAX_MATCH_BYTES && !m.is_empty() {
+            let value = String::from_utf8_lossy(m.as_bytes()).into_owned();
+            if !found.contains(&value) {
+                found.push(value);
+                if found.len() >= CLIENT_DISCOVERY_MAX_MULTI_MATCHES {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Scans `path` across bounded chunks collecting up to
+/// [`CLIENT_DISCOVERY_MAX_MULTI_MATCHES`] distinct IDs and secrets; returns
+/// `None` if either list ends up empty.
+fn scan_candidate_all(
+    path: &Path,
+    id_pattern: &ScanPattern,
+    secret_pattern: &ScanPattern,
+    budget: &mut u64,
+    per_file_cap: u64,
+) -> Option<CandidateMatchSet> {
+    use std::io::Read;
+
+    let CandidateOpen::File(mut file, file_len, mtime) = open_candidate_file(path) else {
+        return None;
+    };
+    let mut chunk = vec![0u8; CLIENT_DISCOVERY_CHUNK_BYTES];
+    let mut carry: Vec<u8> = Vec::new();
+    let mut found_ids: Vec<String> = Vec::new();
+    let mut found_secrets: Vec<String> = Vec::new();
+    let mut scanned: u64 = 0;
+
+    loop {
+        if *budget == 0 {
+            if scanned >= file_len {
+                collect_settled_matches(&carry, id_pattern, true, carry.len(), &mut found_ids);
+                collect_settled_matches(
+                    &carry,
+                    secret_pattern,
+                    true,
+                    carry.len(),
+                    &mut found_secrets,
+                );
+            }
+            break;
+        }
+        let want = (chunk.len() as u64).min(*budget) as usize;
+        let n = loop {
+            match file.read(&mut chunk[..want]) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            }
+        };
+        if n == 0 {
+            collect_settled_matches(&carry, id_pattern, true, carry.len(), &mut found_ids);
+            collect_settled_matches(
+                &carry,
+                secret_pattern,
+                true,
+                carry.len(),
+                &mut found_secrets,
+            );
+            break;
+        }
+        *budget = budget.saturating_sub(n as u64);
+        let prev_len = carry.len();
+        carry.extend_from_slice(&chunk[..n]);
+        scanned = scanned.saturating_add(n as u64);
+        collect_settled_matches(&carry, id_pattern, false, prev_len, &mut found_ids);
+        collect_settled_matches(&carry, secret_pattern, false, prev_len, &mut found_secrets);
+        if found_ids.len() >= CLIENT_DISCOVERY_MAX_MULTI_MATCHES
+            && found_secrets.len() >= CLIENT_DISCOVERY_MAX_MULTI_MATCHES
+        {
+            break;
+        }
+        if carry.len() > CLIENT_DISCOVERY_OVERLAP_BYTES {
+            let drop = carry.len() - CLIENT_DISCOVERY_OVERLAP_BYTES;
+            carry.drain(..drop);
+        }
+        if scanned >= per_file_cap {
+            if scanned >= file_len {
+                collect_settled_matches(&carry, id_pattern, true, carry.len(), &mut found_ids);
+                collect_settled_matches(
+                    &carry,
+                    secret_pattern,
+                    true,
+                    carry.len(),
+                    &mut found_secrets,
+                );
+            }
+            break;
+        }
+    }
+
+    if !found_ids.is_empty() && !found_secrets.is_empty() {
+        Some(CandidateMatchSet {
+            path: path.to_path_buf(),
+            ids: found_ids,
+            secrets: found_secrets,
+            len: file_len,
+            mtime,
+        })
+    } else {
+        None
+    }
+}
+
+/// Scans every configured binary candidate in `client` under `limits` and
+/// returns all [`CandidateMatchSet`]s that carry at least one ID and secret.
+fn discover_client_match_sets(
+    client: &AuthClientDiscovery,
+    limits: ScanLimits,
+) -> Vec<CandidateMatchSet> {
+    let Some((id_pattern, secret_pattern, candidates)) = prepare_scan_inputs(client) else {
+        return Vec::new();
+    };
+    let mut budget = limits.pass_budget;
+    let mut sets = Vec::new();
+    for path in &candidates {
+        if budget == 0 {
+            break;
+        }
+        if let Some(set) = scan_candidate_all(
+            path,
+            &id_pattern,
+            &secret_pattern,
+            &mut budget,
+            limits.per_file_cap,
+        ) {
+            sets.push(set);
+        }
+    }
+    sets
 }
 
 /// The most a token-refresh response body is ever read as, in bytes — 1 MiB,
@@ -3027,6 +3337,21 @@ fn oauth_error_message(code: &str, status: u16) -> String {
 fn is_invalid_client(err: &str) -> bool {
     err.strip_prefix(OAUTH_ERROR_PREFIX)
         .is_some_and(|rest| rest.starts_with("invalid_client "))
+}
+
+/// True for the OAuth `unauthorized_client` error message produced by
+/// [`oauth_error_message`]: means the authenticated client ID itself is not
+/// permitted to refresh the stored grant, so probing other secrets with the
+/// same ID cannot succeed.
+fn is_unauthorized_client(err: &str) -> bool {
+    err.strip_prefix(OAUTH_ERROR_PREFIX)
+        .is_some_and(|rest| rest.starts_with("unauthorized_client "))
+}
+
+/// True when the token endpoint rejected the OAuth client credentials or
+/// client authorization (`invalid_client` or `unauthorized_client`).
+fn is_client_mismatch_error(err: &str) -> bool {
+    is_invalid_client(err) || is_unauthorized_client(err)
 }
 
 /// The most a refreshed token is ever cached as living, in seconds — 24
@@ -5931,6 +6256,214 @@ mod tests {
             ),
             "the backoff must still lapse once its own interval has actually passed"
         );
+    }
+
+    #[test]
+    fn scan_candidate_all_collects_multiple_distinct_ids_and_secrets_across_chunks() {
+        let id_pattern = scan_pattern(&synthetic_id_pattern());
+        let secret_pattern = scan_pattern(&synthetic_secret_pattern());
+
+        let id1 = fake_client_id("710001", "multione");
+        let id2 = fake_client_id("710002", "multitwo");
+        let sec1 = fake_secret(&"A1".repeat(14));
+        let sec2 = fake_secret(&"B2".repeat(14));
+
+        // 2 MiB + tail so matches span two `CLIENT_DISCOVERY_CHUNK_BYTES` reads
+        // with one ID straddling the first chunk boundary and duplicates of the
+        // first pair later in chunk 2.
+        let mut content = vec![b'-'; CLIENT_DISCOVERY_CHUNK_BYTES * 2 + 1024];
+        content[100..100 + id1.len()].copy_from_slice(id1.as_bytes());
+        content[500..500 + sec1.len()].copy_from_slice(sec1.as_bytes());
+        let straddle = CLIENT_DISCOVERY_CHUNK_BYTES - 10;
+        content[straddle..straddle + id2.len()].copy_from_slice(id2.as_bytes());
+        let tail_start = CLIENT_DISCOVERY_CHUNK_BYTES + 4096;
+        content[tail_start..tail_start + sec2.len()].copy_from_slice(sec2.as_bytes());
+        let dup_start = tail_start + 512;
+        content[dup_start..dup_start + id1.len()].copy_from_slice(id1.as_bytes());
+        content[dup_start + 128..dup_start + 128 + sec1.len()].copy_from_slice(sec1.as_bytes());
+
+        let dir = temp_dir("scan-candidate-all-multi");
+        let file = dir.join("client-binary");
+        std::fs::write(&file, &content).unwrap();
+
+        let mut budget = CLIENT_DISCOVERY_PASS_BUDGET_BYTES;
+        let set = scan_candidate_all(
+            &file,
+            &id_pattern,
+            &secret_pattern,
+            &mut budget,
+            CLIENT_DISCOVERY_MAX_SCAN_BYTES,
+        )
+        .expect("both multiple IDs and multiple secrets must be discovered");
+        assert_eq!(set.ids, vec![id1, id2]);
+        assert_eq!(set.secrets, vec![sec1, sec2]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_access_token_with_fallback_probes_remaining_pairs_and_caches_winner() {
+        let dir = temp_dir("fallback-probes-winner");
+        let file = dir.join("client-binary");
+        let id0 = fake_client_id("720001", "probezero");
+        let id1 = fake_client_id("720002", "probeone");
+        let sec0 = fake_secret(&"C3".repeat(14));
+        let sec1 = fake_secret(&"D4".repeat(14));
+        let sec2 = fake_secret(&"E5".repeat(14));
+        std::fs::write(&file, format!("{id0} {sec0} {id1} {sec1} {sec2}")).unwrap();
+
+        let client = AuthClientDiscovery {
+            id_env: None,
+            secret_env: None,
+            id_pattern: Some(synthetic_id_pattern()),
+            secret_pattern: Some(synthetic_secret_pattern()),
+            files: vec![file.to_string_lossy().into_owned()],
+            bins: Vec::new(),
+        };
+        let initial = discover_client(&client).expect("initial pair must resolve");
+        assert_eq!(initial, (id0.clone(), sec0.clone()));
+        let config_key = client_config_key(&client);
+
+        let step = AuthStep {
+            client: Some(client),
+            ..auth_step(AuthType::OauthRefresh)
+        };
+        let key = refresh_cache_key("fallback-winner", &format!("rt-{}", std::process::id()));
+        let mut tried = Vec::new();
+        let out = resolve_access_token_with_fallback(
+            key,
+            &id0,
+            &sec0,
+            &step,
+            true,
+            CLIENT_DISCOVERY_LIMITS,
+            |cid, csec| {
+                tried.push((cid.to_string(), csec.to_string()));
+                if cid == id0 && csec == sec0 {
+                    Err("token refresh failed: invalid_client (HTTP 401)".to_string())
+                } else if cid == id0 && csec == sec1 {
+                    Err("token refresh failed: unauthorized_client (HTTP 401)".to_string())
+                } else if cid == id1 && csec == sec0 {
+                    Err("token refresh failed: invalid_client (HTTP 401)".to_string())
+                } else if cid == id1 && csec == sec1 {
+                    Ok(serde_json::json!({ "access_token": "fresh-ok", "expires_in": 3600 }))
+                } else {
+                    panic!("unexpected pair tried: {cid} / {csec}");
+                }
+            },
+        )
+        .expect("fallback probe must find and accept the working pair");
+
+        assert_eq!(out, ("fresh-ok".to_string(), 3600));
+        // Notice `(id0, sec2)` was skipped after `(id0, sec1)` returned `unauthorized_client`.
+        assert_eq!(
+            tried,
+            vec![
+                (id0.clone(), sec0.clone()),
+                (id0.clone(), sec1.clone()),
+                (id1.clone(), sec0.clone()),
+                (id1.clone(), sec1.clone()),
+            ]
+        );
+        assert_eq!(
+            client_discovery_found_lookup(config_key, &file),
+            Some((id1, sec1)),
+            "winning fallback pair must replace the cached entry in CLIENT_DISCOVERY_FOUND"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_access_token_with_fallback_stops_immediately_on_non_mismatch_error() {
+        let dir = temp_dir("fallback-stops-non-mismatch");
+        let file = dir.join("client-binary");
+        let id0 = fake_client_id("730001", "stopzero");
+        let id1 = fake_client_id("730002", "stopone");
+        let sec0 = fake_secret(&"F6".repeat(14));
+        let sec1 = fake_secret(&"G7".repeat(14));
+        std::fs::write(&file, format!("{id0} {sec0} {id1} {sec1}")).unwrap();
+
+        let client = AuthClientDiscovery {
+            id_env: None,
+            secret_env: None,
+            id_pattern: Some(synthetic_id_pattern()),
+            secret_pattern: Some(synthetic_secret_pattern()),
+            files: vec![file.to_string_lossy().into_owned()],
+            bins: Vec::new(),
+        };
+        let step = AuthStep {
+            client: Some(client),
+            ..auth_step(AuthType::OauthRefresh)
+        };
+        let key = refresh_cache_key("fallback-stop", &format!("rt-{}", std::process::id()));
+        let mut attempts = 0usize;
+        let err = resolve_access_token_with_fallback(
+            key,
+            &id0,
+            &sec0,
+            &step,
+            true,
+            CLIENT_DISCOVERY_LIMITS,
+            |cid, csec| {
+                attempts += 1;
+                if cid == id0 && csec == sec0 {
+                    Err("token refresh failed: invalid_client (HTTP 401)".to_string())
+                } else {
+                    Err("token refresh: the saved sign-in is no longer valid — sign in to Antigravity again".to_string())
+                }
+            },
+        )
+        .expect_err("non-mismatch error must abort further probing");
+
+        assert!(err.contains("no longer valid"), "{err}");
+        assert_eq!(attempts, 2);
+        assert!(matches!(
+            refresh_cache_lookup(key, cache_now() + 1),
+            CacheLookup::Backoff { .. }
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_access_token_with_fallback_skips_probing_for_non_discovered_client() {
+        let dir = temp_dir("fallback-skip-non-discovered");
+        let file = dir.join("client-binary");
+        let id0 = fake_client_id("740001", "skipzero");
+        let id1 = fake_client_id("740002", "skipone");
+        let sec0 = fake_secret(&"H8".repeat(14));
+        let sec1 = fake_secret(&"J9".repeat(14));
+        std::fs::write(&file, format!("{id0} {sec0} {id1} {sec1}")).unwrap();
+
+        let client = AuthClientDiscovery {
+            id_env: None,
+            secret_env: None,
+            id_pattern: Some(synthetic_id_pattern()),
+            secret_pattern: Some(synthetic_secret_pattern()),
+            files: vec![file.to_string_lossy().into_owned()],
+            bins: Vec::new(),
+        };
+        let step = AuthStep {
+            client: Some(client),
+            ..auth_step(AuthType::OauthRefresh)
+        };
+        let key = refresh_cache_key("fallback-skip", &format!("rt-{}", std::process::id()));
+        let mut attempts = 0usize;
+        let err = resolve_access_token_with_fallback(
+            key,
+            &id0,
+            &sec0,
+            &step,
+            false,
+            CLIENT_DISCOVERY_LIMITS,
+            |_, _| {
+                attempts += 1;
+                Err("token refresh failed: invalid_client (HTTP 401)".to_string())
+            },
+        )
+        .expect_err("env/literal pairs must not fall back to binary scanning");
+
+        assert!(err.contains("invalid_client"), "{err}");
+        assert_eq!(attempts, 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
